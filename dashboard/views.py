@@ -19,7 +19,6 @@ ALLOWED_TABLES = {
     "amazon_inventory", "bigbasket_inventory",
     "blinkit_inventory", "jiomart_inventory", "swiggy_inventory", "zepto_inventory",
     "all_platform_inventory",
-    "blinkit_truck_loading",
 }
 
 # Mirrors FastAPI INVENTORY_CONFIG for /inventory-charts aggregation.

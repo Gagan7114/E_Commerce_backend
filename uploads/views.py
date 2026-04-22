@@ -31,8 +31,6 @@ UPLOAD_ALLOWED_TABLES = {
     # Secondary sells
     "blinkitSec", "zeptoSec", "swiggySec", "flipkartSec",
     "jiomartSec", "bigbasketSec", "amazon_sec_daily", "amazon_sec_range",
-    # Truck loading
-    "blinkit_truck_loading",
 }
 
 BATCH_SIZE = 50
