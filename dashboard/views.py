@@ -1,116 +1,393 @@
+import calendar
 import re
-from datetime import date, timedelta
+from collections import defaultdict
+from datetime import date, datetime, timedelta
 
 from django.db import connection
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.response import Response
 
 from accounts.permissions import require
-from platforms.models import PlatformConfig
 
 _IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
+# Tables the dashboard can query. Mirrors FastAPI ALLOWED_TABLES.
+ALLOWED_TABLES = {
+    "master_po", "test_master_po",
+    "amazon_sec_daily", "amazon_sec_range", "bigbasketSec", "blinkitSec",
+    "fk_grocery", "flipkartSec", "jiomartSec", "swiggySec", "zeptoSec",
+    "amazon_inventory", "bigbasket_inventory",
+    "blinkit_inventory", "jiomart_inventory", "swiggy_inventory", "zepto_inventory",
+    "all_platform_inventory",
+    "blinkit_truck_loading",
+}
 
-def _safe(name: str) -> str | None:
-    return name if name and _IDENT.match(name) else None
+# Mirrors FastAPI INVENTORY_CONFIG for /inventory-charts aggregation.
+INVENTORY_CONFIG = {
+    "blinkit":   {"table": "blinkit_inventory",   "qty_col": "total_inv_qty",           "name_col": "item_name",       "city_col": None,     "color": "#f5c518"},
+    "zepto":     {"table": "zepto_inventory",     "qty_col": "units",                   "name_col": "sku_name",        "city_col": "city",   "color": "#7b2ff7"},
+    "swiggy":    {"table": "swiggy_inventory",    "qty_col": "warehouse_qty_available", "name_col": "sku_description", "city_col": "city",   "color": "#fc8019"},
+    "bigbasket": {"table": "bigbasket_inventory", "qty_col": "soh",                     "name_col": "sku_name",        "city_col": "city",   "color": "#84c225"},
+    "jiomart":   {"table": "jiomart_inventory",   "qty_col": "total_sellable_inv",      "name_col": "title",           "city_col": None,     "color": "#0078ad"},
+    "amazon":    {"table": "amazon_inventory",    "qty_col": "sellable_on_hand_units",  "name_col": "product_title",   "id_col": "asin",     "city_col": None, "color": "#ff9900"},
+}
 
 
-def _scalar(sql: str, params: list | None = None):
+def _quoted(table: str) -> str:
+    if table not in ALLOWED_TABLES:
+        raise ValueError(f"Table {table!r} not allowed")
+    return f'"{table}"'
+
+
+def _table_exists(table: str) -> bool:
     with connection.cursor() as cur:
-        cur.execute(sql, params or [])
-        row = cur.fetchone()
-        return row[0] if row else None
+        cur.execute(
+            "SELECT 1 FROM information_schema.tables "
+            "WHERE table_schema = current_schema() AND table_name = %s LIMIT 1",
+            [table],
+        )
+        return cur.fetchone() is not None
 
 
+def _count(table: str) -> int:
+    try:
+        with connection.cursor() as cur:
+            cur.execute(f"SELECT COUNT(*) FROM {_quoted(table)}")
+            row = cur.fetchone()
+            return int(row[0]) if row else 0
+    except Exception:
+        return 0
+
+
+def _sample_row(table: str) -> dict | None:
+    try:
+        with connection.cursor() as cur:
+            cur.execute(f"SELECT * FROM {_quoted(table)} LIMIT 1")
+            if cur.description is None:
+                return None
+            cols = [c[0] for c in cur.description]
+            row = cur.fetchone()
+            return dict(zip(cols, row)) if row else None
+    except Exception:
+        return None
+
+
+def _is_code(name) -> bool:
+    if not name or not isinstance(name, str):
+        return True
+    name = name.strip()
+    if len(name) <= 12 and name.isalnum():
+        return True
+    return False
+
+
+# ─── /table-count/{table} ───
 @api_view(["GET"])
 @permission_classes([require("dashboard.table.view")])
+def table_count(request, table_name: str):
+    if table_name not in ALLOWED_TABLES:
+        return Response({"error": "Table not allowed", "count": 0})
+    return Response({"table": table_name, "count": _count(table_name)})
+
+
+# ─── /table-counts ───
+@api_view(["GET"])
+@permission_classes([require("dashboard.view")])
 def table_counts(request):
-    """Count of rows across every configured warehouse table.
+    return Response({t: _count(t) for t in ALLOWED_TABLES})
 
-    Returns a dict keyed by platform slug with inventory/secondary/po counts,
-    skipping tables whose identifier fails validation or tables that don't
-    exist (returns 0 on pg_class miss).
-    """
-    out: dict[str, dict] = {}
-    for p in PlatformConfig.objects.filter(is_active=True):
-        entry = {"inventory": 0, "secondary": 0, "pos": 0}
-        inv = _safe(p.inventory_table)
-        sec = _safe(p.secondary_table)
-        master = _safe(p.master_po_table or "master_po")
-        if inv:
-            try:
-                entry["inventory"] = _scalar(f'SELECT COUNT(*) FROM "{inv}"') or 0
-            except Exception:
-                entry["inventory"] = 0
-        if sec:
-            try:
-                entry["secondary"] = _scalar(f'SELECT COUNT(*) FROM "{sec}"') or 0
-            except Exception:
-                entry["secondary"] = 0
-        if master:
-            try:
-                entry["pos"] = _scalar(
-                    f'SELECT COUNT(*) FROM "{master}" WHERE platform = %s', [p.slug]
-                ) or 0
-            except Exception:
-                entry["pos"] = 0
-        out[p.slug] = entry
-    return Response(out)
+
+# ─── /table-columns/{table} ───
+@api_view(["GET"])
+@permission_classes([require("dashboard.table.view")])
+def table_columns(request, table_name: str):
+    if table_name not in ALLOWED_TABLES:
+        return Response({"error": "Table not allowed", "columns": [], "sample": None})
+    sample = _sample_row(table_name)
+    if not sample:
+        return Response({"columns": [], "sample": None})
+    return Response({"columns": list(sample.keys()), "sample": sample})
+
+
+# ─── /expiry-alerts/{table} ───
+DATE_COL_PATTERNS = re.compile(
+    r"expir|delivery_date|deliver_by|due_date|valid_until|best_before|shelf_life|end_date|dispatch_date",
+    re.I,
+)
+ALERT_DAYS = 7
 
 
 @api_view(["GET"])
 @permission_classes([require("dashboard.view")])
-def inventory_chart(request):
-    """Per-platform total inventory units for a quick chart."""
-    series = []
-    for p in PlatformConfig.objects.filter(is_active=True).order_by("slug"):
-        inv = _safe(p.inventory_table)
-        if not inv:
-            series.append({"slug": p.slug, "name": p.name, "total_units": 0})
+def expiry_alerts(request, table_name: str):
+    if table_name not in ALLOWED_TABLES:
+        return Response({"alerts": []})
+    sample = _sample_row(table_name)
+    if not sample:
+        return Response({"alerts": []})
+
+    date_cols = []
+    for col, val in sample.items():
+        if not DATE_COL_PATTERNS.search(col):
             continue
-        try:
-            total = _scalar(f'SELECT COALESCE(SUM(quantity), 0) FROM "{inv}"') or 0
-        except Exception:
-            total = 0
-        series.append({"slug": p.slug, "name": p.name, "total_units": int(total)})
-    return Response({"series": series})
+        if isinstance(val, (date, datetime)):
+            date_cols.append(col)
+        elif isinstance(val, str) and re.match(r"^\d{4}-\d{2}-\d{2}", val):
+            date_cols.append(col)
+    if not date_cols:
+        return Response({"alerts": []})
 
-
-@api_view(["GET"])
-@permission_classes([require("dashboard.view")])
-def expiry_alerts(request):
-    """SKUs across all platform inventories expiring within N days (default 30)."""
-    try:
-        days = min(365, max(1, int(request.query_params.get("days", 30))))
-    except ValueError:
-        days = 30
-    cutoff = date.today() + timedelta(days=days)
-
+    today = date.today()
+    soon = today + timedelta(days=ALERT_DAYS)
     alerts = []
+    qt = _quoted(table_name)
+
     with connection.cursor() as cur:
-        for p in PlatformConfig.objects.filter(is_active=True):
-            inv = _safe(p.inventory_table)
-            if not inv:
-                continue
+        for col in date_cols:
+            qc = f'"{col}"'
             try:
-                cur.execute(
-                    f'''
-                    SELECT sku, product_name, quantity, expiry_date
-                    FROM "{inv}"
-                    WHERE expiry_date IS NOT NULL AND expiry_date <= %s
-                    ORDER BY expiry_date ASC
-                    LIMIT 200
-                    ''',
-                    [cutoff],
-                )
-                for row in cur.fetchall():
+                cur.execute(f"SELECT COUNT(*) FROM {qt} WHERE {qc} < %s", [today])
+                expired_count = cur.fetchone()[0] or 0
+                expired_rows = []
+                if expired_count:
+                    cur.execute(
+                        f"SELECT * FROM {qt} WHERE {qc} < %s ORDER BY {qc} DESC LIMIT 5",
+                        [today],
+                    )
+                    cols = [c[0] for c in cur.description]
+                    expired_rows = [dict(zip(cols, r)) for r in cur.fetchall()]
                     alerts.append({
-                        "platform": p.slug,
-                        "sku": row[0],
-                        "product_name": row[1],
-                        "quantity": row[2],
-                        "expiry_date": row[3].isoformat() if row[3] else None,
+                        "table": table_name,
+                        "column": col,
+                        "type": "expired",
+                        "count": int(expired_count),
+                        "rows": expired_rows,
+                    })
+
+                cur.execute(
+                    f"SELECT COUNT(*) FROM {qt} WHERE {qc} >= %s AND {qc} <= %s",
+                    [today, soon],
+                )
+                soon_count = cur.fetchone()[0] or 0
+                if soon_count:
+                    cur.execute(
+                        f"SELECT * FROM {qt} WHERE {qc} >= %s AND {qc} <= %s "
+                        f"ORDER BY {qc} ASC LIMIT 5",
+                        [today, soon],
+                    )
+                    cols = [c[0] for c in cur.description]
+                    rows = [dict(zip(cols, r)) for r in cur.fetchall()]
+                    alerts.append({
+                        "table": table_name,
+                        "column": col,
+                        "type": "expiring",
+                        "count": int(soon_count),
+                        "rows": rows,
                     })
             except Exception:
                 continue
-    return Response({"count": len(alerts), "results": alerts})
+
+    return Response({"alerts": alerts})
+
+
+# ─── /inventory-charts ───
+@api_view(["GET"])
+@permission_classes([require("dashboard.view")])
+def inventory_charts(request):
+    platform_totals = []
+    city_totals: dict[str, int] = defaultdict(int)
+    top_products = []
+
+    for platform, cfg in INVENTORY_CONFIG.items():
+        table = cfg["table"]
+        qty_col = cfg["qty_col"]
+        name_col = cfg["name_col"]
+        id_col = cfg.get("id_col")
+        city_col = cfg.get("city_col")
+        color = cfg["color"]
+
+        total_qty = 0
+        sku_count = 0
+        rows: list[dict] = []
+
+        try:
+            select_cols = [qty_col, name_col]
+            if id_col:
+                select_cols.append(id_col)
+            if city_col:
+                select_cols.append(city_col)
+            cols_sql = ", ".join(f'"{c}"' for c in select_cols)
+            qt = _quoted(table)
+            with connection.cursor() as cur:
+                cur.execute(f"SELECT COUNT(*) FROM {qt}")
+                sku_count = int(cur.fetchone()[0] or 0)
+                cur.execute(f"SELECT {cols_sql} FROM {qt} LIMIT 5000")
+                rows = [dict(zip(select_cols, r)) for r in cur.fetchall()]
+        except Exception:
+            platform_totals.append({
+                "platform": platform, "total_qty": 0, "sku_count": 0, "color": color,
+            })
+            continue
+
+        name_lookup: dict = {}
+        if id_col:
+            for r in rows:
+                rid = r.get(id_col)
+                rname = r.get(name_col)
+                if rid and rname and not _is_code(rname):
+                    name_lookup[rid] = rname
+
+        for r in rows:
+            q = r.get(qty_col)
+            try:
+                total_qty += int(q or 0)
+            except (TypeError, ValueError):
+                pass
+
+        platform_totals.append({
+            "platform": platform,
+            "total_qty": total_qty,
+            "sku_count": sku_count,
+            "color": color,
+        })
+
+        if city_col:
+            for r in rows:
+                city = r.get(city_col)
+                try:
+                    qty = int(r.get(qty_col) or 0)
+                except (TypeError, ValueError):
+                    qty = 0
+                if city and qty > 0:
+                    city_totals[str(city).upper().strip()] += qty
+
+        product_map: dict[str, int] = defaultdict(int)
+        for r in rows:
+            name = r.get(name_col)
+            try:
+                qty = int(r.get(qty_col) or 0)
+            except (TypeError, ValueError):
+                qty = 0
+            if not name or qty <= 0:
+                continue
+            if _is_code(name) and id_col:
+                rid = r.get(id_col) or name
+                name = name_lookup.get(rid, name)
+            product_map[str(name)] += qty
+
+        for name, qty in sorted(product_map.items(), key=lambda x: -x[1])[:5]:
+            top_products.append({
+                "product": name[:80],
+                "qty": qty,
+                "platform": platform,
+                "color": color,
+            })
+
+    platform_totals.sort(key=lambda x: -x["total_qty"])
+    city_list = sorted(
+        [{"city": c, "qty": q} for c, q in city_totals.items()],
+        key=lambda x: -x["qty"],
+    )
+    top_products.sort(key=lambda x: -x["qty"])
+
+    return Response({
+        "platform_totals": platform_totals,
+        "city_distribution": city_list[:15],
+        "top_products": top_products[:15],
+    })
+
+
+# ─── /table-data/{table} ───
+@api_view(["GET"])
+@permission_classes([require("dashboard.table.view")])
+def table_data(request, table_name: str):
+    if table_name not in ALLOWED_TABLES:
+        return Response({"error": "Table not allowed", "data": [], "count": 0})
+
+    q = request.query_params
+    try:
+        page = max(0, int(q.get("page", 0)))
+        page_size = min(200, max(1, int(q.get("page_size", 50))))
+    except ValueError:
+        page, page_size = 0, 50
+
+    search = (q.get("search") or "")[:200]
+    search_columns = q.get("search_columns", "")
+    date_column = q.get("date_column", "")
+    date_from = q.get("date_from", "")
+    date_to = q.get("date_to", "")
+    year = q.get("year", "")
+    month = q.get("month", "")
+    single_date = q.get("date", "")
+    expiry_column = q.get("expiry_column", "")
+    expiry_before = q.get("expiry_before", "")
+
+    where: list[str] = []
+    params: list = []
+
+    def _validate_col(name: str) -> str | None:
+        return name if name and _IDENT.match(name) else None
+
+    dc = _validate_col(date_column)
+    if dc:
+        if date_from:
+            where.append(f'"{dc}" >= %s')
+            params.append(date_from)
+        if date_to:
+            where.append(f'"{dc}" <= %s')
+            params.append(date_to)
+        if year and not date_from and not date_to:
+            where.append(f'"{dc}" >= %s')
+            params.append(f"{year}-01-01")
+            where.append(f'"{dc}" <= %s')
+            params.append(f"{year}-12-31T23:59:59")
+        if month:
+            y = year or str(datetime.now().year)
+            try:
+                m = int(month)
+                last_day = calendar.monthrange(int(y), m)[1]
+                where.append(f'"{dc}" >= %s')
+                params.append(f"{y}-{m:02d}-01")
+                where.append(f'"{dc}" <= %s')
+                params.append(f"{y}-{m:02d}-{last_day}T23:59:59")
+            except ValueError:
+                pass
+        if single_date and not date_from and not date_to:
+            where.append(f'"{dc}" >= %s')
+            params.append(single_date)
+            where.append(f'"{dc}" <= %s')
+            params.append(f"{single_date}T23:59:59")
+
+    ec = _validate_col(expiry_column)
+    if ec and expiry_before:
+        where.append(f'"{ec}" < %s')
+        params.append(expiry_before)
+
+    if search and search_columns:
+        cols = [c.strip() for c in search_columns.split(",") if c.strip() and _IDENT.match(c.strip())]
+        if cols:
+            ors = " OR ".join(f'"{c}"::text ILIKE %s' for c in cols)
+            where.append(f"({ors})")
+            params.extend([f"%{search}%"] * len(cols))
+
+    where_sql = f" WHERE {' AND '.join(where)}" if where else ""
+    qt = _quoted(table_name)
+    try:
+        with connection.cursor() as cur:
+            cur.execute(f"SELECT COUNT(*) FROM {qt}{where_sql}", params)
+            total = int(cur.fetchone()[0] or 0)
+            cur.execute(
+                f"SELECT * FROM {qt}{where_sql} LIMIT %s OFFSET %s",
+                params + [page_size, page * page_size],
+            )
+            cols = [c[0] for c in cur.description]
+            rows = [dict(zip(cols, r)) for r in cur.fetchall()]
+    except Exception:
+        return Response({"error": "Query failed", "data": [], "count": 0})
+
+    return Response({
+        "data": rows,
+        "count": total,
+        "page": page,
+        "page_size": page_size,
+    })

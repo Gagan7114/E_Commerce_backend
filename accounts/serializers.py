@@ -1,19 +1,15 @@
 from django.contrib.auth import get_user_model
 from rest_framework import serializers
-from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
 
-from .permissions import user_permission_codes
+from .permissions import user_permission_codes, user_platform_slugs
 
 UserModel = get_user_model()
-
-
-class EmailTokenObtainPairSerializer(TokenObtainPairSerializer):
-    username_field = UserModel.USERNAME_FIELD
 
 
 class MeSerializer(serializers.ModelSerializer):
     permissions = serializers.SerializerMethodField()
     groups = serializers.SerializerMethodField()
+    platforms = serializers.SerializerMethodField()
 
     class Meta:
         model = UserModel
@@ -27,6 +23,7 @@ class MeSerializer(serializers.ModelSerializer):
             "is_staff",
             "groups",
             "permissions",
+            "platforms",
             "created_at",
         ]
 
@@ -35,3 +32,6 @@ class MeSerializer(serializers.ModelSerializer):
 
     def get_groups(self, obj) -> list[str]:
         return list(obj.groups.values_list("name", flat=True))
+
+    def get_platforms(self, obj) -> list[str]:
+        return user_platform_slugs(obj)

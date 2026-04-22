@@ -1,136 +1,103 @@
-"""Batch upsert endpoint for the external uploader tool.
+"""Batch upload endpoint. Mirrors FastAPI routes/upload.py.
 
 Contract (JSON body):
   {
-    "table":      "blinkit_inventory",   // warehouse table name
-    "unique_keys": ["sku"],              // columns to match on for upsert
-    "rows": [ {...}, {...} ]             // list of row dicts; max 5000/request
+    "table":       "blinkit_inventory",
+    "data":        [ {...}, {...} ],
+    "unique_key":  "sku,warehouse",   // comma-separated; optional
+    "upsert":      true                // default true
   }
 
-Returns: {"inserted": N, "updated": M, "failed": 0}
-
-The endpoint is intentionally generic — it validates the target table is
-known (via PlatformConfig), all columns in `rows` are real columns on that
-table, and then issues a single INSERT ... ON CONFLICT ... DO UPDATE inside
-a transaction.
+Returns: {"success": N, "failed": M, "error": "..." | null}
 """
 
 from __future__ import annotations
 
 import re
 
-from django.db import connection, transaction
-from rest_framework import serializers, status
+from django.db import connection
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.response import Response
 
 from accounts.permissions import require
-from platforms.models import PlatformConfig
 
 _IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-MAX_ROWS = 5000
 
+# Tables the uploader is allowed to write to (mirrors FastAPI).
+UPLOAD_ALLOWED_TABLES = {
+    # Inventory
+    "blinkit_inventory", "zepto_inventory", "swiggy_inventory",
+    "bigbasket_inventory", "jiomart_inventory", "amazon_inventory",
+    # Secondary sells
+    "blinkitSec", "zeptoSec", "swiggySec", "flipkartSec",
+    "jiomartSec", "bigbasketSec", "amazon_sec_daily", "amazon_sec_range",
+    # Truck loading
+    "blinkit_truck_loading",
+}
 
-class BatchSerializer(serializers.Serializer):
-    table = serializers.CharField(max_length=80)
-    unique_keys = serializers.ListField(child=serializers.CharField(max_length=80), min_length=1)
-    rows = serializers.ListField(child=serializers.DictField(), min_length=1, max_length=MAX_ROWS)
-
-    def validate_table(self, value):
-        if not _IDENT.match(value):
-            raise serializers.ValidationError("Invalid table name.")
-        known = set(PlatformConfig.objects.values_list("inventory_table", flat=True)) | \
-                set(PlatformConfig.objects.values_list("secondary_table", flat=True)) | \
-                set(PlatformConfig.objects.values_list("master_po_table", flat=True))
-        if value not in known:
-            raise serializers.ValidationError(f"Table {value!r} is not a registered warehouse table.")
-        return value
-
-    def validate_unique_keys(self, value):
-        for k in value:
-            if not _IDENT.match(k):
-                raise serializers.ValidationError(f"Invalid column identifier: {k!r}")
-        return value
-
-
-def _table_columns(table: str) -> set[str]:
-    with connection.cursor() as cur:
-        cur.execute(
-            """
-            SELECT column_name FROM information_schema.columns
-            WHERE table_name = %s AND table_schema = current_schema()
-            """,
-            [table],
-        )
-        return {r[0] for r in cur.fetchall()}
+BATCH_SIZE = 50
 
 
 @api_view(["POST"])
 @permission_classes([require("upload.use")])
-def batch_upsert(request):
-    ser = BatchSerializer(data=request.data)
-    ser.is_valid(raise_exception=True)
-    data = ser.validated_data
+def batch_upload(request):
+    body = request.data or {}
+    table = body.get("table")
+    data = body.get("data") or []
+    unique_key = body.get("unique_key") or ""
+    upsert = bool(body.get("upsert", True))
 
-    table = data["table"]
-    unique_keys = data["unique_keys"]
-    rows = data["rows"]
+    if table not in UPLOAD_ALLOWED_TABLES:
+        return Response(
+            {"detail": f"Table '{table}' is not allowed for upload"},
+            status=400,
+        )
+    if not _IDENT.match(table):
+        return Response({"detail": "Invalid table name."}, status=400)
+    if not isinstance(data, list) or not data:
+        return Response({"success": 0, "failed": 0, "error": None})
 
-    all_cols = _table_columns(table)
-    if not all_cols:
-        return Response({"detail": f"Table {table!r} has no columns / does not exist."},
-                        status=status.HTTP_400_BAD_REQUEST)
-    if not set(unique_keys).issubset(all_cols):
-        return Response({"detail": f"unique_keys not all present in table: {set(unique_keys) - all_cols}"},
-                        status=status.HTTP_400_BAD_REQUEST)
-
-    # Pick the columns we actually will write — intersection of provided row keys and real columns.
-    provided_cols: set[str] = set()
-    for r in rows:
-        provided_cols.update(r.keys())
-    invalid = [c for c in provided_cols if not _IDENT.match(c)]
+    columns = list(data[0].keys())
+    invalid = [c for c in columns if not _IDENT.match(c)]
     if invalid:
-        return Response({"detail": f"Invalid column identifiers: {invalid}"},
-                        status=status.HTTP_400_BAD_REQUEST)
-    cols = sorted(provided_cols & all_cols)
-    if not cols:
-        return Response({"detail": "No matching columns between rows and target table."},
-                        status=status.HTTP_400_BAD_REQUEST)
-    for uk in unique_keys:
-        if uk not in cols:
-            cols.append(uk)
+        return Response({"detail": f"Invalid column identifiers: {invalid}"}, status=400)
 
-    col_list = ", ".join(f'"{c}"' for c in cols)
-    placeholders = "(" + ", ".join(["%s"] * len(cols)) + ")"
-    update_cols = [c for c in cols if c not in unique_keys]
-    conflict_cols = ", ".join(f'"{c}"' for c in unique_keys)
-    if update_cols:
-        update_clause = ", ".join(f'"{c}" = EXCLUDED."{c}"' for c in update_cols)
-        do_clause = f"DO UPDATE SET {update_clause}"
-    else:
-        do_clause = "DO NOTHING"
+    quoted_cols = [f'"{c}"' for c in columns]
+    col_list = ", ".join(quoted_cols)
+    placeholders = ", ".join(["%s"] * len(columns))
 
-    values: list = []
-    for r in rows:
-        values.append(tuple(r.get(c) for c in cols))
+    upsert_clause = ""
+    if upsert and unique_key:
+        keys = [k.strip() for k in unique_key.split(",") if k.strip()]
+        for k in keys:
+            if not _IDENT.match(k):
+                return Response(
+                    {"detail": f"Invalid unique_key identifier: {k!r}"}, status=400
+                )
+        conflict_cols = ", ".join(f'"{k}"' for k in keys)
+        update_cols = [f'"{c}" = EXCLUDED."{c}"' for c in columns if c not in keys]
+        if update_cols:
+            upsert_clause = (
+                f' ON CONFLICT ({conflict_cols}) DO UPDATE SET {", ".join(update_cols)}'
+            )
+        else:
+            upsert_clause = f" ON CONFLICT ({conflict_cols}) DO NOTHING"
 
-    sql = (
-        f'INSERT INTO "{table}" ({col_list}) VALUES {placeholders} '
-        f'ON CONFLICT ({conflict_cols}) {do_clause}'
-    )
+    sql = f'INSERT INTO "{table}" ({col_list}) VALUES ({placeholders}){upsert_clause}'
 
-    # Execute one row at a time so we can report inserted vs updated. Batched
-    # execute_values would be faster but blurs the insert/update split.
-    inserted = updated = 0
-    with transaction.atomic(), connection.cursor() as cur:
-        for vals in values:
-            cur.execute(sql + " RETURNING (xmax = 0) AS was_insert", vals)
-            row = cur.fetchone()
-            if row is None:
-                continue  # DO NOTHING path with no updatable cols
-            if row[0]:
-                inserted += 1
-            else:
-                updated += 1
+    success = 0
+    failed = 0
+    last_error: str | None = None
 
-    return Response({"inserted": inserted, "updated": updated, "failed": 0})
+    with connection.cursor() as cur:
+        for i in range(0, len(data), BATCH_SIZE):
+            batch = data[i : i + BATCH_SIZE]
+            try:
+                for row in batch:
+                    cur.execute(sql, [row.get(c) for c in columns])
+                success += len(batch)
+            except Exception as e:
+                failed += len(batch)
+                last_error = str(e)
+
+    return Response({"success": success, "failed": failed, "error": last_error})

@@ -7,7 +7,7 @@ urlpatterns = [
     path("api/dashboard/", include("dashboard.urls")),
     path("api/platform/", include("platforms.urls")),
     path("api/sap/", include("sap.urls")),
-    path("api/uploads/", include("uploads.urls")),
+    path("api/upload/", include("uploads.urls")),
 ]
 
 admin.site.site_header = "ECMS Operations"

@@ -88,3 +88,28 @@ def require(code: str):
         {"code": code},
     )
     return cls
+
+
+def user_platform_slugs(user) -> list[str]:
+    """Return the platform slugs this user is allowed to access.
+
+    A user holding `platform.*.access` (admin) or `*` (superuser) gets every
+    active slug from `PlatformConfig`. Otherwise they get exactly the slugs
+    whose `platform.<slug>.access` code they hold.
+    """
+    # Imported here to avoid an import-time cycle (platforms → accounts).
+    from platforms.models import PlatformConfig
+
+    all_slugs = list(
+        PlatformConfig.objects.filter(is_active=True).values_list("slug", flat=True)
+    )
+    if not getattr(user, "is_authenticated", False):
+        return []
+    if user.is_superuser or has_permission_code(user, "platform.*.access"):
+        return all_slugs
+    return [s for s in all_slugs if has_permission_code(user, f"platform.{s}.access")]
+
+
+def can_access_platform(user, slug: str) -> bool:
+    """True if `user` may access the platform with the given slug."""
+    return has_permission_code(user, f"platform.{slug}.access")

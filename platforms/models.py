@@ -13,6 +13,8 @@ class PlatformConfig(models.Model):
     inventory_table = models.CharField(max_length=80, blank=True)
     secondary_table = models.CharField(max_length=80, blank=True)
     master_po_table = models.CharField(max_length=80, default="master_po")
+    po_filter_column = models.CharField(max_length=80, blank=True, default="platform")
+    po_filter_value = models.CharField(max_length=80, blank=True, default="")
     match_column = models.CharField(max_length=80, blank=True)
     is_active = models.BooleanField(default=True)
 
