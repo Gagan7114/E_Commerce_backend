@@ -153,6 +153,8 @@ def expiry_alerts(request, table_name: str):
                         f"SELECT * FROM {qt} WHERE {qc} < %s ORDER BY {qc} DESC LIMIT 5",
                         [today],
                     )
+                    if cur.description is None:
+                        continue
                     cols = [c[0] for c in cur.description]
                     expired_rows = [dict(zip(cols, r)) for r in cur.fetchall()]
                     alerts.append({
@@ -174,6 +176,8 @@ def expiry_alerts(request, table_name: str):
                         f"ORDER BY {qc} ASC LIMIT 5",
                         [today, soon],
                     )
+                    if cur.description is None:
+                        continue
                     cols = [c[0] for c in cur.description]
                     rows = [dict(zip(cols, r)) for r in cur.fetchall()]
                     alerts.append({
@@ -379,6 +383,8 @@ def table_data(request, table_name: str):
                 f"SELECT * FROM {qt}{where_sql} LIMIT %s OFFSET %s",
                 params + [page_size, page * page_size],
             )
+            if cur.description is None:
+                return Response({"error": "No data returned", "data": [], "count": 0})
             cols = [c[0] for c in cur.description]
             rows = [dict(zip(cols, r)) for r in cur.fetchall()]
     except Exception:

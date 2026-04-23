@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m py_compile accounts/models.py accounts/views.py accounts/serializers.py accounts/permissions.py accounts/managers.py)",
+      "Bash(python -m py_compile platforms/models.py platforms/views.py platforms/serializers.py)",
+      "Bash(python -m py_compile sap/views.py sap/service.py sap/router.py)",
+      "Bash(python -m py_compile dashboard/views.py uploads/views.py)",
+      "Bash(python -c \"import django; django.setup\\(\\)\")",
+      "Bash(python -c ' *)"
+    ]
+  }
+}

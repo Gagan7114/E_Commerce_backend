@@ -90,12 +90,12 @@ def batch_upload(request):
     with connection.cursor() as cur:
         for i in range(0, len(data), BATCH_SIZE):
             batch = data[i : i + BATCH_SIZE]
-            try:
-                for row in batch:
+            for row in batch:
+                try:
                     cur.execute(sql, [row.get(c) for c in columns])
-                success += len(batch)
-            except Exception as e:
-                failed += len(batch)
-                last_error = str(e)
+                    success += 1
+                except Exception as e:
+                    failed += 1
+                    last_error = str(e)
 
     return Response({"success": success, "failed": failed, "error": last_error})

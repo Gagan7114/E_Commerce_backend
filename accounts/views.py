@@ -6,6 +6,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework_simplejwt.tokens import RefreshToken
 
+from .permissions import user_permission_codes
 from .serializers import MeSerializer
 
 UserModel = get_user_model()
@@ -68,3 +69,55 @@ class RegisterView(APIView):
 @permission_classes([IsAuthenticated])
 def me(request):
     return Response({"user": _user_payload(request.user)})
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def user_permissions(request):
+    codes = sorted(user_permission_codes(request.user))
+    grouped: dict[str, list[str]] = {}
+    for code in codes:
+        module = code.split(".")[0]
+        grouped.setdefault(module, []).append(code)
+    result = [
+        {"module": mod, "count": len(perms), "permissions": perms}
+        for mod, perms in sorted(grouped.items())
+    ]
+    return Response({"permissions": result})
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def change_password(request):
+    current = request.data.get("current_password", "")
+    new_pwd = request.data.get("new_password", "")
+    if not current or not new_pwd:
+        return Response(
+            {"detail": "Both current_password and new_password are required."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    if len(new_pwd) < 6:
+        return Response(
+            {"detail": "New password must be at least 6 characters."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    if not request.user.check_password(current):
+        return Response(
+            {"detail": "Current password is incorrect."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    request.user.set_password(new_pwd)
+    request.user.save()
+    return Response({"detail": "Password changed successfully."})
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def notifications(request):
+    return Response({"notifications": [], "unread_count": 0})
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def mark_all_read(request):
+    return Response({"status": "ok"})

@@ -33,6 +33,8 @@ def _scalar(sql: str, params: list):
 def _dict_rows(sql: str, params: list) -> list[dict]:
     with connection.cursor() as cur:
         cur.execute(sql, params)
+        if cur.description is None:
+            return []
         cols = [c[0] for c in cur.description]
         return [dict(zip(cols, row)) for row in cur.fetchall()]
 
