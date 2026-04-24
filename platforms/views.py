@@ -1,5 +1,5 @@
 import re
-from datetime import date, datetime
+from datetime import date
 
 from django.db import connection
 from django.shortcuts import get_object_or_404
@@ -314,9 +314,11 @@ def landing_rate_add(request, slug: str):
             cur.execute(
                 'INSERT INTO "monthly_landing_rate" '
                 '("sku_code","sku_name","landing_rate","basic_rate","format","month") '
-                'VALUES (%s,%s,%s,%s,%s,%s)',
+                'VALUES (%s,%s,%s,%s,%s,%s) '
+                'RETURNING "created_at"',
                 [sku_code, sku_name, landing_rate, basic_rate, fmt, month],
             )
+            created_at = cur.fetchone()[0]
     except Exception as e:
         return Response({"ok": False, "error": str(e)}, status=400)
 
@@ -329,5 +331,6 @@ def landing_rate_add(request, slug: str):
             "basic_rate": basic_rate,
             "format": fmt,
             "month": month,
+            "created_at": created_at.isoformat() if created_at else None,
         },
     })

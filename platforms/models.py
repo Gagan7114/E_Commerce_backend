@@ -16,6 +16,8 @@ class PlatformConfig(models.Model):
     po_filter_column = models.CharField(max_length=80, blank=True, default="platform")
     po_filter_value = models.CharField(max_length=80, blank=True, default="")
     match_column = models.CharField(max_length=80, blank=True)
+    # B2B or B2C — drives the TYPE column on the monthly targets dashboard.
+    sales_type = models.CharField(max_length=8, blank=True, default="B2B")
     is_active = models.BooleanField(default=True)
 
     class Meta:
