@@ -11,6 +11,8 @@ DEFAULT_PLATFORMS = [
     ("bigbasket", "BigBasket", "bigbasket_inventory",   "bigbasket_secondary"),
     ("swiggy",    "Swiggy",    "swiggy_inventory",      "swiggy_secondary"),
     ("flipkart",  "Flipkart",  "flipkart_inventory",    "flipkart_secondary"),
+    ("zomato",    "Zomato",    "zomato_inventory",      "zomatoSec"),
+    ("citymall",  "CityMall",  "citymall_inventory",    "citymallSec"),
 ]
 
 
