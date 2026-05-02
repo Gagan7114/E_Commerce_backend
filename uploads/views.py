@@ -13,6 +13,9 @@ Returns: {"success": N, "failed": M, "error": "..." | null}
 
 from __future__ import annotations
 
+from datetime import date, datetime
+from decimal import Decimal
+from difflib import SequenceMatcher
 import re
 
 from django.db import connection
@@ -31,6 +34,7 @@ UPLOAD_ALLOWED_TABLES = {
     # Secondary sells
     "blinkitSec", "zeptoSec", "swiggySec", "flipkartSec",
     "jiomartSec", "bigbasketSec", "amazon_sec_daily", "amazon_sec_range",
+    "fk_grocery", "flipkart_grocery_master",
 }
 
 BATCH_SIZE = 50
@@ -39,8 +43,12 @@ BATCH_SIZE = 50
 @api_view(["POST"])
 @permission_classes([require("upload.use")])
 def batch_upload(request):
-    body = request.data or {}
-    table = body.get("table")
+    return _batch_upload(request.data or {})
+
+
+def _batch_upload(body, *, forced_table: str | None = None):
+    body = body or {}
+    table = forced_table or body.get("table")
     data = body.get("data") or []
     unique_key = body.get("unique_key") or ""
     upsert = bool(body.get("upsert", True))
@@ -99,3 +107,410 @@ def batch_upload(request):
                     last_error = str(e)
 
     return Response({"success": success, "failed": failed, "error": last_error})
+
+
+@api_view(["POST"])
+@permission_classes([require("upload.use")])
+def flipkart_grocery_raw_upload(request):
+    """Upload raw Flipkart Grocery rows into the staging table `fk_grocery`.
+
+    Body matches /api/upload/batch, except `table` is forced to fk_grocery:
+      { "data": [{...}], "unique_key": "optional,columns", "upsert": true }
+    """
+    return _batch_upload(request.data or {}, forced_table="fk_grocery")
+
+
+def _as_decimal(value, default=Decimal("0")):
+    if value is None or value == "":
+        return default
+    try:
+        return Decimal(str(value).replace(",", ""))
+    except Exception:
+        return default
+
+
+def _parse_date(value):
+    if isinstance(value, date):
+        return value
+    if not value:
+        return None
+    text = str(value).strip()
+    for fmt in ("%Y-%m-%d", "%d-%m-%Y", "%d/%m/%Y"):
+        try:
+            return datetime.strptime(text, fmt).date()
+        except ValueError:
+            pass
+    return None
+
+
+def _format_dmy(value):
+    return value.strftime("%d-%m-%Y") if value else None
+
+
+def _jsonable(value):
+    if isinstance(value, Decimal):
+        return float(value)
+    if isinstance(value, (date, datetime)):
+        return value.isoformat()
+    return value
+
+
+def _table_count(cur, table: str) -> int:
+    cur.execute(f'SELECT COUNT(*) FROM "{table}"')
+    row = cur.fetchone()
+    return int(row[0] or 0) if row else 0
+
+
+def _date_bounds(cur, table: str, column: str):
+    cur.execute(f'SELECT MIN("{column}"), MAX("{column}") FROM "{table}"')
+    row = cur.fetchone()
+    if not row:
+        return None, None
+    return _jsonable(row[0]), _jsonable(row[1])
+
+
+@api_view(["GET"])
+@permission_classes([require("upload.use")])
+def flipkart_grocery_upload_schema(request):
+    """Return the client-facing contract for Flipkart Grocery uploads."""
+    return Response(
+        {
+            "raw": {
+                "endpoint": "/api/upload/flipkart-grocery/raw",
+                "table": "fk_grocery",
+                "required": ["data"],
+                "optional": ["unique_key", "upsert"],
+            },
+            "master": {
+                "endpoint": "/api/upload/flipkart-grocery/master",
+                "table": "flipkart_grocery_master",
+                "required_row_fields": ["sku_id or fsn", "date or real_date or raw_date"],
+                "optional_row_fields": ["qty", "brand"],
+                "derived_from": ["master_sheet", "monthly_landing_rate"],
+                "output_columns": [
+                    "date",
+                    "sku_id",
+                    "brand",
+                    "qty",
+                    "per_ltr",
+                    "per_ltr_unit",
+                    "uom",
+                    "ltr_sold",
+                    "real_date",
+                    "month",
+                    "year",
+                    "item",
+                    "landing_rate",
+                    "basic_rate",
+                    "sale_amt_inclusive",
+                    "sale_amt_exclusive",
+                    "category",
+                    "sub_category",
+                    "item_head",
+                ],
+            },
+        }
+    )
+
+
+@api_view(["GET"])
+@permission_classes([require("upload.use")])
+def flipkart_grocery_upload_status(request):
+    """Small health/status payload for the Flipkart Grocery uploader."""
+    status = {
+        "raw": {"table": "fk_grocery", "exists": False, "count": 0},
+        "master": {
+            "table": "flipkart_grocery_master",
+            "exists": False,
+            "count": 0,
+            "min_real_date": None,
+            "max_real_date": None,
+        },
+    }
+    try:
+        with connection.cursor() as cur:
+            cur.execute(
+                """
+                SELECT table_name
+                FROM information_schema.tables
+                WHERE table_schema = current_schema()
+                  AND table_name IN ('fk_grocery', 'flipkart_grocery_master')
+                """
+            )
+            existing = {row[0] for row in cur.fetchall()}
+
+            if "fk_grocery" in existing:
+                status["raw"]["exists"] = True
+                status["raw"]["count"] = _table_count(cur, "fk_grocery")
+
+            if "flipkart_grocery_master" in existing:
+                status["master"]["exists"] = True
+                status["master"]["count"] = _table_count(cur, "flipkart_grocery_master")
+                min_date, max_date = _date_bounds(cur, "flipkart_grocery_master", "real_date")
+                status["master"]["min_real_date"] = min_date
+                status["master"]["max_real_date"] = max_date
+    except Exception as e:
+        return Response({"ok": False, "error": str(e), "status": status}, status=500)
+
+    return Response({"ok": True, "status": status})
+
+
+def _ensure_fk_grocery_master(cur):
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS "flipkart_grocery_master" (
+            "date" VARCHAR(10),
+            "sku_id" VARCHAR,
+            "brand" VARCHAR,
+            "qty" NUMERIC,
+            "per_ltr" NUMERIC,
+            "per_ltr_unit" VARCHAR,
+            "uom" VARCHAR,
+            "ltr_sold" NUMERIC,
+            "real_date" DATE,
+            "month" INTEGER,
+            "year" INTEGER,
+            "item" VARCHAR,
+            "landing_rate" NUMERIC,
+            "basic_rate" NUMERIC,
+            "sale_amt_inclusive" NUMERIC,
+            "sale_amt_exclusive" NUMERIC,
+            "category" VARCHAR,
+            "sub_category" VARCHAR,
+            "item_head" VARCHAR
+        )
+        """
+    )
+    cur.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS flipkart_grocery_master_sku_date_uq
+        ON "flipkart_grocery_master" ("sku_id", "real_date")
+        """
+    )
+
+
+def _get_master_row(cur, sku_id):
+    cur.execute(
+        """
+        SELECT format_sku_code, product_name, item, category, sub_category,
+               per_unit, item_head, brand, uom, per_unit_value
+        FROM master_sheet
+        WHERE format_sku_code = %s
+        LIMIT 1
+        """,
+        [sku_id],
+    )
+    return cur.fetchone()
+
+
+def _get_price_row(cur, sku_id, product_name, real_date):
+    target_month = real_date.replace(day=1).isoformat()
+    params = [sku_id, target_month]
+    name_clause = ""
+    if product_name:
+        name_clause = " OR LOWER(TRIM(sku_name)) = LOWER(TRIM(%s))"
+        params.insert(1, product_name)
+
+    cur.execute(
+        f"""
+        SELECT landing_rate, basic_rate
+        FROM monthly_landing_rate
+        WHERE UPPER(TRIM(format)) = 'FLIPKART GROCERY'
+          AND (sku_code = %s{name_clause})
+          AND month = %s
+        ORDER BY created_at DESC
+        LIMIT 1
+        """,
+        params,
+    )
+    row = cur.fetchone()
+    if row:
+        return row
+
+    params = [sku_id]
+    name_clause = ""
+    if product_name:
+        name_clause = " OR LOWER(TRIM(sku_name)) = LOWER(TRIM(%s))"
+        params.append(product_name)
+
+    cur.execute(
+        f"""
+        SELECT landing_rate, basic_rate
+        FROM monthly_landing_rate
+        WHERE UPPER(TRIM(format)) = 'FLIPKART GROCERY'
+          AND (sku_code = %s{name_clause})
+        ORDER BY month DESC, created_at DESC
+        LIMIT 1
+        """,
+        params,
+    )
+    row = cur.fetchone()
+    if row:
+        return row
+
+    cur.execute(
+        """
+        SELECT sku_code, sku_name, landing_rate, basic_rate
+        FROM monthly_landing_rate
+        WHERE UPPER(TRIM(format)) = 'FLIPKART GROCERY'
+        ORDER BY month DESC, created_at DESC
+        """
+    )
+    candidates = cur.fetchall()
+
+    def norm(value):
+        return "".join(ch for ch in str(value or "").upper() if ch.isalnum()).replace(
+            "O", "0"
+        )
+
+    sku_norm = norm(sku_id)
+    product_norm = norm(product_name)
+    best = None
+    best_score = 0
+    for cand_sku, cand_name, landing_rate, basic_rate in candidates:
+        sku_score = SequenceMatcher(None, sku_norm, norm(cand_sku)).ratio()
+        name_score = (
+            SequenceMatcher(None, product_norm, norm(cand_name)).ratio()
+            if product_norm
+            else 0
+        )
+        score = max(sku_score, name_score)
+        if score > best_score:
+            best_score = score
+            best = (landing_rate, basic_rate)
+
+    return best if best_score >= 0.88 else None
+
+
+@api_view(["POST"])
+@permission_classes([require("upload.use")])
+def fk_grocery_master_upload(request):
+    body = request.data or {}
+    data = body.get("data") or []
+    upsert = bool(body.get("upsert", True))
+    if not isinstance(data, list) or not data:
+        return Response({"success": 0, "failed": 0, "error": None})
+
+    rows = []
+    failed = 0
+    missing_master = set()
+    missing_price = set()
+    master_cache = {}
+    price_cache = {}
+
+    try:
+        with connection.cursor() as cur:
+            _ensure_fk_grocery_master(cur)
+
+            for row in data:
+                sku_id = str(row.get("sku_id") or row.get("fsn") or "").strip()
+                real_date = _parse_date(
+                    row.get("real_date") or row.get("raw_date") or row.get("date")
+                )
+                if not sku_id or real_date is None:
+                    failed += 1
+                    continue
+
+                qty = _as_decimal(row.get("qty"))
+                brand = str(row.get("brand") or "").strip() or None
+                if sku_id not in master_cache:
+                    master_cache[sku_id] = _get_master_row(cur, sku_id)
+                master = master_cache[sku_id]
+                if not master:
+                    missing_master.add(sku_id)
+
+                product_name = master[1] if master else None
+                price_key = (sku_id, product_name or "", real_date.replace(day=1))
+                if price_key not in price_cache:
+                    price_cache[price_key] = _get_price_row(
+                        cur, sku_id, product_name, real_date
+                    )
+                price = price_cache[price_key]
+                if not price:
+                    missing_price.add(sku_id)
+
+                per_ltr = _as_decimal(master[9] if master else None)
+                landing_rate = _as_decimal(price[0] if price else None)
+                basic_rate = _as_decimal(price[1] if price else None)
+
+                rows.append(
+                    (
+                        _format_dmy(real_date),
+                        sku_id,
+                        brand or (master[7] if master else None),
+                        qty,
+                        per_ltr,
+                        master[5] if master else None,
+                        master[8] if master else None,
+                        per_ltr * qty,
+                        real_date,
+                        real_date.month,
+                        real_date.year,
+                        master[2] if master else None,
+                        landing_rate,
+                        basic_rate,
+                        landing_rate * qty,
+                        basic_rate * qty,
+                        master[3] if master else None,
+                        master[4] if master else None,
+                        master[6] if master else None,
+                    )
+                )
+
+            if not rows:
+                return Response(
+                    {
+                        "success": 0,
+                        "failed": failed or len(data),
+                        "error": "No valid rows to upload",
+                    },
+                    status=400,
+                )
+
+            sql = """
+                INSERT INTO "flipkart_grocery_master" (
+                    "date", "sku_id", "brand", "qty", "per_ltr", "per_ltr_unit",
+                    "uom", "ltr_sold", "real_date", "month", "year", "item",
+                    "landing_rate", "basic_rate", "sale_amt_inclusive",
+                    "sale_amt_exclusive", "category", "sub_category", "item_head"
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """
+            if upsert:
+                sql += """
+                    ON CONFLICT ("sku_id", "real_date") DO UPDATE SET
+                        "date" = EXCLUDED."date",
+                        "brand" = EXCLUDED."brand",
+                        "qty" = EXCLUDED."qty",
+                        "per_ltr" = EXCLUDED."per_ltr",
+                        "per_ltr_unit" = EXCLUDED."per_ltr_unit",
+                        "uom" = EXCLUDED."uom",
+                        "ltr_sold" = EXCLUDED."ltr_sold",
+                        "month" = EXCLUDED."month",
+                        "year" = EXCLUDED."year",
+                        "item" = EXCLUDED."item",
+                        "landing_rate" = EXCLUDED."landing_rate",
+                        "basic_rate" = EXCLUDED."basic_rate",
+                        "sale_amt_inclusive" = EXCLUDED."sale_amt_inclusive",
+                        "sale_amt_exclusive" = EXCLUDED."sale_amt_exclusive",
+                        "category" = EXCLUDED."category",
+                        "sub_category" = EXCLUDED."sub_category",
+                        "item_head" = EXCLUDED."item_head"
+                """
+            else:
+                sql += ' ON CONFLICT ("sku_id", "real_date") DO NOTHING'
+
+            cur.executemany(sql, rows)
+
+        return Response(
+            {
+                "success": len(rows),
+                "failed": failed,
+                "error": None,
+                "missing_master": len(missing_master),
+                "missing_price": len(missing_price),
+                "table": "flipkart_grocery_master",
+            }
+        )
+    except Exception as e:
+        return Response({"detail": str(e)}, status=500)

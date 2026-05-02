@@ -165,16 +165,43 @@ def inventory_match(request, slug: str):
 # ─── Monthly Landing Rate ───
 # Single shared table `monthly_landing_rate` with columns:
 #   sku_code, sku_name, landing_rate, basic_rate, format, month
-# `format` partitions rows per-platform (blinkit/zepto/swiggy/bigbasket).
+# `format` partitions rows per-platform.
 # Only INSERTs are performed — prior rows are kept as history.
 
-_LANDING_PLATFORMS = {"blinkit", "zepto", "swiggy", "bigbasket"}
+_LANDING_PLATFORMS = {
+    "blinkit",
+    "zepto",
+    "swiggy",
+    "bigbasket",
+    "flipkart_grocery",
+}
+
+_LANDING_PLATFORM_LABELS = "blinkit, zepto, swiggy, bigbasket, flipkart_grocery"
 
 
 def _format_for(p: PlatformConfig) -> str:
-    # Prefer the platform's po_filter_value (e.g. "big basket") so rows align
-    # with the same string already used in master_po. Fall back to slug.
-    return (p.po_filter_value or p.slug).strip()
+    # Store canonical platform formats in uppercase, matching the source
+    # sheets/tables convention: BLINKIT, BIG BASKET, FLIPKART GROCERY, etc.
+    return (p.po_filter_value or p.slug).strip().upper()
+
+
+def _format_key(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(value or "").strip().lower())
+
+
+def _format_match_clause(p: PlatformConfig) -> tuple[str, list]:
+    aliases = {
+        _format_key(p.po_filter_value),
+        _format_key(p.slug),
+        _format_key(p.name),
+    }
+    aliases.discard("")
+    placeholders = ", ".join(["%s"] * len(aliases))
+    return (
+        "REGEXP_REPLACE(LOWER(TRIM(\"format\"::text)), '[^a-z0-9]+', '', 'g') "
+        f"IN ({placeholders})",
+        sorted(aliases),
+    )
 
 
 def _parse_month(val: str) -> str | None:
@@ -200,7 +227,7 @@ def _parse_month(val: str) -> str | None:
 def landing_rate_list(request, slug: str):
     _ensure_scope(request.user, slug)
     if slug not in _LANDING_PLATFORMS:
-        raise ValidationError("Monthly landing rate is only available for blinkit, zepto, swiggy, bigbasket.")
+        raise ValidationError(f"Monthly landing rate is only available for {_LANDING_PLATFORM_LABELS}.")
     p = _get_platform(slug)
     fmt = _format_for(p)
 
@@ -210,10 +237,11 @@ def landing_rate_list(request, slug: str):
     page, page_size = _page(request)
     offset = page * page_size
 
-    # Case-insensitive format match + trim, so "Blinkit", "blinkit ", and
-    # "big basket" vs "Big Basket" all land on the same rows.
-    base_where = ['LOWER(TRIM("format"::text)) = LOWER(TRIM(%s))']
-    base_params: list = [fmt]
+    # Match stored format aliases, so old `bigbasket` rows and canonical
+    # `big basket` rows are shown together.
+    format_clause, format_params = _format_match_clause(p)
+    base_where = [format_clause]
+    base_params: list = format_params
     if search:
         base_where.append('("sku_code"::text ILIKE %s OR "sku_name" ILIKE %s)')
         s = f"%{search}%"
@@ -232,16 +260,18 @@ def landing_rate_list(request, slug: str):
                 base_params + [page_size, offset],
             )
         else:
-            # Effective view: include every row dated *within or before* the
-            # requested month, then pick the newest per SKU. Using
-            # `month < (next_month_start)` ensures any day inside the target
-            # month (e.g. 2026-04-15) still matches 2026-04.
-            where = base_where + ['"month"::date < (%s::date + INTERVAL \'1 month\')']
-            params = base_params + [month]
+            # Effective view: show the latest row per SKU inside the selected
+            # calendar month only. This keeps May 2026 from showing April 2026
+            # or May rows from any other year.
+            where = base_where + [
+                '"month"::date >= %s::date',
+                '"month"::date < (%s::date + INTERVAL \'1 month\')',
+            ]
+            params = base_params + [month, month]
             where_sql = " WHERE " + " AND ".join(where)
             sub = (
                 f'SELECT DISTINCT ON ("sku_code") * FROM "monthly_landing_rate"'
-                f'{where_sql} ORDER BY "sku_code", "month" DESC'
+                f'{where_sql} ORDER BY "sku_code", "month" DESC, "created_at" DESC'
             )
             total = _scalar(f"SELECT COUNT(*) FROM ({sub}) t", params) or 0
             rows = _dict_rows(
@@ -270,16 +300,17 @@ def landing_rate_list(request, slug: str):
 def landing_rate_skus(request, slug: str):
     _ensure_scope(request.user, slug)
     if slug not in _LANDING_PLATFORMS:
-        raise ValidationError("Monthly landing rate is only available for blinkit, zepto, swiggy, bigbasket.")
+        raise ValidationError(f"Monthly landing rate is only available for {_LANDING_PLATFORM_LABELS}.")
     p = _get_platform(slug)
     fmt = _format_for(p)
+    format_clause, format_params = _format_match_clause(p)
     try:
         rows = _dict_rows(
             'SELECT DISTINCT ON ("sku_code") "sku_code", "sku_name" '
             'FROM "monthly_landing_rate" '
-            'WHERE LOWER(TRIM("format"::text)) = LOWER(TRIM(%s)) '
+            f"WHERE {format_clause} "
             'ORDER BY "sku_code", "month" DESC',
-            [fmt],
+            format_params,
         )
     except Exception:
         rows = []
@@ -292,7 +323,7 @@ def landing_rate_skus(request, slug: str):
 def landing_rate_add(request, slug: str):
     _ensure_scope(request.user, slug)
     if slug not in _LANDING_PLATFORMS:
-        raise ValidationError("Monthly landing rate is only available for blinkit, zepto, swiggy, bigbasket.")
+        raise ValidationError(f"Monthly landing rate is only available for {_LANDING_PLATFORM_LABELS}.")
     p = _get_platform(slug)
     fmt = _format_for(p)
 

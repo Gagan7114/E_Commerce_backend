@@ -10,7 +10,8 @@ Row lifecycle (see MONTHLY_TARGETS_SPEC.md §2.1 and §3.4):
 Source routing:
   * SecMaster platforms: blinkit, swiggy, zepto, bigbasket, flipkart (B2C)
   * master_po  platforms: zomato, citymall  (filter status = 'COMPLETED')
-  * Out of scope:         amazon, jiomart, flipkart_grocery
+  * Flipkart Grocery:     flipkart_grocery_master + monthly_landing_rate
+  * Out of scope:         amazon, jiomart
 """
 
 from __future__ import annotations
@@ -43,14 +44,32 @@ SECMASTER_SLUGS = {"blinkit", "swiggy", "zepto", "bigbasket", "flipkart"}
 
 # Platforms sourced from master_po (with status = 'COMPLETED').
 MASTER_PO_SLUGS = {"zomato", "citymall"}
+FLIPKART_GROCERY_SLUGS = {"flipkart_grocery"}
 
 # Slugs explicitly out of scope — spec §8.1.
-SKIPPED_SLUGS = {"amazon", "jiomart", "flipkart_grocery"}
+SKIPPED_SLUGS = {"amazon", "jiomart"}
 
 # All in-scope slugs, in the order the combined dashboard renders.
-IN_SCOPE_SLUGS = ("blinkit", "swiggy", "zepto", "bigbasket", "zomato", "citymall", "flipkart")
+IN_SCOPE_SLUGS = (
+    "blinkit",
+    "swiggy",
+    "zepto",
+    "bigbasket",
+    "zomato",
+    "citymall",
+    "flipkart",
+    "flipkart_grocery",
+)
 
-ITEM_HEADS = ("PREMIUM", "COMMODITY")
+DASHBOARD_ITEM_HEADS = ("PREMIUM", "COMMODITY")
+DEFAULT_ITEM_HEADS = ("PREMIUM", "COMMODITY")
+FLIPKART_GROCERY_ITEM_HEADS = ("PREMIUM", "COMMODITY", "OTHER")
+
+
+def _item_heads_for(slug: str) -> tuple[str, ...]:
+    if slug in FLIPKART_GROCERY_SLUGS:
+        return FLIPKART_GROCERY_ITEM_HEADS
+    return DEFAULT_ITEM_HEADS
 
 
 def _source_for(slug: str) -> str:
@@ -58,9 +77,12 @@ def _source_for(slug: str) -> str:
         return "secmaster"
     if slug in MASTER_PO_SLUGS:
         return "master_po"
+    if slug in FLIPKART_GROCERY_SLUGS:
+        return "flipkart_grocery"
     raise ValidationError(
         f"Platform '{slug}' is not supported for Monthly Targets. "
-        f"In-scope platforms: {', '.join(sorted(SECMASTER_SLUGS | MASTER_PO_SLUGS))}."
+        f"In-scope platforms: "
+        f"{', '.join(sorted(SECMASTER_SLUGS | MASTER_PO_SLUGS | FLIPKART_GROCERY_SLUGS))}."
     )
 
 
@@ -74,9 +96,8 @@ def _ensure_scope(user, slug: str) -> None:
 
 
 def _format_for(p: PlatformConfig) -> str:
-    """Canonical `format` string we store in month_targets — matches what
-    SecMaster / master_po already use (e.g. 'blinkit', 'big basket')."""
-    return (p.po_filter_value or p.slug).strip()
+    """Canonical uppercase `format` string stored in month_targets."""
+    return (p.po_filter_value or p.slug).strip().upper()
 
 
 # ─── Month/year parsing ───
@@ -125,6 +146,10 @@ _MONTH_NAMES = [
     "", "JANUARY", "FEBRUARY", "MARCH", "APRIL", "MAY", "JUNE",
     "JULY", "AUGUST", "SEPTEMBER", "OCTOBER", "NOVEMBER", "DECEMBER",
 ]
+
+
+def _month_start_iso(month: int, year: int) -> str:
+    return f"{year}-{month:02d}-01"
 
 
 def _read_secmaster(fmt: str, item_head: str, month: int, year: int) -> dict:
@@ -205,9 +230,79 @@ def _read_master_po(fmt: str, item_head: str, month: int, year: int) -> dict:
     }
 
 
+def _read_flipkart_grocery(fmt: str, item_head: str, month: int, year: int) -> dict:
+    """Read Flipkart Grocery target source data.
+
+    `done_ltrs` comes from flipkart_grocery_master.ltr_sold.
+    `done_value` follows the business rule:
+        SALE AMT(EXCLUSIVE) == done_value
+
+    For refreshes, prefer the current monthly_landing_rate.basic_rate for
+    the SKU/month, then the latest available Flipkart Grocery basic rate, then
+    the stored flipkart_grocery_master.basic_rate, and finally the already
+    stored sale_amt_exclusive.
+    """
+    rate_month = _month_start_iso(month, year)
+    sql = """
+        WITH exact_rates AS (
+            SELECT DISTINCT ON (sku_code)
+                   sku_code,
+                   basic_rate
+              FROM monthly_landing_rate
+             WHERE UPPER(TRIM(format)) = 'FLIPKART GROCERY'
+               AND month = %s
+             ORDER BY sku_code, created_at DESC
+        ),
+        fallback_rates AS (
+            SELECT DISTINCT ON (sku_code)
+                   sku_code,
+                   basic_rate
+              FROM monthly_landing_rate
+             WHERE UPPER(TRIM(format)) = 'FLIPKART GROCERY'
+             ORDER BY sku_code, month DESC, created_at DESC
+        )
+        SELECT
+            COALESCE(SUM(fgm.ltr_sold), 0) AS done_ltrs,
+            COALESCE(
+                SUM(
+                    COALESCE(
+                        fgm.qty * COALESCE(
+                            exact_rates.basic_rate,
+                            fallback_rates.basic_rate,
+                            NULLIF(fgm.basic_rate, 0)
+                        ),
+                        fgm.sale_amt_exclusive,
+                        0
+                    )
+                ),
+                0
+            ) AS done_value,
+            MAX(fgm.real_date) AS latest_date
+        FROM flipkart_grocery_master fgm
+        LEFT JOIN exact_rates
+               ON exact_rates.sku_code = fgm.sku_id
+        LEFT JOIN fallback_rates
+               ON fallback_rates.sku_code = fgm.sku_id
+        WHERE fgm.month = %s
+          AND fgm.year = %s
+          AND UPPER(TRIM(fgm.item_head::text)) = UPPER(TRIM(%s))
+    """
+    with connection.cursor() as cur:
+        cur.execute(sql, [rate_month, month, year, item_head])
+        row = cur.fetchone()
+    return {
+        "done_ltrs": Decimal(row[0] or 0),
+        "done_value": Decimal(row[1] or 0),
+        "latest_date": row[2],
+    }
+
+
 def _read_source(slug: str, fmt: str, item_head: str, month: int, year: int) -> dict:
-    if _source_for(slug) == "secmaster":
+    source = _source_for(slug)
+    if source == "secmaster":
         return _read_secmaster(fmt, item_head, month, year)
+    if source == "flipkart_grocery":
+        return _read_flipkart_grocery(fmt, item_head, month, year)
     return _read_master_po(fmt, item_head, month, year)
 
 
@@ -410,8 +505,9 @@ def month_targets_create(request, slug: str):
 
     body = request.data or {}
     item_head = str(body.get("item_head") or "").strip().upper()
-    if item_head not in ITEM_HEADS:
-        raise ValidationError(f"`item_head` must be one of {ITEM_HEADS}.")
+    allowed_item_heads = _item_heads_for(slug)
+    if item_head not in allowed_item_heads:
+        raise ValidationError(f"`item_head` must be one of {allowed_item_heads}.")
 
     try:
         targets = Decimal(str(body.get("targets", "0")))
@@ -563,23 +659,35 @@ def month_targets_refresh(request, slug: str, row_id: int):
 
 # ─── Target correction (UPDATE + audit log) ───
 
-def _insert_log(row: dict, *, change_type: str, reason: str | None, user) -> None:
+def _insert_log(
+    row: dict,
+    *,
+    change_type: str,
+    reason: str | None,
+    user,
+    new_targets: Decimal | None = None,
+) -> None:
     """Snapshot the pre-edit row into `month_target_logs`. Called before
     any UPDATE or DELETE so the audit table always reflects what the row
-    LOOKED LIKE before the change."""
+    LOOKED LIKE before the change.
+
+    `targets` here is the PREVIOUS value (from the pre-edit row).
+    `new_targets` is the value being written by the current edit, so a
+    single log row captures both old and new side by side.
+    """
     with connection.cursor() as cur:
         cur.execute(
             """
             INSERT INTO month_target_logs (
                 month_target_id, "format", "type", item_head, month, year, "date",
-                targets, done_ltrs, done_value, achieved_pct,
+                targets, new_targets, done_ltrs, done_value, achieved_pct,
                 est_ltr, est_value, est_ltr_pct,
                 last_month, growth, growth_pct,
                 change_type, reason,
                 changed_by_id, changed_by_email, changed_at
             ) VALUES (
                 %s, %s, %s, %s, %s, %s, %s,
-                %s, %s, %s, %s,
+                %s, %s, %s, %s, %s,
                 %s, %s, %s,
                 %s, %s, %s,
                 %s, %s,
@@ -589,7 +697,7 @@ def _insert_log(row: dict, *, change_type: str, reason: str | None, user) -> Non
             [
                 row.get("id"), row.get("format"), row.get("type"), row.get("item_head"),
                 row.get("month"), row.get("year"), row.get("date"),
-                row.get("targets"), row.get("done_ltrs"), row.get("done_value"), row.get("achieved_pct"),
+                row.get("targets"), new_targets, row.get("done_ltrs"), row.get("done_value"), row.get("achieved_pct"),
                 row.get("est_ltr"), row.get("est_value"), row.get("est_ltr_pct"),
                 row.get("last_month"), row.get("growth"), row.get("growth_pct"),
                 change_type, reason,
@@ -681,7 +789,13 @@ def month_targets_update(request, slug: str, row_id: int):
 
     with transaction.atomic():
         # Step 2: audit log of the OLD (wrong) state.
-        _insert_log(existing, change_type="UPDATE", reason=reason, user=request.user)
+        _insert_log(
+            existing,
+            change_type="UPDATE",
+            reason=reason,
+            user=request.user,
+            new_targets=new_targets,
+        )
 
         # Step 4: overwrite the main row with the corrected value + fresh
         # derived columns.
@@ -753,7 +867,7 @@ def month_targets_dashboard(request):
                          "month": month, "year": year})
 
     result = {}
-    for item_head in ITEM_HEADS:
+    for item_head in DASHBOARD_ITEM_HEADS:
         params = [month, year, item_head] + formats
         placeholder = ",".join(["LOWER(TRIM(%s))"] * len(formats))
         sql = f"""

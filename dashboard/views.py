@@ -15,7 +15,7 @@ _IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 ALLOWED_TABLES = {
     "master_po", "test_master_po",
     "amazon_sec_daily", "amazon_sec_range", "bigbasketSec", "blinkitSec",
-    "fk_grocery", "flipkartSec", "jiomartSec", "swiggySec", "zeptoSec",
+    "flipkart_grocery_master", "fk_grocery", "flipkartSec", "jiomartSec", "swiggySec", "zeptoSec",
     "amazon_inventory", "bigbasket_inventory",
     "blinkit_inventory", "jiomart_inventory", "swiggy_inventory", "zepto_inventory",
     "all_platform_inventory",
@@ -331,7 +331,11 @@ def table_data(request, table_name: str):
     def _validate_col(name: str) -> str | None:
         return name if name and _IDENT.match(name) else None
 
-    dc = _validate_col(date_column)
+    query_date_column = date_column
+    if table_name == "flipkart_grocery_master" and date_column == "date":
+        query_date_column = "real_date"
+
+    dc = _validate_col(query_date_column)
     if dc:
         if date_from:
             where.append(f'"{dc}" >= %s')
@@ -375,12 +379,16 @@ def table_data(request, table_name: str):
 
     where_sql = f" WHERE {' AND '.join(where)}" if where else ""
     qt = _quoted(table_name)
+    order_sql = ""
+    if table_name == "flipkart_grocery_master":
+        order_sql = ' ORDER BY "real_date" ASC NULLS LAST, "sku_id" ASC NULLS LAST'
+
     try:
         with connection.cursor() as cur:
             cur.execute(f"SELECT COUNT(*) FROM {qt}{where_sql}", params)
             total = int(cur.fetchone()[0] or 0)
             cur.execute(
-                f"SELECT * FROM {qt}{where_sql} LIMIT %s OFFSET %s",
+                f"SELECT * FROM {qt}{where_sql}{order_sql} LIMIT %s OFFSET %s",
                 params + [page_size, page * page_size],
             )
             if cur.description is None:
