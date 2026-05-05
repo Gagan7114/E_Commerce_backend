@@ -1,4 +1,5 @@
 import re
+from calendar import monthrange
 from datetime import date
 
 from django.db import connection
@@ -219,6 +220,525 @@ def _parse_month(val: str) -> str | None:
     except Exception:
         return None
     return None
+
+
+# --- Flipkart Grocery Sec Dashboard ---
+
+_FK_GROCERY_SEC_ITEM_HEADS = ("PREMIUM", "COMMODITY", "OTHER")
+
+_FK_GROCERY_SEC_DETAIL_ROWS = (
+    ("PREMIUM", "CANOLA", "CANOLA", "1 LTR"),
+    ("PREMIUM", "OLIVE", "EXTRA LIGHT", "2 LTR"),
+    ("PREMIUM", "OLIVE", "JIVO POMACE", "1 LTR"),
+    ("PREMIUM", "OLIVE", "JIVO POMACE", "2 LTR"),
+    ("PREMIUM", "OLIVE", "JIVO POMACE", "5 LTR"),
+    ("COMMODITY", "BLENDED", "GOLD", "1 LTR"),
+    ("COMMODITY", "MUSTARD", "MUSTARD KACCHI GHANI", "1 LTR"),
+    ("COMMODITY", "MUSTARD", "MUSTARD KACCHI GHANI", "4 LTR"),
+    ("COMMODITY", "MUSTARD", "MUSTARD KACCHI GHANI", "5 LTR"),
+    ("COMMODITY", "SOYABEAN", "SOYABEAN", "1 LTR"),
+    ("COMMODITY", "SUNFLOWER", "SUNFLOWER", "4 LTR"),
+    ("OTHER", "DRINKS", "APPLE SF", "200 MLS"),
+    ("OTHER", "DRINKS", "BLUEBERRY", "200 MLS"),
+    ("OTHER", "DRINKS", "GINGER ALE SF", "200 MLS"),
+    ("OTHER", "DRINKS", "JEERA", "160 MLS"),
+    ("OTHER", "DRINKS", "JEERA SF", "200 MLS"),
+    ("OTHER", "DRINKS", "MANGO", "500 MLS"),
+    ("OTHER", "DRINKS", "MINERAL WATER", "1 LTR"),
+    ("OTHER", "DRINKS", "MOJITO", "200 MLS"),
+)
+
+
+def _norm_sec_key(value) -> str:
+    return re.sub(r"\s+", " ", str(value or "").strip().upper())
+
+
+def _num(value) -> float:
+    try:
+        return float(value or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _per_liter_shpd(units, litres):
+    litres = _num(litres)
+    if litres == 0:
+        return None
+    return _num(units) / litres
+
+
+def _sec_total(rows: list[dict], *, include_ratio: bool = True) -> dict:
+    shipped_units = sum(_num(r.get("shipped_units")) for r in rows)
+    shipped_ltr = sum(_num(r.get("shipped_ltr")) for r in rows)
+    shipped_value = sum(_num(r.get("shipped_value")) for r in rows)
+    total = {
+        "shipped_units": shipped_units,
+        "shipped_ltr": shipped_ltr,
+        "shipped_value": shipped_value,
+    }
+    if include_ratio:
+        total["per_liter_shpd"] = _per_liter_shpd(shipped_units, shipped_ltr)
+    return total
+
+
+def _safe_div(numerator, denominator) -> float:
+    denominator = _num(denominator)
+    if denominator == 0:
+        return 0.0
+    return _num(numerator) / denominator
+
+
+_FK_GROCERY_DRR_ITEM_ORDER = (
+    "CANOLA 1L",
+    "EXTRA LIGHT 2L",
+    "GOLD 1L",
+    "JIVO POMACE 1L",
+    "JIVO POMACE 2L",
+    "JIVO POMACE 5L",
+    "MUSTARD 1L",
+    "MUSTARD 4L",
+    "MUSTARD 5L",
+    "PUNJABI JEERA 160ML",
+    "SOYABEAN 1L POUCH",
+    "SUNFLOWER 4L",
+    "WATER 1L",
+    "WG APPLE JUICE 200 ML",
+    "WG BLUEBERRY JUICE 200ML",
+    "WG GINGER ALE 200ML",
+    "WG JEERA 200ML",
+    "WG MANGO JUICE 500ML",
+    "WG MOJITO 200ML",
+)
+
+_FK_GROCERY_MOM_TARGETS = {
+    "PREMIUM": 2000,
+    "COMMODITY": 52000,
+}
+
+_FK_GROCERY_MOM_TEMPLATE = (
+    ("CANOLA", "CANOLA 1L", "PREMIUM", 1000),
+    ("EXTRA LIGHT", "EXTRA LIGHT 2L", "PREMIUM", 200),
+    ("GOLD", "GOLD 5L", "COMMODITY", 0),
+    ("JIVO POMACE", "JIVO POMACE 1L", "PREMIUM", 400),
+    ("JIVO POMACE", "JIVO POMACE 5L", "PREMIUM", 400),
+    ("MUSTARD KACHI GHANI", "MUSTARD 1L", "COMMODITY", 45000),
+    ("MUSTARD KACHI GHANI", "MUSTARD 4L", "COMMODITY", 4500),
+    ("MUSTARD KACHI GHANI", "MUSTARD 5L", "COMMODITY", 1000),
+    ("SOYABEAN", "SOYABEAN 1L POUCH", "COMMODITY", 1000),
+    ("SUNFLOWER", "SUNFLOWER 4L", "COMMODITY", 500),
+)
+
+
+def _parse_sec_month_year(params) -> tuple[int, int, bool]:
+    raw_month = str(params.get("month") or "").strip()
+    raw_year = str(params.get("year") or "").strip()
+
+    if re.fullmatch(r"\d{4}-\d{2}", raw_month):
+        year, month = raw_month.split("-")
+        return int(month), int(year), False
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", raw_month):
+        year, month, _ = raw_month.split("-")
+        return int(month), int(year), False
+
+    if raw_month and raw_year:
+        try:
+            month = int(raw_month)
+            year = int(raw_year)
+        except ValueError:
+            raise ValidationError("`month` and `year` must be numeric or month must be YYYY-MM.")
+        if not 1 <= month <= 12:
+            raise ValidationError("`month` must be 1-12.")
+        if year < 2000 or year > 2100:
+            raise ValidationError("`year` looks out of range.")
+        return month, year, False
+
+    latest = _dict_rows(
+        """
+        SELECT "month", "year"
+        FROM "flipkart_grocery_master"
+        WHERE "real_date" IS NOT NULL
+        ORDER BY "real_date" DESC
+        LIMIT 1
+        """,
+        [],
+    )
+    if latest:
+        return int(latest[0]["month"]), int(latest[0]["year"]), True
+
+    today = date.today()
+    return today.month, today.year, True
+
+
+def _date_span(month: int, year: int, max_date: date | None) -> list[date]:
+    if not max_date:
+        return []
+    end_day = min(max_date.day, monthrange(year, month)[1])
+    return [date(year, month, day) for day in range(1, end_day + 1)]
+
+
+def _shift_month(month: int, year: int, offset: int) -> tuple[int, int]:
+    zero_based = (year * 12) + (month - 1) + offset
+    shifted_year, shifted_month_zero = divmod(zero_based, 12)
+    return shifted_month_zero + 1, shifted_year
+
+
+def _month_name(month: int) -> str:
+    return date(2000, month, 1).strftime("%B").upper()
+
+
+def _sum_mom_rows(rows: list[dict]) -> dict:
+    keys = (
+        "target",
+        "current_done_ltr",
+        "estimated_ltr",
+        "previous_1_ltr",
+        "previous_2_ltr",
+        "previous_3_ltr",
+        "previous_4_ltr",
+    )
+    return {key: sum(_num(row.get(key)) for row in rows) for key in keys}
+
+
+@api_view(["GET"])
+@permission_classes([require("platform.secondary.view")])
+def flipkart_grocery_sec_dashboard(request, slug: str):
+    _ensure_scope(request.user, slug)
+    if slug != "flipkart_grocery":
+        raise ValidationError("Sec Dashboard is available only for Flipkart Grocery.")
+
+    month, year, defaulted_to_latest = _parse_sec_month_year(request.query_params)
+
+    max_date = _scalar(
+        """
+        SELECT MAX("real_date")
+        FROM "flipkart_grocery_master"
+        WHERE "month" = %s
+          AND "year" = %s
+        """,
+        [month, year],
+    )
+
+    summary_raw = _dict_rows(
+        """
+        SELECT
+            UPPER(TRIM("item_head"::text)) AS item_head,
+            COALESCE(SUM("qty"), 0) AS shipped_units,
+            COALESCE(SUM("ltr_sold"), 0) AS shipped_ltr,
+            COALESCE(SUM("sale_amt_exclusive"), 0) AS shipped_value
+        FROM "flipkart_grocery_master"
+        WHERE "month" = %s
+          AND "year" = %s
+          AND UPPER(TRIM("item_head"::text)) IN ('PREMIUM', 'COMMODITY', 'OTHER')
+        GROUP BY UPPER(TRIM("item_head"::text))
+        """,
+        [month, year],
+    )
+    summary_by_head = {_norm_sec_key(r.get("item_head")): r for r in summary_raw}
+    summary = []
+    for item_head in _FK_GROCERY_SEC_ITEM_HEADS:
+        row = summary_by_head.get(item_head, {})
+        shipped_units = _num(row.get("shipped_units"))
+        shipped_ltr = _num(row.get("shipped_ltr"))
+        summary.append({
+            "item_head": item_head,
+            "shipped_units": shipped_units,
+            "shipped_ltr": shipped_ltr,
+            "shipped_value": _num(row.get("shipped_value")),
+            "per_liter_shpd": _per_liter_shpd(shipped_units, shipped_ltr),
+        })
+
+    detail_raw = _dict_rows(
+        """
+        SELECT
+            UPPER(TRIM("sub_category"::text)) AS sub_category_key,
+            UPPER(TRIM("per_ltr_unit"::text)) AS per_ltr_key,
+            COALESCE(SUM("sale_amt_exclusive"), 0) AS shipped_value,
+            COALESCE(SUM("qty"), 0) AS shipped_units,
+            COALESCE(SUM("ltr_sold"), 0) AS shipped_ltr
+        FROM "flipkart_grocery_master"
+        WHERE "month" = %s
+          AND "year" = %s
+        GROUP BY
+            UPPER(TRIM("sub_category"::text)),
+            UPPER(TRIM("per_ltr_unit"::text))
+        """,
+        [month, year],
+    )
+    detail_by_key = {
+        (_norm_sec_key(r.get("sub_category_key")), _norm_sec_key(r.get("per_ltr_key"))): r
+        for r in detail_raw
+    }
+
+    details = []
+    for item_head, category, sub_category, per_ltr in _FK_GROCERY_SEC_DETAIL_ROWS:
+        row = detail_by_key.get((_norm_sec_key(sub_category), _norm_sec_key(per_ltr)), {})
+        shipped_units = _num(row.get("shipped_units"))
+        shipped_ltr = _num(row.get("shipped_ltr"))
+        details.append({
+            "item_head": item_head,
+            "category": category,
+            "sub_category": sub_category,
+            "per_ltr": per_ltr,
+            "shipped_value": _num(row.get("shipped_value")),
+            "shipped_units": shipped_units,
+            "shipped_ltr": shipped_ltr,
+            "per_liter_shpd": _per_liter_shpd(shipped_units, shipped_ltr),
+        })
+
+    return Response({
+        "source": "flipkart_grocery_master",
+        "detail_rows_fixed": True,
+        "defaulted_to_latest": defaulted_to_latest,
+        "month": month,
+        "year": year,
+        "max_date": max_date.isoformat() if max_date else None,
+        "summary": summary,
+        "summary_total": _sec_total(summary),
+        "details": details,
+        "detail_total": _sec_total(details),
+    })
+
+
+@api_view(["GET"])
+@permission_classes([require("platform.secondary.view")])
+def flipkart_grocery_drr_dashboard(request, slug: str):
+    _ensure_scope(request.user, slug)
+    if slug != "flipkart_grocery":
+        raise ValidationError("DRR Dashboard is available only for Flipkart Grocery.")
+
+    month, year, defaulted_to_latest = _parse_sec_month_year(request.query_params)
+    sales_of = str(request.query_params.get("sales_of") or "ALL").strip().upper() or "ALL"
+    if sales_of != "ALL":
+        raise ValidationError("DRR Dashboard currently supports SALES OF = ALL only.")
+
+    max_date = _scalar(
+        """
+        SELECT MAX("real_date")
+        FROM "flipkart_grocery_master"
+        WHERE "month" = %s
+          AND "year" = %s
+        """,
+        [month, year],
+    )
+
+    daily_raw = _dict_rows(
+        """
+        SELECT
+            "real_date",
+            COALESCE(SUM("sale_amt_exclusive"), 0) AS ops,
+            COALESCE(SUM("ltr_sold"), 0) AS ltr
+        FROM "flipkart_grocery_master"
+        WHERE "month" = %s
+          AND "year" = %s
+        GROUP BY "real_date"
+        ORDER BY "real_date"
+        """,
+        [month, year],
+    )
+    daily_by_date = {r["real_date"]: r for r in daily_raw}
+    daily = []
+    for current_date in _date_span(month, year, max_date):
+        row = daily_by_date.get(current_date, {})
+        daily.append({
+            "date": current_date.isoformat(),
+            "display_date": current_date.strftime("%d-%m-%Y"),
+            "ops": _num(row.get("ops")),
+            "ltr": _num(row.get("ltr")),
+        })
+
+    item_raw = _dict_rows(
+        """
+        SELECT
+            COALESCE(NULLIF(TRIM("item"::text), ''), 'UNMAPPED') AS item,
+            COALESCE(NULLIF(UPPER(TRIM("item_head"::text)), ''), 'OTHER') AS item_head,
+            COALESCE(SUM("qty"), 0) AS qty,
+            COALESCE(SUM("ltr_sold"), 0) AS liters,
+            COALESCE(SUM("sale_amt_exclusive"), 0) AS landing_amt
+        FROM "flipkart_grocery_master"
+        WHERE "month" = %s
+          AND "year" = %s
+        GROUP BY
+            COALESCE(NULLIF(TRIM("item"::text), ''), 'UNMAPPED'),
+            COALESCE(NULLIF(UPPER(TRIM("item_head"::text)), ''), 'OTHER')
+        """,
+        [month, year],
+    )
+
+    elapsed_days = max_date.day if max_date else 0
+    days_in_month = monthrange(year, month)[1]
+    order = {item: idx for idx, item in enumerate(_FK_GROCERY_DRR_ITEM_ORDER)}
+    items = []
+    for row in sorted(
+        item_raw,
+        key=lambda r: (order.get(str(r.get("item") or "").upper(), 999), str(r.get("item") or "")),
+    ):
+        qty = _num(row.get("qty"))
+        liters = _num(row.get("liters"))
+        landing_amt = _num(row.get("landing_amt"))
+        drr_qty = _safe_div(qty, elapsed_days)
+        drr_liters = _safe_div(liters, elapsed_days)
+        drr_value = _safe_div(landing_amt, elapsed_days)
+        items.append({
+            "item": row.get("item"),
+            "item_head": row.get("item_head"),
+            "qty": qty,
+            "liters": liters,
+            "landing_amt": landing_amt,
+            "drr_qty": drr_qty,
+            "drr_liters": drr_liters,
+            "drr_value": drr_value,
+            "estimated_liters": drr_liters * days_in_month,
+        })
+
+    total_qty = sum(_num(r.get("qty")) for r in items)
+    total_liters = sum(_num(r.get("liters")) for r in items)
+    total_landing_amt = sum(_num(r.get("landing_amt")) for r in items)
+    total_drr_qty = _safe_div(total_qty, elapsed_days)
+    total_drr_liters = _safe_div(total_liters, elapsed_days)
+    total_drr_value = _safe_div(total_landing_amt, elapsed_days)
+    totals = {
+        "qty": total_qty,
+        "liters": total_liters,
+        "landing_amt": total_landing_amt,
+        "drr_qty": total_drr_qty,
+        "drr_liters": total_drr_liters,
+        "drr_value": total_drr_value,
+        "estimated_liters": total_drr_liters * days_in_month,
+    }
+
+    return Response({
+        "source": "flipkart_grocery_master",
+        "defaulted_to_latest": defaulted_to_latest,
+        "sales_of": sales_of,
+        "month": month,
+        "year": year,
+        "max_date": max_date.isoformat() if max_date else None,
+        "elapsed_days": elapsed_days,
+        "days_in_month": days_in_month,
+        "daily": daily,
+        "daily_groups": [daily[i:i + 9] for i in range(0, len(daily), 9)],
+        "items": items,
+        "totals": totals,
+    })
+
+
+@api_view(["GET"])
+@permission_classes([require("platform.secondary.view")])
+def flipkart_grocery_month_on_month_sale(request, slug: str):
+    _ensure_scope(request.user, slug)
+    if slug != "flipkart_grocery":
+        raise ValidationError("Month On Month Sale is available only for Flipkart Grocery.")
+
+    month, year, defaulted_to_latest = _parse_sec_month_year(request.query_params)
+    max_date = _scalar(
+        """
+        SELECT MAX("real_date")
+        FROM "flipkart_grocery_master"
+        WHERE "month" = %s
+          AND "year" = %s
+        """,
+        [month, year],
+    )
+
+    comparison_months = []
+    for index, offset in enumerate([0, -1, -2, -3, -4]):
+        compare_month, compare_year = _shift_month(month, year, offset)
+        comparison_months.append({
+            "key": "current" if index == 0 else f"previous_{index}",
+            "month": compare_month,
+            "year": compare_year,
+            "label": _month_name(compare_month),
+        })
+
+    params: list = []
+    clauses = []
+    for item in comparison_months:
+        clauses.append('("month" = %s AND "year" = %s)')
+        params.extend([item["month"], item["year"]])
+
+    item_month_rows = _dict_rows(
+        f"""
+        SELECT
+            COALESCE(NULLIF(TRIM("item"::text), ''), 'UNMAPPED') AS item,
+            "month",
+            "year",
+            COALESCE(SUM("ltr_sold"), 0) AS ltr
+        FROM "flipkart_grocery_master"
+        WHERE {" OR ".join(clauses)}
+        GROUP BY
+            COALESCE(NULLIF(TRIM("item"::text), ''), 'UNMAPPED'),
+            "month",
+            "year"
+        """,
+        params,
+    )
+    ltr_by_key = {
+        (_norm_sec_key(row.get("item")), int(row.get("month")), int(row.get("year"))): _num(row.get("ltr"))
+        for row in item_month_rows
+    }
+
+    elapsed_days = max_date.day if max_date else 0
+    days_in_month = monthrange(year, month)[1]
+    group_map: dict[str, list[dict]] = {}
+    for sub_category, item, item_head, target in _FK_GROCERY_MOM_TEMPLATE:
+        current_ltr = ltr_by_key.get((_norm_sec_key(item), month, year), 0.0)
+        row = {
+            "sub_category": sub_category,
+            "item": item,
+            "item_head": item_head,
+            "target": float(target),
+            "current_done_ltr": current_ltr,
+            "estimated_ltr": _safe_div(current_ltr, elapsed_days) * days_in_month,
+            "previous_1_ltr": ltr_by_key.get(
+                (_norm_sec_key(item), comparison_months[1]["month"], comparison_months[1]["year"]),
+                0.0,
+            ),
+            "previous_2_ltr": ltr_by_key.get(
+                (_norm_sec_key(item), comparison_months[2]["month"], comparison_months[2]["year"]),
+                0.0,
+            ),
+            "previous_3_ltr": ltr_by_key.get(
+                (_norm_sec_key(item), comparison_months[3]["month"], comparison_months[3]["year"]),
+                0.0,
+            ),
+            "previous_4_ltr": ltr_by_key.get(
+                (_norm_sec_key(item), comparison_months[4]["month"], comparison_months[4]["year"]),
+                0.0,
+            ),
+        }
+        group_map.setdefault(sub_category, []).append(row)
+
+    groups = []
+    for sub_category, rows in group_map.items():
+        groups.append({
+            "sub_category": sub_category,
+            "rows": rows,
+            "total": _sum_mom_rows(rows),
+        })
+
+    group_totals = [group["total"] for group in groups]
+    target_summary = [
+        {"item_head": item_head, "target": float(target)}
+        for item_head, target in _FK_GROCERY_MOM_TARGETS.items()
+    ]
+    target_summary.append({
+        "item_head": "TOTAL",
+        "target": float(sum(_FK_GROCERY_MOM_TARGETS.values())),
+    })
+
+    return Response({
+        "source": "flipkart_grocery_master",
+        "defaulted_to_latest": defaulted_to_latest,
+        "month": month,
+        "year": year,
+        "max_date": max_date.isoformat() if max_date else None,
+        "elapsed_days": elapsed_days,
+        "days_in_month": days_in_month,
+        "target_summary": target_summary,
+        "comparison_months": comparison_months,
+        "groups": groups,
+        "grand_total": _sum_mom_rows(group_totals),
+    })
 
 
 # ─── /{slug}/landing-rate  (GET) ───
