@@ -37,9 +37,21 @@ UPLOAD_ALLOWED_TABLES = {
     "jiomartSec", "bigbasketSec", "amazon_sec_daily", "amazon_sec_range",
     "fk_grocery", "flipkart_grocery_master",
     "zomatoSec", "citymallSec",
+    # Primary
+    "zepto_grn", "zepto_prim",
+    "blinkit_grn", "blinkit_prim",
+    "swiggy_grn", "swiggy_prim",
 }
 
 BATCH_SIZE = 50
+
+UPLOAD_FORCED_UNIQUE_KEYS = {
+    "swiggy_grn": (
+        "grn_number,purchase_order_number,facility_name,vendor_name,"
+        "invoice_date,created_at_date,sku_code,sku_description,"
+        "received_qty,total_amount,invoice_number,lot_expiry_date"
+    ),
+}
 
 
 @api_view(["POST"])
@@ -64,6 +76,14 @@ def _batch_upload(body, *, forced_table: str | None = None):
         return Response({"detail": "Invalid table name."}, status=400)
     if not isinstance(data, list) or not data:
         return Response({"success": 0, "failed": 0, "error": None})
+
+    if upsert and table in UPLOAD_FORCED_UNIQUE_KEYS:
+        unique_key = UPLOAD_FORCED_UNIQUE_KEYS[table]
+
+    if table == "zepto_prim":
+        for row in data:
+            if row.get("created_at") in ("", None):
+                row.pop("created_at", None)
 
     columns = list(data[0].keys())
     invalid = [c for c in columns if not _IDENT.match(c)]
@@ -92,8 +112,14 @@ def _batch_upload(body, *, forced_table: str | None = None):
             upsert_clause = f" ON CONFLICT ({conflict_cols}) DO NOTHING"
 
     sql = f'INSERT INTO "{table}" ({col_list}) VALUES ({placeholders}){upsert_clause}'
+    tracks_upsert_counts = bool(upsert and unique_key)
+    if tracks_upsert_counts:
+        sql += " RETURNING (xmax::text = '0') AS inserted"
 
     success = 0
+    created = 0
+    updated = 0
+    skipped = 0
     failed = 0
     last_error: str | None = None
 
@@ -103,12 +129,32 @@ def _batch_upload(body, *, forced_table: str | None = None):
             for row in batch:
                 try:
                     cur.execute(sql, [row.get(c) for c in columns])
+                    if tracks_upsert_counts:
+                        result = cur.fetchone()
+                        if result is None:
+                            skipped += 1
+                        elif result[0]:
+                            created += 1
+                        else:
+                            updated += 1
+                    else:
+                        created += 1
                     success += 1
                 except Exception as e:
                     failed += 1
                     last_error = str(e)
 
-    return Response({"success": success, "failed": failed, "error": last_error})
+    return Response(
+        {
+            "success": success,
+            "created": created,
+            "updated": updated,
+            "skipped": skipped,
+            "duplicates": updated + skipped,
+            "failed": failed,
+            "error": last_error,
+        }
+    )
 
 
 @api_view(["POST"])
