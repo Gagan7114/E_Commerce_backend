@@ -222,7 +222,7 @@ def _parse_month(val: str) -> str | None:
     return None
 
 
-# --- Flipkart Grocery Sec Dashboard ---
+# --- Secondary Dashboards ---
 
 _FK_GROCERY_SEC_ITEM_HEADS = ("PREMIUM", "COMMODITY", "OTHER")
 
@@ -248,6 +248,25 @@ _FK_GROCERY_SEC_DETAIL_ROWS = (
     ("OTHER", "DRINKS", "MOJITO", "200 MLS"),
 )
 
+_BLINKIT_SEC_ITEM_HEADS = ("PREMIUM", "COMMODITY", "OTHER")
+
+_BLINKIT_SEC_DETAIL_ROWS = (
+    ("PREMIUM", "CANOLA", "CANOLA", "1 LTR", 12644),
+    ("PREMIUM", "CANOLA", "CANOLA", "5 LTR", 6255),
+    ("PREMIUM", "OLIVE", "EXTRA LIGHT", "1 LTR", 3948),
+    ("PREMIUM", "OLIVE", "EXTRA LIGHT", "2 LTR", 5232),
+    ("PREMIUM", "OLIVE", "JIVO POMACE", "1 LTR", 12774),
+    ("PREMIUM", "OLIVE", "JIVO POMACE", "5 LTR", 3740),
+    ("COMMODITY", "MUSTARD", "MUSTARD KACCHI GHANI", "1 LTR", 15382),
+    ("COMMODITY", "MUSTARD", "MUSTARD KACCHI GHANI", "5 LTR", 13310),
+    ("COMMODITY", "SUNFLOWER", "SUNFLOWER", "1 LTR", 2914),
+)
+
+_MONTH_NAME_TO_NUM = {
+    date(2000, month, 1).strftime("%B").upper(): month
+    for month in range(1, 13)
+}
+
 
 def _norm_sec_key(value) -> str:
     return re.sub(r"\s+", " ", str(value or "").strip().upper())
@@ -265,6 +284,13 @@ def _per_liter_shpd(units, litres):
     if litres == 0:
         return None
     return _num(units) / litres
+
+
+def _value_per_unit(value, units):
+    units = _num(units)
+    if units == 0:
+        return None
+    return _num(value) / units
 
 
 def _sec_total(rows: list[dict], *, include_ratio: bool = True) -> dict:
@@ -329,7 +355,7 @@ _FK_GROCERY_MOM_TEMPLATE = (
 )
 
 
-def _parse_sec_month_year(params) -> tuple[int, int, bool]:
+def _parse_sec_month_year(params, *, latest_source: str = "flipkart_grocery") -> tuple[int, int, bool]:
     raw_month = str(params.get("month") or "").strip()
     raw_year = str(params.get("year") or "").strip()
 
@@ -352,18 +378,38 @@ def _parse_sec_month_year(params) -> tuple[int, int, bool]:
             raise ValidationError("`year` looks out of range.")
         return month, year, False
 
-    latest = _dict_rows(
-        """
-        SELECT "month", "year"
-        FROM "flipkart_grocery_master"
-        WHERE "real_date" IS NOT NULL
-        ORDER BY "real_date" DESC
-        LIMIT 1
-        """,
-        [],
-    )
+    if latest_source == "secmaster_blinkit":
+        latest = _dict_rows(
+            """
+            SELECT "month", "year"
+            FROM "SecMaster"
+            WHERE REGEXP_REPLACE(LOWER(TRIM("format"::text)), '[^a-z0-9]+', '', 'g') = 'blinkit'
+              AND "date" IS NOT NULL
+            ORDER BY "date" DESC
+            LIMIT 1
+            """,
+            [],
+        )
+    else:
+        latest = _dict_rows(
+            """
+            SELECT "month", "year"
+            FROM "flipkart_grocery_master"
+            WHERE "real_date" IS NOT NULL
+            ORDER BY "real_date" DESC
+            LIMIT 1
+            """,
+            [],
+        )
     if latest:
-        return int(latest[0]["month"]), int(latest[0]["year"]), True
+        month_value = latest[0]["month"]
+        if isinstance(month_value, str) and not month_value.strip().isdigit():
+            month = _MONTH_NAME_TO_NUM.get(_norm_sec_key(month_value))
+            if month is None:
+                month = date.today().month
+        else:
+            month = int(month_value)
+        return month, int(latest[0]["year"]), True
 
     today = date.today()
     return today.month, today.year, True
@@ -403,8 +449,10 @@ def _sum_mom_rows(rows: list[dict]) -> dict:
 @permission_classes([require("platform.secondary.view")])
 def flipkart_grocery_sec_dashboard(request, slug: str):
     _ensure_scope(request.user, slug)
+    if slug == "blinkit":
+        return _blinkit_sec_dashboard_response(request)
     if slug != "flipkart_grocery":
-        raise ValidationError("Sec Dashboard is available only for Flipkart Grocery.")
+        raise ValidationError("Sec Dashboard is available only for Blinkit and Flipkart Grocery.")
 
     month, year, defaulted_to_latest = _parse_sec_month_year(request.query_params)
 
@@ -496,6 +544,126 @@ def flipkart_grocery_sec_dashboard(request, slug: str):
         "summary_total": _sec_total(summary),
         "details": details,
         "detail_total": _sec_total(details),
+    })
+
+
+def _blinkit_sec_dashboard_response(request):
+    month, year, defaulted_to_latest = _parse_sec_month_year(
+        request.query_params,
+        latest_source="secmaster_blinkit",
+    )
+    month_name = _month_name(month)
+
+    max_date = _scalar(
+        """
+        SELECT MAX("date")
+        FROM "SecMaster"
+        WHERE REGEXP_REPLACE(LOWER(TRIM("format"::text)), '[^a-z0-9]+', '', 'g') = 'blinkit'
+          AND UPPER(TRIM("month"::text)) = %s
+          AND "year"::numeric = %s
+        """,
+        [month_name, year],
+    )
+
+    summary_raw = _dict_rows(
+        """
+        SELECT
+            UPPER(TRIM("item_head"::text)) AS item_head,
+            COALESCE(SUM("quantity"), 0) AS shipped_units,
+            COALESCE(SUM("ltr_sold"), 0) AS shipped_ltr,
+            COALESCE(SUM("sales_amt_exc"), 0) AS shipped_value
+        FROM "SecMaster"
+        WHERE REGEXP_REPLACE(LOWER(TRIM("format"::text)), '[^a-z0-9]+', '', 'g') = 'blinkit'
+          AND UPPER(TRIM("month"::text)) = %s
+          AND "year"::numeric = %s
+          AND UPPER(TRIM("item_head"::text)) IN ('PREMIUM', 'COMMODITY', 'OTHER')
+        GROUP BY UPPER(TRIM("item_head"::text))
+        """,
+        [month_name, year],
+    )
+    summary_by_head = {_norm_sec_key(r.get("item_head")): r for r in summary_raw}
+    summary = []
+    for item_head in _BLINKIT_SEC_ITEM_HEADS:
+        row = summary_by_head.get(item_head, {})
+        shipped_value = _num(row.get("shipped_value"))
+        shipped_units = _num(row.get("shipped_units"))
+        summary.append({
+            "item_head": item_head,
+            "shipped_units": shipped_units,
+            "shipped_ltr": _num(row.get("shipped_ltr")),
+            "shipped_value": shipped_value,
+            "per_liter_shpd": _value_per_unit(shipped_value, shipped_units),
+        })
+
+    detail_raw = _dict_rows(
+        """
+        SELECT
+            UPPER(TRIM("sub_category"::text)) AS sub_category_key,
+            UPPER(TRIM("per_ltr_unit"::text)) AS per_ltr_key,
+            COALESCE(SUM("sales_amt_exc"), 0) AS shipped_value,
+            COALESCE(SUM("quantity"), 0) AS shipped_units,
+            COALESCE(SUM("ltr_sold"), 0) AS shipped_ltr
+        FROM "SecMaster"
+        WHERE REGEXP_REPLACE(LOWER(TRIM("format"::text)), '[^a-z0-9]+', '', 'g') = 'blinkit'
+          AND UPPER(TRIM("month"::text)) = %s
+          AND "year"::numeric = %s
+        GROUP BY
+            UPPER(TRIM("sub_category"::text)),
+            UPPER(TRIM("per_ltr_unit"::text))
+        """,
+        [month_name, year],
+    )
+    detail_by_key = {
+        (_norm_sec_key(r.get("sub_category_key")), _norm_sec_key(r.get("per_ltr_key"))): r
+        for r in detail_raw
+    }
+
+    details = []
+    for item_head, category, sub_category, per_ltr, last_month in _BLINKIT_SEC_DETAIL_ROWS:
+        row = detail_by_key.get((_norm_sec_key(sub_category), _norm_sec_key(per_ltr)), {})
+        shipped_value = _num(row.get("shipped_value"))
+        shipped_units = _num(row.get("shipped_units"))
+        details.append({
+            "format": "BLINKIT",
+            "item_head": item_head,
+            "category": category,
+            "sub_category": sub_category,
+            "per_ltr": per_ltr,
+            "shipped_value": shipped_value,
+            "shipped_units": shipped_units,
+            "shipped_ltr": _num(row.get("shipped_ltr")),
+            "per_liter_shpd": _value_per_unit(shipped_value, shipped_units),
+            "last_month": last_month,
+        })
+
+    summary_total = _sec_total(summary)
+    summary_total["per_liter_shpd"] = _value_per_unit(
+        summary_total["shipped_value"],
+        summary_total["shipped_units"],
+    )
+    detail_total = _sec_total(details)
+    detail_total["per_liter_shpd"] = _value_per_unit(
+        detail_total["shipped_value"],
+        detail_total["shipped_units"],
+    )
+    detail_total["last_month"] = sum(_num(r.get("last_month")) for r in details)
+
+    return Response({
+        "source": "SecMaster",
+        "format": "BLINKIT",
+        "detail_rows_fixed": True,
+        "defaulted_to_latest": defaulted_to_latest,
+        "month": month,
+        "year": year,
+        "max_date": max_date.isoformat() if hasattr(max_date, "isoformat") else max_date,
+        "summary": summary,
+        "summary_total": summary_total,
+        "details": details,
+        "detail_total": detail_total,
+        "show_format_column": True,
+        "show_last_month": True,
+        "dashboard_title": "Blinkit Secondary Dashboard",
+        "detail_subtitle": "Excel rows 12-20 from SECONDARY DASHBOARD",
     })
 
 
