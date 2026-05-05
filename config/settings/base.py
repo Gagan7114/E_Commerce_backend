@@ -10,9 +10,17 @@ env = environ.Env(
 )
 environ.Env.read_env(BASE_DIR / ".env")
 
+
+def _clean_env_list(name, default):
+    return [value.strip() for value in env.list(name, default=default) if value.strip()]
+
+
 SECRET_KEY = env("DJANGO_SECRET_KEY", default="insecure-dev-key")
 DEBUG = env.bool("DJANGO_DEBUG", default=False)
-ALLOWED_HOSTS = env.list("DJANGO_ALLOWED_HOSTS", default=["localhost", "127.0.0.1"])
+ALLOWED_HOSTS = _clean_env_list(
+    "DJANGO_ALLOWED_HOSTS",
+    default=["localhost", "127.0.0.1"],
+)
 
 INSTALLED_APPS = [
     "django.contrib.admin",
@@ -123,7 +131,7 @@ SIMPLE_JWT = {
     "USER_ID_CLAIM": "user_id",
 }
 
-CORS_ALLOWED_ORIGINS = env.list(
+CORS_ALLOWED_ORIGINS = _clean_env_list(
     "CORS_ALLOWED_ORIGINS",
     default=["http://localhost:5173", "http://127.0.0.1:5173"],
 )
