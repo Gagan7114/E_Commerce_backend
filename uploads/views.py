@@ -40,6 +40,7 @@ UPLOAD_ALLOWED_TABLES = {
     # Primary
     "zepto_grn", "zepto_prim",
     "blinkit_grn", "blinkit_prim",
+    "bigbasket_prim",
     "swiggy_grn", "swiggy_prim",
 }
 
@@ -48,8 +49,8 @@ BATCH_SIZE = 50
 UPLOAD_FORCED_UNIQUE_KEYS = {
     "swiggy_grn": (
         "grn_number,purchase_order_number,facility_name,vendor_name,"
-        "invoice_date,created_at_date,sku_code,sku_description,"
-        "received_qty,total_amount,invoice_number,lot_expiry_date"
+        "invoice_number,invoice_date,created_at_date,dn_quantity,dn_value,"
+        "sku_code,sku_description,received_qty,lot_expiry_date,total_amount"
     ),
 }
 
