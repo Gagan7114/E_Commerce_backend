@@ -84,6 +84,7 @@ def _batch_upload(body, *, forced_table: str | None = None):
         for row in data:
             if row.get("created_at") in ("", None):
                 row.pop("created_at", None)
+    missing_rates = _collect_zepto_missing_rates(data) if table == "zeptoSec" else []
 
     columns = list(data[0].keys())
     invalid = [c for c in columns if not _IDENT.match(c)]
@@ -153,6 +154,11 @@ def _batch_upload(body, *, forced_table: str | None = None):
             "duplicates": updated + skipped,
             "failed": failed,
             "error": last_error,
+            "warnings": [
+                f"Missing rate for {r['item']}, {r['month_label']} ({r['rows']} rows)"
+                for r in missing_rates
+            ],
+            "missing_rates": missing_rates,
         }
     )
 
@@ -193,6 +199,63 @@ def _parse_date(value):
 
 def _format_dmy(value):
     return value.strftime("%d-%m-%Y") if value else None
+
+
+def _month_label(value: date) -> str:
+    return value.strftime("%B %Y")
+
+
+def _collect_zepto_missing_rates(data) -> list[dict]:
+    missing = {}
+    with connection.cursor() as cur:
+        for row in data:
+            sku_code = str(row.get("SKU Number") or "").strip()
+            row_date = _parse_date(row.get("Date"))
+            if not sku_code or row_date is None:
+                continue
+            rate_month = row_date.replace(day=1).isoformat()
+            cur.execute(
+                """
+                SELECT 1
+                FROM monthly_landing_rate
+                WHERE UPPER(TRIM(sku_code::text)) = UPPER(TRIM(%s))
+                  AND REGEXP_REPLACE(LOWER(TRIM(format::text)), '[^a-z0-9]+', '', 'g') = 'zepto'
+                  AND month = %s
+                LIMIT 1
+                """,
+                [sku_code, rate_month],
+            )
+            if cur.fetchone():
+                continue
+
+            cur.execute(
+                """
+                SELECT item, product_name
+                FROM master_sheet
+                WHERE UPPER(TRIM(format_sku_code::text)) = UPPER(TRIM(%s))
+                LIMIT 1
+                """,
+                [sku_code],
+            )
+            master = cur.fetchone()
+            label = (
+                str(master[0] or master[1] or "").strip()
+                if master
+                else str(row.get("SKU Name") or sku_code).strip()
+            )
+            key = (sku_code.upper(), rate_month, label)
+            hit = missing.setdefault(
+                key,
+                {
+                    "sku_code": sku_code,
+                    "item": label,
+                    "month": rate_month,
+                    "month_label": _month_label(row_date),
+                    "rows": 0,
+                },
+            )
+            hit["rows"] += 1
+    return list(missing.values())
 
 
 def _jsonable(value):

@@ -15,6 +15,7 @@ urlpatterns = [
     path("<slug:slug>/pos", views.platform_pos, name="platform-pos"),
     path("<slug:slug>/inventory-match", views.inventory_match, name="platform-inventory-match"),
     path("<slug:slug>/sec-dashboard", views.flipkart_grocery_sec_dashboard, name="platform-sec-dashboard"),
+    path("<slug:slug>/sku-analysis-dashboard", views.sku_analysis_dashboard, name="platform-sku-analysis-dashboard"),
     path("<slug:slug>/drr-dashboard", views.flipkart_grocery_drr_dashboard, name="platform-drr-dashboard"),
     path("<slug:slug>/month-on-month-sale", views.flipkart_grocery_month_on_month_sale, name="platform-month-on-month-sale"),
     path("<slug:slug>/landing-rate", views.landing_rate_list, name="platform-landing-rate-list"),
