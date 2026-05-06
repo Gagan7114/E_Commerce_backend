@@ -1,5 +1,5 @@
 from django.contrib.auth import get_user_model
-from rest_framework import serializers, status
+from rest_framework import status
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
@@ -41,27 +41,6 @@ class LoginView(APIView):
             return Response(
                 {"detail": "Account disabled"}, status=status.HTTP_403_FORBIDDEN
             )
-        return Response({"user": _user_payload(user), "token": _issue_token(user)})
-
-
-class RegisterView(APIView):
-    permission_classes = [AllowAny]
-
-    class _Body(serializers.Serializer):
-        email = serializers.EmailField()
-        password = serializers.CharField(min_length=1)
-
-    def post(self, request):
-        ser = self._Body(data=request.data)
-        ser.is_valid(raise_exception=True)
-        email = ser.validated_data["email"].strip().lower()
-        password = ser.validated_data["password"]
-        if UserModel.objects.filter(email=email).exists():
-            return Response(
-                {"detail": "Email already registered"},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-        user = UserModel.objects.create_user(email=email, password=password)
         return Response({"user": _user_payload(user), "token": _issue_token(user)})
 
 
