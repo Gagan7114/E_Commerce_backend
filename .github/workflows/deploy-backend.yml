@@ -20,4 +20,4 @@ jobs:
           key: ${{ secrets.SSH_KEY }}
           script: |
             cd /home/superadmin/e-commerce
-            bash factory_backend_deploy.sh
+            bash deploy.sh
