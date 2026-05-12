@@ -14,8 +14,10 @@ _IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 # Tables the dashboard can query. Mirrors FastAPI ALLOWED_TABLES.
 ALLOWED_TABLES = {
     "master_po", "test_master_po",
-    "amazon_sec_daily", "amazon_sec_range", "bigbasketSec", "blinkitSec",
-    "flipkart_grocery_master", "fk_grocery", "flipkartSec", "jiomartSec", "swiggySec", "zeptoSec",
+    "amazon_price_data", "amazon_sec_daily", "amazon_sec_range",
+    "amazon_sec_range_margins", "amazon_sec_range_master_view",
+    "bigbasketSec", "blinkitSec", "flipkart_grocery_master", "fk_grocery", "flipkartSec", "flipkart_secondary_all",
+    "jiomartSec", "swiggySec", "zeptoSec",
     "amazon_inventory", "bigbasket_inventory",
     "blinkit_inventory", "jiomart_inventory", "swiggy_inventory", "zepto_inventory",
     "all_platform_inventory",
@@ -382,6 +384,8 @@ def table_data(request, table_name: str):
     order_sql = ""
     if table_name == "flipkart_grocery_master":
         order_sql = ' ORDER BY "real_date" ASC NULLS LAST, "sku_id" ASC NULLS LAST'
+    elif table_name == "amazon_sec_range_master_view":
+        order_sql = ' ORDER BY "from_date" ASC NULLS LAST, "to_date" ASC NULLS LAST, "asin" ASC NULLS LAST'
 
     try:
         with connection.cursor() as cur:

@@ -35,6 +35,7 @@ UPLOAD_ALLOWED_TABLES = {
     # Secondary sells
     "blinkitSec", "zeptoSec", "swiggySec", "flipkartSec",
     "jiomartSec", "bigbasketSec", "amazon_sec_daily", "amazon_sec_range",
+    "amazon_price_data", "amazon_sec_range_margins",
     "fk_grocery", "flipkart_grocery_master",
     "zomatoSec", "citymallSec",
     # Primary

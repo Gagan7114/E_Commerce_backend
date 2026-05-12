@@ -165,6 +165,127 @@ def inventory_match(request, slug: str):
     return Response({"match": rows[0] if rows else None})
 
 
+def _parse_price_upload_date(value: str) -> date | None:
+    value = str(value or "").strip()
+    if not value:
+        return None
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+        raise ValidationError("`date` must be YYYY-MM-DD.")
+    try:
+        return date.fromisoformat(value)
+    except ValueError:
+        raise ValidationError("`date` must be a valid calendar date.")
+
+
+@api_view(["GET"])
+@permission_classes([require("platform.stats.view")])
+def amazon_price_dashboard(request, slug: str):
+    _ensure_scope(request.user, slug)
+    if slug != "amazon":
+        raise ValidationError("Amazon Price Dashboard is available only for Amazon.")
+
+    selected_date = _parse_price_upload_date(request.query_params.get("date", ""))
+    defaulted_to_latest = False
+    if selected_date is None:
+        latest = _scalar(
+            'SELECT MAX(upload_date) FROM amazon_price_data',
+            [],
+        )
+        selected_date = latest
+        defaulted_to_latest = True
+
+    upload_dates = _dict_rows(
+        """
+        SELECT upload_date, COUNT(*) AS rows
+        FROM amazon_price_data
+        GROUP BY upload_date
+        ORDER BY upload_date DESC
+        LIMIT 30
+        """,
+        [],
+    )
+
+    if selected_date is None:
+        return Response({
+            "source": "amazon_price_data",
+            "dashboard_title": "Amazon Price Dashboard",
+            "selected_date": None,
+            "defaulted_to_latest": defaulted_to_latest,
+            "upload_dates": [],
+            "summary": {
+                "total_rows": 0,
+                "in_stock": 0,
+                "out_of_stock": 0,
+                "missing_url_price": 0,
+                "seller_count": 0,
+                "avg_url_price": None,
+            },
+            "rows": [],
+        })
+
+    summary_rows = _dict_rows(
+        """
+        SELECT
+            COUNT(*) AS total_rows,
+            COALESCE(SUM(CASE WHEN stock_status ILIKE '%%in stock%%' THEN 1 ELSE 0 END), 0) AS in_stock,
+            COALESCE(SUM(CASE WHEN stock_status ILIKE '%%out%%' THEN 1 ELSE 0 END), 0) AS out_of_stock,
+            COALESCE(SUM(CASE WHEN url_price IS NULL THEN 1 ELSE 0 END), 0) AS missing_url_price,
+            COUNT(DISTINCT NULLIF(TRIM(seller), '')) AS seller_count,
+            AVG(url_price) AS avg_url_price
+        FROM amazon_price_data
+        WHERE upload_date = %s
+        """,
+        [selected_date],
+    )
+    rows = _dict_rows(
+        """
+        SELECT
+            upload_date,
+            url,
+            asin,
+            product,
+            margin_basis,
+            mrp,
+            asp,
+            margin_pct,
+            tax_pct,
+            cost_without_tax,
+            url_price,
+            stock_status,
+            seller,
+            rk_price,
+            jm_price,
+            svd_price,
+            bau_price,
+            art_price,
+            created_at,
+            updated_at
+        FROM amazon_price_data
+        WHERE upload_date = %s
+        ORDER BY product ASC NULLS LAST, asin ASC
+        """,
+        [selected_date],
+    )
+
+    return Response({
+        "source": "amazon_price_data",
+        "dashboard_title": "Amazon Price Dashboard",
+        "selected_date": selected_date.isoformat(),
+        "defaulted_to_latest": defaulted_to_latest,
+        "upload_dates": [
+            {
+                "date": row["upload_date"].isoformat()
+                if hasattr(row["upload_date"], "isoformat")
+                else row["upload_date"],
+                "rows": int(row["rows"] or 0),
+            }
+            for row in upload_dates
+        ],
+        "summary": summary_rows[0] if summary_rows else {},
+        "rows": rows,
+    })
+
+
 # ─── Monthly Landing Rate ───
 # Single shared table `monthly_landing_rate` with columns:
 #   sku_code, sku_name, landing_rate, basic_rate, format, month
@@ -393,6 +514,89 @@ _BIGBASKET_SEC_DETAIL_ROWS = (
     ("OTHER", "DRINKS", "TONIC WATER", "200 MLS"),
 )
 
+_FLIPKART_SEC_ITEM_HEADS = ("PREMIUM", "COMMODITY", "OTHER")
+
+_FLIPKART_SEC_DETAIL_ROWS = (
+    ("PREMIUM", "OLIVE", "EXTRA LIGHT"),
+    ("PREMIUM", "CANOLA", "CANOLA"),
+    ("PREMIUM", "OLIVE", "JIVO POMACE"),
+    ("PREMIUM", "GROUNDNUT", "GROUNDNUT"),
+    ("COMMODITY", "MUSTARD", "MUSTARD KACCHI GHANI"),
+    ("PREMIUM", "OLIVE", "EXTRA VIRGIN"),
+    ("PREMIUM", "OLIVE", "SANO POMACE"),
+    ("COMMODITY", "RICE BRAN", "RICE BRAN"),
+    ("COMMODITY", "SUNFLOWER OIL", "SUNFLOWER OIL"),
+    ("PREMIUM", "COCONUT", "COCONUT"),
+    ("COMMODITY", "BLENDED", "GOLD"),
+    ("PREMIUM", "BLENDED", "SO OLIVE"),
+    ("PREMIUM", "YELLOW MUSTARD", "YELLOW MUSTARD"),
+    ("COMMODITY", "SOYABEAN", "SOYABEAN"),
+    ("PREMIUM", "GHEE", "A2 GHEE"),
+    ("OTHER", "SPICES", "SAFFRON"),
+    ("PREMIUM", "SESAME", "SESAME"),
+    ("OTHER", "SEEDS", "FLAX SEEDS"),
+    ("OTHER", "SEEDS", "ALL SEEDS"),
+    ("OTHER", "SEEDS", "BAASIL SEEDS"),
+    ("OTHER", "SEEDS", "CHIA SEEDS"),
+    ("OTHER", "HONEY", "HONEY"),
+    ("PREMIUM", "GHEE", "DESI GHEE"),
+    ("PREMIUM", "OLIVE", "CLASSIC"),
+    ("PREMIUM", "OLIVE", "POMACE"),
+    ("OTHER", "Casserole", "Casserole"),
+    ("OTHER", "COFFEE", "COFFEE"),
+    ("OTHER", "Crypto", "Crypto"),
+    ("OTHER", "ELEGANCE", "ELEGANCE"),
+    ("OTHER", "Ferrero", "Ferrero"),
+    ("OTHER", "FlipPRo", "FlipPRo"),
+    ("OTHER", "GIFT PACK", "DRY FRUITS"),
+    ("OTHER", "LUNCH BOX", "LUNCH BOX"),
+    ("OTHER", "RICE", "RICE"),
+    ("OTHER", "SEEDS", "BASIL SEEDS"),
+    ("OTHER", "SEEDS", "CHIA SEED"),
+    ("OTHER", "SEEDS", "FLAX SEED"),
+    ("OTHER", "SEEDS", "PUMPKIN SEED"),
+    ("OTHER", "SEEDS", "PUMPKIN SEEDS"),
+    ("OTHER", "SEEDS", "Seeds"),
+    ("OTHER", "SEEDS", "SUNFLOWER SEEDS"),
+    ("OTHER", "SPICES", "BLACK CARDAMOM"),
+    ("OTHER", "SPICES", "BLACK PEPPER"),
+    ("OTHER", "SPICES", "CINNAMON"),
+    ("OTHER", "SPICES", "CUMIN"),
+    ("OTHER", "SPICES", "GREEN CARDAMOM"),
+    ("OTHER", "WHEATGRASS", "PUNJABI JEERA"),
+    ("OTHER", "WHEATGRASS", "WHEATGRASS APPLE"),
+    ("OTHER", "WHEATGRASS", "WHEATGRASS BLUEBERRY"),
+    ("OTHER", "WHEATGRASS", "WHEATGRASS GIGNGER ALE"),
+    ("OTHER", "WHEATGRASS", "WHEATGRASS MANGO"),
+    ("OTHER", "WHEATGRASS", "WHEATGRASS MOJITO"),
+)
+
+_FLIPKART_SEC_MONTHLY_CATEGORY_ROWS = (
+    ("PREMIUM", "BLENDED", "SO OLIVE"),
+    ("", "CANOLA", "CANOLA"),
+    ("", "COCONUT", "COCONUT"),
+    ("", "GHEE", "A2 GHEE"),
+    ("", "GHEE", "DESI GHEE"),
+    ("", "GROUNDNUT", "GROUNDNUT"),
+    ("", "OLIVE", "CLASSIC"),
+    ("", "OLIVE", "EXTRA LIGHT"),
+    ("", "OLIVE", "EXTRA VIRGIN"),
+    ("", "OLIVE", "JIVO POMACE"),
+    ("", "OLIVE", "POMACE"),
+    ("", "OLIVE", "SANO POMACE"),
+    ("", "SESAME", "SESAME"),
+    ("", "YELLOW MUSTARD", "YELLOW MUSTARD"),
+    ("COMMODITY", "BLENDED", "GOLD"),
+    ("", "MUSTARD", "MUSTARD KACCHI GHANI"),
+    ("", "RICE BRAN", "RICE BRAN"),
+    ("", "SOYABEAN", "SOYABEAN"),
+    ("", "SUNFLOWER OIL", "SUNFLOWER OIL"),
+)
+
+_FLIPKART_SEC_MONTHLY_ITEM_HEADS = ("PREMIUM", "COMMODITY")
+
+_FLIPKART_MP_DRR_SALES_OF = ("ALL", "PREMIUM", "COMMODITY", "OTHER")
+
 _MONTH_NAME_TO_NUM = {
     date(2000, month, 1).strftime("%B").upper(): month
     for month in range(1, 13)
@@ -442,6 +646,12 @@ def _sec_total(rows: list[dict], *, include_ratio: bool = True) -> dict:
     }
     if include_ratio:
         total["per_liter_shpd"] = _per_liter_shpd(shipped_units, shipped_ltr)
+    return total
+
+
+def _sec_total_with_order_value(rows: list[dict]) -> dict:
+    total = _sec_total(rows)
+    total["order_value"] = sum(_num(r.get("order_value")) for r in rows)
     return total
 
 
@@ -529,15 +739,25 @@ _BIGBASKET_MOM_TEMPLATE = (
 
 
 def _parse_sec_month_year(params, *, latest_source: str = "flipkart_grocery") -> tuple[int, int, bool]:
+    raw_date = str(params.get("date") or "").strip()
     raw_month = str(params.get("month") or "").strip()
     raw_year = str(params.get("year") or "").strip()
 
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", raw_date):
+        try:
+            selected = date.fromisoformat(raw_date)
+        except ValueError:
+            raise ValidationError("`date` must be a valid calendar date.")
+        return selected.month, selected.year, False
     if re.fullmatch(r"\d{4}-\d{2}", raw_month):
         year, month = raw_month.split("-")
         return int(month), int(year), False
     if re.fullmatch(r"\d{4}-\d{2}-\d{2}", raw_month):
-        year, month, _ = raw_month.split("-")
-        return int(month), int(year), False
+        try:
+            selected = date.fromisoformat(raw_month)
+        except ValueError:
+            raise ValidationError("`month` date must be a valid calendar date.")
+        return selected.month, selected.year, False
 
     if raw_month and raw_year:
         try:
@@ -551,7 +771,29 @@ def _parse_sec_month_year(params, *, latest_source: str = "flipkart_grocery") ->
             raise ValidationError("`year` looks out of range.")
         return month, year, False
 
-    if latest_source.startswith("secmaster_"):
+    if latest_source == "flipkart_secondary_all":
+        latest = _dict_rows(
+            """
+            SELECT "month", "year"
+            FROM "flipkart_secondary_all"
+            WHERE "Order Date" IS NOT NULL
+            ORDER BY "Order Date" DESC
+            LIMIT 1
+            """,
+            [],
+        )
+    elif latest_source == "amazon_sec_range_master_view":
+        latest = _dict_rows(
+            """
+            SELECT "month", "year"
+            FROM "amazon_sec_range_master_view"
+            WHERE "to_date" IS NOT NULL
+            ORDER BY "to_date" DESC
+            LIMIT 1
+            """,
+            [],
+        )
+    elif latest_source.startswith("secmaster_"):
         source_format = latest_source.replace("secmaster_", "", 1)
         date_expr = (
             _secmaster_zepto_date_expr()
@@ -594,6 +836,116 @@ def _parse_sec_month_year(params, *, latest_source: str = "flipkart_grocery") ->
     return today.month, today.year, True
 
 
+def _parse_flipkart_secondary_monthly_year(params) -> tuple[int, bool]:
+    raw_year = str(params.get("year") or "").strip()
+    if raw_year:
+        try:
+            year = int(raw_year)
+        except ValueError:
+            raise ValidationError("`year` must be numeric.")
+        if year < 2000 or year > 2100:
+            raise ValidationError("`year` looks out of range.")
+        return year, False
+
+    latest_year = _scalar(
+        'SELECT "year" FROM "flipkart_secondary_all" WHERE "year" IS NOT NULL ORDER BY "year" DESC LIMIT 1',
+        [],
+    )
+    return int(latest_year) if latest_year else date.today().year, True
+
+
+def _parse_amazon_secondary_monthly_year(params) -> tuple[int, bool]:
+    raw_year = str(params.get("year") or "").strip()
+    if raw_year:
+        try:
+            year = int(raw_year)
+        except ValueError:
+            raise ValidationError("`year` must be numeric.")
+        if year < 2000 or year > 2100:
+            raise ValidationError("`year` looks out of range.")
+        return year, False
+
+    latest_year = _scalar(
+        """
+        SELECT "year"
+        FROM "amazon_sec_range_master_view"
+        WHERE "year" IS NOT NULL
+        ORDER BY "to_date" DESC NULLS LAST, "year" DESC
+        LIMIT 1
+        """,
+        [],
+    )
+    return int(latest_year) if latest_year else date.today().year, True
+
+
+def _parse_amazon_comparison_params(params) -> tuple[str, int, int, bool]:
+    raw_month = str(params.get("month") or "").strip().upper()
+    raw_year = str(params.get("year") or "").strip()
+    defaulted_to_latest = False
+
+    if not raw_month or not raw_year:
+        latest = _dict_rows(
+            """
+            SELECT "month", "year"
+            FROM "amazon_sec_range_master_view"
+            WHERE "to_date" IS NOT NULL
+            ORDER BY "to_date" DESC
+            LIMIT 1
+            """,
+            [],
+        )
+        if latest:
+            raw_month = str(latest[0].get("month") or "").strip().upper()
+            raw_year = str(latest[0].get("year") or "").strip()
+            defaulted_to_latest = True
+        else:
+            raw_month = raw_month or "MAY"
+            raw_year = raw_year or "2026"
+
+    raw_history_year = str(params.get("history_year") or raw_year).strip()
+
+    if raw_month.isdigit():
+        month_number = int(raw_month)
+        if not 1 <= month_number <= 12:
+            raise ValidationError("`month` must be 1-12 or a month name.")
+        month_name = _month_name(month_number)
+    else:
+        month_name = _norm_sec_key(raw_month)
+        if month_name not in _MONTH_NAME_TO_NUM:
+            raise ValidationError("`month` must be 1-12 or a month name.")
+
+    try:
+        year = int(raw_year)
+        history_year = int(raw_history_year)
+    except ValueError:
+        raise ValidationError("`year` and `history_year` must be numeric.")
+    if not 2000 <= year <= 2100 or not 2000 <= history_year <= 2100:
+        raise ValidationError("`year` or `history_year` looks out of range.")
+    return month_name, year, history_year, defaulted_to_latest
+
+
+def _parse_sec_selected_date(params) -> date | None:
+    raw_date = str(params.get("date") or "").strip()
+    raw_month = str(params.get("month") or "").strip()
+    candidate = raw_date or (
+        raw_month if re.fullmatch(r"\d{4}-\d{2}-\d{2}", raw_month) else ""
+    )
+    if not candidate:
+        return None
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", candidate):
+        raise ValidationError("`date` must be YYYY-MM-DD.")
+    try:
+        return date.fromisoformat(candidate)
+    except ValueError:
+        raise ValidationError("`date` must be a valid calendar date.")
+
+
+def _sec_date_filter(selected_date: date | None, date_expr: str = '"date"') -> tuple[str, list]:
+    if not selected_date:
+        return "", []
+    return f" AND ({date_expr})::date = %s", [selected_date]
+
+
 def _secmaster_zepto_date_expr(alias: str | None = None) -> str:
     prefix = f'{alias}.' if alias else ""
     return f"""
@@ -624,6 +976,108 @@ def _month_name(month: int) -> str:
     return date(2000, month, 1).strftime("%B").upper()
 
 
+_AMAZON_SEC_ITEM_HEADS = ("PREMIUM", "COMMODITY", "OTHER")
+
+_AMAZON_SEC_CATEGORY_ROWS = (
+    ("AMAZON", "PREMIUM", "BLENDED", "SO OLIVE"),
+    ("AMAZON", "PREMIUM", "CANOLA", "CANOLA"),
+    ("AMAZON", "PREMIUM", "COCONUT", "COCONUT"),
+    ("AMAZON", "PREMIUM", "GHEE", "A2 GHEE"),
+    ("AMAZON", "PREMIUM", "GHEE", "DESI GHEE"),
+    ("AMAZON", "PREMIUM", "GROUNDNUT", "GROUNDNUT"),
+    ("AMAZON", "PREMIUM", "MUSTARD", "YELLOW MUSTARD"),
+    ("AMAZON", "PREMIUM", "OLIVE", "CLASSIC"),
+    ("AMAZON", "PREMIUM", "OLIVE", "EXTRA LIGHT"),
+    ("AMAZON", "PREMIUM", "OLIVE", "EXTRA VIRGIN"),
+    ("AMAZON", "PREMIUM", "OLIVE", "JIVO POMACE"),
+    ("AMAZON", "PREMIUM", "OLIVE", "SANO POMACE"),
+    ("AMAZON", "PREMIUM", "SESAME OIL", "SESAME OIL"),
+    ("AMAZON", "COMMODITY", "BLENDED", "GOLD"),
+    ("AMAZON", "COMMODITY", "MUSTARD", "MUSTARD KACCHI GHANI"),
+    ("AMAZON", "COMMODITY", "RICE BRAN", "RICE BRAN"),
+    ("AMAZON", "COMMODITY", "SOYABEAN", "SOYABEAN"),
+    ("AMAZON", "COMMODITY", "SUNFLOWER", "SUNFLOWER"),
+    ("AMAZON", "OTHER", "COFFEE", "COFFEE"),
+    ("AMAZON", "OTHER", "DRINKS", "APPLE"),
+    ("AMAZON", "OTHER", "DRINKS", "COLA"),
+    ("AMAZON", "OTHER", "DRINKS", "GINGER ALE SF"),
+    ("AMAZON", "OTHER", "DRINKS", "JEERA"),
+    ("AMAZON", "OTHER", "DRINKS", "LEMON"),
+    ("AMAZON", "OTHER", "DRINKS", "MANGO"),
+    ("AMAZON", "OTHER", "DRINKS", "MINERAL WATER"),
+    ("AMAZON", "OTHER", "DRINKS", "MOJITO"),
+    ("AMAZON", "OTHER", "DRINKS", "ORANGE"),
+    ("AMAZON", "OTHER", "DRINKS", "ROSE"),
+    ("AMAZON", "OTHER", "DRINKS", "SODA"),
+    ("AMAZON", "OTHER", "DRINKS", "TONIC WATER"),
+    ("AMAZON", "OTHER", "GIFT PACK", "DRY FRUITS"),
+    ("AMAZON", "OTHER", "HONEY", "NATURAL HONEY"),
+    ("AMAZON", "OTHER", "RICE", "BASMATI"),
+    ("AMAZON", "OTHER", "ROSEMARY LEAVES", "ROSEMARY LEAVES"),
+    ("AMAZON", "OTHER", "SEEDS", "BASIL"),
+    ("AMAZON", "OTHER", "SEEDS", "CHIA"),
+    ("AMAZON", "OTHER", "SEEDS", "FLAX"),
+    ("AMAZON", "OTHER", "SEEDS", "PUMPKIN"),
+    ("AMAZON", "OTHER", "SEEDS", "QUINOA SEEDS"),
+    ("AMAZON", "OTHER", "SEEDS", "SUNFLOWER SEEDS"),
+    ("AMAZON", "OTHER", "SLICED OLIVE", "BLACK OLIVE"),
+    ("AMAZON", "OTHER", "SPICES", "BLACK PEPPER"),
+    ("AMAZON", "OTHER", "SPICES", "CARDAMOM"),
+    ("AMAZON", "OTHER", "SPICES", "CINNAMON"),
+    ("AMAZON", "OTHER", "SPICES", "CLOVE"),
+    ("AMAZON", "OTHER", "SPICES", "CUMIN SEEDS"),
+    ("AMAZON", "OTHER", "SPICES", "GREEN CARDAMOM"),
+    ("AMAZON", "OTHER", "SPICES", "SAFFRON"),
+)
+
+_AMAZON_SEC_MONTHLY_CATEGORY_ROWS = (
+    ("PREMIUM", "BLENDED", "SO OLIVE"),
+    ("", "CANOLA", "CANOLA"),
+    ("", "COCONUT", "COCONUT"),
+    ("", "GHEE", "A2 GHEE"),
+    ("", "GHEE", "DESI GHEE"),
+    ("", "GROUNDNUT", "GROUNDNUT"),
+    ("", "MUSTARD", "YELLOW MUSTARD"),
+    ("", "OLIVE", "CLASSIC"),
+    ("", "OLIVE", "EXTRA LIGHT"),
+    ("", "OLIVE", "EXTRA VIRGIN"),
+    ("", "OLIVE", "JIVO POMACE"),
+    ("", "OLIVE", "SANO POMACE"),
+    ("COMMODITY", "BLENDED", "GOLD"),
+    ("", "MUSTARD", "MUSTARD KACCHI GHANI"),
+    ("", "RICE BRAN", "RICE BRAN"),
+    ("", "SOYABEAN", "SOYABEAN"),
+    ("", "SUNFLOWER", "SUNFLOWER"),
+)
+
+_AMAZON_SEC_MONTHLY_ITEM_HEADS = ("PREMIUM", "COMMODITY")
+
+_AMAZON_COMPARISON_ROWS = (
+    ("PREMIUM", "BLENDED", "SO OLIVE", "JIVO"),
+    ("PREMIUM", "CANOLA", "CANOLA", "JIVO"),
+    ("PREMIUM", "CANOLA", "CANOLA", "SANO"),
+    ("PREMIUM", "COCONUT", "COCONUT", "JIVO"),
+    ("PREMIUM", "GHEE", "A2 GHEE", "JIVO"),
+    ("PREMIUM", "GHEE", "DESI GHEE", "JIVO"),
+    ("PREMIUM", "GROUNDNUT", "GROUNDNUT", "JIVO"),
+    ("PREMIUM", "MUSTARD", "YELLOW MUSTARD", "JIVO"),
+    ("PREMIUM", "OLIVE", "CLASSIC", "SANO"),
+    ("PREMIUM", "OLIVE", "EXTRA LIGHT", "JIVO"),
+    ("PREMIUM", "OLIVE", "EXTRA VIRGIN", "JIVO"),
+    ("PREMIUM", "OLIVE", "JIVO POMACE", "JIVO"),
+    ("PREMIUM", "OLIVE", "SANO POMACE", "SANO"),
+    ("PREMIUM", "SEASAME OIL", "SEASAME OIL", "JIVO"),
+    ("COMMODITY", "BLENDED", "GOLD", "JIVO"),
+    ("COMMODITY", "MUSTARD", "MUSTARD KACCHI GHANI", "JIVO"),
+    ("COMMODITY", "MUSTARD", "MUSTARD KACCHI GHANI", "SANO"),
+    ("COMMODITY", "RICE BRAN", "RICE BRAN", "JIVO"),
+    ("COMMODITY", "SOYABEAN", "SOYABEAN", "JIVO"),
+    ("COMMODITY", "SOYABEAN", "SOYABEAN", "SANO"),
+    ("COMMODITY", "SUNFLOWER", "SUNFLOWER", "JIVO"),
+    ("COMMODITY", "SUNFLOWER", "SUNFLOWER", "SANO"),
+)
+
+
 def _sum_mom_rows(rows: list[dict]) -> dict:
     keys = (
         "target",
@@ -649,25 +1103,32 @@ def flipkart_grocery_sec_dashboard(request, slug: str):
         return _zepto_sec_dashboard_response(request)
     if slug == "bigbasket":
         return _bigbasket_sec_dashboard_response(request)
+    if slug == "flipkart":
+        return _flipkart_sec_dashboard_response(request)
+    if slug == "amazon":
+        return _amazon_sec_dashboard_response(request)
     if slug != "flipkart_grocery":
         raise ValidationError(
-            "Sec Dashboard is available only for Big Basket, Blinkit, Swiggy, Zepto and Flipkart Grocery."
+            "Sec Dashboard is available only for Amazon, Big Basket, Blinkit, Swiggy, Zepto, Flipkart and Flipkart Grocery."
         )
 
     month, year, defaulted_to_latest = _parse_sec_month_year(request.query_params)
+    selected_date = _parse_sec_selected_date(request.query_params)
+    date_filter, date_params = _sec_date_filter(selected_date, '"real_date"')
 
     max_date = _scalar(
-        """
+        f"""
         SELECT MAX("real_date")
         FROM "flipkart_grocery_master"
         WHERE "month" = %s
           AND "year" = %s
+          {date_filter}
         """,
-        [month, year],
+        [month, year, *date_params],
     )
 
     summary_raw = _dict_rows(
-        """
+        f"""
         SELECT
             UPPER(TRIM("item_head"::text)) AS item_head,
             COALESCE(SUM("qty"), 0) AS shipped_units,
@@ -676,10 +1137,11 @@ def flipkart_grocery_sec_dashboard(request, slug: str):
         FROM "flipkart_grocery_master"
         WHERE "month" = %s
           AND "year" = %s
+          {date_filter}
           AND UPPER(TRIM("item_head"::text)) IN ('PREMIUM', 'COMMODITY', 'OTHER')
         GROUP BY UPPER(TRIM("item_head"::text))
         """,
-        [month, year],
+        [month, year, *date_params],
     )
     summary_by_head = {_norm_sec_key(r.get("item_head")): r for r in summary_raw}
     summary = []
@@ -696,7 +1158,7 @@ def flipkart_grocery_sec_dashboard(request, slug: str):
         })
 
     detail_raw = _dict_rows(
-        """
+        f"""
         SELECT
             UPPER(TRIM("sub_category"::text)) AS sub_category_key,
             UPPER(TRIM("per_ltr_unit"::text)) AS per_ltr_key,
@@ -706,11 +1168,12 @@ def flipkart_grocery_sec_dashboard(request, slug: str):
         FROM "flipkart_grocery_master"
         WHERE "month" = %s
           AND "year" = %s
+          {date_filter}
         GROUP BY
             UPPER(TRIM("sub_category"::text)),
             UPPER(TRIM("per_ltr_unit"::text))
         """,
-        [month, year],
+        [month, year, *date_params],
     )
     detail_by_key = {
         (_norm_sec_key(r.get("sub_category_key")), _norm_sec_key(r.get("per_ltr_key"))): r
@@ -739,6 +1202,7 @@ def flipkart_grocery_sec_dashboard(request, slug: str):
         "defaulted_to_latest": defaulted_to_latest,
         "month": month,
         "year": year,
+        "selected_date": selected_date.isoformat() if selected_date else None,
         "max_date": max_date.isoformat() if max_date else None,
         "summary": summary,
         "summary_total": _sec_total(summary),
@@ -747,28 +1211,804 @@ def flipkart_grocery_sec_dashboard(request, slug: str):
     })
 
 
+def _amazon_effective_margin(row: dict) -> float | None:
+    shipped_value = _num(row.get("shipped_value"))
+    margin_value = _num(row.get("margin_value"))
+    if shipped_value == 0:
+        return None
+    return margin_value / shipped_value
+
+
+def _amazon_projection(shipped_ltr, elapsed_day: int, days_in_month: int) -> float:
+    if elapsed_day <= 0:
+        return 0.0
+    return _num(shipped_ltr) / elapsed_day * days_in_month
+
+
+def _amazon_sec_totals(rows: list[dict], *, include_projection: bool = True) -> dict:
+    total = {
+        "order_value": sum(_num(row.get("order_value")) for row in rows),
+        "order_ltr": sum(_num(row.get("order_ltr")) for row in rows),
+        "shipped_value": sum(_num(row.get("shipped_value")) for row in rows),
+        "shipped_ltr": sum(_num(row.get("shipped_ltr")) for row in rows),
+        "return_value": sum(_num(row.get("return_value")) for row in rows),
+        "return_ltr": sum(_num(row.get("return_ltr")) for row in rows),
+        "shipped_units": sum(_num(row.get("shipped_units")) for row in rows),
+        "return_units": sum(_num(row.get("return_units")) for row in rows),
+    }
+    total["per_liter_shpd"] = _value_per_ltr_zero(
+        total["shipped_value"],
+        total["shipped_ltr"],
+    )
+    if include_projection:
+        total["projection_ltr"] = sum(_num(row.get("projection_ltr")) for row in rows)
+    margin_value = sum(_num(row.get("margin_value")) for row in rows)
+    margin_tax_value = sum(_num(row.get("margin_tax_value")) for row in rows)
+    total["margin_value"] = margin_value
+    total["margin_tax_value"] = margin_tax_value
+    total["margin_pct"] = (
+        margin_value / total["shipped_value"]
+        if total["shipped_value"]
+        else None
+    )
+    total["net_realise_shpd"] = _value_per_ltr_zero(
+        total["shipped_value"] - margin_tax_value,
+        total["shipped_ltr"],
+    )
+    return total
+
+
+def _amazon_secondary_monthly_dashboard_response(request):
+    year, defaulted_to_latest = _parse_amazon_secondary_monthly_year(request.query_params)
+    months = []
+    for month in range(1, 13):
+        month_key = _month_name(month)
+        day = monthrange(year, month)[1]
+        months.append({
+            "month": month,
+            "key": month_key,
+            "label": "FEBURARY" if month == 2 else month_key,
+            "day": day,
+            "month_day": f"{day}-{month_key}",
+        })
+    month_keys = [month["key"] for month in months]
+    month_days = [month["month_day"] for month in months]
+    month_day_by_key = {month["key"]: month["month_day"] for month in months}
+    placeholders = ", ".join(["%s"] * len(month_days))
+
+    def empty_month_values(fields: tuple[str, ...]) -> dict:
+        return {month_key: {field: 0.0 for field in fields} for month_key in month_keys}
+
+    def sum_month_rows(rows: list[dict], fields: tuple[str, ...]) -> dict:
+        total = {"months": empty_month_values(fields)}
+        for month_key in month_keys:
+            for field in fields:
+                total["months"][month_key][field] = sum(
+                    _num(row.get("months", {}).get(month_key, {}).get(field))
+                    for row in rows
+                )
+        return total
+
+    max_date = _scalar(
+        """
+        SELECT MAX("to_date")
+        FROM "amazon_sec_range_master_view"
+        WHERE "year" = %s
+        """,
+        [year],
+    )
+
+    period_row_count = int(_scalar(
+        f"""
+        SELECT COUNT(*)
+        FROM "amazon_sec_range_master_view"
+        WHERE "year" = %s
+          AND UPPER(TRIM("month_day"::text)) IN ({placeholders})
+        """,
+        [year, *month_days],
+    ) or 0)
+
+    monthly_summary_raw = _dict_rows(
+        f"""
+        SELECT
+            UPPER(TRIM("month_day"::text)) AS month_day_key,
+            UPPER(TRIM("item_head"::text)) AS item_head,
+            COALESCE(SUM("ordered_revenue"), 0) AS order_value,
+            COALESCE(SUM("calculated_shipped_revenue"), 0) AS shipped_value,
+            COALESCE(SUM("ordered_litres"), 0) AS order_ltr,
+            COALESCE(SUM("shipped_litres"), 0) AS shipped_ltr
+        FROM "amazon_sec_range_master_view"
+        WHERE "year" = %s
+          AND UPPER(TRIM("month_day"::text)) IN ({placeholders})
+          AND UPPER(TRIM("item_head"::text)) IN ('PREMIUM', 'COMMODITY')
+        GROUP BY
+            UPPER(TRIM("month_day"::text)),
+            UPPER(TRIM("item_head"::text))
+        """,
+        [year, *month_days],
+    )
+    summary_by_key = {
+        (_norm_sec_key(row.get("item_head")), _norm_sec_key(row.get("month_day_key"))): row
+        for row in monthly_summary_raw
+    }
+
+    sales_liters = []
+    sales_values = []
+    for item_head in _AMAZON_SEC_MONTHLY_ITEM_HEADS:
+        litre_months = empty_month_values(("order_ltr", "shipped_ltr"))
+        value_months = empty_month_values(("order_value", "shipped_value"))
+        for month_key in month_keys:
+            month_day = month_day_by_key[month_key]
+            row = summary_by_key.get((item_head, month_day), {})
+            litre_months[month_key]["order_ltr"] = _num(row.get("order_ltr"))
+            litre_months[month_key]["shipped_ltr"] = _num(row.get("shipped_ltr"))
+            value_months[month_key]["order_value"] = _num(row.get("order_value"))
+            value_months[month_key]["shipped_value"] = _num(row.get("shipped_value"))
+        sales_liters.append({
+            "type": item_head,
+            "months": litre_months,
+        })
+        sales_values.append({
+            "type": item_head,
+            "months": value_months,
+        })
+
+    sales_values_total_raw = _dict_rows(
+        f"""
+        SELECT
+            UPPER(TRIM("month_day"::text)) AS month_day_key,
+            COALESCE(SUM("ordered_revenue"), 0) AS order_value,
+            COALESCE(SUM("calculated_shipped_revenue"), 0) AS shipped_value
+        FROM "amazon_sec_range_master_view"
+        WHERE "year" = %s
+          AND UPPER(TRIM("month_day"::text)) IN ({placeholders})
+        GROUP BY UPPER(TRIM("month_day"::text))
+        """,
+        [year, *month_days],
+    )
+    sales_values_total_by_key = {
+        _norm_sec_key(row.get("month_day_key")): row
+        for row in sales_values_total_raw
+    }
+    sales_values_total = {"months": empty_month_values(("order_value", "shipped_value"))}
+    for month_key in month_keys:
+        month_day = month_day_by_key[month_key]
+        row = sales_values_total_by_key.get(month_day, {})
+        sales_values_total["months"][month_key]["order_value"] = _num(row.get("order_value"))
+        sales_values_total["months"][month_key]["shipped_value"] = _num(row.get("shipped_value"))
+
+    category_raw = _dict_rows(
+        f"""
+        SELECT
+            UPPER(TRIM("month_day"::text)) AS month_day_key,
+            UPPER(TRIM("sub_category"::text)) AS sub_category_key,
+            COALESCE(SUM("ordered_revenue"), 0) AS order_value,
+            COALESCE(SUM("calculated_shipped_revenue"), 0) AS shipped_value,
+            COALESCE(SUM("ordered_litres"), 0) AS order_ltr,
+            COALESCE(SUM("shipped_litres"), 0) AS shipped_ltr
+        FROM "amazon_sec_range_master_view"
+        WHERE "year" = %s
+          AND UPPER(TRIM("month_day"::text)) IN ({placeholders})
+        GROUP BY
+            UPPER(TRIM("month_day"::text)),
+            UPPER(TRIM("sub_category"::text))
+        """,
+        [year, *month_days],
+    )
+    category_by_key = {
+        (_norm_sec_key(row.get("sub_category_key")), _norm_sec_key(row.get("month_day_key"))): row
+        for row in category_raw
+    }
+
+    category_liters = []
+    category_values = []
+    for item_head, category, sub_category in _AMAZON_SEC_MONTHLY_CATEGORY_ROWS:
+        litre_months = empty_month_values(("order_ltr", "shipped_ltr"))
+        value_months = empty_month_values(("order_value", "shipped_value"))
+        for month_key in month_keys:
+            month_day = month_day_by_key[month_key]
+            row = category_by_key.get((_norm_sec_key(sub_category), month_day), {})
+            litre_months[month_key]["order_ltr"] = _num(row.get("order_ltr"))
+            litre_months[month_key]["shipped_ltr"] = _num(row.get("shipped_ltr"))
+            value_months[month_key]["order_value"] = _num(row.get("order_value"))
+            value_months[month_key]["shipped_value"] = _num(row.get("shipped_value"))
+        category_liters.append({
+            "type": item_head,
+            "category": category,
+            "sub_category": sub_category,
+            "months": litre_months,
+        })
+        category_values.append({
+            "type": item_head,
+            "category": category,
+            "sub_category": sub_category,
+            "months": value_months,
+        })
+
+    mom_raw = _dict_rows(
+        f"""
+        SELECT
+            UPPER(TRIM("month_day"::text)) AS month_day_key,
+            UPPER(TRIM("item_head"::text)) AS item_head,
+            COALESCE(SUM("shipped_litres"), 0) AS shipped_ltr
+        FROM "amazon_sec_range_master_view"
+        WHERE UPPER(TRIM("month_day"::text)) IN ({placeholders})
+          AND UPPER(TRIM("item_head"::text)) IN ('PREMIUM', 'COMMODITY')
+        GROUP BY
+            UPPER(TRIM("month_day"::text)),
+            UPPER(TRIM("item_head"::text))
+        """,
+        month_days,
+    )
+    mom_by_key = {
+        (_norm_sec_key(row.get("item_head")), _norm_sec_key(row.get("month_day_key"))): _num(row.get("shipped_ltr"))
+        for row in mom_raw
+    }
+
+    mom_growth = []
+    previous_premium = 0.0
+    previous_commodity = 0.0
+    for index, month_info in enumerate(months):
+        month_day = month_info["month_day"]
+        premium_ltr = mom_by_key.get(("PREMIUM", month_day), 0.0)
+        commodity_ltr = mom_by_key.get(("COMMODITY", month_day), 0.0)
+        if index == 0:
+            premium_growth = 0.0
+            commodity_growth = 0.0
+        else:
+            premium_growth = _safe_div(premium_ltr - previous_premium, previous_premium)
+            commodity_growth = _safe_div(commodity_ltr - previous_commodity, previous_commodity)
+        mom_growth.append({
+            "month": month_info["key"],
+            "label": month_info["label"],
+            "month_day": month_day,
+            "premium_ltr": premium_ltr,
+            "commodity_ltr": commodity_ltr,
+            "premium_growth": premium_growth,
+            "commodity_growth": commodity_growth,
+        })
+        previous_premium = premium_ltr
+        previous_commodity = commodity_ltr
+
+    notes = []
+    if period_row_count == 0:
+        notes.append("No Amazon SEC range month-end data found for the selected year.")
+    notes.append("Uses exact Excel month-end filters against amazon_sec_range_master_view.")
+    notes.append("MOM growth follows Excel and does not filter by year.")
+
+    return Response({
+        "source": "amazon_sec_range_master_view",
+        "format": "AMAZON",
+        "dashboard_title": "Amazon Secondary Monthly Dashboard",
+        "defaulted_to_latest": defaulted_to_latest,
+        "year": year,
+        "max_date": max_date.isoformat() if hasattr(max_date, "isoformat") else max_date,
+        "month_strategy": "excel_month_end",
+        "period_row_count": period_row_count,
+        "months": months,
+        "sales_liters": sales_liters,
+        "sales_liters_total": sum_month_rows(
+            sales_liters,
+            ("order_ltr", "shipped_ltr"),
+        ),
+        "sales_values": sales_values,
+        "sales_values_total": sales_values_total,
+        "category_liters": category_liters,
+        "category_liters_total": sum_month_rows(
+            category_liters,
+            ("order_ltr", "shipped_ltr"),
+        ),
+        "category_values": category_values,
+        "category_values_total": sum_month_rows(
+            category_values,
+            ("order_value", "shipped_value"),
+        ),
+        "mom_growth": mom_growth,
+        "notes": {
+            "messages": notes,
+            "mom_growth_year_filter": False,
+            "month_strategy": "excel_month_end",
+            "source_view_only": True,
+            "value_total_includes_all_item_heads": True,
+            "litre_total_item_heads": list(_AMAZON_SEC_MONTHLY_ITEM_HEADS),
+            "category_template_fixed": True,
+        },
+    })
+
+
+def _amazon_comparison_dashboard_response(request):
+    (
+        selected_month,
+        selected_year,
+        history_year,
+        defaulted_to_latest,
+    ) = _parse_amazon_comparison_params(request.query_params)
+    selected_to_date = _scalar(
+        """
+        SELECT MAX("to_date")
+        FROM "amazon_sec_range_master_view"
+        WHERE UPPER(TRIM("month"::text)) = %s
+        """,
+        [selected_month],
+    )
+    selected_month_day = (
+        f"{selected_to_date.day:02d}-{selected_month}"
+        if hasattr(selected_to_date, "day")
+        else None
+    )
+
+    current_by_key = {}
+    if selected_month_day:
+        current_raw = _dict_rows(
+            """
+            SELECT
+                UPPER(TRIM("sub_category"::text)) AS sub_category_key,
+                UPPER(TRIM("brand_2"::text)) AS brand_key,
+                COALESCE(SUM("shipped_litres"), 0) AS shipped_ltr,
+                COALESCE(SUM("calculated_shipped_revenue"), 0) AS shipped_rev,
+                COALESCE(SUM("shipped_revenue_after_margin"), 0) AS rev_after_margin
+            FROM "amazon_sec_range_master_view"
+            WHERE "year" = %s
+              AND UPPER(TRIM("month_day"::text)) = %s
+            GROUP BY
+                UPPER(TRIM("sub_category"::text)),
+                UPPER(TRIM("brand_2"::text))
+            """,
+            [selected_year, selected_month_day],
+        )
+        current_by_key = {
+            (
+                _norm_sec_key(row.get("sub_category_key")),
+                _norm_sec_key(row.get("brand_key")),
+            ): row
+            for row in current_raw
+        }
+
+    highest_raw = _dict_rows(
+        """
+        WITH monthly AS (
+            SELECT
+                UPPER(TRIM("sub_category"::text)) AS sub_category_key,
+                UPPER(TRIM("brand_2"::text)) AS brand_key,
+                UPPER(TRIM("month"::text)) AS month_key,
+                COALESCE(SUM("shipped_litres"), 0) AS shipped_ltr,
+                COALESCE(SUM("calculated_shipped_revenue"), 0) AS shipped_rev,
+                COALESCE(SUM("shipped_revenue_after_margin"), 0) AS rev_after_margin
+            FROM "amazon_sec_range_master_view"
+            WHERE "year" = %s
+            GROUP BY
+                UPPER(TRIM("sub_category"::text)),
+                UPPER(TRIM("brand_2"::text)),
+                UPPER(TRIM("month"::text))
+        ),
+        ranked AS (
+            SELECT
+                *,
+                ROW_NUMBER() OVER (
+                    PARTITION BY sub_category_key, brand_key
+                    ORDER BY shipped_ltr DESC, month_key ASC
+                ) AS rn
+            FROM monthly
+        )
+        SELECT
+            sub_category_key,
+            brand_key,
+            month_key,
+            shipped_ltr,
+            shipped_rev,
+            rev_after_margin
+        FROM ranked
+        WHERE rn = 1
+        """,
+        [history_year],
+    )
+    highest_by_key = {
+        (
+            _norm_sec_key(row.get("sub_category_key")),
+            _norm_sec_key(row.get("brand_key")),
+        ): row
+        for row in highest_raw
+    }
+
+    rows = []
+    for item_head, category, sub_category, brand in _AMAZON_COMPARISON_ROWS:
+        highest = highest_by_key.get(
+            (_norm_sec_key(sub_category), _norm_sec_key(brand)),
+            {},
+        )
+        highest_ltr = _num(highest.get("shipped_ltr"))
+        highest_rev = _num(highest.get("shipped_rev"))
+        highest_rev_after_margin = _num(highest.get("rev_after_margin"))
+        current = current_by_key.get(
+            (_norm_sec_key(sub_category), _norm_sec_key(brand)),
+            {},
+        )
+        shipped_ltr = _num(current.get("shipped_ltr"))
+        shipped_rev = _num(current.get("shipped_rev"))
+        rev_after_margin = _num(current.get("rev_after_margin"))
+        rows.append({
+            "type": item_head,
+            "category": category,
+            "sub_category": sub_category,
+            "brand": brand,
+            "highest": {
+                "month": highest.get("month_key") or None,
+                "shipped_ltr": highest_ltr,
+                "shipped_rev": highest_rev,
+                "rev_after_margin": highest_rev_after_margin,
+                "price_per_ltr": _value_per_ltr_zero(highest_rev, highest_ltr) * 1.05,
+                "net_realise": (
+                    _value_per_ltr_zero(highest_rev_after_margin, highest_ltr) * 0.95
+                ),
+            },
+            "current": {
+                "shipped_ltr": shipped_ltr,
+                "shipped_rev": shipped_rev,
+                "rev_after_margin": rev_after_margin,
+                "price_per_ltr": _value_per_ltr_zero(shipped_rev, shipped_ltr) * 1.05,
+                "net_realise": _value_per_ltr_zero(rev_after_margin, shipped_ltr) * 0.95,
+            },
+        })
+
+    totals = {
+        "highest": {
+            "shipped_ltr": sum(_num(row["highest"].get("shipped_ltr")) for row in rows),
+            "shipped_rev": sum(_num(row["highest"].get("shipped_rev")) for row in rows),
+            "rev_after_margin": sum(
+                _num(row["highest"].get("rev_after_margin"))
+                for row in rows
+            ),
+            "price_per_ltr": None,
+            "net_realise": None,
+        },
+        "current": {
+            "shipped_ltr": sum(_num(row["current"].get("shipped_ltr")) for row in rows),
+            "shipped_rev": sum(_num(row["current"].get("shipped_rev")) for row in rows),
+            "rev_after_margin": None,
+            "price_per_ltr": None,
+            "net_realise": None,
+        },
+    }
+
+    return Response({
+        "source": "amazon_sec_range_master_view",
+        "dashboard_title": "Amazon Comparison Dashboard",
+        "format": "AMAZON",
+        "selected_month": selected_month,
+        "selected_year": selected_year,
+        "history_year": history_year,
+        "defaulted_to_latest": defaulted_to_latest,
+        "selected_to_date": (
+            selected_to_date.isoformat()
+            if hasattr(selected_to_date, "isoformat")
+            else selected_to_date
+        ),
+        "selected_month_day": selected_month_day,
+        "rows": rows,
+        "totals": totals,
+        "notes": {
+            "excel_visible_match": False,
+            "highest_block_calculated": True,
+            "numeric_empty_values": 0,
+            "text_empty_display": "-",
+        },
+    })
+
+
+def _amazon_sec_dashboard_response(request):
+    month, year, defaulted_to_latest = _parse_sec_month_year(
+        request.query_params,
+        latest_source="amazon_sec_range_master_view",
+    )
+    selected_date = _parse_sec_selected_date(request.query_params)
+    month_name = _month_name(month)
+    days_in_month = monthrange(year, month)[1]
+
+    max_date = selected_date or _scalar(
+        """
+        SELECT MAX("to_date")
+        FROM "amazon_sec_range_master_view"
+        WHERE "month" = %s
+          AND "year" = %s
+        """,
+        [month_name, year],
+    )
+    elapsed_day = _sec_elapsed_day(max_date)
+    cutoff_month_day = (
+        f"{elapsed_day:02d}-{month_name}"
+        if elapsed_day
+        else None
+    )
+
+    base_params = [month_name, year]
+    base_where = 'WHERE "month" = %s AND "year" = %s'
+    if cutoff_month_day:
+        base_where += ' AND "month_day" = %s'
+        base_params.append(cutoff_month_day)
+    else:
+        base_where += " AND 1 = 0"
+
+    period_row_count = int(_scalar(
+        f'SELECT COUNT(*) FROM "amazon_sec_range_master_view" {base_where}',
+        base_params,
+    ) or 0)
+    has_period_data = period_row_count > 0
+    sub_category_key_expr = """
+        CASE
+            WHEN UPPER(TRIM("sub_category"::text)) = 'SEASAME OIL'
+                THEN 'SESAME OIL'
+            ELSE UPPER(TRIM("sub_category"::text))
+        END
+    """
+
+    category_raw = _dict_rows(
+        f"""
+        SELECT
+            {sub_category_key_expr} AS sub_category_key,
+            COALESCE(SUM("ordered_revenue"), 0) AS order_value,
+            COALESCE(SUM("ordered_litres"), 0) AS order_ltr,
+            COALESCE(SUM("calculated_shipped_revenue"), 0) AS shipped_value,
+            COALESCE(SUM("shipped_litres"), 0) AS shipped_ltr,
+            COALESCE(SUM("return_value"), 0) AS return_value,
+            COALESCE(SUM("return_litres"), 0) AS return_ltr,
+            COALESCE(SUM("shipped_units"), 0) AS shipped_units,
+            COALESCE(SUM("return_units"), 0) AS return_units,
+            COALESCE(
+                SUM(
+                    "calculated_shipped_revenue"
+                    * (COALESCE("margin_pct", 0) / 100.0)
+                ),
+                0
+            ) AS margin_value,
+            COALESCE(
+                SUM(
+                    "calculated_shipped_revenue"
+                    * ((COALESCE("margin_pct", 0) + 5) / 100.0)
+                ),
+                0
+            ) AS margin_tax_value
+        FROM "amazon_sec_range_master_view"
+        {base_where}
+        GROUP BY {sub_category_key_expr}
+        """,
+        base_params,
+    )
+    category_by_key = {
+        _norm_sec_key(row.get("sub_category_key")): row
+        for row in category_raw
+    }
+
+    category_summary = []
+    for fmt, item_head, category, sub_category in _AMAZON_SEC_CATEGORY_ROWS:
+        row = category_by_key.get(_norm_sec_key(sub_category), {})
+        shipped_value = _num(row.get("shipped_value"))
+        shipped_ltr = _num(row.get("shipped_ltr"))
+        margin_pct = _amazon_effective_margin(row)
+        margin_tax_value = _num(row.get("margin_tax_value"))
+        category_summary.append({
+            "format": fmt,
+            "item_head": item_head,
+            "category": category,
+            "sub_category": sub_category,
+            "order_value": _num(row.get("order_value")),
+            "order_ltr": _num(row.get("order_ltr")),
+            "shipped_value": shipped_value,
+            "shipped_ltr": shipped_ltr,
+            "return_value": _num(row.get("return_value")),
+            "return_ltr": _num(row.get("return_ltr")),
+            "shipped_units": _num(row.get("shipped_units")),
+            "return_units": _num(row.get("return_units")),
+            "margin_pct": margin_pct,
+            "margin_value": _num(row.get("margin_value")),
+            "margin_tax_value": margin_tax_value,
+            "per_liter_shpd": _value_per_ltr_zero(shipped_value, shipped_ltr),
+            "net_realise_shpd": _value_per_ltr_zero(
+                shipped_value - margin_tax_value,
+                shipped_ltr,
+            ),
+            "projection_ltr": _amazon_projection(
+                shipped_ltr,
+                elapsed_day,
+                days_in_month,
+            ),
+        })
+
+    rk_raw = _dict_rows(
+        f"""
+        SELECT
+            UPPER(TRIM("item_head"::text)) AS item_head,
+            COALESCE(SUM("ordered_revenue"), 0) AS order_value,
+            COALESCE(SUM("ordered_litres"), 0) AS order_ltr,
+            COALESCE(SUM("calculated_shipped_revenue"), 0) AS shipped_value,
+            COALESCE(SUM("shipped_litres"), 0) AS shipped_ltr,
+            COALESCE(SUM("return_value"), 0) AS return_value,
+            COALESCE(SUM("return_litres"), 0) AS return_ltr,
+            COALESCE(SUM("shipped_units"), 0) AS shipped_units,
+            COALESCE(SUM("return_units"), 0) AS return_units,
+            COALESCE(
+                SUM(
+                    "calculated_shipped_revenue"
+                    * (COALESCE("margin_pct", 0) / 100.0)
+                ),
+                0
+            ) AS margin_value,
+            COALESCE(
+                SUM(
+                    "calculated_shipped_revenue"
+                    * ((COALESCE("margin_pct", 0) + 5) / 100.0)
+                ),
+                0
+            ) AS margin_tax_value
+        FROM "amazon_sec_range_master_view"
+        {base_where}
+          AND UPPER(TRIM("item_head"::text)) IN ('PREMIUM', 'COMMODITY', 'OTHER')
+        GROUP BY UPPER(TRIM("item_head"::text))
+        """,
+        base_params,
+    )
+    rk_by_key = {_norm_sec_key(row.get("item_head")): row for row in rk_raw}
+
+    rk_world_summary = []
+    rk_world_returns = []
+    for item_head in _AMAZON_SEC_ITEM_HEADS:
+        row = rk_by_key.get(item_head, {})
+        shipped_value = _num(row.get("shipped_value"))
+        shipped_ltr = _num(row.get("shipped_ltr"))
+        margin_tax_value = _num(row.get("margin_tax_value"))
+        rk_world_summary.append({
+            "item_head": item_head,
+            "order_value": _num(row.get("order_value")),
+            "order_ltr": _num(row.get("order_ltr")),
+            "shipped_value": shipped_value,
+            "shipped_ltr": shipped_ltr,
+            "shipped_units": _num(row.get("shipped_units")),
+            "return_value": _num(row.get("return_value")),
+            "return_ltr": _num(row.get("return_ltr")),
+            "return_units": _num(row.get("return_units")),
+            "margin_pct": _amazon_effective_margin(row),
+            "margin_value": _num(row.get("margin_value")),
+            "margin_tax_value": margin_tax_value,
+            "per_liter_shpd": _value_per_ltr_zero(shipped_value, shipped_ltr),
+            "net_realise_shpd": _value_per_ltr_zero(
+                shipped_value - margin_tax_value,
+                shipped_ltr,
+            ),
+            "projection_ltr": _amazon_projection(
+                shipped_ltr,
+                elapsed_day,
+                days_in_month,
+            ),
+        })
+        rk_world_returns.append({
+            "item_head": item_head,
+            "return_value": _num(row.get("return_value")),
+            "return_ltr": _num(row.get("return_ltr")),
+            "return_units": _num(row.get("return_units")),
+        })
+
+    sku_details = _dict_rows(
+        f"""
+        SELECT
+            UPPER(TRIM("item_head"::text)) AS item_head,
+            UPPER(TRIM("category"::text)) AS category,
+            UPPER(TRIM("sub_category"::text)) AS sub_category,
+            COALESCE(NULLIF(TRIM("brand_2"::text), ''), '-') AS brand,
+            COALESCE(NULLIF(TRIM("per_unit"::text), ''), '-') AS per_ltr,
+            TRIM("asin"::text) AS asin,
+            COALESCE(SUM("ordered_revenue"), 0) AS order_value,
+            COALESCE(SUM("ordered_litres"), 0) AS order_ltr,
+            COALESCE(SUM("calculated_shipped_revenue"), 0) AS shipped_value,
+            COALESCE(SUM("shipped_litres"), 0) AS shipped_ltr,
+            COALESCE(SUM("return_value"), 0) AS return_value,
+            COALESCE(SUM("return_litres"), 0) AS return_ltr,
+            COALESCE(SUM("shipped_units"), 0) AS shipped_units,
+            COALESCE(SUM("return_units"), 0) AS return_units
+        FROM "amazon_sec_range_master_view"
+        {base_where}
+          AND NULLIF(TRIM("asin"::text), '') IS NOT NULL
+        GROUP BY
+            UPPER(TRIM("item_head"::text)),
+            UPPER(TRIM("category"::text)),
+            UPPER(TRIM("sub_category"::text)),
+            COALESCE(NULLIF(TRIM("brand_2"::text), ''), '-'),
+            COALESCE(NULLIF(TRIM("per_unit"::text), ''), '-'),
+            TRIM("asin"::text)
+        ORDER BY
+            UPPER(TRIM("item_head"::text)) DESC,
+            UPPER(TRIM("category"::text)) ASC,
+            UPPER(TRIM("sub_category"::text)) ASC,
+            COALESCE(NULLIF(TRIM("per_unit"::text), ''), '-') ASC,
+            TRIM("asin"::text) ASC
+        """,
+        base_params,
+    )
+    for row in sku_details:
+        row["order_value"] = _num(row.get("order_value"))
+        row["order_ltr"] = _num(row.get("order_ltr"))
+        row["shipped_value"] = _num(row.get("shipped_value"))
+        row["shipped_ltr"] = _num(row.get("shipped_ltr"))
+        row["return_value"] = _num(row.get("return_value"))
+        row["return_ltr"] = _num(row.get("return_ltr"))
+        row["shipped_units"] = _num(row.get("shipped_units"))
+        row["return_units"] = _num(row.get("return_units"))
+        row["per_liter_shpd"] = _value_per_ltr_zero(
+            row["shipped_value"],
+            row["shipped_ltr"],
+        )
+
+    sku_total = _amazon_sec_totals(sku_details, include_projection=False)
+    category_total = _amazon_sec_totals(category_summary)
+    rk_world_total = _amazon_sec_totals(rk_world_summary)
+    rk_return_total = {
+        "return_value": sum(_num(row.get("return_value")) for row in rk_world_returns),
+        "return_ltr": sum(_num(row.get("return_ltr")) for row in rk_world_returns),
+        "return_units": sum(_num(row.get("return_units")) for row in rk_world_returns),
+    }
+
+    notes = []
+    if not has_period_data:
+        notes.append("No Amazon SEC range data found for the selected period.")
+    notes.append("AMAZON MP block is excluded because this dashboard uses only amazon_sec_range_master_view.")
+    notes.append("Margins are sourced from amazon_sec_range_margins through amazon_sec_range_master_view.")
+
+    return Response({
+        "source": "amazon_sec_range_master_view",
+        "dashboard_title": "Amazon Secondary Dashboard",
+        "defaulted_to_latest": defaulted_to_latest,
+        "month": month,
+        "month_name": month_name,
+        "year": year,
+        "selected_date": selected_date.isoformat() if selected_date else None,
+        "max_date": max_date.isoformat() if hasattr(max_date, "isoformat") else max_date,
+        "cutoff_month_day": cutoff_month_day,
+        "elapsed_day": elapsed_day,
+        "period_row_count": period_row_count,
+        "days_in_month": days_in_month,
+        "amazon_mp_available": False,
+        "category_summary": category_summary,
+        "category_total": category_total,
+        "rk_world_summary": rk_world_summary,
+        "rk_world_total": rk_world_total,
+        "rk_world_returns": rk_world_returns,
+        "rk_world_return_total": rk_return_total,
+        "sku_details": sku_details,
+        "sku_total": sku_total,
+        "notes": notes,
+        "show_amazon_excel_columns": True,
+        "summary": rk_world_summary,
+        "summary_total": rk_world_total,
+        "details": sku_details,
+        "detail_total": sku_total,
+        "summary_note": "Uses amazon_sec_range_master_view and latest available date in the selected month.",
+        "detail_subtitle": "ASIN-level detail from amazon_sec_range_master_view",
+    })
+
+
 def _bigbasket_sec_dashboard_response(request):
     month, year, defaulted_to_latest = _parse_sec_month_year(
         request.query_params,
         latest_source="secmaster_bigbasket",
     )
+    selected_date = _parse_sec_selected_date(request.query_params)
+    date_filter, date_params = _sec_date_filter(selected_date)
     month_name = _month_name(month)
     days_in_month = monthrange(year, month)[1]
 
     max_date = _scalar(
-        """
+        f"""
         SELECT MAX("date")
         FROM "SecMaster"
         WHERE REGEXP_REPLACE(LOWER(TRIM("format"::text)), '[^a-z0-9]+', '', 'g') = 'bigbasket'
           AND UPPER(TRIM("month"::text)) = %s
           AND "year"::numeric = %s
+          {date_filter}
         """,
-        [month_name, year],
+        [month_name, year, *date_params],
     )
     elapsed_day = _sec_elapsed_day(max_date)
 
     summary_raw = _dict_rows(
-        """
+        f"""
         SELECT
             UPPER(TRIM("item_head"::text)) AS item_head,
             COALESCE(SUM("quantity"), 0) AS shipped_units,
@@ -778,10 +2018,11 @@ def _bigbasket_sec_dashboard_response(request):
         WHERE REGEXP_REPLACE(LOWER(TRIM("format"::text)), '[^a-z0-9]+', '', 'g') = 'bigbasket'
           AND UPPER(TRIM("month"::text)) = %s
           AND "year"::numeric = %s
+          {date_filter}
           AND UPPER(TRIM("item_head"::text)) IN ('PREMIUM', 'COMMODITY', 'OTHER')
         GROUP BY UPPER(TRIM("item_head"::text))
         """,
-        [month_name, year],
+        [month_name, year, *date_params],
     )
     summary_by_head = {_norm_sec_key(r.get("item_head")): r for r in summary_raw}
     summary = []
@@ -807,7 +2048,7 @@ def _bigbasket_sec_dashboard_response(request):
         })
 
     detail_raw = _dict_rows(
-        """
+        f"""
         SELECT
             UPPER(TRIM("sub_category"::text)) AS sub_category_key,
             UPPER(TRIM("per_ltr_unit"::text)) AS per_ltr_key,
@@ -818,11 +2059,12 @@ def _bigbasket_sec_dashboard_response(request):
         WHERE REGEXP_REPLACE(LOWER(TRIM("format"::text)), '[^a-z0-9]+', '', 'g') = 'bigbasket'
           AND UPPER(TRIM("month"::text)) = %s
           AND "year"::numeric = %s
+          {date_filter}
         GROUP BY
             UPPER(TRIM("sub_category"::text)),
             UPPER(TRIM("per_ltr_unit"::text))
         """,
-        [month_name, year],
+        [month_name, year, *date_params],
     )
     detail_by_key = {
         (_norm_sec_key(r.get("sub_category_key")), _norm_sec_key(r.get("per_ltr_key"))): r
@@ -871,6 +2113,7 @@ def _bigbasket_sec_dashboard_response(request):
         "defaulted_to_latest": defaulted_to_latest,
         "month": month,
         "year": year,
+        "selected_date": selected_date.isoformat() if selected_date else None,
         "max_date": max_date.isoformat() if hasattr(max_date, "isoformat") else max_date,
         "elapsed_day": elapsed_day,
         "days_in_month": days_in_month,
@@ -887,26 +2130,419 @@ def _bigbasket_sec_dashboard_response(request):
     })
 
 
+def _flipkart_sec_dashboard_response(request):
+    month, year, defaulted_to_latest = _parse_sec_month_year(
+        request.query_params,
+        latest_source="flipkart_secondary_all",
+    )
+    selected_date = _parse_sec_selected_date(request.query_params)
+    date_filter, date_params = _sec_date_filter(selected_date, '"Order Date"')
+    month_name = _month_name(month)
+    days_in_month = monthrange(year, month)[1]
+
+    max_date = _scalar(
+        f"""
+        SELECT MAX("Order Date")
+        FROM "flipkart_secondary_all"
+        WHERE UPPER(TRIM("month"::text)) = %s
+          AND "year" = %s
+          {date_filter}
+        """,
+        [month_name, year, *date_params],
+    )
+    elapsed_day = _sec_elapsed_day(max_date)
+
+    summary_raw = _dict_rows(
+        f"""
+        SELECT
+            COALESCE(NULLIF(UPPER(TRIM("item_head"::text)), ''), 'OTHER') AS item_head,
+            COALESCE(SUM("GMV"), 0) AS order_value,
+            COALESCE(SUM("ltr_ordered"), 0) AS order_ltr,
+            COALESCE(SUM("Final Sale Units"), 0) AS shipped_units,
+            COALESCE(SUM("Final Sale Amount"), 0) AS shipped_value,
+            COALESCE(SUM("ltr_sold"), 0) AS shipped_ltr,
+            COALESCE(SUM("Cancellation Amount"), 0) AS cancelled_value,
+            COALESCE(SUM("cancellation_ltr"), 0) AS cancelled_ltr,
+            COALESCE(SUM("Return Amount"), 0) AS return_value,
+            COALESCE(SUM("return_ltr"), 0) AS return_ltr,
+            COALESCE(SUM("Return Units"), 0) AS return_units
+        FROM "flipkart_secondary_all"
+        WHERE UPPER(TRIM("month"::text)) = %s
+          AND "year" = %s
+          {date_filter}
+          AND COALESCE(NULLIF(UPPER(TRIM("item_head"::text)), ''), 'OTHER') IN ('PREMIUM', 'COMMODITY', 'OTHER')
+        GROUP BY COALESCE(NULLIF(UPPER(TRIM("item_head"::text)), ''), 'OTHER')
+        """,
+        [month_name, year, *date_params],
+    )
+    summary_by_head = {_norm_sec_key(r.get("item_head")): r for r in summary_raw}
+    summary = []
+    for item_head in _FLIPKART_SEC_ITEM_HEADS:
+        row = summary_by_head.get(item_head, {})
+        shipped_value = _num(row.get("shipped_value"))
+        shipped_ltr = _num(row.get("shipped_ltr"))
+        drr = _safe_div(shipped_ltr, elapsed_day)
+        summary.append({
+            "item_head": item_head,
+            "order_value": _num(row.get("order_value")),
+            "order_ltr": _num(row.get("order_ltr")),
+            "shipped_units": _num(row.get("shipped_units")),
+            "shipped_ltr": shipped_ltr,
+            "shipped_value": shipped_value,
+            "cancelled_value": _num(row.get("cancelled_value")),
+            "cancelled_ltr": _num(row.get("cancelled_ltr")),
+            "return_value": _num(row.get("return_value")),
+            "return_ltr": _num(row.get("return_ltr")),
+            "return_units": _num(row.get("return_units")),
+            "drr": drr,
+            "projection": drr * 31,
+            "per_liter_shpd": _value_per_ltr_zero(shipped_value, shipped_ltr),
+        })
+
+    detail_raw = _dict_rows(
+        f"""
+        SELECT
+            UPPER(TRIM("sub_category"::text)) AS sub_category_key,
+            COALESCE(SUM("GMV"), 0) AS order_value,
+            COALESCE(SUM("ltr_ordered"), 0) AS order_ltr,
+            COALESCE(SUM("Final Sale Amount"), 0) AS shipped_value,
+            COALESCE(SUM("Final Sale Units"), 0) AS shipped_units,
+            COALESCE(SUM("ltr_sold"), 0) AS shipped_ltr,
+            COALESCE(SUM("Return Units"), 0) AS return_units
+        FROM "flipkart_secondary_all"
+        WHERE UPPER(TRIM("month"::text)) = %s
+          AND "year" = %s
+          {date_filter}
+        GROUP BY UPPER(TRIM("sub_category"::text))
+        """,
+        [month_name, year, *date_params],
+    )
+    detail_by_key = {_norm_sec_key(r.get("sub_category_key")): r for r in detail_raw}
+
+    details = []
+    for item_head, category, sub_category in _FLIPKART_SEC_DETAIL_ROWS:
+        row = detail_by_key.get(_norm_sec_key(sub_category), {})
+        order_value = _num(row.get("order_value"))
+        order_ltr = _num(row.get("order_ltr"))
+        shipped_value = _num(row.get("shipped_value"))
+        shipped_ltr = _num(row.get("shipped_ltr"))
+        drr_value = _safe_div(order_value, elapsed_day)
+        drr_ltr = _safe_div(order_ltr, elapsed_day)
+        details.append({
+            "format": "FLIPKART",
+            "item_head": item_head,
+            "category": category,
+            "sub_category": sub_category,
+            "per_ltr": "",
+            "order_value": order_value,
+            "order_ltr": order_ltr,
+            "shipped_value": shipped_value,
+            "shipped_units": _num(row.get("shipped_units")),
+            "shipped_ltr": shipped_ltr,
+            "drr_value": drr_value,
+            "drr_ltr": drr_ltr,
+            "projection": drr_value * days_in_month,
+            "return_units": _num(row.get("return_units")),
+            "return_units_percent": 0,
+            "per_liter_shpd": _value_per_ltr_zero(shipped_value, shipped_ltr),
+        })
+
+    total_return_units = sum(_num(row.get("return_units")) for row in details)
+    for row in details:
+        row["return_units_percent"] = _safe_div(row.get("return_units"), total_return_units)
+
+    summary_total = _sec_total_with_order_value(summary)
+    summary_total["order_ltr"] = sum(_num(row.get("order_ltr")) for row in summary)
+    summary_total["cancelled_value"] = sum(_num(row.get("cancelled_value")) for row in summary)
+    summary_total["cancelled_ltr"] = sum(_num(row.get("cancelled_ltr")) for row in summary)
+    summary_total["return_value"] = sum(_num(row.get("return_value")) for row in summary)
+    summary_total["return_ltr"] = sum(_num(row.get("return_ltr")) for row in summary)
+    summary_total["return_units"] = sum(_num(row.get("return_units")) for row in summary)
+    summary_total["drr"] = _safe_div(summary_total["shipped_ltr"], elapsed_day)
+    summary_total["projection"] = summary_total["drr"] * 31
+    summary_total["per_liter_shpd"] = _value_per_ltr_zero(
+        summary_total["shipped_value"],
+        summary_total["shipped_ltr"],
+    )
+
+    detail_total = _sec_total_with_order_value(details)
+    detail_total["order_ltr"] = sum(_num(row.get("order_ltr")) for row in details)
+    detail_total["drr_value"] = sum(_num(row.get("drr_value")) for row in details)
+    detail_total["drr_ltr"] = _safe_div(detail_total["shipped_ltr"], elapsed_day)
+    detail_total["projection"] = sum(_num(row.get("projection")) for row in details)
+    detail_total["return_units"] = total_return_units
+    detail_total["return_units_percent"] = 1 if total_return_units else 0
+    detail_total["per_liter_shpd"] = _value_per_ltr_zero(
+        detail_total["shipped_value"],
+        detail_total["shipped_ltr"],
+    )
+
+    return Response({
+        "source": "flipkart_secondary_all",
+        "format": "FLIPKART",
+        "detail_rows_fixed": True,
+        "defaulted_to_latest": defaulted_to_latest,
+        "month": month,
+        "year": year,
+        "selected_date": selected_date.isoformat() if selected_date else None,
+        "max_date": max_date.isoformat() if hasattr(max_date, "isoformat") else max_date,
+        "summary": summary,
+        "summary_total": summary_total,
+        "details": details,
+        "detail_total": detail_total,
+        "elapsed_day": elapsed_day,
+        "days_in_month": days_in_month,
+        "show_flipkart_excel_columns": True,
+        "dashboard_title": "Flipkart Secondary Dashboard",
+        "detail_subtitle": "Excel rows 12-63 from SECONDARY DASHBOARD",
+        "summary_note": "Uses flipkart_secondary_all to match the Excel SECONDARY formulas.",
+        "value_source_note": "Source changed from SecMaster to flipkart_secondary_all.",
+        "kpi_labels": {
+            "units": "Shipped Units",
+            "litres": "Shipped LTR",
+            "value": "Shipped Value",
+        },
+        "summary_labels": {
+            "item_head": "Item Head",
+            "order_value": "Order Value",
+            "order_ltr": "Order LTR",
+            "value": "Shipped Value",
+            "units": "Shipped Units",
+            "litres": "Shipped LTR",
+        },
+        "detail_labels": {
+            "per_ltr": "Formula Level",
+            "order_value": "Order Value",
+            "order_ltr": "Order LTR",
+            "value": "Shipped Value",
+            "units": "Shipped Units",
+            "litres": "Shipped LTR",
+        },
+    })
+
+
+@api_view(["GET"])
+@permission_classes([require("platform.secondary.view")])
+def amazon_comparison_dashboard(request, slug: str):
+    _ensure_scope(request.user, slug)
+    if slug != "amazon":
+        raise ValidationError("Comparison Dashboard is available only for Amazon.")
+    return _amazon_comparison_dashboard_response(request)
+
+
+@api_view(["GET"])
+@permission_classes([require("platform.secondary.view")])
+def flipkart_secondary_monthly_dashboard(request, slug: str):
+    _ensure_scope(request.user, slug)
+    if slug == "amazon":
+        return _amazon_secondary_monthly_dashboard_response(request)
+    if slug != "flipkart":
+        raise ValidationError("Month Sale is available only for Amazon and Flipkart.")
+
+    year, defaulted_to_latest = _parse_flipkart_secondary_monthly_year(request.query_params)
+    months = [
+        {
+            "month": month,
+            "key": _month_name(month),
+            "label": date(2000, month, 1).strftime("%B"),
+        }
+        for month in range(1, 13)
+    ]
+    month_keys = [month["key"] for month in months]
+
+    def empty_month_values(fields: tuple[str, ...]) -> dict:
+        return {month_key: {field: 0.0 for field in fields} for month_key in month_keys}
+
+    def sum_month_rows(rows: list[dict], fields: tuple[str, ...]) -> dict:
+        total = {"months": empty_month_values(fields)}
+        for month_key in month_keys:
+            for field in fields:
+                total["months"][month_key][field] = sum(
+                    _num(row.get("months", {}).get(month_key, {}).get(field))
+                    for row in rows
+                )
+        return total
+
+    max_date = _scalar(
+        """
+        SELECT MAX("Order Date")
+        FROM "flipkart_secondary_all"
+        WHERE "year" = %s
+        """,
+        [year],
+    )
+
+    monthly_summary_raw = _dict_rows(
+        """
+        SELECT
+            UPPER(TRIM("month"::text)) AS month_key,
+            COALESCE(NULLIF(UPPER(TRIM("item_head"::text)), ''), 'OTHER') AS item_head,
+            COALESCE(SUM("GMV"), 0) AS order_value,
+            COALESCE(SUM("Final Sale Amount"), 0) AS shipped_value,
+            COALESCE(SUM("ltr_ordered"), 0) AS order_ltr,
+            COALESCE(SUM("ltr_sold"), 0) AS shipped_ltr
+        FROM "flipkart_secondary_all"
+        WHERE "year" = %s
+          AND COALESCE(NULLIF(UPPER(TRIM("item_head"::text)), ''), 'OTHER') IN ('PREMIUM', 'COMMODITY')
+        GROUP BY
+            UPPER(TRIM("month"::text)),
+            COALESCE(NULLIF(UPPER(TRIM("item_head"::text)), ''), 'OTHER')
+        """,
+        [year],
+    )
+    summary_by_key = {
+        (_norm_sec_key(row.get("item_head")), _norm_sec_key(row.get("month_key"))): row
+        for row in monthly_summary_raw
+    }
+
+    sales_liters = []
+    sales_values = []
+    for item_head in _FLIPKART_SEC_MONTHLY_ITEM_HEADS:
+        litre_months = empty_month_values(("order_ltr", "shipped_ltr"))
+        value_months = empty_month_values(("order_value", "shipped_value"))
+        for month_key in month_keys:
+            row = summary_by_key.get((item_head, month_key), {})
+            litre_months[month_key]["order_ltr"] = _num(row.get("order_ltr"))
+            litre_months[month_key]["shipped_ltr"] = _num(row.get("shipped_ltr"))
+            value_months[month_key]["order_value"] = _num(row.get("order_value"))
+            value_months[month_key]["shipped_value"] = _num(row.get("shipped_value"))
+        sales_liters.append({
+            "type": item_head,
+            "months": litre_months,
+        })
+        sales_values.append({
+            "type": item_head,
+            "months": value_months,
+        })
+
+    category_raw = _dict_rows(
+        """
+        SELECT
+            UPPER(TRIM("month"::text)) AS month_key,
+            UPPER(TRIM("sub_category"::text)) AS sub_category_key,
+            COALESCE(SUM("ltr_ordered"), 0) AS order_ltr,
+            COALESCE(SUM("ltr_sold"), 0) AS shipped_ltr
+        FROM "flipkart_secondary_all"
+        WHERE "year" = %s
+        GROUP BY
+            UPPER(TRIM("month"::text)),
+            UPPER(TRIM("sub_category"::text))
+        """,
+        [year],
+    )
+    category_by_key = {
+        (_norm_sec_key(row.get("sub_category_key")), _norm_sec_key(row.get("month_key"))): row
+        for row in category_raw
+    }
+
+    category_liters = []
+    for item_head, category, sub_category in _FLIPKART_SEC_MONTHLY_CATEGORY_ROWS:
+        row_months = empty_month_values(("order_ltr", "shipped_ltr"))
+        for month_key in month_keys:
+            row = category_by_key.get((_norm_sec_key(sub_category), month_key), {})
+            row_months[month_key]["order_ltr"] = _num(row.get("order_ltr"))
+            row_months[month_key]["shipped_ltr"] = _num(row.get("shipped_ltr"))
+        category_liters.append({
+            "type": item_head,
+            "category": category,
+            "sub_category": sub_category,
+            "months": row_months,
+        })
+
+    mom_raw = _dict_rows(
+        """
+        SELECT
+            UPPER(TRIM("month"::text)) AS month_key,
+            COALESCE(NULLIF(UPPER(TRIM("item_head"::text)), ''), 'OTHER') AS item_head,
+            COALESCE(SUM("ltr_sold"), 0) AS shipped_ltr
+        FROM "flipkart_secondary_all"
+        WHERE COALESCE(NULLIF(UPPER(TRIM("item_head"::text)), ''), 'OTHER') IN ('PREMIUM', 'COMMODITY')
+        GROUP BY
+            UPPER(TRIM("month"::text)),
+            COALESCE(NULLIF(UPPER(TRIM("item_head"::text)), ''), 'OTHER')
+        """,
+        [],
+    )
+    mom_by_key = {
+        (_norm_sec_key(row.get("item_head")), _norm_sec_key(row.get("month_key"))): _num(row.get("shipped_ltr"))
+        for row in mom_raw
+    }
+
+    mom_growth = []
+    previous_premium = 0.0
+    previous_commodity = 0.0
+    for index, month_info in enumerate(months):
+        month_key = month_info["key"]
+        premium_ltr = mom_by_key.get(("PREMIUM", month_key), 0.0)
+        commodity_ltr = mom_by_key.get(("COMMODITY", month_key), 0.0)
+        if index == 0:
+            premium_growth = 0.0
+            commodity_growth = 0.0
+        else:
+            premium_growth = _safe_div(premium_ltr - previous_premium, previous_premium)
+            commodity_growth = _safe_div(commodity_ltr - previous_commodity, previous_commodity)
+        mom_growth.append({
+            "month": month_key,
+            "label": month_info["label"],
+            "premium_ltr": premium_ltr,
+            "commodity_ltr": commodity_ltr,
+            "premium_growth": premium_growth,
+            "commodity_growth": commodity_growth,
+        })
+        previous_premium = premium_ltr
+        previous_commodity = commodity_ltr
+
+    return Response({
+        "source": "flipkart_secondary_all",
+        "format": "FLIPKART",
+        "defaulted_to_latest": defaulted_to_latest,
+        "year": year,
+        "max_date": max_date.isoformat() if hasattr(max_date, "isoformat") else max_date,
+        "months": months,
+        "sales_liters": sales_liters,
+        "sales_values": sales_values,
+        "sales_values_total": sum_month_rows(
+            sales_values,
+            ("order_value", "shipped_value"),
+        ),
+        "category_liters": category_liters,
+        "category_liters_total": sum_month_rows(
+            category_liters,
+            ("order_ltr", "shipped_ltr"),
+        ),
+        "mom_growth": mom_growth,
+        "dashboard_title": "Flipkart Month Sale",
+        "notes": {
+            "mom_growth_year_filter": False,
+            "other_excluded_from_totals": True,
+            "category_template_fixed": True,
+        },
+    })
+
+
 def _blinkit_sec_dashboard_response(request):
     month, year, defaulted_to_latest = _parse_sec_month_year(
         request.query_params,
         latest_source="secmaster_blinkit",
     )
+    selected_date = _parse_sec_selected_date(request.query_params)
+    date_filter, date_params = _sec_date_filter(selected_date)
     month_name = _month_name(month)
 
     max_date = _scalar(
-        """
+        f"""
         SELECT MAX("date")
         FROM "SecMaster"
         WHERE REGEXP_REPLACE(LOWER(TRIM("format"::text)), '[^a-z0-9]+', '', 'g') = 'blinkit'
           AND UPPER(TRIM("month"::text)) = %s
           AND "year"::numeric = %s
+          {date_filter}
         """,
-        [month_name, year],
+        [month_name, year, *date_params],
     )
 
     summary_raw = _dict_rows(
-        """
+        f"""
         SELECT
             UPPER(TRIM("item_head"::text)) AS item_head,
             COALESCE(SUM("quantity"), 0) AS shipped_units,
@@ -916,10 +2552,11 @@ def _blinkit_sec_dashboard_response(request):
         WHERE REGEXP_REPLACE(LOWER(TRIM("format"::text)), '[^a-z0-9]+', '', 'g') = 'blinkit'
           AND UPPER(TRIM("month"::text)) = %s
           AND "year"::numeric = %s
+          {date_filter}
           AND UPPER(TRIM("item_head"::text)) IN ('PREMIUM', 'COMMODITY', 'OTHER')
         GROUP BY UPPER(TRIM("item_head"::text))
         """,
-        [month_name, year],
+        [month_name, year, *date_params],
     )
     summary_by_head = {_norm_sec_key(r.get("item_head")): r for r in summary_raw}
     summary = []
@@ -936,7 +2573,7 @@ def _blinkit_sec_dashboard_response(request):
         })
 
     detail_raw = _dict_rows(
-        """
+        f"""
         SELECT
             UPPER(TRIM("sub_category"::text)) AS sub_category_key,
             UPPER(TRIM("per_ltr_unit"::text)) AS per_ltr_key,
@@ -947,11 +2584,12 @@ def _blinkit_sec_dashboard_response(request):
         WHERE REGEXP_REPLACE(LOWER(TRIM("format"::text)), '[^a-z0-9]+', '', 'g') = 'blinkit'
           AND UPPER(TRIM("month"::text)) = %s
           AND "year"::numeric = %s
+          {date_filter}
         GROUP BY
             UPPER(TRIM("sub_category"::text)),
             UPPER(TRIM("per_ltr_unit"::text))
         """,
-        [month_name, year],
+        [month_name, year, *date_params],
     )
     detail_by_key = {
         (_norm_sec_key(r.get("sub_category_key")), _norm_sec_key(r.get("per_ltr_key"))): r
@@ -995,6 +2633,7 @@ def _blinkit_sec_dashboard_response(request):
         "defaulted_to_latest": defaulted_to_latest,
         "month": month,
         "year": year,
+        "selected_date": selected_date.isoformat() if selected_date else None,
         "max_date": max_date.isoformat() if hasattr(max_date, "isoformat") else max_date,
         "summary": summary,
         "summary_total": summary_total,
@@ -1012,23 +2651,26 @@ def _swiggy_sec_dashboard_response(request):
         request.query_params,
         latest_source="secmaster_swiggy",
     )
+    selected_date = _parse_sec_selected_date(request.query_params)
+    date_filter, date_params = _sec_date_filter(selected_date)
     month_name = _month_name(month)
     prev_month, prev_year = _shift_month(month, year, -1)
     prev_month_name = _month_name(prev_month)
 
     max_date = _scalar(
-        """
+        f"""
         SELECT MAX("date")
         FROM "SecMaster"
         WHERE REGEXP_REPLACE(LOWER(TRIM("format"::text)), '[^a-z0-9]+', '', 'g') = 'swiggy'
           AND UPPER(TRIM("month"::text)) = %s
           AND "year"::numeric = %s
+          {date_filter}
         """,
-        [month_name, year],
+        [month_name, year, *date_params],
     )
 
     summary_raw = _dict_rows(
-        """
+        f"""
         SELECT
             UPPER(TRIM("item_head"::text)) AS item_head,
             COALESCE(SUM("quantity"), 0) AS shipped_units,
@@ -1038,10 +2680,11 @@ def _swiggy_sec_dashboard_response(request):
         WHERE REGEXP_REPLACE(LOWER(TRIM("format"::text)), '[^a-z0-9]+', '', 'g') = 'swiggy'
           AND UPPER(TRIM("month"::text)) = %s
           AND "year"::numeric = %s
+          {date_filter}
           AND UPPER(TRIM("item_head"::text)) IN ('PREMIUM', 'COMMODITY', 'OTHER')
         GROUP BY UPPER(TRIM("item_head"::text))
         """,
-        [month_name, year],
+        [month_name, year, *date_params],
     )
     summary_by_head = {_norm_sec_key(r.get("item_head")): r for r in summary_raw}
     summary = []
@@ -1058,7 +2701,7 @@ def _swiggy_sec_dashboard_response(request):
         })
 
     detail_raw = _dict_rows(
-        """
+        f"""
         SELECT
             UPPER(TRIM("sub_category"::text)) AS sub_category_key,
             UPPER(TRIM("per_ltr_unit"::text)) AS per_ltr_key,
@@ -1069,11 +2712,12 @@ def _swiggy_sec_dashboard_response(request):
         WHERE REGEXP_REPLACE(LOWER(TRIM("format"::text)), '[^a-z0-9]+', '', 'g') = 'swiggy'
           AND UPPER(TRIM("month"::text)) = %s
           AND "year"::numeric = %s
+          {date_filter}
         GROUP BY
             UPPER(TRIM("sub_category"::text)),
             UPPER(TRIM("per_ltr_unit"::text))
         """,
-        [month_name, year],
+        [month_name, year, *date_params],
     )
     detail_by_key = {
         (_norm_sec_key(r.get("sub_category_key")), _norm_sec_key(r.get("per_ltr_key"))): r
@@ -1140,6 +2784,7 @@ def _swiggy_sec_dashboard_response(request):
         "defaulted_to_latest": defaulted_to_latest,
         "month": month,
         "year": year,
+        "selected_date": selected_date.isoformat() if selected_date else None,
         "max_date": max_date.isoformat() if hasattr(max_date, "isoformat") else max_date,
         "previous_month": prev_month,
         "previous_year": prev_year,
@@ -1180,21 +2825,25 @@ def _zepto_sec_dashboard_response(request):
         request.query_params,
         latest_source="secmaster_zepto",
     )
+    selected_date = _parse_sec_selected_date(request.query_params)
+    date_expr = _secmaster_zepto_date_expr()
+    date_filter, date_params = _sec_date_filter(selected_date, date_expr)
     month_name = _month_name(month)
 
     max_date = _scalar(
-        """
-        SELECT MAX("date")
+        f"""
+        SELECT MAX({date_expr})
         FROM "SecMaster"
         WHERE REGEXP_REPLACE(LOWER(TRIM("format"::text)), '[^a-z0-9]+', '', 'g') = 'zepto'
           AND UPPER(TRIM("month"::text)) = %s
           AND "year"::numeric = %s
+          {date_filter}
         """,
-        [month_name, year],
+        [month_name, year, *date_params],
     )
 
     summary_raw = _dict_rows(
-        """
+        f"""
         SELECT
             UPPER(TRIM("item_head"::text)) AS item_head,
             COALESCE(SUM("quantity"), 0) AS shipped_units,
@@ -1204,10 +2853,11 @@ def _zepto_sec_dashboard_response(request):
         WHERE REGEXP_REPLACE(LOWER(TRIM("format"::text)), '[^a-z0-9]+', '', 'g') = 'zepto'
           AND UPPER(TRIM("month"::text)) = %s
           AND "year"::numeric = %s
+          {date_filter}
           AND UPPER(TRIM("item_head"::text)) IN ('PREMIUM', 'COMMODITY', 'OTHER')
         GROUP BY UPPER(TRIM("item_head"::text))
         """,
-        [month_name, year],
+        [month_name, year, *date_params],
     )
     summary_by_head = {_norm_sec_key(r.get("item_head")): r for r in summary_raw}
     summary = []
@@ -1224,7 +2874,7 @@ def _zepto_sec_dashboard_response(request):
         })
 
     detail_raw = _dict_rows(
-        """
+        f"""
         SELECT
             UPPER(TRIM("sub_category"::text)) AS sub_category_key,
             UPPER(TRIM("per_ltr_unit"::text)) AS per_ltr_key,
@@ -1235,11 +2885,12 @@ def _zepto_sec_dashboard_response(request):
         WHERE REGEXP_REPLACE(LOWER(TRIM("format"::text)), '[^a-z0-9]+', '', 'g') = 'zepto'
           AND UPPER(TRIM("month"::text)) = %s
           AND "year"::numeric = %s
+          {date_filter}
         GROUP BY
             UPPER(TRIM("sub_category"::text)),
             UPPER(TRIM("per_ltr_unit"::text))
         """,
-        [month_name, year],
+        [month_name, year, *date_params],
     )
     detail_by_key = {
         (_norm_sec_key(r.get("sub_category_key")), _norm_sec_key(r.get("per_ltr_key"))): r
@@ -1282,6 +2933,7 @@ def _zepto_sec_dashboard_response(request):
         "defaulted_to_latest": defaulted_to_latest,
         "month": month,
         "year": year,
+        "selected_date": selected_date.isoformat() if selected_date else None,
         "max_date": max_date.isoformat() if hasattr(max_date, "isoformat") else max_date,
         "summary": summary,
         "summary_total": summary_total,
@@ -1732,8 +3384,10 @@ def _zepto_sku_analysis_dashboard_response(request):
 @permission_classes([require("platform.secondary.view")])
 def flipkart_grocery_drr_dashboard(request, slug: str):
     _ensure_scope(request.user, slug)
+    if slug == "flipkart":
+        return _flipkart_mp_drr_dashboard_response(request)
     if slug != "flipkart_grocery":
-        raise ValidationError("DRR Dashboard is available only for Flipkart Grocery.")
+        raise ValidationError("DRR Dashboard is available only for Flipkart and Flipkart Grocery.")
 
     month, year, defaulted_to_latest = _parse_sec_month_year(request.query_params)
     sales_of = str(request.query_params.get("sales_of") or "ALL").strip().upper() or "ALL"
@@ -1848,6 +3502,144 @@ def flipkart_grocery_drr_dashboard(request, slug: str):
         "daily_groups": [daily[i:i + 9] for i in range(0, len(daily), 9)],
         "items": items,
         "totals": totals,
+    })
+
+
+def _flipkart_mp_drr_dashboard_response(request):
+    month, year, defaulted_to_latest = _parse_sec_month_year(
+        request.query_params,
+        latest_source="flipkart_secondary_all",
+    )
+    month_name = _month_name(month)
+    days_in_month = monthrange(year, month)[1]
+    sales_of = str(request.query_params.get("sales_of") or "ALL").strip().upper() or "ALL"
+    if sales_of not in _FLIPKART_MP_DRR_SALES_OF:
+        raise ValidationError(
+            "`sales_of` must be one of ALL, PREMIUM, COMMODITY or OTHER."
+        )
+
+    max_date = _scalar(
+        """
+        SELECT MAX("Order Date")
+        FROM "flipkart_secondary_all"
+        WHERE UPPER(TRIM("month"::text)) = %s
+          AND "year" = %s
+        """,
+        [month_name, year],
+    )
+    elapsed_days = _sec_elapsed_day(max_date)
+
+    daily_sales_of_filter = ""
+    daily_params = [month_name, year]
+    if sales_of != "ALL":
+        daily_sales_of_filter = 'AND UPPER(TRIM("item_head"::text)) = %s'
+        daily_params.append(sales_of)
+
+    daily_raw = _dict_rows(
+        f"""
+        SELECT
+            "Order Date"::date AS sale_date,
+            COALESCE(SUM("Final Sale Amount"), 0) AS ops,
+            COALESCE(SUM("ltr_sold"), 0) AS ltr
+        FROM "flipkart_secondary_all"
+        WHERE UPPER(TRIM("month"::text)) = %s
+          AND "year" = %s
+          {daily_sales_of_filter}
+        GROUP BY "Order Date"::date
+        ORDER BY "Order Date"::date
+        """,
+        daily_params,
+    )
+    daily_by_date = {r["sale_date"]: r for r in daily_raw}
+    daily = []
+    for day in range(1, days_in_month + 1):
+        current_date = date(year, month, day)
+        row = daily_by_date.get(current_date, {})
+        daily.append({
+            "date": current_date.isoformat(),
+            "display_date": current_date.strftime("%d-%m-%Y"),
+            "ops": _num(row.get("ops")),
+            "ltr": _num(row.get("ltr")),
+        })
+
+    item_raw = _dict_rows(
+        """
+        SELECT
+            COALESCE(NULLIF(UPPER(TRIM("item"::text)), ''), 'UNMAPPED') AS item,
+            COALESCE(NULLIF(UPPER(TRIM("item_head"::text)), ''), 'OTHER') AS item_head,
+            COALESCE(SUM("Final Sale Units"), 0) AS qty,
+            COALESCE(SUM("ltr_sold"), 0) AS liters,
+            COALESCE(SUM("Final Sale Amount"), 0) AS landing_amt
+        FROM "flipkart_secondary_all"
+        WHERE UPPER(TRIM("month"::text)) = %s
+          AND "year" = %s
+        GROUP BY
+            COALESCE(NULLIF(UPPER(TRIM("item"::text)), ''), 'UNMAPPED'),
+            COALESCE(NULLIF(UPPER(TRIM("item_head"::text)), ''), 'OTHER')
+        ORDER BY COALESCE(NULLIF(UPPER(TRIM("item"::text)), ''), 'UNMAPPED')
+        """,
+        [month_name, year],
+    )
+
+    items = []
+    for row in item_raw:
+        qty = _num(row.get("qty"))
+        liters = _num(row.get("liters"))
+        landing_amt = _num(row.get("landing_amt"))
+        drr_qty = _safe_div(qty, elapsed_days)
+        drr_liters = _safe_div(liters, elapsed_days)
+        drr_value = _safe_div(landing_amt, elapsed_days)
+        items.append({
+            "item": row.get("item"),
+            "item_head": row.get("item_head"),
+            "qty": qty,
+            "liters": liters,
+            "landing_amt": landing_amt,
+            "drr_qty": drr_qty,
+            "drr_liters": drr_liters,
+            "drr_value": drr_value,
+            "estimated_liters": None,
+        })
+
+    total_qty = sum(_num(r.get("qty")) for r in items)
+    total_liters = sum(_num(r.get("liters")) for r in items)
+    total_landing_amt = sum(_num(r.get("landing_amt")) for r in items)
+    total_drr_qty = _safe_div(total_qty, elapsed_days)
+    total_drr_liters = _safe_div(total_liters, elapsed_days)
+    total_drr_value = _safe_div(total_landing_amt, elapsed_days)
+    totals = {
+        "qty": total_qty,
+        "liters": total_liters,
+        "landing_amt": total_landing_amt,
+        "drr_qty": total_drr_qty,
+        "drr_liters": total_drr_liters,
+        "drr_value": total_drr_value,
+        "estimated_liters": None,
+    }
+
+    return Response({
+        "source": "flipkart_secondary_all",
+        "format": "FLIPKART",
+        "defaulted_to_latest": defaulted_to_latest,
+        "sales_of": sales_of,
+        "sales_of_options": list(_FLIPKART_MP_DRR_SALES_OF),
+        "month": month,
+        "year": year,
+        "max_date": max_date.isoformat() if hasattr(max_date, "isoformat") else max_date,
+        "elapsed_days": elapsed_days,
+        "days_in_month": days_in_month,
+        "daily": daily,
+        "daily_groups": [daily[i:i + 9] for i in range(0, len(daily), 9)],
+        "items": items,
+        "totals": totals,
+        "show_estimated_liters": False,
+        "value_label": "Shipped Value",
+        "item_label": "Product",
+        "qty_label": "Shipped QTY",
+        "liters_label": "Shipped LTRS",
+        "item_table_subtitle": "Month-to-date shipped totals",
+        "summary_note": "Uses flipkart_secondary_all to match the Excel DRR formulas.",
+        "normalization_note": "Case-only duplicate product names are normalized so totals reconcile with daily source totals.",
     })
 
 
@@ -2203,18 +3995,126 @@ def landing_rate_skus(request, slug: str):
         raise ValidationError(f"Monthly landing rate is only available for {_LANDING_PLATFORM_LABELS}.")
     p = _get_platform(slug)
     fmt = _format_for(p)
+    month = _parse_month(request.query_params.get("month") or "") or date.today().replace(day=1).isoformat()
     format_clause, format_params = _format_match_clause(p)
     try:
         rows = _dict_rows(
-            'SELECT DISTINCT ON ("sku_code") "sku_code", "sku_name" '
-            'FROM "monthly_landing_rate" '
-            f"WHERE {format_clause} "
-            'ORDER BY "sku_code", "month" DESC',
-            format_params,
+            f"""
+            SELECT sku_code, sku_name
+            FROM (
+                SELECT DISTINCT ON (sku_key)
+                    sku_code,
+                    sku_name
+                FROM (
+                    SELECT
+                        UPPER(TRIM("sku_code"::text)) AS sku_key,
+                        TRIM("sku_code"::text) AS sku_code,
+                        TRIM("sku_name"::text) AS sku_name,
+                        0 AS source_priority,
+                        "month"::text AS source_month
+                    FROM "monthly_landing_rate"
+                    WHERE {format_clause}
+                      AND NULLIF(TRIM("sku_code"::text), '') IS NOT NULL
+
+                    UNION ALL
+
+                    SELECT
+                        UPPER(TRIM("format_sku_code"::text)) AS sku_key,
+                        TRIM("format_sku_code"::text) AS sku_code,
+                        TRIM(COALESCE(NULLIF("product_name"::text, ''), "item"::text, '')) AS sku_name,
+                        1 AS source_priority,
+                        NULL AS source_month
+                    FROM "master_sheet"
+                    WHERE {format_clause}
+                      AND NULLIF(TRIM("format_sku_code"::text), '') IS NOT NULL
+                ) candidates
+                ORDER BY sku_key, source_priority, source_month DESC NULLS LAST
+            ) deduped
+            ORDER BY sku_code ASC
+            """,
+            format_params + format_params,
         )
+        rate_rows = _dict_rows(
+            f"""
+            SELECT DISTINCT UPPER(TRIM("sku_code"::text)) AS sku_key
+            FROM "monthly_landing_rate"
+            WHERE {format_clause}
+              AND "month"::date >= %s::date
+              AND "month"::date < (%s::date + INTERVAL '1 month')
+            """,
+            format_params + [month, month],
+        )
+        rated_skus = {row["sku_key"] for row in rate_rows}
+        for row in rows:
+            row["has_rate"] = _norm_sec_key(row.get("sku_code")) in rated_skus
     except Exception:
         rows = []
-    return Response({"skus": rows, "format": fmt})
+    return Response({"skus": rows, "format": fmt, "month": month})
+
+
+@api_view(["POST"])
+@permission_classes([require("platform.landing_rate.edit")])
+def landing_rate_sku_add(request, slug: str):
+    _ensure_scope(request.user, slug)
+    if slug not in _LANDING_PLATFORMS:
+        raise ValidationError(f"Monthly landing rate is only available for {_LANDING_PLATFORM_LABELS}.")
+    p = _get_platform(slug)
+    fmt = _format_for(p)
+    format_clause, format_params = _format_match_clause(p)
+
+    body = request.data or {}
+    sku_code = str(body.get("sku_code") or "").strip()
+    sku_name = str(body.get("sku_name") or "").strip()
+
+    if not sku_code or not sku_name:
+        raise ValidationError("sku_code and sku_name are required.")
+
+    try:
+        with transaction.atomic(), connection.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT "format_sku_code", COALESCE(NULLIF("product_name"::text, ''), "item"::text, '')
+                FROM "master_sheet"
+                WHERE {format_clause}
+                  AND UPPER(TRIM("format_sku_code"::text)) = UPPER(TRIM(%s))
+                LIMIT 1
+                """,
+                format_params + [sku_code],
+            )
+            existing = cur.fetchone()
+            if existing:
+                return Response({
+                    "ok": True,
+                    "created": False,
+                    "sku": {
+                        "sku_code": existing[0],
+                        "sku_name": existing[1] or sku_name,
+                        "format": fmt,
+                    },
+                })
+
+            cur.execute(
+                """
+                INSERT INTO "master_sheet"
+                ("format_sku_code", "product_name", "item", "format")
+                VALUES (%s, %s, %s, %s)
+                RETURNING "format_sku_code", "product_name", "format"
+                """,
+                [sku_code, sku_name, sku_name, fmt],
+            )
+            inserted = cur.fetchone()
+    except Exception as e:
+        return Response({"ok": False, "error": str(e)}, status=400)
+
+    return Response({
+        "ok": True,
+        "created": True,
+        "sku": {
+            "sku_code": inserted[0],
+            "sku_name": inserted[1],
+            "format": inserted[2] or fmt,
+        },
+    })
 
 
 # ─── /{slug}/landing-rate/add  (POST) ───
