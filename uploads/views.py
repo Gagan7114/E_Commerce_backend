@@ -42,7 +42,10 @@ UPLOAD_ALLOWED_TABLES = {
     "zepto_grn", "zepto_prim",
     "blinkit_grn", "blinkit_prim",
     "bigbasket_prim",
+    "flipkart_grocery_prim",
     "swiggy_grn", "swiggy_prim",
+    "zomato_prim",
+    "citymall_prim",
 }
 
 BATCH_SIZE = 50
