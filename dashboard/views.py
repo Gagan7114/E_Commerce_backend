@@ -17,7 +17,7 @@ ALLOWED_TABLES = {
     "bigbasket_prim", "blinkit_prim", "citymall_prim",
     "flipkart_grocery_prim", "swiggy_prim", "zepto_prim", "zomato_prim",
     "blinkit_grn", "swiggy_grn", "zepto_grn",
-    "amazon_price_data", "amazon_sec_daily", "amazon_sec_range",
+    "amazon_price_data", "amazon_sec_daily", "amazon_sec_daily_master_view", "amazon_sec_range",
     "amazon_sec_range_margins", "amazon_sec_range_master_view",
     "bigbasketSec", "blinkitSec", "flipkart_grocery_master", "fk_grocery", "flipkartSec", "flipkart_secondary_all",
     "jiomartSec", "swiggySec", "zeptoSec",
@@ -428,11 +428,11 @@ def table_data(request, table_name: str):
         order_sql = f" ORDER BY {_date_expr(order_col)} {direction} NULLS LAST"
         if table_name == "flipkart_grocery_master":
             order_sql += ', "sku_id" ASC NULLS LAST'
-        elif table_name == "amazon_sec_range_master_view":
+        elif table_name in {"amazon_sec_daily_master_view", "amazon_sec_range_master_view"}:
             order_sql += ', "to_date" ASC NULLS LAST, "asin" ASC NULLS LAST'
     elif table_name == "flipkart_grocery_master":
         order_sql = ' ORDER BY "real_date" DESC NULLS LAST, "sku_id" ASC NULLS LAST'
-    elif table_name == "amazon_sec_range_master_view":
+    elif table_name in {"amazon_sec_daily_master_view", "amazon_sec_range_master_view"}:
         order_sql = ' ORDER BY "from_date" ASC NULLS LAST, "to_date" ASC NULLS LAST, "asin" ASC NULLS LAST'
 
     try:

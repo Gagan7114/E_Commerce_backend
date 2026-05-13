@@ -596,6 +596,8 @@ _FLIPKART_SEC_MONTHLY_CATEGORY_ROWS = (
 _FLIPKART_SEC_MONTHLY_ITEM_HEADS = ("PREMIUM", "COMMODITY")
 
 _FLIPKART_MP_DRR_SALES_OF = ("ALL", "PREMIUM", "COMMODITY", "OTHER")
+_AMAZON_DRR_ITEM_HEADS = ("ALL", "PREMIUM", "COMMODITY", "OTHER")
+_AMAZON_DRR_SALES_MODES = ("ORDERED", "SHIPPED")
 
 _MONTH_NAME_TO_NUM = {
     date(2000, month, 1).strftime("%B").upper(): month
@@ -796,6 +798,17 @@ def _parse_sec_month_year(params, *, latest_source: str = "flipkart_grocery") ->
             """
             SELECT "month", "year"
             FROM "amazon_sec_range_master_view"
+            WHERE "to_date" IS NOT NULL
+            ORDER BY "to_date" DESC
+            LIMIT 1
+            """,
+            [],
+        )
+    elif latest_source == "amazon_sec_daily_master_view":
+        latest = _dict_rows(
+            """
+            SELECT "month", "year"
+            FROM "amazon_sec_daily_master_view"
             WHERE "to_date" IS NOT NULL
             ORDER BY "to_date" DESC
             LIMIT 1
@@ -3395,10 +3408,12 @@ def _zepto_sku_analysis_dashboard_response(request):
 @permission_classes([require("platform.secondary.view")])
 def flipkart_grocery_drr_dashboard(request, slug: str):
     _ensure_scope(request.user, slug)
+    if slug == "amazon":
+        return _amazon_drr_dashboard_response(request)
     if slug == "flipkart":
         return _flipkart_mp_drr_dashboard_response(request)
     if slug != "flipkart_grocery":
-        raise ValidationError("DRR Dashboard is available only for Flipkart and Flipkart Grocery.")
+        raise ValidationError("DRR Dashboard is available only for Amazon, Flipkart and Flipkart Grocery.")
 
     month, year, defaulted_to_latest = _parse_sec_month_year(request.query_params)
     sales_of = str(request.query_params.get("sales_of") or "ALL").strip().upper() or "ALL"
@@ -3513,6 +3528,129 @@ def flipkart_grocery_drr_dashboard(request, slug: str):
         "daily_groups": [daily[i:i + 9] for i in range(0, len(daily), 9)],
         "items": items,
         "totals": totals,
+    })
+
+
+def _amazon_drr_dashboard_response(request):
+    month, year, defaulted_to_latest = _parse_sec_month_year(
+        request.query_params,
+        latest_source="amazon_sec_daily_master_view",
+    )
+    month_name = _month_name(month)
+    days_in_month = monthrange(year, month)[1]
+
+    item_head = str(
+        request.query_params.get("item_head")
+        or request.query_params.get("sales_of")
+        or "ALL"
+    ).strip().upper() or "ALL"
+    if item_head not in _AMAZON_DRR_ITEM_HEADS:
+        raise ValidationError(
+            "`item_head` must be one of ALL, PREMIUM, COMMODITY or OTHER."
+        )
+
+    sales_mode = str(
+        request.query_params.get("sales_mode")
+        or request.query_params.get("mode")
+        or "SHIPPED"
+    ).strip().upper() or "SHIPPED"
+    if sales_mode not in _AMAZON_DRR_SALES_MODES:
+        raise ValidationError("`sales_mode` must be ORDERED or SHIPPED.")
+
+    metric_columns = {
+        "ORDERED": ("ordered_revenue", "ordered_units", "ordered_litres"),
+        "SHIPPED": ("shipped_revenue_2", "shipped_units", "shipped_litres"),
+    }
+    ops_col, units_col, ltr_col = metric_columns[sales_mode]
+
+    max_date = _scalar(
+        """
+        SELECT MAX("to_date"::date)
+        FROM "amazon_sec_daily_master_view"
+        WHERE UPPER(TRIM("month"::text)) = %s
+          AND "year" = %s
+        """,
+        [month_name, year],
+    )
+    elapsed_days = _sec_elapsed_day(max_date)
+
+    item_head_filter = ""
+    daily_params = [month_name, year]
+    if item_head != "ALL":
+        item_head_filter = 'AND UPPER(TRIM("item_head"::text)) = %s'
+        daily_params.append(item_head)
+
+    daily_raw = _dict_rows(
+        f"""
+        SELECT
+            "to_date"::date AS sale_date,
+            COALESCE(SUM("{ops_col}"), 0) AS ops,
+            COALESCE(SUM("{units_col}"), 0) AS units,
+            COALESCE(SUM("{ltr_col}"), 0) AS ltr
+        FROM "amazon_sec_daily_master_view"
+        WHERE UPPER(TRIM("month"::text)) = %s
+          AND "year" = %s
+          AND "to_date" IS NOT NULL
+          {item_head_filter}
+        GROUP BY "to_date"::date
+        ORDER BY "to_date"::date
+        """,
+        daily_params,
+    )
+    daily_by_date = {row["sale_date"]: row for row in daily_raw}
+
+    daily = []
+    total_ops = 0.0
+    total_units = 0.0
+    total_ltr = 0.0
+    for day in range(1, days_in_month + 1):
+        current_date = date(year, month, day)
+        row = daily_by_date.get(current_date, {})
+        ops = _num(row.get("ops"))
+        units = _num(row.get("units"))
+        ltr = _num(row.get("ltr"))
+        if max_date and current_date <= max_date:
+            total_ops += ops
+            total_units += units
+            total_ltr += ltr
+        daily.append({
+            "date": current_date.isoformat(),
+            "display_date": current_date.strftime("%d-%m-%Y"),
+            "day": day,
+            "ops": ops,
+            "units": units,
+            "ltr": ltr,
+        })
+
+    max_date_label = max_date.strftime("%d %B %Y").upper() if max_date else f"{month_name} {year}"
+    totals = {
+        "ops": total_ops,
+        "units": total_units,
+        "ltr": total_ltr,
+        "avg_value": _safe_div(total_ops, elapsed_days),
+        "avg_ltrs": _safe_div(total_ltr, elapsed_days),
+    }
+
+    return Response({
+        "source": "amazon_sec_daily_master_view",
+        "format": "AMAZON_DRR",
+        "defaulted_to_latest": defaulted_to_latest,
+        "month": month,
+        "month_name": month_name,
+        "year": year,
+        "max_date": max_date.isoformat() if max_date else None,
+        "elapsed_days": elapsed_days,
+        "days_in_month": days_in_month,
+        "item_head": item_head,
+        "sales_of": item_head,
+        "item_head_options": list(_AMAZON_DRR_ITEM_HEADS),
+        "sales_mode": sales_mode,
+        "sales_mode_options": list(_AMAZON_DRR_SALES_MODES),
+        "title": f"JIVO AMAZON SALE ({max_date_label})",
+        "daily": daily,
+        "daily_groups": [daily[:9], daily[9:18], daily[18:27], daily[27:]],
+        "totals": totals,
+        "summary_note": "Uses amazon_sec_daily_master_view to match DRR rows 1-20 from AMAZON SHEET.xlsx.",
     })
 
 
