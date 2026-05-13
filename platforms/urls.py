@@ -21,6 +21,7 @@ urlpatterns = [
     path("<slug:slug>/landing-rate", views.landing_rate_list, name="platform-landing-rate-list"),
     path("<slug:slug>/landing-rate/skus", views.landing_rate_skus, name="platform-landing-rate-skus"),
     path("<slug:slug>/landing-rate/add", views.landing_rate_add, name="platform-landing-rate-add"),
+    path("<slug:slug>/landing-rate/update", views.landing_rate_update, name="platform-landing-rate-update"),
 
     # Monthly Targets — per-platform.
     path(

@@ -1,8 +1,9 @@
 import re
 from calendar import monthrange
 from datetime import date
+from decimal import Decimal, InvalidOperation
 
-from django.db import connection
+from django.db import connection, transaction
 from django.shortcuts import get_object_or_404
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.exceptions import PermissionDenied, ValidationError
@@ -13,6 +14,7 @@ from accounts.permissions import can_access_platform, require
 from .models import PlatformConfig
 
 _IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_LANDING_BASIC_DIVISOR = Decimal("1.05")
 
 
 def _safe_ident(name: str) -> str:
@@ -220,6 +222,22 @@ def _parse_month(val: str) -> str | None:
     except Exception:
         return None
     return None
+
+
+def _decimal_input(value, field: str) -> Decimal:
+    if value is None or str(value).strip() == "":
+        raise ValidationError(f"{field} must be numeric.")
+    try:
+        return Decimal(str(value).strip())
+    except (InvalidOperation, ValueError):
+        raise ValidationError(f"{field} must be numeric.")
+
+
+def _landing_basic_rate(body, landing_rate: Decimal) -> Decimal:
+    manual = body.get("manual_basic_rate") in (True, "true", "True", "1", 1)
+    if manual:
+        return _decimal_input(body.get("basic_rate"), "basic_rate")
+    return landing_rate / _LANDING_BASIC_DIVISOR
 
 
 # --- Secondary Dashboards ---
@@ -2216,11 +2234,8 @@ def landing_rate_add(request, slug: str):
     if not sku_code or not sku_name or not month:
         raise ValidationError("sku_code, sku_name and month are required.")
 
-    try:
-        landing_rate = float(body.get("landing_rate"))
-        basic_rate = float(body.get("basic_rate"))
-    except (TypeError, ValueError):
-        raise ValidationError("landing_rate and basic_rate must be numeric.")
+    landing_rate = _decimal_input(body.get("landing_rate"), "landing_rate")
+    basic_rate = _landing_basic_rate(body, landing_rate)
 
     try:
         with connection.cursor() as cur:
@@ -2245,5 +2260,127 @@ def landing_rate_add(request, slug: str):
             "format": fmt,
             "month": month,
             "created_at": created_at.isoformat() if created_at else None,
+        },
+    })
+
+
+@api_view(["POST"])
+@permission_classes([require("platform.landing_rate.edit")])
+def landing_rate_update(request, slug: str):
+    _ensure_scope(request.user, slug)
+    if slug not in _LANDING_PLATFORMS:
+        raise ValidationError(f"Monthly landing rate is only available for {_LANDING_PLATFORM_LABELS}.")
+    p = _get_platform(slug)
+    fmt = _format_for(p)
+    format_clause, format_params = _format_match_clause(p)
+
+    body = request.data or {}
+    sku_code = str(body.get("sku_code") or "").strip()
+    sku_name = str(body.get("sku_name") or "").strip()
+    month = _parse_month(str(body.get("month") or ""))
+    reason = str(body.get("reason") or "").strip()
+
+    if not sku_code or not month:
+        raise ValidationError("sku_code and month are required.")
+    if not reason:
+        raise ValidationError("reason is required for landing rate updates.")
+
+    landing_rate = _decimal_input(body.get("landing_rate"), "landing_rate")
+    basic_rate = _landing_basic_rate(body, landing_rate)
+
+    user = request.user if getattr(request, "user", None) and request.user.is_authenticated else None
+    updated_by_id = getattr(user, "id", None)
+    updated_by_email = getattr(user, "email", "") or getattr(user, "username", "") if user else ""
+
+    try:
+        with transaction.atomic(), connection.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT ctid::text, "sku_code", "sku_name", "landing_rate", "basic_rate",
+                       "format", "month", "created_at"
+                FROM "monthly_landing_rate"
+                WHERE {format_clause}
+                  AND UPPER(TRIM("sku_code"::text)) = UPPER(TRIM(%s))
+                  AND "month"::date >= %s::date
+                  AND "month"::date < (%s::date + INTERVAL '1 month')
+                ORDER BY "created_at" DESC
+                LIMIT 1
+                FOR UPDATE
+                """,
+                format_params + [sku_code, month, month],
+            )
+            row = cur.fetchone()
+            if not row:
+                return Response(
+                    {"ok": False, "error": "No landing rate row found for this SKU and month."},
+                    status=404,
+                )
+
+            (
+                row_ctid,
+                old_sku_code,
+                old_sku_name,
+                old_landing_rate,
+                old_basic_rate,
+                old_format,
+                old_month,
+                old_created_at,
+            ) = row
+            next_sku_name = sku_name or old_sku_name
+
+            cur.execute(
+                """
+                INSERT INTO month_landingrate_logs
+                (sku_code, sku_name, format, month, old_landing_rate, old_basic_rate,
+                 new_landing_rate, new_basic_rate, reason, updated_by_id,
+                 updated_by_email, source_created_at)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                RETURNING id, updated_at
+                """,
+                [
+                    old_sku_code,
+                    old_sku_name,
+                    old_format,
+                    old_month,
+                    old_landing_rate,
+                    old_basic_rate,
+                    landing_rate,
+                    basic_rate,
+                    reason,
+                    updated_by_id,
+                    updated_by_email,
+                    old_created_at,
+                ],
+            )
+            log_id, updated_at = cur.fetchone()
+
+            cur.execute(
+                """
+                UPDATE "monthly_landing_rate"
+                SET "sku_name" = %s, "landing_rate" = %s, "basic_rate" = %s
+                WHERE ctid = %s::tid
+                RETURNING "sku_code", "sku_name", "landing_rate", "basic_rate",
+                          "format", "month", "created_at"
+                """,
+                [next_sku_name, landing_rate, basic_rate, row_ctid],
+            )
+            updated = cur.fetchone()
+    except Exception as e:
+        return Response({"ok": False, "error": str(e)}, status=400)
+
+    return Response({
+        "ok": True,
+        "log": {
+            "id": log_id,
+            "updated_at": updated_at.isoformat() if updated_at else None,
+        },
+        "row": {
+            "sku_code": updated[0],
+            "sku_name": updated[1],
+            "landing_rate": updated[2],
+            "basic_rate": updated[3],
+            "format": updated[4] or fmt,
+            "month": updated[5],
+            "created_at": updated[6].isoformat() if updated[6] else None,
         },
     })

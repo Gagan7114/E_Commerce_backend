@@ -58,6 +58,24 @@ UPLOAD_FORCED_UNIQUE_KEYS = {
 }
 
 
+def _quote_ident(name: str) -> str:
+    return '"' + str(name).replace('"', '""') + '"'
+
+
+def _upload_table_columns(table: str) -> set[str]:
+    with connection.cursor() as cur:
+        cur.execute(
+            """
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = 'public'
+              AND table_name = %s
+            """,
+            [table],
+        )
+        return {row[0] for row in cur.fetchall()}
+
+
 @api_view(["POST"])
 @permission_classes([require("upload.use")])
 def batch_upload(request):
@@ -90,25 +108,34 @@ def _batch_upload(body, *, forced_table: str | None = None):
                 row.pop("created_at", None)
     missing_rates = _collect_zepto_missing_rates(data) if table == "zeptoSec" else []
 
+    table_columns = _upload_table_columns(table)
     columns = list(data[0].keys())
-    invalid = [c for c in columns if not _IDENT.match(c)]
+    invalid = [c for c in columns if c not in table_columns]
     if invalid:
-        return Response({"detail": f"Invalid column identifiers: {invalid}"}, status=400)
+        return Response(
+            {"detail": f"Unknown columns for table '{table}': {invalid}"},
+            status=400,
+        )
 
-    quoted_cols = [f'"{c}"' for c in columns]
+    quoted_cols = [_quote_ident(c) for c in columns]
     col_list = ", ".join(quoted_cols)
     placeholders = ", ".join(["%s"] * len(columns))
 
     upsert_clause = ""
     if upsert and unique_key:
         keys = [k.strip() for k in unique_key.split(",") if k.strip()]
-        for k in keys:
-            if not _IDENT.match(k):
-                return Response(
-                    {"detail": f"Invalid unique_key identifier: {k!r}"}, status=400
-                )
-        conflict_cols = ", ".join(f'"{k}"' for k in keys)
-        update_cols = [f'"{c}" = EXCLUDED."{c}"' for c in columns if c not in keys]
+        invalid_keys = [k for k in keys if k not in table_columns]
+        if invalid_keys:
+            return Response(
+                {"detail": f"Unknown unique_key columns for table '{table}': {invalid_keys}"},
+                status=400,
+            )
+        conflict_cols = ", ".join(_quote_ident(k) for k in keys)
+        update_cols = [
+            f'{_quote_ident(c)} = EXCLUDED.{_quote_ident(c)}'
+            for c in columns
+            if c not in keys
+        ]
         if update_cols:
             upsert_clause = (
                 f' ON CONFLICT ({conflict_cols}) DO UPDATE SET {", ".join(update_cols)}'
@@ -116,7 +143,7 @@ def _batch_upload(body, *, forced_table: str | None = None):
         else:
             upsert_clause = f" ON CONFLICT ({conflict_cols}) DO NOTHING"
 
-    sql = f'INSERT INTO "{table}" ({col_list}) VALUES ({placeholders}){upsert_clause}'
+    sql = f'INSERT INTO {_quote_ident(table)} ({col_list}) VALUES ({placeholders}){upsert_clause}'
     tracks_upsert_counts = bool(upsert and unique_key)
     if tracks_upsert_counts:
         sql += " RETURNING (xmax::text = '0') AS inserted"
