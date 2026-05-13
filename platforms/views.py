@@ -672,6 +672,15 @@ def _sec_elapsed_day(max_date) -> int:
     return 0
 
 
+def _amazon_sec_month_day_keys(max_date, month_name: str) -> list[str]:
+    day = _sec_elapsed_day(max_date)
+    if not day or not month_name:
+        return []
+    month_name = _norm_sec_key(month_name)
+    keys = [f"{day}-{month_name}", f"{day:02d}-{month_name}"]
+    return list(dict.fromkeys(keys))
+
+
 _FK_GROCERY_DRR_ITEM_ORDER = (
     "CANOLA 1L",
     "EXTRA LIGHT 2L",
@@ -1696,15 +1705,17 @@ def _amazon_comparison_dashboard_response(request):
 
 
 def _amazon_sec_dashboard_response(request):
+    month_params = request.query_params.copy()
+    month_params.pop("date", None)
     month, year, defaulted_to_latest = _parse_sec_month_year(
-        request.query_params,
+        month_params,
         latest_source="amazon_sec_range_master_view",
     )
-    selected_date = _parse_sec_selected_date(request.query_params)
+    selected_date = None
     month_name = _month_name(month)
     days_in_month = monthrange(year, month)[1]
 
-    max_date = selected_date or _scalar(
+    max_date = _scalar(
         """
         SELECT MAX("to_date")
         FROM "amazon_sec_range_master_view"
@@ -1714,31 +1725,16 @@ def _amazon_sec_dashboard_response(request):
         """,
         [month_name, year],
     )
-    period_rows = []
-    if max_date:
-        period_rows = _dict_rows(
-            """
-            SELECT
-                UPPER(TRIM("month_day"::text)) AS month_day,
-                MAX("to_date") AS to_date
-            FROM "amazon_sec_range_master_view"
-            WHERE UPPER(TRIM("month"::text)) = %s
-              AND "year" = %s
-              AND "to_date" = %s::date
-            GROUP BY UPPER(TRIM("month_day"::text))
-            ORDER BY MAX("to_date") DESC
-            LIMIT 1
-            """,
-            [month_name, year, max_date],
-        )
     elapsed_day = _sec_elapsed_day(max_date)
-    cutoff_month_day = period_rows[0]["month_day"] if period_rows else None
+    cutoff_month_day_keys = _amazon_sec_month_day_keys(max_date, month_name)
+    cutoff_month_day = cutoff_month_day_keys[0] if cutoff_month_day_keys else None
 
     base_params = [year]
     base_where = 'WHERE "year" = %s'
-    if cutoff_month_day and max_date:
-        base_where += ' AND UPPER(TRIM("month_day"::text)) = %s AND "to_date" = %s::date'
-        base_params.extend([cutoff_month_day, max_date])
+    if cutoff_month_day_keys:
+        month_day_placeholders = ", ".join(["%s"] * len(cutoff_month_day_keys))
+        base_where += f' AND UPPER(TRIM("month_day"::text)) IN ({month_day_placeholders})'
+        base_params.extend(cutoff_month_day_keys)
     else:
         base_where += " AND 1 = 0"
 
@@ -1975,6 +1971,7 @@ def _amazon_sec_dashboard_response(request):
         "selected_date": selected_date.isoformat() if selected_date else None,
         "max_date": max_date.isoformat() if hasattr(max_date, "isoformat") else max_date,
         "cutoff_month_day": cutoff_month_day,
+        "cutoff_month_day_keys": cutoff_month_day_keys,
         "elapsed_day": elapsed_day,
         "period_row_count": period_row_count,
         "days_in_month": days_in_month,
@@ -1993,7 +1990,7 @@ def _amazon_sec_dashboard_response(request):
         "summary_total": rk_world_total,
         "details": sku_details,
         "detail_total": sku_total,
-        "summary_note": "Uses amazon_sec_range_master_view filtered by year, month_day and to_date.",
+        "summary_note": "Uses amazon_sec_range_master_view filtered by year and month_day built from the selected month's max date.",
         "detail_subtitle": "ASIN-level detail from amazon_sec_range_master_view",
     })
 
