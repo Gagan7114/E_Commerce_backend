@@ -18,7 +18,7 @@ from decimal import Decimal
 from difflib import SequenceMatcher
 import re
 
-from django.db import connection
+from django.db import connection, transaction
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.response import Response
 
@@ -50,6 +50,46 @@ UPLOAD_ALLOWED_TABLES = {
 
 BATCH_SIZE = 50
 
+MASTER_SHEET_COLUMNS = [
+    "format_sku_code",
+    "product_name",
+    "item",
+    "format",
+    "sku_sap_code",
+    "sku_sap_name",
+    "category",
+    "sub_category",
+    "case_pack",
+    "per_unit",
+    "item_head",
+    "brand",
+    "uom",
+    "per_unit_value",
+    "category_head",
+    "is_litre",
+    "is_litre_oil",
+    "packaging_cost",
+    "tax_rate",
+]
+
+MASTER_SHEET_NUMERIC_COLUMNS = {
+    "case_pack",
+    "per_unit_value",
+    "packaging_cost",
+    "tax_rate",
+}
+
+MASTER_SHEET_SEARCH_COLUMNS = [
+    "format_sku_code",
+    "sku_sap_code",
+    "product_name",
+    "item",
+    "sku_sap_name",
+    "brand",
+    "category",
+    "sub_category",
+]
+
 UPLOAD_FORCED_UNIQUE_KEYS = {
     "swiggy_grn": (
         "grn_number,purchase_order_number,facility_name,vendor_name,"
@@ -75,6 +115,223 @@ def _upload_table_columns(table: str) -> set[str]:
             [table],
         )
         return {row[0] for row in cur.fetchall()}
+
+
+def _master_sheet_select_columns() -> str:
+    quoted = ", ".join(_quote_ident(col) for col in MASTER_SHEET_COLUMNS)
+    return f'ctid::text AS "row_id", {quoted}'
+
+
+def _coerce_master_sheet_value(column: str, value):
+    if value == "":
+        return None
+    if value is None:
+        return None
+    if column not in MASTER_SHEET_NUMERIC_COLUMNS:
+        return str(value).strip()
+
+    try:
+        if column == "case_pack":
+            return int(value)
+        return Decimal(str(value).strip())
+    except Exception:
+        raise ValueError(f"{column} must be a number.")
+
+
+def _master_sheet_payload(data) -> dict:
+    if not isinstance(data, dict):
+        raise ValueError("Row data is required.")
+    row = {}
+    for column in MASTER_SHEET_COLUMNS:
+        if column in data:
+            row[column] = _coerce_master_sheet_value(column, data.get(column))
+    return row
+
+
+def _master_sheet_row_by_id(row_id: str):
+    rows = _master_sheet_rows('WHERE ctid = %s::tid', [row_id], limit=1)
+    return rows[0] if rows else None
+
+
+def _master_sheet_rows(where_sql: str = "", params: list | None = None, *, limit: int = 50, offset: int = 0):
+    params = list(params or [])
+    with connection.cursor() as cur:
+        cur.execute(
+            f"""
+            SELECT {_master_sheet_select_columns()}
+            FROM master_sheet
+            {where_sql}
+            ORDER BY COALESCE(format, ''), COALESCE(format_sku_code, ''), COALESCE(product_name, '')
+            LIMIT %s OFFSET %s
+            """,
+            [*params, limit, offset],
+        )
+        cols = [c[0] for c in cur.description]
+        return [dict(zip(cols, row)) for row in cur.fetchall()]
+
+
+@api_view(["GET"])
+@permission_classes([require("upload.use")])
+def master_sheet_list(request):
+    query = str(request.query_params.get("search") or "").strip()
+    fmt = str(
+        request.query_params.get("format_name")
+        or request.query_params.get("platform_format")
+        or ""
+    ).strip()
+    try:
+        page = max(0, int(request.query_params.get("page", 0)))
+        page_size = min(100, max(1, int(request.query_params.get("page_size", 25))))
+    except ValueError:
+        page, page_size = 0, 25
+
+    where = []
+    params = []
+    rank_expr = "3"
+    if query:
+        like = f"%{query}%"
+        exact = query.upper()
+        where.append(
+            "("
+            + " OR ".join(f"CAST({_quote_ident(col)} AS text) ILIKE %s" for col in MASTER_SHEET_SEARCH_COLUMNS)
+            + ")"
+        )
+        params.extend([like] * len(MASTER_SHEET_SEARCH_COLUMNS))
+        rank_expr = """
+            CASE
+              WHEN UPPER(TRIM(format_sku_code::text)) = %s THEN 0
+              WHEN UPPER(TRIM(sku_sap_code::text)) = %s THEN 1
+              WHEN product_name ILIKE %s OR item ILIKE %s OR sku_sap_name ILIKE %s THEN 2
+              ELSE 3
+            END
+        """
+    if fmt:
+        where.append("UPPER(TRIM(format::text)) = UPPER(TRIM(%s))")
+        params.append(fmt)
+
+    where_sql = f"WHERE {' AND '.join(where)}" if where else ""
+    offset = page * page_size
+
+    with connection.cursor() as cur:
+        count_params = list(params)
+        cur.execute(f"SELECT COUNT(*) FROM master_sheet {where_sql}", count_params)
+        total = cur.fetchone()[0]
+
+        rank_params = []
+        if query:
+            rank_params.extend([query.upper(), query.upper(), f"{query}%", f"{query}%", f"{query}%"])
+        cur.execute(
+            f"""
+            SELECT {_master_sheet_select_columns()}
+            FROM master_sheet
+            {where_sql}
+            ORDER BY {rank_expr}, COALESCE(format, ''), COALESCE(format_sku_code, ''), COALESCE(product_name, '')
+            LIMIT %s OFFSET %s
+            """,
+            [*params, *rank_params, page_size, offset],
+        )
+        cols = [c[0] for c in cur.description]
+        rows = [dict(zip(cols, row)) for row in cur.fetchall()]
+
+    return Response({
+        "columns": MASTER_SHEET_COLUMNS,
+        "rows": rows,
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+    })
+
+
+@api_view(["POST"])
+@permission_classes([require("upload.use")])
+def master_sheet_create(request):
+    try:
+        row = _master_sheet_payload(request.data or {})
+        if not row.get("format_sku_code"):
+            return Response({"detail": "format_sku_code is required."}, status=400)
+        if not row.get("format"):
+            return Response({"detail": "format is required."}, status=400)
+    except ValueError as exc:
+        return Response({"detail": str(exc)}, status=400)
+
+    columns = [col for col in MASTER_SHEET_COLUMNS if col in row]
+    placeholders = ", ".join(["%s"] * len(columns))
+    values = [row[col] for col in columns]
+    with transaction.atomic(), connection.cursor() as cur:
+        cur.execute(
+            f"""
+            INSERT INTO master_sheet ({", ".join(_quote_ident(col) for col in columns)})
+            VALUES ({placeholders})
+            RETURNING {_master_sheet_select_columns()}
+            """,
+            values,
+        )
+        cols = [c[0] for c in cur.description]
+        created = dict(zip(cols, cur.fetchone()))
+
+    return Response({"ok": True, "row": created})
+
+
+@api_view(["POST"])
+@permission_classes([require("upload.use")])
+def master_sheet_update(request):
+    row_id = str((request.data or {}).get("row_id") or "").strip()
+    if not row_id:
+        return Response({"detail": "row_id is required."}, status=400)
+    try:
+        row = _master_sheet_payload((request.data or {}).get("row") or {})
+    except ValueError as exc:
+        return Response({"detail": str(exc)}, status=400)
+    if not row:
+        return Response({"detail": "No fields to update."}, status=400)
+
+    assignments = ", ".join(f"{_quote_ident(col)} = %s" for col in row)
+    values = [row[col] for col in row]
+    with transaction.atomic(), connection.cursor() as cur:
+        cur.execute(
+            f"""
+            UPDATE master_sheet
+            SET {assignments}
+            WHERE ctid = %s::tid
+            RETURNING {_master_sheet_select_columns()}
+            """,
+            [*values, row_id],
+        )
+        updated_row = cur.fetchone()
+        if not updated_row:
+            return Response({"detail": "Row was not found. Please search again."}, status=404)
+        cols = [c[0] for c in cur.description]
+
+    return Response({"ok": True, "row": dict(zip(cols, updated_row))})
+
+
+@api_view(["POST"])
+@permission_classes([require("upload.use")])
+def master_sheet_delete(request):
+    row_id = str((request.data or {}).get("row_id") or "").strip()
+    if not row_id:
+        return Response({"detail": "row_id is required."}, status=400)
+    with transaction.atomic(), connection.cursor() as cur:
+        cur.execute(
+            """
+            DELETE FROM master_sheet
+            WHERE ctid = %s::tid
+            RETURNING format_sku_code, product_name, format
+            """,
+            [row_id],
+        )
+        deleted = cur.fetchone()
+        if not deleted:
+            return Response({"detail": "Row was not found. Please search again."}, status=404)
+
+    return Response({
+        "ok": True,
+        "deleted": {
+            "format_sku_code": deleted[0],
+            "product_name": deleted[1],
+            "format": deleted[2],
+        },
+    })
 
 
 @api_view(["POST"])
@@ -187,7 +444,7 @@ def _batch_upload(body, *, forced_table: str | None = None):
             "failed": failed,
             "error": last_error,
             "warnings": [
-                f"Missing rate for {r['item']}, {r['month_label']} ({r['rows']} rows)"
+                f"Landing rate missing for {r['item']}, {r['month_label']} ({r['rows']} rows)"
                 for r in missing_rates
             ],
             "missing_rates": missing_rates,

@@ -1708,23 +1708,37 @@ def _amazon_sec_dashboard_response(request):
         """
         SELECT MAX("to_date")
         FROM "amazon_sec_range_master_view"
-        WHERE "month" = %s
+        WHERE UPPER(TRIM("month"::text)) = %s
           AND "year" = %s
+          AND "to_date" IS NOT NULL
         """,
         [month_name, year],
     )
+    period_rows = []
+    if max_date:
+        period_rows = _dict_rows(
+            """
+            SELECT
+                UPPER(TRIM("month_day"::text)) AS month_day,
+                MAX("to_date") AS to_date
+            FROM "amazon_sec_range_master_view"
+            WHERE UPPER(TRIM("month"::text)) = %s
+              AND "year" = %s
+              AND "to_date" = %s::date
+            GROUP BY UPPER(TRIM("month_day"::text))
+            ORDER BY MAX("to_date") DESC
+            LIMIT 1
+            """,
+            [month_name, year, max_date],
+        )
     elapsed_day = _sec_elapsed_day(max_date)
-    cutoff_month_day = (
-        f"{elapsed_day:02d}-{month_name}"
-        if elapsed_day
-        else None
-    )
+    cutoff_month_day = period_rows[0]["month_day"] if period_rows else None
 
-    base_params = [month_name, year]
-    base_where = 'WHERE "month" = %s AND "year" = %s'
-    if cutoff_month_day:
-        base_where += ' AND "month_day" = %s'
-        base_params.append(cutoff_month_day)
+    base_params = [year]
+    base_where = 'WHERE "year" = %s'
+    if cutoff_month_day and max_date:
+        base_where += ' AND UPPER(TRIM("month_day"::text)) = %s AND "to_date" = %s::date'
+        base_params.extend([cutoff_month_day, max_date])
     else:
         base_where += " AND 1 = 0"
 
@@ -1979,7 +1993,7 @@ def _amazon_sec_dashboard_response(request):
         "summary_total": rk_world_total,
         "details": sku_details,
         "detail_total": sku_total,
-        "summary_note": "Uses amazon_sec_range_master_view and latest available date in the selected month.",
+        "summary_note": "Uses amazon_sec_range_master_view filtered by year, month_day and to_date.",
         "detail_subtitle": "ASIN-level detail from amazon_sec_range_master_view",
     })
 
