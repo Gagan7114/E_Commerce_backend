@@ -10,6 +10,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal, InvalidOperation
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -33,6 +34,7 @@ MAX_UPLOAD_SIZE = 20 * 1024 * 1024
 ALLOWED_EXTENSIONS = {".csv", ".xlsx"}
 UPLOAD_DIR = Path(settings.BASE_DIR) / "uploaded_files" / "amazon"
 logger = logging.getLogger(__name__)
+SYNC_BUSINESS_WARNING_ROW_LIMIT = 1000
 
 
 @dataclass(frozen=True)
@@ -261,6 +263,20 @@ def _parse_temporal(
         return None, None
     text = re.sub(r"\s+", " ", text)
     text = re.sub(r"\s+(IST|UTC|GMT)$", "", text, flags=re.IGNORECASE).strip()
+    return _parse_temporal_text(
+        text,
+        want_datetime=want_datetime,
+        prefer_month_first=prefer_month_first,
+    )
+
+
+@lru_cache(maxsize=4096)
+def _parse_temporal_text(
+    text: str,
+    *,
+    want_datetime: bool,
+    prefer_month_first: bool = False,
+) -> tuple[date | datetime | None, str | None]:
     slash_date = re.match(r"^(\d{1,2})/\d{1,2}/\d{2,4}(?:\s|$)", text)
     if prefer_month_first and slash_date and not slash_date.group(1).startswith("0"):
         preferred_formats = (
@@ -356,7 +372,7 @@ def _parse_temporal(
             parsed = parsed.astimezone(timezone.get_current_timezone()).replace(tzinfo=None)
         return (parsed if want_datetime else parsed.date()), None
     except ValueError:
-        return None, f"Invalid {'datetime' if want_datetime else 'date'} value: {value}"
+        return None, f"Invalid {'datetime' if want_datetime else 'date'} value: {text}"
 
 
 def _normalize_text_value(config: ReportConfig, field: str, value: Any) -> str | None:
@@ -1004,6 +1020,23 @@ def _upload_exception_message(default: str, exc: Exception) -> str:
     return default
 
 
+def _request_bool(data: Any, *names: str, default: bool = False) -> bool:
+    for name in names:
+        if name not in data:
+            continue
+        value = data.get(name)
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return bool(value)
+        text = str(value).strip().lower()
+        if text in {"1", "true", "yes", "y", "on"}:
+            return True
+        if text in {"0", "false", "no", "n", "off", ""}:
+            return False
+    return default
+
+
 def _transform_appointment(cur, upload_id: int) -> tuple[int, int]:
     cur.execute(
         """
@@ -1500,6 +1533,13 @@ def process_upload(request) -> tuple[dict[str, Any], int]:
     ).strip()
     file_hash = hashlib.sha256(content).hexdigest()
     stored_file_path = _store_file(content, original_name)
+    reprocess_duplicate = _request_bool(
+        request.data,
+        "reprocess_duplicate",
+        "reprocess_duplicates",
+        "reprocessDuplicate",
+        default=True,
+    )
     base_metadata = {
         "report_type": config.report_type,
         "upload_source": upload_source,
@@ -1532,8 +1572,49 @@ def process_upload(request) -> tuple[dict[str, Any], int]:
                 base_metadata = {
                     **base_metadata,
                     "duplicate_of": duplicate[0],
-                    "duplicate_processed": True,
+                    "duplicate_processed": reprocess_duplicate,
                 }
+                if not reprocess_duplicate:
+                    upload_id = _insert_upload_file(
+                        cur,
+                        config=config,
+                        original_file_name=original_name,
+                        stored_file_path=stored_file_path,
+                        file_hash=file_hash,
+                        file_extension=extension,
+                        uploaded_by=uploaded_by,
+                        status_value="duplicate",
+                        metadata=base_metadata,
+                    )
+                    issues = [
+                        {
+                            "row_number": None,
+                            "field_name": "file_hash",
+                            "error_type": "duplicate_file",
+                            "error_message": (
+                                f"This exact file was already uploaded as upload_id {duplicate[0]}."
+                            ),
+                            "severity": "warning",
+                        }
+                    ]
+                    _insert_validation_issues_best_effort(
+                        cur,
+                        upload_id=upload_id,
+                        config=config,
+                        issues=issues,
+                    )
+                    payload = _response_payload(
+                        upload_id=upload_id,
+                        config=config,
+                        status_value="duplicate",
+                        rows_received=0,
+                        rows_inserted_staging=0,
+                        inserted=0,
+                        updated=0,
+                        issues=issues,
+                    )
+                    payload["duplicate_of"] = duplicate[0]
+                    return payload, status.HTTP_200_OK
 
             upload_id = _insert_upload_file(
                 cur,
@@ -1619,29 +1700,30 @@ def process_upload(request) -> tuple[dict[str, Any], int]:
                         "severity": "error",
                     }
                 )
-            try:
-                with transaction.atomic():
-                    issues.extend(
-                        _add_business_warnings(
-                            cur,
-                            config=config,
-                            upload_id=upload_id,
+            if rows_received <= SYNC_BUSINESS_WARNING_ROW_LIMIT:
+                try:
+                    with transaction.atomic():
+                        issues.extend(
+                            _add_business_warnings(
+                                cur,
+                                config=config,
+                                upload_id=upload_id,
+                            )
                         )
+                except Exception as exc:
+                    logger.exception("Could not add upload business warnings for upload_id=%s", upload_id)
+                    issues.append(
+                        {
+                            "row_number": None,
+                            "field_name": None,
+                            "error_type": "business_warning_check_failed",
+                            "error_message": _upload_exception_message(
+                                "Could not complete master-data warning checks.",
+                                exc,
+                            ),
+                            "severity": "warning",
+                        }
                     )
-            except Exception as exc:
-                logger.exception("Could not add upload business warnings for upload_id=%s", upload_id)
-                issues.append(
-                    {
-                        "row_number": None,
-                        "field_name": None,
-                        "error_type": "business_warning_check_failed",
-                        "error_message": _upload_exception_message(
-                            "Could not complete master-data warning checks.",
-                            exc,
-                        ),
-                        "severity": "warning",
-                    }
-                )
 
             _insert_validation_issues_best_effort(
                 cur,

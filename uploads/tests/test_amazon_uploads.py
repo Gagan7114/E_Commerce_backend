@@ -626,6 +626,35 @@ class AmazonUploadTests(TransactionTestCase):
         self.assertEqual(response.data["status"], "completed")
         self.assertEqual(response.data["rows_updated_final"], 1)
 
+    def test_duplicate_upload_can_skip_reprocessing(self):
+        good_po = (
+            "PO\tOrder date\tStatus\tASIN\tRequested quantity\tShip-to location\n"
+            "PO-DUP\t2026-05-01\tUnconfirmed\tASIN-DUP\t6\tFC1"
+        )
+        response = self.client.post(
+            "/api/uploads",
+            {"report_type": "AMAZON_PO", "pasted_data": good_po},
+            format="multipart",
+        )
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual(response.data["rows_inserted_staging"], 1)
+
+        duplicate_response = self.client.post(
+            "/api/uploads",
+            {
+                "report_type": "AMAZON_PO",
+                "pasted_data": good_po,
+                "reprocess_duplicate": "false",
+            },
+            format="multipart",
+        )
+
+        self.assertEqual(duplicate_response.status_code, 200, duplicate_response.data)
+        self.assertEqual(duplicate_response.data["status"], "duplicate")
+        self.assertEqual(duplicate_response.data["rows_received"], 0)
+        self.assertEqual(duplicate_response.data["rows_inserted_staging"], 0)
+        self.assertIn("duplicate_of", duplicate_response.data)
+
     def test_amazon_po_upload_enriches_and_upserts(self):
         with connection.cursor() as cur:
             cur.execute(
@@ -851,6 +880,33 @@ class AmazonUploadTests(TransactionTestCase):
         self.assertEqual(response.status_code, 200, response.data)
         self.assertEqual(response.data["status"], "partially_successful")
         self.assertIn(
+            "business_warning_check_failed",
+            {item["error_type"] for item in response.data["warnings"]},
+        )
+
+    def test_large_amazon_po_upload_skips_synchronous_business_warning_scan(self):
+        rows = "\n".join(
+            f"PO-LARGE-{idx}\t2026-05-01\tUnconfirmed\tASIN-LARGE-{idx}\t6\tFC1"
+            for idx in range(1001)
+        )
+        content = (
+            "PO\tOrder date\tStatus\tASIN\tRequested quantity\tShip-to location\n"
+            f"{rows}"
+        )
+
+        def broken_warning_check(cur, *, config, upload_id):
+            raise AssertionError("Large uploads should not run synchronous business warnings.")
+
+        with patch("uploads.amazon_uploads._add_business_warnings", broken_warning_check):
+            response = self.client.post(
+                "/api/uploads",
+                {"report_type": "AMAZON_PO", "pasted_data": content},
+                format="multipart",
+            )
+
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual(response.data["rows_received"], 1001)
+        self.assertNotIn(
             "business_warning_check_failed",
             {item["error_type"] for item in response.data["warnings"]},
         )
