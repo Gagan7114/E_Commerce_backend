@@ -145,6 +145,255 @@ def platform_pos(request, slug: str):
 
 
 # ─── /{slug}/inventory-match?sku= ───
+def _bigbasket_primary_zero_row(item_head: str | None = None, item: str | None = None) -> dict:
+    row = {
+        "done_value": 0.0,
+        "done_ltrs": 0.0,
+        "pending_value": 0.0,
+        "pending_ltrs": 0.0,
+        "dp_value": 0.0,
+        "dp_ltrs": 0.0,
+        "expired_value": 0.0,
+        "expired_ltrs": 0.0,
+        "cancelled_value": 0.0,
+        "cancelled_ltrs": 0.0,
+    }
+    if item_head is not None:
+        row["item_head"] = item_head
+    if item is not None:
+        row["item"] = item
+    return row
+
+
+def _bigbasket_primary_normalize_row(row: dict, *, include_cancelled: bool = True) -> dict:
+    result = {
+        "item_head": row.get("item_head"),
+        "done_value": _num(row.get("done_value")),
+        "done_ltrs": _num(row.get("done_ltrs")),
+        "pending_value": _num(row.get("pending_value")),
+        "pending_ltrs": _num(row.get("pending_ltrs")),
+        "expired_value": _num(row.get("expired_value")),
+        "expired_ltrs": _num(row.get("expired_ltrs")),
+    }
+    result["dp_value"] = result["done_value"] + result["pending_value"]
+    result["dp_ltrs"] = result["done_ltrs"] + result["pending_ltrs"]
+    if "item" in row:
+        result["item"] = row.get("item")
+    if include_cancelled:
+        result["cancelled_value"] = _num(row.get("cancelled_value"))
+        result["cancelled_ltrs"] = _num(row.get("cancelled_ltrs"))
+    return result
+
+
+def _bigbasket_primary_total(rows: list[dict], *, include_cancelled: bool = True) -> dict:
+    fields = [
+        "done_value",
+        "done_ltrs",
+        "pending_value",
+        "pending_ltrs",
+        "dp_value",
+        "dp_ltrs",
+        "expired_value",
+        "expired_ltrs",
+    ]
+    if include_cancelled:
+        fields.extend(["cancelled_value", "cancelled_ltrs"])
+    return {field: sum(_num(row.get(field)) for row in rows) for field in fields}
+
+
+_PRIMARY_DASHBOARD_FORMATS = {
+    "bigbasket": "BIG BASKET",
+    "blinkit": "BLINKIT",
+    "citymall": "CITY MALL",
+    "flipkart_grocery": "FLIPKART GROCERY",
+    "swiggy": "SWIGGY",
+    "zomato": "ZOMATO",
+}
+_PRIMARY_DASHBOARD_DONE_VALUE_COLUMNS = {
+    ("bigbasket", "DEL MONTH"): "total_delivered_amt_exclusive",
+    ("bigbasket", "PO MONTH"): "total_delivered_amt_exclusive",
+    ("blinkit", "DEL MONTH"): "total_delivered_amt_exclusive",
+    ("blinkit", "PO MONTH"): "total_delivered_amt_exclusive",
+    ("citymall", "DEL MONTH"): "total_delivered_amt_exclusive",
+    ("citymall", "PO MONTH"): "total_delivered_amt_exclusive",
+    ("flipkart_grocery", "DEL MONTH"): "total_delivered_amt_exclusive",
+    ("flipkart_grocery", "PO MONTH"): "total_delivered_amt_exclusive",
+    ("swiggy", "DEL MONTH"): "total_delivered_amt_exclusive",
+    ("swiggy", "PO MONTH"): "total_delivered_amt_exclusive",
+    ("zomato", "DEL MONTH"): "total_order_amt_exclusive",
+    ("zomato", "PO MONTH"): "total_delivered_amt_exclusive",
+}
+
+
+def _bigbasket_primary_period_bounds(month_name: str, year: int) -> tuple[date, date]:
+    month_num = _MONTH_NAME_TO_NUM[month_name]
+    next_month, next_year = _shift_month(month_num, year, 1)
+    return date(year, month_num, 1), date(next_year, next_month, 1)
+
+
+@api_view(["GET"])
+@permission_classes([require("platform.po.view")])
+def bigbasket_primary_dashboard(request, slug: str):
+    _ensure_scope(request.user, slug)
+    platform_format = _PRIMARY_DASHBOARD_FORMATS.get(slug)
+    if not platform_format:
+        raise ValidationError(
+            "Primary Dashboard is available only for BigBasket, Blinkit, Zomato, CityMall, Flipkart Grocery, and Swiggy."
+        )
+
+    month_type, _month_col, date_col, month_name, year, defaulted_to_latest = (
+        _parse_bigbasket_primary_period(request.query_params, platform_format)
+    )
+    done_value_col = _PRIMARY_DASHBOARD_DONE_VALUE_COLUMNS.get(
+        (slug, month_type),
+        "total_delivered_amt_exclusive",
+    )
+    date_expr = _primary_text_date_expr(date_col)
+    period_start, period_end = _bigbasket_primary_period_bounds(month_name, year)
+    selected_period = f"({date_expr}) >= %s AND ({date_expr}) < %s"
+    pending_status = "UPPER(TRIM(\"po_status\"::text)) IN ('APPOINTMENT DONE', 'PENDING')"
+    period_where = (
+        f"UPPER(TRIM(\"format\"::text)) = %s "
+        f"AND (({selected_period}) OR {pending_status})"
+    )
+    filtered_cte = f"""
+        WITH filtered AS (
+            SELECT
+                *,
+                ({selected_period}) AS in_selected_period
+            FROM "prim_master_po"
+            WHERE {period_where}
+        )
+    """
+    filtered_params = [
+        period_start,
+        period_end,
+        platform_format,
+        period_start,
+        period_end,
+    ]
+
+    max_date = _scalar(
+        f"""
+        SELECT MAX({date_expr})
+        FROM "prim_master_po"
+        WHERE UPPER(TRIM("format"::text)) = %s
+          AND ({date_expr}) >= %s
+          AND ({date_expr}) < %s
+        """,
+        [platform_format, period_start, period_end],
+    )
+
+    summary_raw = _dict_rows(
+        f"""
+        {filtered_cte}
+        SELECT
+            COALESCE(NULLIF(UPPER(TRIM("item_head"::text)), ''), 'OTHER') AS item_head,
+            COALESCE(SUM(CASE WHEN in_selected_period
+                AND UPPER(TRIM("po_status"::text)) = 'COMPLETED'
+                THEN "{done_value_col}" ELSE 0 END), 0) AS done_value,
+            COALESCE(SUM(CASE WHEN in_selected_period
+                AND UPPER(TRIM("po_status"::text)) = 'COMPLETED'
+                THEN "total_delivered_liters" ELSE 0 END), 0) AS done_ltrs,
+            COALESCE(SUM(CASE WHEN UPPER(TRIM("po_status"::text)) IN ('APPOINTMENT DONE', 'PENDING')
+                THEN "total_order_amt_exclusive" ELSE 0 END), 0) AS pending_value,
+            COALESCE(SUM(CASE WHEN UPPER(TRIM("po_status"::text)) IN ('APPOINTMENT DONE', 'PENDING')
+                THEN "total_order_liters" ELSE 0 END), 0) AS pending_ltrs,
+            COALESCE(SUM(CASE WHEN in_selected_period
+                AND UPPER(TRIM("po_status"::text)) = 'EXPIRED'
+                THEN "total_order_amt_exclusive" ELSE 0 END), 0) AS expired_value,
+            COALESCE(SUM(CASE WHEN in_selected_period
+                AND UPPER(TRIM("po_status"::text)) = 'EXPIRED'
+                THEN "total_order_liters" ELSE 0 END), 0) AS expired_ltrs,
+            COALESCE(SUM(CASE WHEN in_selected_period
+                AND UPPER(TRIM("po_status"::text)) = 'CANCELLED'
+                THEN "total_order_amt_exclusive" ELSE 0 END), 0) AS cancelled_value,
+            COALESCE(SUM(CASE WHEN in_selected_period
+                AND UPPER(TRIM("po_status"::text)) = 'CANCELLED'
+                THEN "total_order_liters" ELSE 0 END), 0) AS cancelled_ltrs
+        FROM filtered
+        GROUP BY 1
+        """,
+        filtered_params,
+    )
+    summary_by_head = {
+        str(row.get("item_head") or "OTHER").upper(): _bigbasket_primary_normalize_row(row)
+        for row in summary_raw
+    }
+    summary = [
+        summary_by_head.get(item_head) or _bigbasket_primary_zero_row(item_head)
+        for item_head in _BIGBASKET_PRIMARY_ITEM_HEADS
+    ]
+
+    item_raw = _dict_rows(
+        f"""
+        {filtered_cte},
+        grouped AS (
+            SELECT
+                COALESCE(NULLIF(UPPER(TRIM("item_head"::text)), ''), 'OTHER') AS item_head,
+                COALESCE(NULLIF(UPPER(TRIM("item"::text)), ''), 'UNMAPPED') AS item,
+                COALESCE(SUM(CASE WHEN in_selected_period
+                    AND UPPER(TRIM("po_status"::text)) = 'COMPLETED'
+                    THEN "{done_value_col}" ELSE 0 END), 0) AS done_value,
+                COALESCE(SUM(CASE WHEN in_selected_period
+                    AND UPPER(TRIM("po_status"::text)) = 'COMPLETED'
+                    THEN "total_delivered_liters" ELSE 0 END), 0) AS done_ltrs,
+                COALESCE(SUM(CASE WHEN UPPER(TRIM("po_status"::text)) IN ('APPOINTMENT DONE', 'PENDING')
+                    THEN "total_order_amt_exclusive" ELSE 0 END), 0) AS pending_value,
+                COALESCE(SUM(CASE WHEN UPPER(TRIM("po_status"::text)) IN ('APPOINTMENT DONE', 'PENDING')
+                    THEN "total_order_liters" ELSE 0 END), 0) AS pending_ltrs,
+                COALESCE(SUM(CASE WHEN in_selected_period
+                    AND UPPER(TRIM("po_status"::text)) = 'EXPIRED'
+                    THEN "total_order_amt_exclusive" ELSE 0 END), 0) AS expired_value,
+                COALESCE(SUM(CASE WHEN in_selected_period
+                    AND UPPER(TRIM("po_status"::text)) = 'EXPIRED'
+                    THEN "total_order_liters" ELSE 0 END), 0) AS expired_ltrs
+            FROM filtered
+            GROUP BY 1, 2
+        )
+        SELECT *
+        FROM grouped
+        ORDER BY
+            CASE item_head
+                WHEN 'PREMIUM' THEN 1
+                WHEN 'COMMODITY' THEN 2
+                WHEN 'OTHER' THEN 3
+                ELSE 4
+            END,
+            item
+        """,
+        filtered_params,
+    )
+    items = [
+        _bigbasket_primary_normalize_row(row, include_cancelled=False)
+        for row in item_raw
+    ]
+
+    return Response({
+        "source": "prim_master_po",
+        "format": f"{slug.upper()}_PRIMARY",
+        "source_format": platform_format,
+        "defaulted_to_latest": defaulted_to_latest,
+        "month_type": month_type,
+        "month": _MONTH_NAME_TO_NUM.get(month_name),
+        "month_name": month_name,
+        "year": year,
+        "period_start": period_start.isoformat(),
+        "period_end": period_end.isoformat(),
+        "max_date": max_date.isoformat() if hasattr(max_date, "isoformat") else None,
+        "summary": summary,
+        "summary_total": _bigbasket_primary_total(summary),
+        "items": items,
+        "item_total": _bigbasket_primary_total(items, include_cancelled=False),
+        "notes": [
+            "DONE metrics use COMPLETED for every item head.",
+            f"Done value uses {done_value_col}.",
+            "Pending metrics use total order amount/litres for all open PENDING and APPOINTMENT DONE rows.",
+            "Selected month type controls the date column used for done, expired, cancelled, and max date.",
+        ],
+    })
+
+
 @api_view(["GET"])
 @permission_classes([require("platform.inventory.view")])
 def inventory_match(request, slug: str):
@@ -598,6 +847,8 @@ _FLIPKART_SEC_MONTHLY_ITEM_HEADS = ("PREMIUM", "COMMODITY")
 _FLIPKART_MP_DRR_SALES_OF = ("ALL", "PREMIUM", "COMMODITY", "OTHER")
 _AMAZON_DRR_ITEM_HEADS = ("ALL", "PREMIUM", "COMMODITY", "OTHER")
 _AMAZON_DRR_SALES_MODES = ("ORDERED", "SHIPPED")
+_BIGBASKET_PRIMARY_ITEM_HEADS = ("PREMIUM", "COMMODITY", "OTHER")
+_BIGBASKET_PRIMARY_MONTH_TYPES = ("DEL MONTH", "PO MONTH")
 
 _MONTH_NAME_TO_NUM = {
     date(2000, month, 1).strftime("%B").upper(): month
@@ -996,6 +1247,95 @@ def _shift_month(month: int, year: int, offset: int) -> tuple[int, int]:
 
 def _month_name(month: int) -> str:
     return date(2000, month, 1).strftime("%B").upper()
+
+
+def _parse_bigbasket_primary_month_type(raw_value) -> tuple[str, str, str]:
+    month_type = _norm_sec_key(raw_value or "DEL MONTH")
+    if month_type in {"DEL", "DELIVERY", "DELIVERY MONTH"}:
+        month_type = "DEL MONTH"
+    if month_type not in _BIGBASKET_PRIMARY_MONTH_TYPES:
+        raise ValidationError("`month_type` must be DEL MONTH or PO MONTH.")
+    if month_type == "PO MONTH":
+        return month_type, "po_month", "po_date"
+    return month_type, "delivery_month", "delivery_date"
+
+
+def _parse_month_name_param(raw_value, *, param_name: str = "month") -> str | None:
+    value = str(raw_value or "").strip()
+    if not value:
+        return None
+    if re.fullmatch(r"\d{4}-\d{2}", value):
+        _, raw_month = value.split("-")
+        month_num = int(raw_month)
+        if not 1 <= month_num <= 12:
+            raise ValidationError(f"`{param_name}` must contain a valid month.")
+        return _month_name(month_num)
+    if value.isdigit():
+        month_num = int(value)
+        if not 1 <= month_num <= 12:
+            raise ValidationError(f"`{param_name}` must be 1-12 or a month name.")
+        return _month_name(month_num)
+    month_name = _norm_sec_key(value)
+    if month_name not in _MONTH_NAME_TO_NUM:
+        raise ValidationError(f"`{param_name}` must be 1-12 or a month name.")
+    return month_name
+
+
+def _primary_text_date_expr(column_name: str) -> str:
+    return f"""
+        CASE
+            WHEN TRIM("{column_name}"::text) ~ '^\\d{{2}}-\\d{{2}}-\\d{{4}}$'
+                THEN TO_DATE(TRIM("{column_name}"::text), 'DD-MM-YYYY')
+            WHEN TRIM("{column_name}"::text) ~ '^\\d{{4}}-\\d{{2}}-\\d{{2}}$'
+                THEN TRIM("{column_name}"::text)::date
+            ELSE NULL
+        END
+    """
+
+
+def _parse_bigbasket_primary_period(params, platform_format: str) -> tuple[str, str, str, str, int, bool]:
+    month_type, month_col, date_col = _parse_bigbasket_primary_month_type(
+        params.get("month_type")
+    )
+    raw_year = str(params.get("year") or "").strip()
+    month_name = _parse_month_name_param(params.get("month"))
+    defaulted_to_latest = False
+
+    if month_name and raw_year:
+        try:
+            year = int(raw_year)
+        except ValueError:
+            raise ValidationError("`year` must be numeric.")
+        if not 2000 <= year <= 2100:
+            raise ValidationError("`year` looks out of range.")
+        return month_type, month_col, date_col, month_name, year, defaulted_to_latest
+
+    date_expr = _primary_text_date_expr(date_col)
+    latest = _dict_rows(
+        f"""
+        SELECT ({date_expr}) AS latest_date
+        FROM "prim_master_po"
+        WHERE UPPER(TRIM("format"::text)) = %s
+          AND ({date_expr}) IS NOT NULL
+        ORDER BY ({date_expr}) DESC
+        LIMIT 1
+        """,
+        [platform_format],
+    )
+    if latest:
+        latest_date = latest[0].get("latest_date")
+        if hasattr(latest_date, "month") and hasattr(latest_date, "year"):
+            return (
+                month_type,
+                month_col,
+                date_col,
+                _month_name(latest_date.month),
+                int(latest_date.year),
+                True,
+            )
+
+    today = date.today()
+    return month_type, month_col, date_col, _month_name(today.month), today.year, True
 
 
 _AMAZON_SEC_ITEM_HEADS = ("PREMIUM", "COMMODITY", "OTHER")

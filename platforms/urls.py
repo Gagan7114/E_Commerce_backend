@@ -14,6 +14,7 @@ urlpatterns = [
     path("<slug:slug>/stats", views.platform_stats, name="platform-stats"),
     path("<slug:slug>/pos", views.platform_pos, name="platform-pos"),
     path("<slug:slug>/inventory-match", views.inventory_match, name="platform-inventory-match"),
+    path("<slug:slug>/primary-dashboard", views.bigbasket_primary_dashboard, name="platform-bigbasket-primary-dashboard"),
     path("<slug:slug>/price-dashboard", views.amazon_price_dashboard, name="platform-amazon-price-dashboard"),
     path("<slug:slug>/comparison-dashboard", views.amazon_comparison_dashboard, name="platform-amazon-comparison-dashboard"),
     path("<slug:slug>/sec-dashboard", views.flipkart_grocery_sec_dashboard, name="platform-sec-dashboard"),
