@@ -14,6 +14,9 @@ _IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 # Tables the dashboard can query. Mirrors FastAPI ALLOWED_TABLES.
 ALLOWED_TABLES = {
     "master_po", "test_master_po",
+    "bigbasket_prim", "blinkit_prim", "citymall_prim",
+    "flipkart_grocery_prim", "swiggy_prim", "zepto_prim", "zomato_prim",
+    "blinkit_grn", "swiggy_grn", "zepto_grn",
     "amazon_price_data", "amazon_sec_daily", "amazon_sec_range",
     "amazon_sec_range_margins", "amazon_sec_range_master_view",
     "bigbasketSec", "blinkitSec", "flipkart_grocery_master", "fk_grocery", "flipkartSec", "flipkart_secondary_all",
@@ -82,6 +85,22 @@ def _is_code(name) -> bool:
     return False
 
 
+def _date_expr(col: str) -> str:
+    qc = f'"{col}"'
+    text_value = f"btrim({qc}::text)"
+    return (
+        "CASE "
+        f"WHEN {qc} IS NULL THEN NULL "
+        f"WHEN {text_value} ~ '^\\d{{4}}-\\d{{2}}-\\d{{2}}' "
+        f"THEN left({text_value}, 10)::date "
+        f"WHEN {text_value} ~ '^\\d{{2}}-\\d{{2}}-\\d{{4}}' "
+        f"THEN to_date(left({text_value}, 10), 'DD-MM-YYYY') "
+        f"WHEN {text_value} ~ '^\\d{{1,2}}/\\d{{1,2}}/\\d{{4}}' "
+        f"THEN to_date(split_part({text_value}, ' ', 1), 'DD/MM/YYYY') "
+        "ELSE NULL END"
+    )
+
+
 # ─── /table-count/{table} ───
 @api_view(["GET"])
 @permission_classes([require("dashboard.table.view")])
@@ -142,55 +161,64 @@ def expiry_alerts(request, table_name: str):
     soon = today + timedelta(days=ALERT_DAYS)
     alerts = []
     qt = _quoted(table_name)
+    date_exprs = [_date_expr(col) for col in date_cols]
+    expired_condition = " OR ".join(f"{expr} < %s::date" for expr in date_exprs)
+    expiring_condition = " OR ".join(
+        f"({expr} >= %s::date AND {expr} <= %s::date)" for expr in date_exprs
+    )
+    expired_params = [today] * len(date_cols)
+    expiring_params = expired_params + [v for _ in date_cols for v in (today, soon)]
+    columns_label = ", ".join(date_cols)
 
     with connection.cursor() as cur:
-        for col in date_cols:
-            qc = f'"{col}"'
-            try:
-                cur.execute(f"SELECT COUNT(*) FROM {qt} WHERE {qc} < %s", [today])
-                expired_count = cur.fetchone()[0] or 0
-                expired_rows = []
-                if expired_count:
-                    cur.execute(
-                        f"SELECT * FROM {qt} WHERE {qc} < %s ORDER BY {qc} DESC LIMIT 5",
-                        [today],
-                    )
-                    if cur.description is None:
-                        continue
-                    cols = [c[0] for c in cur.description]
-                    expired_rows = [dict(zip(cols, r)) for r in cur.fetchall()]
-                    alerts.append({
-                        "table": table_name,
-                        "column": col,
-                        "type": "expired",
-                        "count": int(expired_count),
-                        "rows": expired_rows,
-                    })
-
+        try:
+            cur.execute(
+                f"SELECT COUNT(*) FROM {qt} WHERE {expired_condition}",
+                expired_params,
+            )
+            expired_count = int(cur.fetchone()[0] or 0)
+            if expired_count:
                 cur.execute(
-                    f"SELECT COUNT(*) FROM {qt} WHERE {qc} >= %s AND {qc} <= %s",
-                    [today, soon],
+                    f"SELECT * FROM {qt} WHERE {expired_condition} "
+                    f"ORDER BY {date_exprs[0]} DESC NULLS LAST LIMIT 5",
+                    expired_params,
                 )
-                soon_count = cur.fetchone()[0] or 0
-                if soon_count:
-                    cur.execute(
-                        f"SELECT * FROM {qt} WHERE {qc} >= %s AND {qc} <= %s "
-                        f"ORDER BY {qc} ASC LIMIT 5",
-                        [today, soon],
-                    )
-                    if cur.description is None:
-                        continue
-                    cols = [c[0] for c in cur.description]
-                    rows = [dict(zip(cols, r)) for r in cur.fetchall()]
-                    alerts.append({
-                        "table": table_name,
-                        "column": col,
-                        "type": "expiring",
-                        "count": int(soon_count),
-                        "rows": rows,
-                    })
-            except Exception:
-                continue
+                cols = [c[0] for c in cur.description]
+                rows = [dict(zip(cols, r)) for r in cur.fetchall()]
+                alerts.append({
+                    "table": table_name,
+                    "column": columns_label,
+                    "columns": date_cols,
+                    "type": "expired",
+                    "count": expired_count,
+                    "rows": rows,
+                })
+
+            cur.execute(
+                f"SELECT COUNT(*) FROM {qt} "
+                f"WHERE NOT ({expired_condition}) AND ({expiring_condition})",
+                expiring_params,
+            )
+            soon_count = int(cur.fetchone()[0] or 0)
+            if soon_count:
+                cur.execute(
+                    f"SELECT * FROM {qt} "
+                    f"WHERE NOT ({expired_condition}) AND ({expiring_condition}) "
+                    f"ORDER BY {date_exprs[0]} ASC NULLS LAST LIMIT 5",
+                    expiring_params,
+                )
+                cols = [c[0] for c in cur.description]
+                rows = [dict(zip(cols, r)) for r in cur.fetchall()]
+                alerts.append({
+                    "table": table_name,
+                    "column": columns_label,
+                    "columns": date_cols,
+                    "type": "expiring",
+                    "count": soon_count,
+                    "rows": rows,
+                })
+        except Exception:
+            return Response({"alerts": []})
 
     return Response({"alerts": alerts})
 
@@ -324,6 +352,9 @@ def table_data(request, table_name: str):
     year = q.get("year", "")
     month = q.get("month", "")
     single_date = q.get("date", "")
+    max_date = q.get("max_date", "")
+    sort_by = q.get("sort_by", "")
+    sort_dir = (q.get("sort_dir", "desc") or "desc").lower()
     expiry_column = q.get("expiry_column", "")
     expiry_before = q.get("expiry_before", "")
 
@@ -338,34 +369,33 @@ def table_data(request, table_name: str):
         query_date_column = "real_date"
 
     dc = _validate_col(query_date_column)
+    date_expr = _date_expr(dc) if dc else None
     if dc:
         if date_from:
-            where.append(f'"{dc}" >= %s')
+            where.append(f"{date_expr} >= %s::date")
             params.append(date_from)
         if date_to:
-            where.append(f'"{dc}" <= %s')
+            where.append(f"{date_expr} <= %s::date")
             params.append(date_to)
         if year and not date_from and not date_to:
-            where.append(f'"{dc}" >= %s')
+            where.append(f"{date_expr} >= %s::date")
             params.append(f"{year}-01-01")
-            where.append(f'"{dc}" <= %s')
-            params.append(f"{year}-12-31T23:59:59")
+            where.append(f"{date_expr} <= %s::date")
+            params.append(f"{year}-12-31")
         if month:
             y = year or str(datetime.now().year)
             try:
                 m = int(month)
                 last_day = calendar.monthrange(int(y), m)[1]
-                where.append(f'"{dc}" >= %s')
+                where.append(f"{date_expr} >= %s::date")
                 params.append(f"{y}-{m:02d}-01")
-                where.append(f'"{dc}" <= %s')
-                params.append(f"{y}-{m:02d}-{last_day}T23:59:59")
+                where.append(f"{date_expr} <= %s::date")
+                params.append(f"{y}-{m:02d}-{last_day}")
             except ValueError:
                 pass
         if single_date and not date_from and not date_to:
-            where.append(f'"{dc}" >= %s')
+            where.append(f"{date_expr} = %s::date")
             params.append(single_date)
-            where.append(f'"{dc}" <= %s')
-            params.append(f"{single_date}T23:59:59")
 
     ec = _validate_col(expiry_column)
     if ec and expiry_before:
@@ -379,16 +409,38 @@ def table_data(request, table_name: str):
             where.append(f"({ors})")
             params.extend([f"%{search}%"] * len(cols))
 
-    where_sql = f" WHERE {' AND '.join(where)}" if where else ""
     qt = _quoted(table_name)
+
+    if max_date and date_expr:
+        base_where = list(where)
+        base_params = list(params)
+        base_where_sql = f" WHERE {' AND '.join(base_where)}" if base_where else ""
+        where.append(
+            f"{date_expr} = (SELECT MAX({_date_expr(dc)}) FROM {qt}{base_where_sql})"
+        )
+        params.extend(base_params)
+
+    where_sql = f" WHERE {' AND '.join(where)}" if where else ""
     order_sql = ""
-    if table_name == "flipkart_grocery_master":
-        order_sql = ' ORDER BY "real_date" ASC NULLS LAST, "sku_id" ASC NULLS LAST'
+    order_col = _validate_col(sort_by) or dc
+    if order_col:
+        direction = "ASC" if sort_dir == "asc" else "DESC"
+        order_sql = f" ORDER BY {_date_expr(order_col)} {direction} NULLS LAST"
+        if table_name == "flipkart_grocery_master":
+            order_sql += ', "sku_id" ASC NULLS LAST'
+        elif table_name == "amazon_sec_range_master_view":
+            order_sql += ', "to_date" ASC NULLS LAST, "asin" ASC NULLS LAST'
+    elif table_name == "flipkart_grocery_master":
+        order_sql = ' ORDER BY "real_date" DESC NULLS LAST, "sku_id" ASC NULLS LAST'
     elif table_name == "amazon_sec_range_master_view":
         order_sql = ' ORDER BY "from_date" ASC NULLS LAST, "to_date" ASC NULLS LAST, "asin" ASC NULLS LAST'
 
     try:
         with connection.cursor() as cur:
+            latest_date = None
+            if date_expr:
+                cur.execute(f"SELECT MAX({date_expr}) FROM {qt}")
+                latest_date = cur.fetchone()[0]
             cur.execute(f"SELECT COUNT(*) FROM {qt}{where_sql}", params)
             total = int(cur.fetchone()[0] or 0)
             cur.execute(
@@ -407,4 +459,5 @@ def table_data(request, table_name: str):
         "count": total,
         "page": page,
         "page_size": page_size,
+        "max_date": latest_date,
     })
