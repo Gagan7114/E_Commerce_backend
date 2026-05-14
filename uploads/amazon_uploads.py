@@ -635,6 +635,25 @@ def _insert_validation_issues(
     )
 
 
+def _insert_validation_issues_best_effort(
+    cur,
+    *,
+    upload_id: int,
+    config: ReportConfig,
+    issues: list[dict[str, Any]],
+) -> None:
+    try:
+        with transaction.atomic():
+            _insert_validation_issues(
+                cur,
+                upload_id=upload_id,
+                config=config,
+                issues=issues,
+            )
+    except Exception:
+        logger.exception("Could not store validation issues for upload_id=%s", upload_id)
+
+
 def _upsert_summary(
     cur,
     *,
@@ -1624,7 +1643,12 @@ def process_upload(request) -> tuple[dict[str, Any], int]:
                     }
                 )
 
-            _insert_validation_issues(cur, upload_id=upload_id, config=config, issues=issues)
+            _insert_validation_issues_best_effort(
+                cur,
+                upload_id=upload_id,
+                config=config,
+                issues=issues,
+            )
             error_count = sum(1 for issue in issues if issue.get("severity") == "error")
             warning_count = sum(1 for issue in issues if issue.get("severity") == "warning")
 
@@ -1663,7 +1687,7 @@ def process_upload(request) -> tuple[dict[str, Any], int]:
                             "severity": "error",
                         }
                     )
-                    _insert_validation_issues(
+                    _insert_validation_issues_best_effort(
                         cur,
                         upload_id=upload_id,
                         config=config,
@@ -1673,31 +1697,78 @@ def process_upload(request) -> tuple[dict[str, Any], int]:
                     status_value = "failed"
 
             valid_rows = max(rows_received - _count_issue_rows(issues, "error"), 0)
-            _upsert_summary(
-                cur,
-                upload_id=upload_id,
-                config=config,
-                total_rows=rows_received,
-                valid_rows=valid_rows,
-                error_rows=_count_issue_rows(issues, "error"),
-                warning_rows=_count_issue_rows(issues, "warning"),
-                inserted=inserted,
-                updated=updated,
-                status_value=status_value,
-            )
-            _update_upload_file(
-                cur,
-                upload_id=upload_id,
-                status_value=status_value,
-                row_count=rows_received,
-                error_count=error_count,
-                warning_count=warning_count,
-                metadata={
-                    "rows_inserted_staging": rows_inserted_staging,
-                    "rows_inserted_final": inserted,
-                    "rows_updated_final": updated,
-                },
-            )
+            try:
+                with transaction.atomic():
+                    _upsert_summary(
+                        cur,
+                        upload_id=upload_id,
+                        config=config,
+                        total_rows=rows_received,
+                        valid_rows=valid_rows,
+                        error_rows=_count_issue_rows(issues, "error"),
+                        warning_rows=_count_issue_rows(issues, "warning"),
+                        inserted=inserted,
+                        updated=updated,
+                        status_value=status_value,
+                    )
+            except Exception as exc:
+                logger.exception("Could not update upload summary for upload_id=%s", upload_id)
+                issues.append(
+                    {
+                        "row_number": None,
+                        "field_name": None,
+                        "error_type": "summary_update_failed",
+                        "error_message": _upload_exception_message(
+                            "Rows were processed, but the upload summary could not be updated.",
+                            exc,
+                        ),
+                        "severity": "warning",
+                    }
+                )
+                _insert_validation_issues_best_effort(
+                    cur,
+                    upload_id=upload_id,
+                    config=config,
+                    issues=[issues[-1]],
+                )
+
+            error_count = sum(1 for issue in issues if issue.get("severity") == "error")
+            warning_count = sum(1 for issue in issues if issue.get("severity") == "warning")
+            try:
+                with transaction.atomic():
+                    _update_upload_file(
+                        cur,
+                        upload_id=upload_id,
+                        status_value=status_value,
+                        row_count=rows_received,
+                        error_count=error_count,
+                        warning_count=warning_count,
+                        metadata={
+                            "rows_inserted_staging": rows_inserted_staging,
+                            "rows_inserted_final": inserted,
+                            "rows_updated_final": updated,
+                        },
+                    )
+            except Exception as exc:
+                logger.exception("Could not finalize upload_file row for upload_id=%s", upload_id)
+                issues.append(
+                    {
+                        "row_number": None,
+                        "field_name": None,
+                        "error_type": "upload_status_update_failed",
+                        "error_message": _upload_exception_message(
+                            "Rows were processed, but the upload status could not be finalized.",
+                            exc,
+                        ),
+                        "severity": "warning",
+                    }
+                )
+                _insert_validation_issues_best_effort(
+                    cur,
+                    upload_id=upload_id,
+                    config=config,
+                    issues=[issues[-1]],
+                )
 
             http_status = status.HTTP_400_BAD_REQUEST if status_value == "failed" else status.HTTP_200_OK
             return (
@@ -1906,17 +1977,52 @@ def _upload_diagnostics(
     summary: dict[str, Any] | None,
 ) -> dict[str, Any]:
     config = REPORTS.get(upload.get("report_type") or "")
-    diagnostics: dict[str, Any] = {
-        "issue_groups": _upload_issue_groups(cur, int(upload["upload_id"])),
-    }
+    upload_id = int(upload["upload_id"])
+    diagnostics: dict[str, Any] = {"issue_groups": []}
+    diagnostic_errors: list[dict[str, Any]] = []
+    try:
+        with transaction.atomic():
+            diagnostics["issue_groups"] = _upload_issue_groups(cur, upload_id)
+    except Exception as exc:
+        logger.exception("Could not load issue groups for upload_id=%s", upload_id)
+        diagnostic_errors.append(
+            {
+                "type": "issue_groups_failed",
+                "message": _upload_exception_message("Could not load issue groups.", exc),
+            }
+        )
     if config:
-        diagnostics["column_check"] = _upload_column_check(upload, config)
-        if config.report_type == "AMAZON_PO":
-            diagnostics["amazon_po"] = _amazon_upload_diagnostics(
-                cur,
-                int(upload["upload_id"]),
-                summary,
+        try:
+            diagnostics["column_check"] = _upload_column_check(upload, config)
+        except Exception as exc:
+            logger.exception("Could not check upload columns for upload_id=%s", upload_id)
+            diagnostic_errors.append(
+                {
+                    "type": "column_check_failed",
+                    "message": _upload_exception_message("Could not check upload columns.", exc),
+                }
             )
+        if config.report_type == "AMAZON_PO":
+            try:
+                with transaction.atomic():
+                    diagnostics["amazon_po"] = _amazon_upload_diagnostics(
+                        cur,
+                        upload_id,
+                        summary,
+                    )
+            except Exception as exc:
+                logger.exception("Could not load Amazon PO diagnostics for upload_id=%s", upload_id)
+                diagnostic_errors.append(
+                    {
+                        "type": "amazon_po_diagnostics_failed",
+                        "message": _upload_exception_message(
+                            "Could not load Amazon PO diagnostics.",
+                            exc,
+                        ),
+                    }
+                )
+    if diagnostic_errors:
+        diagnostics["diagnostic_errors"] = diagnostic_errors
     return diagnostics
 
 
