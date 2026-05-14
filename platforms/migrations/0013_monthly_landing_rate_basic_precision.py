@@ -16,6 +16,12 @@ class Migration(migrations.Migration):
                 mat_index_sql text[];
                 idx_sql text;
             BEGIN
+                IF to_regclass('public."SecMaster"') IS NULL
+                   OR to_regclass('public.monthly_landing_rate') IS NULL THEN
+                    RAISE NOTICE 'SecMaster/monthly_landing_rate missing; skipping basic_rate precision patch.';
+                    RETURN;
+                END IF;
+
                 SELECT pg_get_viewdef('"SecMaster"'::regclass, true)
                   INTO view_sql;
 
@@ -54,6 +60,11 @@ class Migration(migrations.Migration):
                 mat_index_sql text[];
                 idx_sql text;
             BEGIN
+                IF to_regclass('public."SecMaster"') IS NULL
+                   OR to_regclass('public.monthly_landing_rate') IS NULL THEN
+                    RETURN;
+                END IF;
+
                 SELECT pg_get_viewdef('"SecMaster"'::regclass, true)
                   INTO view_sql;
 

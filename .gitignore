@@ -10,6 +10,7 @@ env/
 *.env
 db.sqlite3
 staticfiles/
+uploaded_files/
 media/
 .vscode/
 .idea/

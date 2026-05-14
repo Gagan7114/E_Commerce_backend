@@ -10,6 +10,15 @@ from django.db import migrations
 # Note: `item_head`, `format`, `type`, `date`, and the 11 numeric columns
 # already exist on the table — we do not touch them here.
 ADD_SQL = """
+-- Fresh test/dev databases may not have the legacy singular table yet.
+-- The live database already had it before this migration was introduced.
+CREATE TABLE IF NOT EXISTS month_targets (
+    id        BIGSERIAL PRIMARY KEY,
+    "format" TEXT,
+    item_head TEXT,
+    "date"   DATE
+);
+
 -- Primary key. Uses BIGSERIAL so new rows get an auto-incrementing id.
 -- If some existing rows have NULL ids they get backfilled by DEFAULT.
 ALTER TABLE month_targets
