@@ -64,7 +64,7 @@ Allowed `report_type` values:
 - staging: `staging."amazon data"`
 - final: `reporting."Amazon PO"`
 - persistence: upsert
-- upsert key: `source_line_key = md5(po_number | external_id | merchant_sku | ship_to_location)`
+- upsert key: `source_line_key = md5(po_number | asin)`
 
 `APPOINTMENT`:
 
@@ -92,7 +92,7 @@ Amazon PO required fields:
 - `po_number`
 - `order_date`
 - `ship_to_location`
-- at least one of `external_id`, `asin`, `merchant_sku`
+- `asin`
 
 Amazon PO warnings:
 

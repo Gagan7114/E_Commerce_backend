@@ -318,8 +318,8 @@ class AmazonUploadTests(TransactionTestCase):
         rows, _, _ = parse_uploaded_file(
             config=REPORTS["AMAZON_PO"],
             content=(
-                "PO,External ID,Order date,Ship-to location\n"
-                "PO1,EXT1,2026-05-01,FC1\n"
+                "PO,ASIN,External ID,Order date,Ship-to location\n"
+                "PO1,ASIN1,EXT1,2026-05-01,FC1\n"
             ).encode(),
             extension=".csv",
         )
@@ -357,6 +357,27 @@ class AmazonUploadTests(TransactionTestCase):
                 item
                 for item in issues
                 if item.get("error_type") == "missing_required_column"
+            ]
+        )
+
+    def test_amazon_po_full_month_name_dates_parse(self):
+        rows, issues, rows_received = parse_uploaded_file(
+            config=REPORTS["AMAZON_PO"],
+            content=(
+                "PO,ASIN,External ID,Order date,Ship-to location,Cancellation deadline\n"
+                "PO1,ASIN1,EXT1,14-May-2026,DED5,05-June-2026\n"
+            ).encode(),
+            extension=".csv",
+        )
+        self.assertEqual(rows_received, 1)
+        self.assertEqual(rows[0]["order_date"], date(2026, 5, 14))
+        self.assertEqual(rows[0]["cancellation_deadline"], date(2026, 6, 5))
+        self.assertFalse(
+            [
+                item
+                for item in issues
+                if item.get("field_name") == "cancellation_deadline"
+                and item.get("error_type") == "invalid_date"
             ]
         )
 
@@ -441,10 +462,9 @@ class AmazonUploadTests(TransactionTestCase):
         self.assertEqual(rows[0]["creation_date"], date(2026, 5, 8))
         self.assertFalse([item for item in issues if item.get("severity") == "error"])
 
-    def test_appointment_deduplicates_same_id_keeps_last_row(self):
-        # Two rows with the same appointment_id but different pos values — only the last
-        # row (highest raw_row_number) should survive. The key is appointment_id only,
-        # so differing pos does not create a second record.
+    def test_appointment_same_id_with_different_pos_creates_po_rows(self):
+        # Appointment rows are keyed by appointment_id + PO, so one appointment
+        # can appear as separate final rows for each PO.
         response = self.client.post(
             "/api/uploads",
             {
@@ -459,22 +479,54 @@ class AmazonUploadTests(TransactionTestCase):
             format="multipart",
         )
         self.assertEqual(response.status_code, 200, response.data)
-        self.assertEqual(response.data["rows_inserted_final"], 1)
+        self.assertEqual(response.data["rows_inserted_final"], 2)
         with connection.cursor() as cur:
             cur.execute(
                 'SELECT appointment_id, pos, creation_date, month '
-                'FROM reporting."appointment"'
+                'FROM reporting."appointment" ORDER BY pos'
             )
             rows = cur.fetchall()
-        self.assertEqual(len(rows), 1)
+        self.assertEqual(len(rows), 2)
         self.assertEqual(rows[0][0], "545000000000")
-        self.assertEqual(rows[0][1], "56LAFBLG")   # last row in file wins
+        self.assertEqual([row[1] for row in rows], ["56LAFBLG", "8QWBFBWG"])
         self.assertEqual(rows[0][2], date(2026, 5, 8))
         self.assertEqual(rows[0][3], "MAY")
 
-    def test_appointment_reuploads_same_id_updates_pos(self):
-        # Re-uploading the same appointment_id with updated pos should UPDATE the
-        # existing row (rows_updated_final = 1) not insert a second record.
+    def test_appointment_single_row_with_multiple_pos_splits_to_rows(self):
+        response = self.client.post(
+            "/api/uploads",
+            {
+                "report_type": "APPOINTMENT",
+                "pasted_data": (
+                    "Appointment ID\tStatus\tAppointment Time\tCreation Date\tPOs\tDestination FC\tPRO\n"
+                    "APT-MULTI\tConfirmed\t23/05/2026 08:30 AM IST\t5/8/2026\tPO-A, PO-B; PO-C\tDED5\tVAS1\n"
+                ),
+            },
+            format="multipart",
+        )
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual(response.data["rows_inserted_final"], 3)
+        with connection.cursor() as cur:
+            cur.execute(
+                """
+                SELECT appointment_id, status, appointment_time, creation_date,
+                       pos, destination_fc, pro, month, year
+                  FROM reporting."appointment"
+                 ORDER BY pos
+                """
+            )
+            rows = cur.fetchall()
+        self.assertEqual([row[4] for row in rows], ["PO-A", "PO-B", "PO-C"])
+        self.assertTrue(all(row[0] == "APT-MULTI" for row in rows))
+        self.assertTrue(all(row[1] == "Confirmed" for row in rows))
+        self.assertTrue(all(row[5] == "DED5" for row in rows))
+        self.assertTrue(all(row[6] == "VAS1" for row in rows))
+        self.assertTrue(all(row[7] == "MAY" for row in rows))
+        self.assertTrue(all(row[8] == 2026 for row in rows))
+
+    def test_appointment_reupload_same_id_replaces_removed_pos(self):
+        # Re-uploading the same appointment_id with a different PO should remove
+        # the old PO row and keep only the latest uploaded PO set.
         first_csv = (
             "Appointment ID,Status,Appointment Time,Creation Date,POs,Destination FC,PRO\n"
             "APT-001,Confirmed,23/05/2026 08:30 AM IST,5/8/2026,OLD-PO,DED5,VAS1\n"
@@ -498,8 +550,8 @@ class AmazonUploadTests(TransactionTestCase):
             format="multipart",
         )
         self.assertEqual(r2.status_code, 200, r2.data)
-        self.assertEqual(r2.data["rows_inserted_final"], 0)
-        self.assertEqual(r2.data["rows_updated_final"], 1)
+        self.assertEqual(r2.data["rows_inserted_final"], 1)
+        self.assertEqual(r2.data["rows_updated_final"], 0)
 
         with connection.cursor() as cur:
             cur.execute('SELECT COUNT(*), MAX(pos) FROM reporting."appointment"')
@@ -670,7 +722,8 @@ class AmazonUploadTests(TransactionTestCase):
                 "report_type": "AMAZON_PO",
                 "file": csv_file(
                     "amazon-po-update.csv",
-                    content.replace(",80,20,", ",90,10,"),
+                    content.replace("ASIN1,EXT1,MSKU1", "ASIN1,EXT2,MSKU2")
+                    .replace(",80,20,", ",90,10,"),
                 ),
             },
             format="multipart",
@@ -678,8 +731,53 @@ class AmazonUploadTests(TransactionTestCase):
         self.assertEqual(response.status_code, 200, response.data)
         self.assertEqual(response.data["rows_updated_final"], 1)
         with connection.cursor() as cur:
-            cur.execute('SELECT COUNT(*), MAX(received_qty) FROM reporting."Amazon PO"')
-            self.assertEqual(cur.fetchone(), (1, Decimal("90")))
+            cur.execute(
+                'SELECT COUNT(*), MAX(received_qty), MAX(external_id), MAX(merchant_sku) '
+                'FROM reporting."Amazon PO"'
+            )
+            self.assertEqual(cur.fetchone(), (1, Decimal("90"), "EXT2", "MSKU2"))
+
+    def test_amazon_po_status_uses_excel_formula_order(self):
+        with connection.cursor() as cur:
+            cur.execute(
+                "INSERT INTO master.fc_master (fc_code, fc_name, city, state) VALUES (%s, %s, %s, %s)",
+                ["FC1", "FC One", "Delhi", "Delhi"],
+            )
+
+        content = (
+            "PO,Order date,Status,ASIN,Availability,Requested quantity,Accepted quantity,"
+            "Received quantity,Cancelled quantity,Ship-to location,Cancellation deadline\n"
+            "PO-STATUS,2026-05-01,Confirmed,ASIN-EXPIRED,AC - Accepted: In stock,10,5,0,0,FC1,2000-01-01\n"
+            "PO-STATUS,2026-05-01,Confirmed,ASIN-MOV,OS - Cancelled: Out of stock,10,0,0,0,FC1,2099-01-01\n"
+            "PO-STATUS,2026-05-01,Closed,ASIN-CANCELLED,OS - Cancelled: Out of stock,10,0,0,0,FC1,2099-01-01\n"
+            "PO-STATUS,2026-05-01,Confirmed,ASIN-COMPLETED,AC - Accepted: In stock,10,5,2,0,FC1,2099-01-01\n"
+            "PO-STATUS,2026-05-01,Unconfirmed,ASIN-PENDING,AC - Accepted: In stock,10,0,0,0,FC1,2099-01-01\n"
+        )
+        response = self.client.post(
+            "/api/uploads",
+            {"report_type": "AMAZON_PO", "file": csv_file("po-status.csv", content)},
+            format="multipart",
+        )
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual(response.data["rows_inserted_final"], 5)
+
+        with connection.cursor() as cur:
+            cur.execute(
+                """
+                SELECT asin, po_status
+                  FROM reporting."Amazon PO"
+                 WHERE po_number = %s
+                 ORDER BY asin
+                """,
+                ["PO-STATUS"],
+            )
+            rows = dict(cur.fetchall())
+
+        self.assertEqual(rows["ASIN-CANCELLED"], "CANCELLED")
+        self.assertEqual(rows["ASIN-COMPLETED"], "COMPLETED")
+        self.assertEqual(rows["ASIN-EXPIRED"], "EXPIRED")
+        self.assertEqual(rows["ASIN-MOV"], "MOV")
+        self.assertEqual(rows["ASIN-PENDING"], "PENDING")
 
     def test_validation_errors_and_warnings_are_stored(self):
         response = self.client.post(
@@ -718,8 +816,8 @@ class AmazonUploadTests(TransactionTestCase):
                 "report_type": "AMAZON_PO",
                 "file": csv_file(
                     "missing-master.csv",
-                    "PO,Order date,Ship-to location,External ID\n"
-                    "PO2,2026-05-01,UNKNOWN,EXT-MISSING\n",
+                    "PO,Order date,ASIN,Ship-to location,External ID\n"
+                    "PO2,2026-05-01,ASIN-MISSING,UNKNOWN,EXT-MISSING\n",
                 ),
             },
             format="multipart",
@@ -761,8 +859,8 @@ class AmazonUploadTests(TransactionTestCase):
                 "report_type": "AMAZON_PO",
                 "file": csv_file(
                     "solid-product.csv",
-                    "PO,Order date,Status,Product name,External ID,Requested quantity,Ship-to location\n"
-                    "PO3,2026-05-01,Confirmed,Solid product 800g,SOLID-1,2,FC1\n",
+                    "PO,Order date,Status,Product name,ASIN,External ID,Requested quantity,Ship-to location\n"
+                    "PO3,2026-05-01,Confirmed,Solid product 800g,SOLID-1,SOLID-1,2,FC1\n",
                 ),
             },
             format="multipart",
@@ -800,16 +898,82 @@ class AmazonUploadTests(TransactionTestCase):
                 "report_type": "AMAZON_PO",
                 "file": csv_file(
                     "liquid-product.csv",
-                    "PO,Order date,Status,Product name,External ID,Requested quantity,Ship-to location\n"
-                    "PO4,2026-05-01,Confirmed,Liquid product 1 litre,LIQUID-1,2,FC1\n",
+                    "PO,Order date,Status,Product name,ASIN,External ID,Requested quantity,Ship-to location\n"
+                    "PO4,2026-05-01,Confirmed,Liquid product 1 litre,LIQUID-1,LIQUID-1,2,FC1\n",
                 ),
             },
             format="multipart",
         )
         self.assertEqual(response.status_code, 200, response.data)
-        self.assertEqual(response.data["status"], "partially_successful")
-        warning_types = {item["error_type"] for item in response.data["warnings"]}
-        self.assertIn("per_unit_value_missing", warning_types)
+        self.assertEqual(response.data["status"], "completed")
+        self.assertEqual(response.data["warning_count"], 0)
+        with connection.cursor() as cur:
+            cur.execute(
+                """
+                SELECT per_liter, total_order_liters
+                  FROM reporting."Amazon PO"
+                 WHERE po_number = %s
+                   AND external_id = %s
+                """,
+                ["PO4", "LIQUID-1"],
+            )
+            self.assertEqual(cur.fetchone(), (Decimal("1"), Decimal("2")))
+
+    def test_amazon_po_uses_raw_case_size_when_master_case_pack_is_blank(self):
+        with connection.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO public.master_sheet (
+                    format, format_sku_code, product_name, category,
+                    sub_category, per_unit, uom, sku_sap_name
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                [
+                    "AMAZON",
+                    "CASE-FALLBACK",
+                    "Fallback case product",
+                    "OLIVE",
+                    "POMACE",
+                    "500 MLS",
+                    "MLS",
+                    "CASE PRODUCT",
+                ],
+            )
+            cur.execute(
+                "INSERT INTO master.fc_master (fc_code, fc_name, city, state) VALUES (%s, %s, %s, %s)",
+                ["FC1", "FC1", "City", "State"],
+            )
+
+        response = self.client.post(
+            "/api/uploads",
+            {
+                "report_type": "AMAZON_PO",
+                "file": csv_file(
+                    "case-fallback.csv",
+                    "PO,Order date,Status,Product name,ASIN,External ID,Requested quantity,Ship-to location,Case size\n"
+                    "PO5,2026-05-01,Confirmed,Fallback case product,CASE-FALLBACK,CASE-FALLBACK,12,FC1,6\n",
+                ),
+            },
+            format="multipart",
+        )
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual(response.data["status"], "completed")
+        self.assertEqual(response.data["warning_count"], 0)
+
+        with connection.cursor() as cur:
+            cur.execute(
+                """
+                SELECT case_pack, requested_boxes, per_liter, total_order_liters
+                  FROM reporting."Amazon PO"
+                 WHERE po_number = %s
+                """,
+                ["PO5"],
+            )
+            self.assertEqual(
+                cur.fetchone(),
+                (Decimal("6.0000"), Decimal("2.0000000000000000"), Decimal("0.5"), Decimal("6.0")),
+            )
 
     def test_price_upload_type_is_not_supported(self):
         response = self.client.post(

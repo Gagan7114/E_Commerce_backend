@@ -155,7 +155,7 @@ REPORTS: dict[str, ReportConfig] = {
             "consolidation_id",
             "cancellation_deadline",
         ),
-        required_columns=("po_number", "order_date", "ship_to_location"),
+        required_columns=("po_number", "order_date", "asin", "ship_to_location"),
         numeric_fields=AMAZON_NUMERIC_FIELDS,
         date_fields=(
             "order_date",
@@ -304,14 +304,26 @@ def _parse_temporal(
         "%d-%b-%Y %H:%M",
         "%d-%b-%Y %I:%M:%S %p",
         "%d-%b-%Y %I:%M %p",
+        "%d-%B-%Y %H:%M:%S",
+        "%d-%B-%Y %H:%M",
+        "%d-%B-%Y %I:%M:%S %p",
+        "%d-%B-%Y %I:%M %p",
         "%d-%b-%y %H:%M:%S",
         "%d-%b-%y %H:%M",
         "%d-%b-%y %I:%M:%S %p",
         "%d-%b-%y %I:%M %p",
+        "%d-%B-%y %H:%M:%S",
+        "%d-%B-%y %H:%M",
+        "%d-%B-%y %I:%M:%S %p",
+        "%d-%B-%y %I:%M %p",
         "%d %b %Y %H:%M:%S",
         "%d %b %Y %H:%M",
         "%d %b %Y %I:%M:%S %p",
         "%d %b %Y %I:%M %p",
+        "%d %B %Y %H:%M:%S",
+        "%d %B %Y %H:%M",
+        "%d %B %Y %I:%M:%S %p",
+        "%d %B %Y %I:%M %p",
         "%Y-%m-%d",
         "%d-%m-%Y",
         "%d-%m-%y",
@@ -322,8 +334,12 @@ def _parse_temporal(
         "%d.%m.%Y",
         "%d-%b-%Y",
         "%d-%b-%y",
+        "%d-%B-%Y",
+        "%d-%B-%y",
         "%d %b %Y",
         "%d %b %y",
+        "%d %B %Y",
+        "%d %B %y",
         "%Y/%m/%d",
     )
     for fmt in formats:
@@ -431,21 +447,6 @@ def parse_uploaded_file(
                     "severity": "error",
                 }
             )
-    if config.report_type == "AMAZON_PO" and not {
-        "external_id",
-        "asin",
-        "merchant_sku",
-    }.intersection(mapped_fields):
-        issues.append(
-            {
-                "row_number": None,
-                "field_name": "external_id",
-                "error_type": "missing_required_column",
-                "error_message": "At least one identifier column is required: external_id, asin, or merchant_sku.",
-                "severity": "error",
-            }
-        )
-
     parsed_rows: list[dict[str, Any]] = []
     for row_idx, raw_row in enumerate(table[1:], start=2):
         row = {col: None for col in config.staging_columns}
@@ -511,18 +512,6 @@ def parse_uploaded_file(
                         "severity": "error",
                     }
                 )
-        if config.report_type == "AMAZON_PO" and all(
-            _is_blank(row.get(field)) for field in ("external_id", "asin", "merchant_sku")
-        ):
-            issues.append(
-                {
-                    "row_number": row_idx,
-                    "field_name": "external_id",
-                    "error_type": "missing_required_value",
-                    "error_message": "At least one of external_id, asin, or merchant_sku is required.",
-                    "severity": "error",
-                }
-            )
         parsed_rows.append(row)
 
     return parsed_rows, issues, max(len(table) - 1, 0)
@@ -715,7 +704,23 @@ def _master_warning_for_amazon(cur, row: dict[str, Any]) -> list[dict[str, Any]]
     warnings: list[dict[str, Any]] = []
     cur.execute(
         """
-        SELECT format_sku_code, case_pack, per_unit_value, per_unit,
+        SELECT format_sku_code, case_pack,
+               COALESCE(
+                   NULLIF(per_unit_value::numeric, 0),
+                   CASE
+                       WHEN NULLIF(TRIM(per_unit::text), '') IS NULL THEN NULL
+                       WHEN substring(per_unit::text from '([0-9]+(?:\.[0-9]+)?)') IS NULL THEN NULL
+                       WHEN UPPER(COALESCE(uom, '')) IN ('ML', 'MLS')
+                            OR UPPER(per_unit::text) LIKE '%%ML%%'
+                            THEN substring(per_unit::text from '([0-9]+(?:\.[0-9]+)?)')::numeric / 1000
+                       WHEN UPPER(COALESCE(uom, '')) IN ('LTR', 'LITRE', 'LITRES')
+                            OR UPPER(per_unit::text) LIKE '%%LTR%%'
+                            OR UPPER(per_unit::text) LIKE '%%LITRE%%'
+                            THEN substring(per_unit::text from '([0-9]+(?:\.[0-9]+)?)')::numeric
+                       ELSE NULL
+                   END
+               ) AS per_unit_value,
+               per_unit,
                uom, sku_sap_name, sku_sap_code
           FROM public.master_sheet
          WHERE (
@@ -774,9 +779,10 @@ def _master_warning_for_amazon(cur, row: dict[str, Any]) -> list[dict[str, Any]]
         )
     else:
         has_pack_reference = bool(product[5] or product[6])
+        case_pack = product[1] or row.get("case_size")
         unit_text = f"{product[3] or ''} {product[4] or ''}".upper()
         is_litre_product = any(token in unit_text for token in ("LTR", "LITRE", "ML"))
-        if product[1] in (None, 0) and has_pack_reference:
+        if case_pack in (None, 0) and has_pack_reference:
             warnings.append(
                 {
                     "row_number": row_number,
@@ -831,14 +837,14 @@ def _add_business_warnings(
         """
         WITH src AS (
             SELECT raw_row_number, external_id, asin, merchant_sku, product_name,
-                   ship_to_location
+                   ship_to_location, case_size
               FROM staging."amazon data"
              WHERE upload_id = %s
         ),
         matched AS (
             SELECT s.*,
                    pm.format_sku_code,
-                   pm.case_pack,
+                   COALESCE(pm.case_pack, NULLIF(s.case_size, 0)) AS case_pack,
                    pm.per_unit_value,
                    pm.per_unit,
                    pm.uom,
@@ -847,7 +853,23 @@ def _add_business_warnings(
                    fc.fc_id
               FROM src s
               LEFT JOIN LATERAL (
-                  SELECT format_sku_code, case_pack, per_unit_value, per_unit,
+                  SELECT format_sku_code, case_pack,
+                         COALESCE(
+                             NULLIF(per_unit_value::numeric, 0),
+                             CASE
+                                 WHEN NULLIF(TRIM(per_unit::text), '') IS NULL THEN NULL
+                                 WHEN substring(per_unit::text from '([0-9]+(?:\.[0-9]+)?)') IS NULL THEN NULL
+                                 WHEN UPPER(COALESCE(uom, '')) IN ('ML', 'MLS')
+                                      OR UPPER(per_unit::text) LIKE '%%ML%%'
+                                      THEN substring(per_unit::text from '([0-9]+(?:\.[0-9]+)?)')::numeric / 1000
+                                 WHEN UPPER(COALESCE(uom, '')) IN ('LTR', 'LITRE', 'LITRES')
+                                      OR UPPER(per_unit::text) LIKE '%%LTR%%'
+                                      OR UPPER(per_unit::text) LIKE '%%LITRE%%'
+                                      THEN substring(per_unit::text from '([0-9]+(?:\.[0-9]+)?)')::numeric
+                                 ELSE NULL
+                             END
+                         ) AS per_unit_value,
+                         per_unit,
                          uom, sku_sap_name, sku_sap_code
                     FROM public.master_sheet pm
                    WHERE (
@@ -959,18 +981,54 @@ def _transform_appointment(cur, upload_id: int) -> tuple[int, int]:
     cur.execute(
         """
         WITH src AS (
-            SELECT *,
-                   md5(LOWER(TRIM(COALESCE(appointment_id, '')))) AS appointment_line_key
+            SELECT *
               FROM staging."appointment data"
              WHERE upload_id = %s
                AND NULLIF(TRIM(appointment_id), '') IS NOT NULL
+        ),
+        expanded AS (
+            SELECT md5(concat_ws('|',
+                       LOWER(TRIM(COALESCE(s.appointment_id, ''))),
+                       LOWER(TRIM(COALESCE(split_pos, '')))
+                   )) AS appointment_line_key,
+                   s.appointment_id, s.status, s.appointment_time,
+                   s.creation_date, split_pos AS pos, s.destination_fc,
+                   s.pro, s.upload_id, s.raw_row_number
+              FROM src s
+              CROSS JOIN LATERAL (
+                  SELECT NULLIF(TRIM(po_value), '') AS split_pos
+                    FROM unnest(
+                        CASE
+                            WHEN NULLIF(TRIM(COALESCE(s.pos, '')), '') IS NULL
+                                THEN ARRAY[NULL::text]
+                            ELSE regexp_split_to_array(s.pos, '\\s*[,;]\\s*')
+                        END
+                    ) AS parts(po_value)
+                   WHERE NULLIF(TRIM(COALESCE(s.pos, '')), '') IS NULL
+                      OR NULLIF(TRIM(po_value), '') IS NOT NULL
+              ) po_parts
         ),
         deduped AS (
             SELECT DISTINCT ON (appointment_line_key)
                    appointment_line_key, appointment_id, status, appointment_time,
                    creation_date, pos, destination_fc, pro, upload_id
-              FROM src
+              FROM expanded
              ORDER BY appointment_line_key, raw_row_number DESC
+        ),
+        current_appointments AS (
+            SELECT DISTINCT LOWER(TRIM(appointment_id)) AS appointment_id_key
+              FROM deduped
+        ),
+        stale_deleted AS (
+            DELETE FROM reporting."appointment" existing
+             USING current_appointments current_ids
+             WHERE LOWER(TRIM(existing.appointment_id)) = current_ids.appointment_id_key
+               AND NOT EXISTS (
+                   SELECT 1
+                     FROM deduped d
+                    WHERE d.appointment_line_key = existing.appointment_line_key
+               )
+             RETURNING 1
         )
         INSERT INTO reporting."appointment" (
             appointment_line_key, appointment_id, status, appointment_time, creation_date, pos,
@@ -1008,10 +1066,8 @@ def _transform_amazon_po(cur, upload_id: int) -> tuple[int, int]:
         WITH src AS (
             SELECT *,
                    md5(concat_ws('|',
-                       COALESCE(po_number, ''),
-                       COALESCE(external_id, ''),
-                       COALESCE(merchant_sku, ''),
-                       COALESCE(ship_to_location, '')
+                       LOWER(TRIM(COALESCE(po_number, ''))),
+                       LOWER(TRIM(COALESCE(asin, '')))
                    )) AS source_line_key
               FROM staging."amazon data"
              WHERE upload_id = %s
@@ -1020,6 +1076,7 @@ def _transform_amazon_po(cur, upload_id: int) -> tuple[int, int]:
             SELECT DISTINCT ON (source_line_key) *
               FROM src
              WHERE NULLIF(TRIM(po_number), '') IS NOT NULL
+               AND NULLIF(TRIM(asin), '') IS NOT NULL
                AND NULLIF(TRIM(ship_to_location), '') IS NOT NULL
              ORDER BY source_line_key, raw_row_number DESC
         ),
@@ -1028,7 +1085,7 @@ def _transform_amazon_po(cur, upload_id: int) -> tuple[int, int]:
                    pm.product_name AS master_product_name,
                    pm.item, pm.sku_sap_name AS sap_sku_name,
                    pm.sku_sap_code AS sap_sku_code, pm.category,
-                   pm.sub_category, pm.case_pack,
+                   pm.sub_category, COALESCE(pm.case_pack, NULLIF(s.case_size, 0)) AS case_pack,
                    pm.per_unit_value, pm.per_unit, pm.item_head,
                    pm.tax_rate, pm.brand, pm.category_head, pm.uom,
                    margin.margin_percent AS asin_margin_percent,
@@ -1038,7 +1095,22 @@ def _transform_amazon_po(cur, upload_id: int) -> tuple[int, int]:
               LEFT JOIN LATERAL (
                   SELECT format_sku_code, product_name, item, sku_sap_name,
                          sku_sap_code, category, sub_category, case_pack,
-                         per_unit_value::numeric AS per_unit_value, per_unit,
+                         COALESCE(
+                             NULLIF(per_unit_value::numeric, 0),
+                             CASE
+                                 WHEN NULLIF(TRIM(per_unit::text), '') IS NULL THEN NULL
+                                 WHEN substring(per_unit::text from '([0-9]+(?:\.[0-9]+)?)') IS NULL THEN NULL
+                                 WHEN UPPER(COALESCE(uom, '')) IN ('ML', 'MLS')
+                                      OR UPPER(per_unit::text) LIKE '%%ML%%'
+                                      THEN substring(per_unit::text from '([0-9]+(?:\.[0-9]+)?)')::numeric / 1000
+                                 WHEN UPPER(COALESCE(uom, '')) IN ('LTR', 'LITRE', 'LITRES')
+                                      OR UPPER(per_unit::text) LIKE '%%LTR%%'
+                                      OR UPPER(per_unit::text) LIKE '%%LITRE%%'
+                                      THEN substring(per_unit::text from '([0-9]+(?:\.[0-9]+)?)')::numeric
+                                 ELSE NULL
+                             END
+                         ) AS per_unit_value,
+                         per_unit,
                          tax_rate::numeric AS tax_rate,
                          item_head, brand, category_head, uom, format
                     FROM public.master_sheet pm
@@ -1099,20 +1171,55 @@ def _transform_amazon_po(cur, upload_id: int) -> tuple[int, int]:
             SELECT c.*,
                    GREATEST((c.expiry_calc - CURRENT_DATE)::int, 0) AS days_to_expiry_calc,
                    CASE
-                       WHEN LOWER(COALESCE(c.status, '')) = 'closed'
-                            AND COALESCE(c.cancelled_quantity, 0) > 0 THEN 'CANCELLED'
-                       WHEN LOWER(COALESCE(c.status, '')) = 'closed'
-                            AND COALESCE(c.received_quantity, 0) >= COALESCE(NULLIF(c.requested_quantity, 0), c.received_quantity, 0)
-                            THEN 'COMPLETED'
-                       WHEN LOWER(COALESCE(c.status, '')) = 'closed' THEN 'CANCELLED'
-                       WHEN c.expiry_calc IS NOT NULL AND c.expiry_calc < CURRENT_DATE THEN 'EXPIRED'
-                       WHEN c.availability ILIKE 'OS%%'
-                            OR COALESCE(c.accepted_quantity, 0) = 0 THEN 'MOV'
-                       WHEN COALESCE(c.received_quantity, 0) > 0
-                            AND COALESCE(c.received_quantity, 0) >= COALESCE(NULLIF(c.accepted_quantity, 0), c.received_quantity, 0)
-                            THEN 'COMPLETED'
-                       WHEN COALESCE(c.accepted_quantity, 0) > 0 THEN 'PENDING'
-                       ELSE NULLIF(UPPER(COALESCE(c.status, '')), '')
+                       WHEN TRIM(COALESCE(c.availability, '')) = 'AC - Accepted: In stock'
+                            AND COALESCE(c.received_quantity, 0) = 0
+                            AND COALESCE(c.accepted_quantity, 0) = 0
+                            AND COALESCE(c.cancelled_quantity, 0) = 0
+                            AND c.expiry_calc IS NOT NULL
+                            AND c.expiry_calc < CURRENT_DATE THEN 'EXPIRED'
+                       WHEN TRIM(COALESCE(c.availability, '')) = 'AC - Accepted: In stock'
+                            AND TRIM(COALESCE(c.status, '')) = 'Confirmed'
+                            AND COALESCE(c.accepted_quantity, 0) > 0
+                            AND COALESCE(c.received_quantity, 0) = 0
+                            AND COALESCE(c.cancelled_quantity, 0) = 0
+                            AND c.expiry_calc IS NOT NULL
+                            AND c.expiry_calc < CURRENT_DATE THEN 'EXPIRED'
+                       WHEN TRIM(COALESCE(c.status, '')) = 'Confirmed'
+                            AND TRIM(COALESCE(c.availability, '')) = 'OS - Cancelled: Out of stock'
+                            AND COALESCE(c.accepted_quantity, 0) = 0
+                            AND COALESCE(c.received_quantity, 0) = 0
+                            AND COALESCE(c.cancelled_quantity, 0) = 0 THEN 'MOV'
+                       WHEN TRIM(COALESCE(c.status, '')) = 'Closed'
+                            AND TRIM(COALESCE(c.availability, '')) = 'OS - Cancelled: Out of stock'
+                            AND COALESCE(c.accepted_quantity, 0) = 0
+                            AND COALESCE(c.received_quantity, 0) = 0
+                            AND COALESCE(c.cancelled_quantity, 0) = 0 THEN 'CANCELLED'
+                       WHEN TRIM(COALESCE(c.availability, '')) = 'AC - Accepted: In stock'
+                            AND COALESCE(c.accepted_quantity, 0) > 0
+                            AND COALESCE(c.received_quantity, 0) > 0 THEN 'COMPLETED'
+                       WHEN TRIM(COALESCE(c.availability, '')) = 'AC - Accepted: In stock'
+                            AND TRIM(COALESCE(c.status, '')) = 'Closed'
+                            AND COALESCE(c.received_quantity, 0) > 0 THEN 'COMPLETED'
+                       WHEN TRIM(COALESCE(c.availability, '')) = 'AC - Accepted: In stock'
+                            AND COALESCE(c.cancelled_quantity, 0) > 0
+                            AND COALESCE(c.received_quantity, 0) = 0 THEN 'CANCELLED'
+                       WHEN TRIM(COALESCE(c.availability, '')) = 'AC - Accepted: In stock'
+                            AND TRIM(COALESCE(c.status, '')) = 'Unconfirmed'
+                            AND COALESCE(c.accepted_quantity, 0) = 0
+                            AND COALESCE(c.received_quantity, 0) = 0
+                            AND COALESCE(c.cancelled_quantity, 0) = 0 THEN 'PENDING'
+                       WHEN TRIM(COALESCE(c.availability, '')) = 'AC - Accepted: In stock'
+                            AND TRIM(COALESCE(c.status, '')) = 'Confirmed'
+                            AND COALESCE(c.accepted_quantity, 0) > 0
+                            AND COALESCE(c.received_quantity, 0) = 0
+                            AND COALESCE(c.cancelled_quantity, 0) = 0 THEN 'PENDING'
+                       WHEN TRIM(COALESCE(c.availability, '')) = 'AC - Accepted: In stock'
+                            AND TRIM(COALESCE(c.status, '')) = 'Confirmed'
+                            AND COALESCE(c.requested_quantity, 0) > 0
+                            AND COALESCE(c.accepted_quantity, 0) = 0
+                            AND COALESCE(c.received_quantity, 0) = 0
+                            AND COALESCE(c.cancelled_quantity, 0) = 0 THEN 'PENDING'
+                       ELSE ''
                    END AS po_status_calc
               FROM calculated c
         )
@@ -1659,9 +1766,7 @@ def _upload_column_check(upload: dict[str, Any], config: ReportConfig) -> dict[s
     base = {
         "available": False,
         "required_columns": list(config.required_columns),
-        "identifier_columns": ["external_id", "asin", "merchant_sku"]
-        if config.report_type == "AMAZON_PO"
-        else [],
+        "identifier_columns": ["asin"] if config.report_type == "AMAZON_PO" else [],
         "found_fields": [],
         "missing_required_columns": list(config.required_columns),
         "missing_identifier_columns": [],
@@ -1729,13 +1834,11 @@ def _amazon_upload_diagnostics(cur, upload_id: int, summary: dict[str, Any] | No
         """
         SELECT COUNT(*) AS raw_rows,
                COUNT(DISTINCT md5(concat_ws('|',
-                   COALESCE(po_number, ''),
-                   COALESCE(external_id, ''),
-                   COALESCE(merchant_sku, ''),
-                   COALESCE(ship_to_location, '')
+                   LOWER(TRIM(COALESCE(po_number, ''))),
+                   LOWER(TRIM(COALESCE(asin, '')))
                ))) FILTER (
                    WHERE NULLIF(TRIM(po_number), '') IS NOT NULL
-                     AND NULLIF(TRIM(ship_to_location), '') IS NOT NULL
+                     AND NULLIF(TRIM(asin), '') IS NOT NULL
                ) AS unique_final_keys
           FROM staging."amazon data"
          WHERE upload_id = %s
@@ -2112,7 +2215,6 @@ def amazon_po_report(request):
     _add_ilike(where, params, "asin", q.get("asin"))
     _add_ilike(where, params, "fulfillment_center", q.get("fulfillment_center"))
     _add_ilike(where, params, "vendor", q.get("vendor"))
-    _add_ilike(where, params, "status", q.get("status"))
     _add_ilike(where, params, "category", q.get("category"))
     _add_ilike(where, params, "item_head", q.get("item_head"))
     _add_ilike(where, params, "state", q.get("state"))
@@ -2207,10 +2309,27 @@ def amazon_po_filter_options(request):
         )
         fulfillment_centers = [row[0] for row in cur.fetchall()]
 
+        cur.execute(
+            """
+            WITH options(value) AS (
+                SELECT po_status::text
+                  FROM reporting."Amazon PO"
+                 WHERE po_status IS NOT NULL AND TRIM(po_status::text) != ''
+            )
+            SELECT DISTINCT value
+              FROM options
+             WHERE value IS NOT NULL AND TRIM(value) != ''
+             ORDER BY value ASC
+             LIMIT 500
+            """
+        )
+        po_statuses = [row[0] for row in cur.fetchall()]
+
     return Response(
         {
             "asins": asins,
             "fulfillment_centers": fulfillment_centers,
+            "po_statuses": po_statuses,
             "item_heads": ["PREMIUM", "COMMODITY", "OTHER"],
         }
     )
