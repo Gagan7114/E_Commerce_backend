@@ -574,7 +574,7 @@ class AmazonUploadTests(TransactionTestCase):
         self.assertEqual(response.data["rows_inserted_staging"], 0)
         self.assertIn("no_data_rows", {item["error_type"] for item in response.data["errors"]})
 
-    def test_duplicate_check_ignores_failed_uploads_and_scopes_report(self):
+    def test_duplicate_check_ignores_failed_uploads_and_allows_reupload(self):
         bad_appointment = (
             "Appointment ID\tStatus\tAppointment Time\tDestination FC\n"
             "APT-BAD\tScheduled\tnot-a-date\tFC1"
@@ -621,8 +621,9 @@ class AmazonUploadTests(TransactionTestCase):
             {"report_type": "APPOINTMENT", "pasted_data": good_appointment},
             format="multipart",
         )
-        self.assertEqual(response.status_code, 409, response.data)
-        self.assertEqual(response.data["status"], "duplicate")
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual(response.data["status"], "completed")
+        self.assertEqual(response.data["rows_updated_final"], 1)
 
     def test_amazon_po_upload_enriches_and_upserts(self):
         with connection.cursor() as cur:

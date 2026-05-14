@@ -1471,8 +1471,6 @@ def process_upload(request) -> tuple[dict[str, Any], int]:
         or getattr(request.user, "username", "")
         or "unknown"
     ).strip()
-    reprocess = str(request.data.get("reprocess") or "").strip().lower() in {"1", "true", "yes"}
-
     file_hash = hashlib.sha256(content).hexdigest()
     stored_file_path = _store_file(content, original_name)
     base_metadata = {
@@ -1503,62 +1501,12 @@ def process_upload(request) -> tuple[dict[str, Any], int]:
                 ],
             )
             duplicate = cur.fetchone()
-            if duplicate and not reprocess:
-                upload_id = _insert_upload_file(
-                    cur,
-                    config=config,
-                    original_file_name=original_name,
-                    stored_file_path=stored_file_path,
-                    file_hash=file_hash,
-                    file_extension=extension,
-                    uploaded_by=uploaded_by,
-                    status_value="duplicate",
-                    metadata={**base_metadata, "duplicate_of": duplicate[0]},
-                )
-                issues = [
-                    {
-                        "row_number": None,
-                        "field_name": "file_hash",
-                        "error_type": "duplicate_file",
-                        "error_message": f"This exact file was already uploaded as upload_id {duplicate[0]}.",
-                        "severity": "warning",
-                    }
-                ]
-                _insert_validation_issues(cur, upload_id=upload_id, config=config, issues=issues)
-                _upsert_summary(
-                    cur,
-                    upload_id=upload_id,
-                    config=config,
-                    total_rows=0,
-                    valid_rows=0,
-                    error_rows=0,
-                    warning_rows=0,
-                    inserted=0,
-                    updated=0,
-                    status_value="duplicate",
-                )
-                _update_upload_file(
-                    cur,
-                    upload_id=upload_id,
-                    status_value="duplicate",
-                    row_count=0,
-                    error_count=0,
-                    warning_count=1,
-                    metadata={"duplicate_of": duplicate[0]},
-                )
-                return (
-                    _response_payload(
-                        upload_id=upload_id,
-                        config=config,
-                        status_value="duplicate",
-                        rows_received=0,
-                        rows_inserted_staging=0,
-                        inserted=0,
-                        updated=0,
-                        issues=issues,
-                    ),
-                    status.HTTP_409_CONFLICT,
-                )
+            if duplicate:
+                base_metadata = {
+                    **base_metadata,
+                    "duplicate_of": duplicate[0],
+                    "duplicate_processed": True,
+                }
 
             upload_id = _insert_upload_file(
                 cur,

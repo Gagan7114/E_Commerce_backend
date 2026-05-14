@@ -85,7 +85,7 @@ Common behavior:
 - Raw row numbers are preserved.
 - Numeric parse failures create row errors.
 - Date parse failures create row errors.
-- Duplicate file hashes return `duplicate` unless `reprocess=true`.
+- Duplicate file hashes are allowed to process again. Existing final rows update through the normal upsert keys.
 
 Amazon PO required fields:
 
