@@ -2109,6 +2109,7 @@ def amazon_po_report(request):
     where: list[str] = []
     params: list[Any] = []
     _add_ilike(where, params, "po_number", q.get("po_number"))
+    _add_ilike(where, params, "asin", q.get("asin"))
     _add_ilike(where, params, "fulfillment_center", q.get("fulfillment_center"))
     _add_ilike(where, params, "vendor", q.get("vendor"))
     _add_ilike(where, params, "status", q.get("status"))
@@ -2148,6 +2149,70 @@ def amazon_po_report(request):
             page_size=page_size,
             offset=offset,
         )
+    )
+
+
+@api_view(["GET"])
+@permission_classes([require("platform.po.view")])
+def amazon_po_filter_options(request):
+    _ensure_amazon_access(request.user)
+    with connection.cursor() as cur:
+        cur.execute(
+            """
+            WITH options(value) AS (
+                SELECT asin::text
+                  FROM reporting."Amazon PO"
+                 WHERE asin IS NOT NULL AND TRIM(asin::text) != ''
+                UNION
+                SELECT asin::text
+                  FROM staging."amazon data"
+                 WHERE asin IS NOT NULL AND TRIM(asin::text) != ''
+                UNION
+                SELECT format_sku_code::text
+                  FROM public.master_sheet
+                 WHERE UPPER(COALESCE(format, '')) = 'AMAZON'
+                   AND format_sku_code IS NOT NULL
+                   AND TRIM(format_sku_code::text) != ''
+            )
+            SELECT DISTINCT value
+              FROM options
+             WHERE value IS NOT NULL AND TRIM(value) != ''
+             ORDER BY value ASC
+             LIMIT 5000
+            """
+        )
+        asins = [row[0] for row in cur.fetchall()]
+
+        cur.execute(
+            """
+            WITH options(value) AS (
+                SELECT fulfillment_center::text
+                  FROM reporting."Amazon PO"
+                 WHERE fulfillment_center IS NOT NULL AND TRIM(fulfillment_center::text) != ''
+                UNION
+                SELECT ship_to_location::text
+                  FROM staging."amazon data"
+                 WHERE ship_to_location IS NOT NULL AND TRIM(ship_to_location::text) != ''
+                UNION
+                SELECT fc::text
+                  FROM public.fc_city_state_channel_master
+                 WHERE fc IS NOT NULL AND TRIM(fc::text) != ''
+            )
+            SELECT DISTINCT value
+              FROM options
+             WHERE value IS NOT NULL AND TRIM(value) != ''
+             ORDER BY value ASC
+             LIMIT 1000
+            """
+        )
+        fulfillment_centers = [row[0] for row in cur.fetchall()]
+
+    return Response(
+        {
+            "asins": asins,
+            "fulfillment_centers": fulfillment_centers,
+            "item_heads": ["PREMIUM", "COMMODITY", "OTHER"],
+        }
     )
 
 

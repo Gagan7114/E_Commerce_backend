@@ -14,6 +14,11 @@ urlpatterns = [
     path("api/uploads", amazon_uploads.uploads_collection, name="amazon-uploads"),
     path("api/uploads/<int:upload_id>", amazon_uploads.upload_detail, name="amazon-upload-detail"),
     path("api/reports/amazon-po", amazon_uploads.amazon_po_report, name="amazon-po-report"),
+    path(
+        "api/reports/amazon-po/filter-options",
+        amazon_uploads.amazon_po_filter_options,
+        name="amazon-po-filter-options",
+    ),
     path("api/reports/amazon-po/summary", amazon_uploads.amazon_po_summary, name="amazon-po-summary"),
     path("api/reports/appointment", amazon_uploads.appointment_report, name="appointment-report"),
     path("api/reports/appointment/summary", amazon_uploads.appointment_summary, name="appointment-summary"),
