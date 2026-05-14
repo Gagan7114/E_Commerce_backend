@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import date, datetime
 from decimal import Decimal
+from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
 from django.core.files.uploadedfile import SimpleUploadedFile
@@ -828,6 +829,53 @@ class AmazonUploadTests(TransactionTestCase):
         warning_types = {item["error_type"] for item in response.data["warnings"]}
         self.assertIn("master_sheet_missing", warning_types)
         self.assertIn("fc_master_missing", warning_types)
+
+    def test_business_warning_database_error_returns_structured_response(self):
+        def broken_warning_check(cur, *, config, upload_id):
+            cur.execute("SELECT * FROM missing_upload_warning_table")
+
+        with patch("uploads.amazon_uploads._add_business_warnings", broken_warning_check):
+            response = self.client.post(
+                "/api/uploads",
+                {
+                    "report_type": "AMAZON_PO",
+                    "pasted_data": (
+                        "PO\tOrder date\tStatus\tASIN\tRequested quantity\t"
+                        "Ship-to location\tWindow end\tCase size\n"
+                        "PO-WARN\t2026-05-01\tUnconfirmed\tASIN-WARN\t6\tFC1\t2026-05-25\t1"
+                    ),
+                },
+                format="multipart",
+            )
+
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual(response.data["status"], "partially_successful")
+        self.assertIn(
+            "business_warning_check_failed",
+            {item["error_type"] for item in response.data["warnings"]},
+        )
+
+    def test_transform_database_error_returns_structured_response(self):
+        def broken_transform(cur, *, config, upload_id):
+            cur.execute("SELECT * FROM missing_upload_transform_table")
+
+        with patch("uploads.amazon_uploads._run_transform", broken_transform):
+            response = self.client.post(
+                "/api/uploads",
+                {
+                    "report_type": "AMAZON_PO",
+                    "pasted_data": (
+                        "PO\tOrder date\tStatus\tASIN\tRequested quantity\t"
+                        "Ship-to location\tWindow end\tCase size\n"
+                        "PO-TRANSFORM\t2026-05-01\tUnconfirmed\tASIN-TRANSFORM\t6\tFC1\t2026-05-25\t1"
+                    ),
+                },
+                format="multipart",
+            )
+
+        self.assertEqual(response.status_code, 400, response.data)
+        self.assertEqual(response.data["status"], "failed")
+        self.assertIn("transform_failed", {item["error_type"] for item in response.data["errors"]})
 
     def test_non_litre_master_gaps_do_not_create_formula_warnings(self):
         with connection.cursor() as cur:

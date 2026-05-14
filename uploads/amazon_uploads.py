@@ -4,6 +4,7 @@ import csv
 import hashlib
 import io
 import json
+import logging
 import re
 import uuid
 from dataclasses import dataclass
@@ -31,6 +32,7 @@ except ImportError:  # pragma: no cover - exercised only when dependency missing
 MAX_UPLOAD_SIZE = 20 * 1024 * 1024
 ALLOWED_EXTENSIONS = {".csv", ".xlsx"}
 UPLOAD_DIR = Path(settings.BASE_DIR) / "uploaded_files" / "amazon"
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -977,6 +979,12 @@ def _has_errors(issues: list[dict[str, Any]]) -> bool:
     return any(issue.get("severity") == "error" for issue in issues)
 
 
+def _upload_exception_message(default: str, exc: Exception) -> str:
+    if settings.DEBUG:
+        return f"{default} Details: {exc}"
+    return default
+
+
 def _transform_appointment(cur, upload_id: int) -> tuple[int, int]:
     cur.execute(
         """
@@ -1592,13 +1600,29 @@ def process_upload(request) -> tuple[dict[str, Any], int]:
                         "severity": "error",
                     }
                 )
-            issues.extend(
-                _add_business_warnings(
-                    cur,
-                    config=config,
-                    upload_id=upload_id,
+            try:
+                with transaction.atomic():
+                    issues.extend(
+                        _add_business_warnings(
+                            cur,
+                            config=config,
+                            upload_id=upload_id,
+                        )
+                    )
+            except Exception as exc:
+                logger.exception("Could not add upload business warnings for upload_id=%s", upload_id)
+                issues.append(
+                    {
+                        "row_number": None,
+                        "field_name": None,
+                        "error_type": "business_warning_check_failed",
+                        "error_message": _upload_exception_message(
+                            "Could not complete master-data warning checks.",
+                            exc,
+                        ),
+                        "severity": "warning",
+                    }
                 )
-            )
 
             _insert_validation_issues(cur, upload_id=upload_id, config=config, issues=issues)
             error_count = sum(1 for issue in issues if issue.get("severity") == "error")
@@ -1618,19 +1642,24 @@ def process_upload(request) -> tuple[dict[str, Any], int]:
                     warning_count=warning_count,
                 )
                 try:
-                    inserted, updated = _run_transform(
-                        cur,
-                        config=config,
-                        upload_id=upload_id,
-                    )
+                    with transaction.atomic():
+                        inserted, updated = _run_transform(
+                            cur,
+                            config=config,
+                            upload_id=upload_id,
+                        )
                     status_value = "partially_successful" if warning_count else "completed"
-                except Exception:
+                except Exception as exc:
+                    logger.exception("Could not transform upload_id=%s", upload_id)
                     issues.append(
                         {
                             "row_number": None,
                             "field_name": None,
                             "error_type": "transform_failed",
-                            "error_message": "Could not transform staged rows into the reporting table.",
+                            "error_message": _upload_exception_message(
+                                "Could not transform staged rows into the reporting table.",
+                                exc,
+                            ),
                             "severity": "error",
                         }
                     )
