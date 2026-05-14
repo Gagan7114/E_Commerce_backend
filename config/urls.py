@@ -21,6 +21,7 @@ urlpatterns = [
     ),
     path("api/reports/amazon-po/summary", amazon_uploads.amazon_po_summary, name="amazon-po-summary"),
     path("api/reports/appointment", amazon_uploads.appointment_report, name="appointment-report"),
+    path("api/reports/appointment/filter-options", amazon_uploads.appointment_filter_options, name="appointment-filter-options"),
     path("api/reports/appointment/summary", amazon_uploads.appointment_summary, name="appointment-summary"),
     path("api/master/products", amazon_uploads.product_master_lookup, name="product-master-lookup"),
     path("api/master/fcs", amazon_uploads.fc_master_lookup, name="fc-master-lookup"),

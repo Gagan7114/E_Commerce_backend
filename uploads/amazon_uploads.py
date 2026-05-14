@@ -2153,6 +2153,7 @@ def _paginated_select(
     page: int,
     page_size: int,
     offset: int,
+    total_columns: tuple[str, ...] | None = None,
 ) -> dict[str, Any]:
     where_sql = f" WHERE {' AND '.join(where)}" if where else ""
     column_sql = ", ".join(f'"{col}"' for col in columns)
@@ -2164,7 +2165,19 @@ def _paginated_select(
             params + [page_size, offset],
         )
         results = _rows_to_dicts(cur)
-    return {"results": results, "count": total, "page": page, "page_size": page_size}
+        column_totals = None
+        if total_columns:
+            sum_sql = ", ".join(
+                f'COALESCE(SUM("{col}"::numeric), 0) AS "{col}"'
+                for col in total_columns
+            )
+            cur.execute(f"SELECT {sum_sql} FROM {table_sql}{where_sql}", params)
+            row = cur.fetchone()
+            column_totals = {col: float(row[i]) for i, col in enumerate(total_columns)}
+    payload: dict[str, Any] = {"results": results, "count": total, "page": page, "page_size": page_size}
+    if column_totals is not None:
+        payload["totals"] = column_totals
+    return payload
 
 
 def _ensure_amazon_access(user) -> None:
@@ -2415,6 +2428,14 @@ def amazon_po_report(request):
             page=page,
             page_size=page_size,
             offset=offset,
+            total_columns=(
+                "requested_qty",
+                "total_order_liters",
+                "total_order_amt_exclusive",
+                "received_qty",
+                "total_delivered_liters",
+                "total_received_cost",
+            ),
         )
     )
 
@@ -2512,6 +2533,7 @@ def appointment_report(request):
     _add_ilike(where, params, "status", q.get("status"))
     _add_ilike(where, params, "destination_fc", q.get("destination_fc"))
     _add_ilike(where, params, "pro", q.get("pro"))
+    _add_ilike(where, params, "pos", q.get("pos"))
     status_exact = str(q.get("status_exact") or "").strip()
     if status_exact:
         where.append("LOWER(status) = %s")
@@ -2541,6 +2563,39 @@ def appointment_report(request):
             offset=offset,
         )
     )
+
+
+@api_view(["GET"])
+@permission_classes([require("platform.po.view")])
+def appointment_filter_options(request):
+    _ensure_amazon_access(request.user)
+    with connection.cursor() as cur:
+        cur.execute(
+            """
+            SELECT DISTINCT TRIM(pos) AS pos
+            FROM reporting."appointment"
+            WHERE pos IS NOT NULL AND TRIM(pos) != ''
+            ORDER BY pos ASC
+            LIMIT 2000
+            """
+        )
+        pos_numbers = [row[0] for row in cur.fetchall()]
+
+        cur.execute(
+            """
+            SELECT DISTINCT TRIM(destination_fc) AS destination_fc
+            FROM reporting."appointment"
+            WHERE destination_fc IS NOT NULL AND TRIM(destination_fc) != ''
+            ORDER BY destination_fc ASC
+            LIMIT 500
+            """
+        )
+        destination_fcs = [row[0] for row in cur.fetchall()]
+
+    return Response({
+        "pos_numbers": pos_numbers,
+        "destination_fcs": destination_fcs,
+    })
 
 
 @api_view(["GET"])
