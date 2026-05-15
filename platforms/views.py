@@ -601,8 +601,7 @@ def primary_dashboard(request, slug: str):
                 0
             )), 0) AS pending_value
         FROM normalized
-        WHERE {period_filter}
-          AND UPPER(TRIM(COALESCE(open_close::text, ''))) = 'OPEN'
+        WHERE UPPER(TRIM(COALESCE(open_close::text, ''))) = 'OPEN'
         GROUP BY 1
         HAVING COALESCE(SUM(GREATEST(
             COALESCE(total_order_amt_exclusive, 0)
@@ -611,7 +610,7 @@ def primary_dashboard(request, slug: str):
         )), 0) > 0
         ORDER BY pending_value DESC, vendor
         """,
-        period_params,
+        [],
     )
 
     detail_total = _primary_total(details)
