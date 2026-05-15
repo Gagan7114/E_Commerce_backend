@@ -105,6 +105,9 @@ STATIC_URL = "static/"
 STATIC_ROOT = BASE_DIR / "staticfiles"
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
+# Allow pasted CSV data up to 25 MB (default is 2.5 MB, too small for large Amazon PO pastes)
+DATA_UPLOAD_MAX_MEMORY_SIZE = 25 * 1024 * 1024
+
 REST_FRAMEWORK = {
     "DEFAULT_AUTHENTICATION_CLASSES": (
         "rest_framework_simplejwt.authentication.JWTAuthentication",
