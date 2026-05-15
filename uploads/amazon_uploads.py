@@ -733,6 +733,9 @@ def _upsert_summary(
     )
 
 
+_STAGING_BATCH_SIZE = 500
+
+
 def _insert_staging_rows(
     cur,
     *,
@@ -744,16 +747,23 @@ def _insert_staging_rows(
         return 0
     columns = ("upload_id", "raw_row_number", *config.staging_columns)
     quoted_columns = ", ".join(f'"{col}"' for col in columns)
-    placeholders = ", ".join(["%s"] * len(columns))
-    values = [
+    col_count = len(columns)
+    all_values = [
         [upload_id, row.get("raw_row_number"), *[row.get(col) for col in config.staging_columns]]
         for row in rows
     ]
-    cur.executemany(
-        f"INSERT INTO {config.staging_table_sql} ({quoted_columns}) VALUES ({placeholders})",
-        values,
-    )
-    return len(values)
+    inserted = 0
+    for i in range(0, len(all_values), _STAGING_BATCH_SIZE):
+        batch = all_values[i : i + _STAGING_BATCH_SIZE]
+        row_placeholder = f"({', '.join(['%s'] * col_count)})"
+        values_clause = ", ".join([row_placeholder] * len(batch))
+        flat = [v for row in batch for v in row]
+        cur.execute(
+            f"INSERT INTO {config.staging_table_sql} ({quoted_columns}) VALUES {values_clause}",
+            flat,
+        )
+        inserted += len(batch)
+    return inserted
 
 
 def _master_warning_for_amazon(cur, row: dict[str, Any]) -> list[dict[str, Any]]:
@@ -1703,13 +1713,32 @@ def process_upload(request) -> tuple[dict[str, Any], int]:
                     }
                 )
 
-            rows_inserted_staging = _insert_staging_rows(
-                cur,
-                upload_id=upload_id,
-                config=config,
-                rows=rows,
-            )
-            if rows_inserted_staging != len(rows):
+            try:
+                with transaction.atomic():
+                    rows_inserted_staging = _insert_staging_rows(
+                        cur,
+                        upload_id=upload_id,
+                        config=config,
+                        rows=rows,
+                    )
+            except Exception as exc:
+                logger.exception("Could not insert staging rows for upload_id=%s", upload_id)
+                rows_inserted_staging = 0
+                issues.append(
+                    {
+                        "row_number": None,
+                        "field_name": None,
+                        "error_type": "staging_insert_failed",
+                        "error_message": _upload_exception_message(
+                            "Could not insert rows into the staging table.",
+                            exc,
+                        ),
+                        "severity": "error",
+                    }
+                )
+            if rows_inserted_staging != len(rows) and not any(
+                i.get("error_type") == "staging_insert_failed" for i in issues
+            ):
                 issues.append(
                     {
                         "row_number": None,
