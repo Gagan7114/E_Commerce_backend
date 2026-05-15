@@ -584,6 +584,35 @@ def primary_dashboard(request, slug: str):
         {"item": row.get("item") or "OTHER", **_primary_metrics(row)}
         for row in top_item_raw
     ]
+    open_vendor_pending = _dict_rows(
+        f"""
+        {_PRIM_MASTER_PO_CTE}
+        SELECT
+            COALESCE(
+                NULLIF(UPPER(TRIM(vendor_new::text)), ''),
+                NULLIF(UPPER(TRIM(vendor_name::text)), ''),
+                'UNMAPPED'
+            ) AS vendor,
+            COALESCE(SUM(COALESCE(total_order_amt_exclusive, 0)), 0) AS order_value,
+            COALESCE(SUM(COALESCE(total_delivered_amt_exclusive, 0)), 0) AS delivered_value,
+            COALESCE(SUM(GREATEST(
+                COALESCE(total_order_amt_exclusive, 0)
+                - COALESCE(total_delivered_amt_exclusive, 0),
+                0
+            )), 0) AS pending_value
+        FROM normalized
+        WHERE {period_filter}
+          AND UPPER(TRIM(COALESCE(open_close::text, ''))) = 'OPEN'
+        GROUP BY 1
+        HAVING COALESCE(SUM(GREATEST(
+            COALESCE(total_order_amt_exclusive, 0)
+            - COALESCE(total_delivered_amt_exclusive, 0),
+            0
+        )), 0) > 0
+        ORDER BY pending_value DESC, vendor
+        """,
+        period_params,
+    )
 
     detail_total = _primary_total(details)
     summary_total = _primary_total(summary)
@@ -718,6 +747,7 @@ def primary_dashboard(request, slug: str):
         "details": details,
         "detail_total": detail_total,
         "top_items": top_items,
+        "open_vendor_pending": open_vendor_pending,
         "trends": {
             "day": daily_trend,
             "month": monthly_trend,
