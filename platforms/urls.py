@@ -17,6 +17,7 @@ urlpatterns = [
     path("<slug:slug>/soh-doh-dashboard", views.blinkit_soh_doh_dashboard, name="platform-blinkit-soh-doh-dashboard"),
     path("blinkit/drr-dashboard", views.blinkit_drr_dashboard, name="platform-blinkit-drr-dashboard"),
     path("zepto/drr-dashboard", views.zepto_drr_dashboard, name="platform-zepto-drr-dashboard"),
+    path("swiggy/drr-dashboard", views.swiggy_drr_dashboard, name="platform-swiggy-drr-dashboard"),
     path(
         "zepto/primary-dashboard",
         views.primary_dashboard,

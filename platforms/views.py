@@ -794,6 +794,12 @@ _INVENTORY_DASHBOARD_PLATFORMS = {
         "sales_format": "zepto",
         "latest_source": "secmaster_zepto",
     },
+    "swiggy": {
+        "label": "Swiggy",
+        "format": "SWIGGY",
+        "sales_format": "swiggy",
+        "latest_source": "secmaster_swiggy",
+    },
 }
 
 
@@ -801,7 +807,7 @@ def _inventory_dashboard_platform(slug: str, dashboard_name: str) -> dict:
     config = _INVENTORY_DASHBOARD_PLATFORMS.get(slug)
     if not config:
         raise ValidationError(
-            f"{dashboard_name} is available only for Blinkit and Zepto."
+            f"{dashboard_name} is available only for Blinkit, Zepto and Swiggy."
         )
     return config
 
@@ -5051,6 +5057,13 @@ def zepto_drr_dashboard(request):
 
 
 @api_view(["GET"])
+@permission_classes([require("platform.inventory.view")])
+def swiggy_drr_dashboard(request):
+    _ensure_scope(request.user, "swiggy")
+    return _swiggy_drr_dashboard_response(request)
+
+
+@api_view(["GET"])
 @permission_classes([require("platform.secondary.view")])
 def flipkart_grocery_drr_dashboard(request, slug: str):
     _ensure_scope(request.user, slug)
@@ -5458,7 +5471,15 @@ def _blinkit_drr_dashboard_response(request):
 
 
 def _zepto_drr_dashboard_response(request):
-    platform = _INVENTORY_DASHBOARD_PLATFORMS["zepto"]
+    return _inventory_drr_dashboard_response(request, "zepto")
+
+
+def _swiggy_drr_dashboard_response(request):
+    return _inventory_drr_dashboard_response(request, "swiggy")
+
+
+def _inventory_drr_dashboard_response(request, slug: str):
+    platform = _inventory_dashboard_platform(slug, "DRR Dashboard")
     month, year, defaulted_to_latest = _parse_sec_month_year(
         request.query_params,
         latest_source=platform["latest_source"],
@@ -5466,9 +5487,10 @@ def _zepto_drr_dashboard_response(request):
     month_name = _month_name(month)
     days_in_month = monthrange(year, month)[1]
     month_start = date(year, month, 1)
-    sale_date_expr = _secmaster_inventory_date_expr("zepto")
+    sale_date_expr = _secmaster_inventory_date_expr(slug)
     sales_format = platform["sales_format"]
     inventory_format = platform["format"]
+    dashboard_title = f"{platform['label']} DRR Dashboard"
 
     sales_of = str(request.query_params.get("sales_of") or "ALL").strip().upper() or "ALL"
     if sales_of not in _BLINKIT_DRR_SALES_OF:
@@ -5495,8 +5517,8 @@ def _zepto_drr_dashboard_response(request):
             "inventory": "all_platform_inventory",
         },
         "format": inventory_format,
-        "platform": "zepto",
-        "dashboard_title": "Zepto DRR Dashboard",
+        "platform": slug,
+        "dashboard_title": dashboard_title,
         "defaulted_to_latest": defaulted_to_latest,
         "month": month,
         "month_name": month_name,
@@ -5664,8 +5686,8 @@ def _zepto_drr_dashboard_response(request):
             "inventory": "all_platform_inventory",
         },
         "format": inventory_format,
-        "platform": "zepto",
-        "dashboard_title": "Zepto DRR Dashboard",
+        "platform": slug,
+        "dashboard_title": dashboard_title,
         "defaulted_to_latest": defaulted_to_latest,
         "month": month,
         "month_name": month_name,
