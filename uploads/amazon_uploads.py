@@ -1421,6 +1421,7 @@ def _transform_amazon_po(cur, upload_id: int) -> tuple[int, int]:
                             AND COALESCE(c.accepted_quantity, 0) = 0
                             AND COALESCE(c.received_quantity, 0) = 0
                             AND COALESCE(c.cancelled_quantity, 0) = 0 THEN 'PENDING'
+                       WHEN COALESCE(c.received_quantity, 0) > 0 THEN 'COMPLETED'
                        ELSE ''
                    END AS po_status_calc
               FROM calculated c
