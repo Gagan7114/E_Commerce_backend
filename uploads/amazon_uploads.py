@@ -1169,71 +1169,173 @@ def _transform_amazon_po(cur, upload_id: int) -> tuple[int, int]:
                AND NULLIF(TRIM(ship_to_location), '') IS NOT NULL
              ORDER BY source_line_key, raw_row_number DESC
         ),
-        enriched AS (
-            SELECT s.*,
+        product_matches AS (
+            SELECT s.source_line_key,
                    pm.product_name AS master_product_name,
                    pm.item, pm.sku_sap_name AS sap_sku_name,
                    pm.sku_sap_code AS sap_sku_code, pm.category,
                    pm.sub_category, COALESCE(pm.case_pack, NULLIF(s.case_size, 0)) AS case_pack,
+                   COALESCE(
+                       NULLIF(pm.per_unit_value::numeric, 0),
+                       CASE
+                           WHEN NULLIF(TRIM(pm.per_unit::text), '') IS NULL THEN NULL
+                           WHEN substring(pm.per_unit::text from '([0-9]+(?:\.[0-9]+)?)') IS NULL THEN NULL
+                           WHEN UPPER(COALESCE(pm.uom, '')) IN ('ML', 'MLS')
+                                OR UPPER(pm.per_unit::text) LIKE '%%ML%%'
+                                THEN substring(pm.per_unit::text from '([0-9]+(?:\.[0-9]+)?)')::numeric / 1000
+                           WHEN UPPER(COALESCE(pm.uom, '')) IN ('LTR', 'LITRE', 'LITRES')
+                                OR UPPER(pm.per_unit::text) LIKE '%%LTR%%'
+                                OR UPPER(pm.per_unit::text) LIKE '%%LITRE%%'
+                                THEN substring(pm.per_unit::text from '([0-9]+(?:\.[0-9]+)?)')::numeric
+                           ELSE NULL
+                       END
+                   ) AS per_unit_value,
+                   pm.per_unit,
+                   pm.tax_rate::numeric AS tax_rate,
+                   pm.item_head, pm.brand, pm.category_head, pm.uom, pm.format,
+                   1 AS match_rank
+              FROM deduped s
+              JOIN public.master_sheet pm
+                ON NULLIF(s.asin, '') IS NOT NULL
+               AND UPPER(TRIM(pm.format_sku_code::text)) = UPPER(TRIM(s.asin::text))
+
+            UNION ALL
+
+            SELECT s.source_line_key,
+                   pm.product_name AS master_product_name,
+                   pm.item, pm.sku_sap_name AS sap_sku_name,
+                   pm.sku_sap_code AS sap_sku_code, pm.category,
+                   pm.sub_category, COALESCE(pm.case_pack, NULLIF(s.case_size, 0)) AS case_pack,
+                   COALESCE(
+                       NULLIF(pm.per_unit_value::numeric, 0),
+                       CASE
+                           WHEN NULLIF(TRIM(pm.per_unit::text), '') IS NULL THEN NULL
+                           WHEN substring(pm.per_unit::text from '([0-9]+(?:\.[0-9]+)?)') IS NULL THEN NULL
+                           WHEN UPPER(COALESCE(pm.uom, '')) IN ('ML', 'MLS')
+                                OR UPPER(pm.per_unit::text) LIKE '%%ML%%'
+                                THEN substring(pm.per_unit::text from '([0-9]+(?:\.[0-9]+)?)')::numeric / 1000
+                           WHEN UPPER(COALESCE(pm.uom, '')) IN ('LTR', 'LITRE', 'LITRES')
+                                OR UPPER(pm.per_unit::text) LIKE '%%LTR%%'
+                                OR UPPER(pm.per_unit::text) LIKE '%%LITRE%%'
+                                THEN substring(pm.per_unit::text from '([0-9]+(?:\.[0-9]+)?)')::numeric
+                           ELSE NULL
+                       END
+                   ) AS per_unit_value,
+                   pm.per_unit,
+                   pm.tax_rate::numeric AS tax_rate,
+                   pm.item_head, pm.brand, pm.category_head, pm.uom, pm.format,
+                   2 AS match_rank
+              FROM deduped s
+              JOIN public.master_sheet pm
+                ON NULLIF(s.external_id, '') IS NOT NULL
+               AND UPPER(TRIM(pm.format_sku_code::text)) = UPPER(TRIM(s.external_id::text))
+
+            UNION ALL
+
+            SELECT s.source_line_key,
+                   pm.product_name AS master_product_name,
+                   pm.item, pm.sku_sap_name AS sap_sku_name,
+                   pm.sku_sap_code AS sap_sku_code, pm.category,
+                   pm.sub_category, COALESCE(pm.case_pack, NULLIF(s.case_size, 0)) AS case_pack,
+                   COALESCE(
+                       NULLIF(pm.per_unit_value::numeric, 0),
+                       CASE
+                           WHEN NULLIF(TRIM(pm.per_unit::text), '') IS NULL THEN NULL
+                           WHEN substring(pm.per_unit::text from '([0-9]+(?:\.[0-9]+)?)') IS NULL THEN NULL
+                           WHEN UPPER(COALESCE(pm.uom, '')) IN ('ML', 'MLS')
+                                OR UPPER(pm.per_unit::text) LIKE '%%ML%%'
+                                THEN substring(pm.per_unit::text from '([0-9]+(?:\.[0-9]+)?)')::numeric / 1000
+                           WHEN UPPER(COALESCE(pm.uom, '')) IN ('LTR', 'LITRE', 'LITRES')
+                                OR UPPER(pm.per_unit::text) LIKE '%%LTR%%'
+                                OR UPPER(pm.per_unit::text) LIKE '%%LITRE%%'
+                                THEN substring(pm.per_unit::text from '([0-9]+(?:\.[0-9]+)?)')::numeric
+                           ELSE NULL
+                       END
+                   ) AS per_unit_value,
+                   pm.per_unit,
+                   pm.tax_rate::numeric AS tax_rate,
+                   pm.item_head, pm.brand, pm.category_head, pm.uom, pm.format,
+                   3 AS match_rank
+              FROM deduped s
+              JOIN public.master_sheet pm
+                ON NULLIF(s.merchant_sku, '') IS NOT NULL
+               AND UPPER(TRIM(pm.item::text)) = UPPER(TRIM(s.merchant_sku::text))
+
+            UNION ALL
+
+            SELECT s.source_line_key,
+                   pm.product_name AS master_product_name,
+                   pm.item, pm.sku_sap_name AS sap_sku_name,
+                   pm.sku_sap_code AS sap_sku_code, pm.category,
+                   pm.sub_category, COALESCE(pm.case_pack, NULLIF(s.case_size, 0)) AS case_pack,
+                   COALESCE(
+                       NULLIF(pm.per_unit_value::numeric, 0),
+                       CASE
+                           WHEN NULLIF(TRIM(pm.per_unit::text), '') IS NULL THEN NULL
+                           WHEN substring(pm.per_unit::text from '([0-9]+(?:\.[0-9]+)?)') IS NULL THEN NULL
+                           WHEN UPPER(COALESCE(pm.uom, '')) IN ('ML', 'MLS')
+                                OR UPPER(pm.per_unit::text) LIKE '%%ML%%'
+                                THEN substring(pm.per_unit::text from '([0-9]+(?:\.[0-9]+)?)')::numeric / 1000
+                           WHEN UPPER(COALESCE(pm.uom, '')) IN ('LTR', 'LITRE', 'LITRES')
+                                OR UPPER(pm.per_unit::text) LIKE '%%LTR%%'
+                                OR UPPER(pm.per_unit::text) LIKE '%%LITRE%%'
+                                THEN substring(pm.per_unit::text from '([0-9]+(?:\.[0-9]+)?)')::numeric
+                           ELSE NULL
+                       END
+                   ) AS per_unit_value,
+                   pm.per_unit,
+                   pm.tax_rate::numeric AS tax_rate,
+                   pm.item_head, pm.brand, pm.category_head, pm.uom, pm.format,
+                   4 AS match_rank
+              FROM deduped s
+              JOIN public.master_sheet pm
+                ON NULLIF(s.product_name, '') IS NOT NULL
+               AND LOWER(TRIM(pm.product_name::text)) = LOWER(TRIM(s.product_name::text))
+        ),
+        ranked_products AS (
+            SELECT *,
+                   row_number() OVER (
+                       PARTITION BY source_line_key
+                       ORDER BY
+                           CASE
+                               WHEN UPPER(COALESCE(format, '')) = 'AMAZON' THEN match_rank
+                               ELSE 5
+                           END
+                   ) AS product_rank
+              FROM product_matches
+        ),
+        margin_matches AS (
+            SELECT s.source_line_key,
+                   margin.margin_percent::numeric AS asin_margin_percent,
+                   margin.id
+              FROM deduped s
+              JOIN public.amazon_asin_margin margin
+                ON NULLIF(s.asin, '') IS NOT NULL
+               AND UPPER(TRIM(margin.asin::text)) = UPPER(TRIM(s.asin::text))
+        ),
+        ranked_margins AS (
+            SELECT source_line_key, asin_margin_percent,
+                   row_number() OVER (PARTITION BY source_line_key ORDER BY id) AS margin_rank
+              FROM margin_matches
+        ),
+        enriched AS (
+            SELECT s.*,
+                   pm.master_product_name,
+                   pm.item, pm.sap_sku_name,
+                   pm.sap_sku_code, pm.category,
+                   pm.sub_category, pm.case_pack,
                    pm.per_unit_value, pm.per_unit, pm.item_head,
                    pm.tax_rate, pm.brand, pm.category_head, pm.uom,
-                   margin.margin_percent AS asin_margin_percent,
+                   margin.asin_margin_percent,
                    fc_channel.channel AS core_fresh_now_channel,
                    fc.city, fc.state
               FROM deduped s
-              LEFT JOIN LATERAL (
-                  SELECT format_sku_code, product_name, item, sku_sap_name,
-                         sku_sap_code, category, sub_category, case_pack,
-                         COALESCE(
-                             NULLIF(per_unit_value::numeric, 0),
-                             CASE
-                                 WHEN NULLIF(TRIM(per_unit::text), '') IS NULL THEN NULL
-                                 WHEN substring(per_unit::text from '([0-9]+(?:\.[0-9]+)?)') IS NULL THEN NULL
-                                 WHEN UPPER(COALESCE(uom, '')) IN ('ML', 'MLS')
-                                      OR UPPER(per_unit::text) LIKE '%%ML%%'
-                                      THEN substring(per_unit::text from '([0-9]+(?:\.[0-9]+)?)')::numeric / 1000
-                                 WHEN UPPER(COALESCE(uom, '')) IN ('LTR', 'LITRE', 'LITRES')
-                                      OR UPPER(per_unit::text) LIKE '%%LTR%%'
-                                      OR UPPER(per_unit::text) LIKE '%%LITRE%%'
-                                      THEN substring(per_unit::text from '([0-9]+(?:\.[0-9]+)?)')::numeric
-                                 ELSE NULL
-                             END
-                         ) AS per_unit_value,
-                         per_unit,
-                         tax_rate::numeric AS tax_rate,
-                         item_head, brand, category_head, uom, format
-                    FROM public.master_sheet pm
-                   WHERE (
-                          (NULLIF(s.asin, '') IS NOT NULL AND UPPER(TRIM(pm.format_sku_code::text)) = UPPER(TRIM(s.asin::text)))
-                       OR (NULLIF(s.external_id, '') IS NOT NULL AND UPPER(TRIM(pm.format_sku_code::text)) = UPPER(TRIM(s.external_id::text)))
-                       OR (NULLIF(s.merchant_sku, '') IS NOT NULL AND UPPER(TRIM(pm.item::text)) = UPPER(TRIM(s.merchant_sku::text)))
-                       OR (NULLIF(s.product_name, '') IS NOT NULL AND LOWER(TRIM(pm.product_name::text)) = LOWER(TRIM(s.product_name::text)))
-                     )
-                   ORDER BY CASE
-                       WHEN UPPER(COALESCE(pm.format, '')) = 'AMAZON'
-                            AND NULLIF(s.asin, '') IS NOT NULL
-                            AND UPPER(TRIM(pm.format_sku_code::text)) = UPPER(TRIM(s.asin::text)) THEN 1
-                       WHEN UPPER(COALESCE(pm.format, '')) = 'AMAZON'
-                            AND NULLIF(s.external_id, '') IS NOT NULL
-                            AND UPPER(TRIM(pm.format_sku_code::text)) = UPPER(TRIM(s.external_id::text)) THEN 2
-                       WHEN UPPER(COALESCE(pm.format, '')) = 'AMAZON'
-                            AND NULLIF(s.merchant_sku, '') IS NOT NULL
-                            AND UPPER(TRIM(pm.item::text)) = UPPER(TRIM(s.merchant_sku::text)) THEN 3
-                       WHEN UPPER(COALESCE(pm.format, '')) = 'AMAZON'
-                            AND NULLIF(s.product_name, '') IS NOT NULL
-                            AND LOWER(TRIM(pm.product_name::text)) = LOWER(TRIM(s.product_name::text)) THEN 4
-                       ELSE 5
-                   END
-                   LIMIT 1
-              ) pm ON true
-              LEFT JOIN LATERAL (
-                  SELECT margin_percent::numeric AS margin_percent
-                    FROM public.amazon_asin_margin margin
-                   WHERE NULLIF(s.asin, '') IS NOT NULL
-                     AND UPPER(TRIM(margin.asin::text)) = UPPER(TRIM(s.asin::text))
-                   ORDER BY id
-                   LIMIT 1
-              ) margin ON true
+              LEFT JOIN ranked_products pm
+                ON pm.source_line_key = s.source_line_key
+               AND pm.product_rank = 1
+              LEFT JOIN ranked_margins margin
+                ON margin.source_line_key = s.source_line_key
+               AND margin.margin_rank = 1
               LEFT JOIN public.fc_city_state_channel_master fc_channel
                 ON NULLIF(s.ship_to_location, '') IS NOT NULL
                AND UPPER(TRIM(fc_channel.fc::text)) = UPPER(TRIM(s.ship_to_location::text))
