@@ -781,6 +781,724 @@ def _parse_price_upload_date(value: str) -> date | None:
         raise ValidationError("`date` must be a valid calendar date.")
 
 
+_INVENTORY_DASHBOARD_PLATFORMS = {
+    "blinkit": {
+        "label": "Blinkit",
+        "format": "BLINKIT",
+        "sales_format": "blinkit",
+        "latest_source": "secmaster_blinkit",
+    },
+    "zepto": {
+        "label": "Zepto",
+        "format": "ZEPTO",
+        "sales_format": "zepto",
+        "latest_source": "secmaster_zepto",
+    },
+}
+
+
+def _inventory_dashboard_platform(slug: str, dashboard_name: str) -> dict:
+    config = _INVENTORY_DASHBOARD_PLATFORMS.get(slug)
+    if not config:
+        raise ValidationError(
+            f"{dashboard_name} is available only for Blinkit and Zepto."
+        )
+    return config
+
+
+def _secmaster_inventory_date_expr(slug: str) -> str:
+    if slug == "zepto":
+        return _secmaster_zepto_date_expr()
+    return '"date"::date'
+
+
+@api_view(["GET"])
+@permission_classes([require("platform.inventory.view")])
+def blinkit_soh_doh_dashboard(request, slug: str):
+    _ensure_scope(request.user, slug)
+    if slug == "amazon":
+        return _amazon_soh_doh_dashboard(request)
+
+    platform = _inventory_dashboard_platform(slug, "SOH/DOH Dashboard")
+    inventory_format = platform["format"]
+    sales_format = platform["sales_format"]
+    sale_date_expr = _secmaster_inventory_date_expr(slug)
+
+    requested_date = _parse_price_upload_date(request.query_params.get("date", ""))
+    defaulted_to_latest = False
+    if requested_date is None:
+        requested_date = _scalar(
+            """
+            SELECT MAX(inventory_date)
+            FROM all_platform_inventory
+            WHERE UPPER(TRIM(format::text)) = %s
+            """,
+            [inventory_format],
+        )
+        defaulted_to_latest = True
+
+    available_dates = _dict_rows(
+        """
+        SELECT inventory_date, COUNT(*) AS rows
+        FROM all_platform_inventory
+        WHERE UPPER(TRIM(format::text)) = %s
+        GROUP BY inventory_date
+        ORDER BY inventory_date DESC
+        LIMIT 30
+        """,
+        [inventory_format],
+    )
+
+    if requested_date is None:
+        return Response({
+            "source": {
+                "sales": "SecMaster",
+                "inventory": "all_platform_inventory",
+            },
+            "format": inventory_format,
+            "platform": slug,
+            "dashboard_title": f"{platform['label']} SOH/DOH Dashboard",
+            "requested_date": None,
+            "effective_date": None,
+            "month_start": None,
+            "defaulted_to_latest": defaulted_to_latest,
+            "available_dates": [],
+            "rows": [],
+            "total": _blinkit_soh_doh_empty_total(),
+        })
+
+    effective_date = _scalar(
+        """
+        SELECT MAX(inventory_date)
+        FROM all_platform_inventory
+        WHERE UPPER(TRIM(format::text)) = %s
+          AND inventory_date <= %s
+        """,
+        [inventory_format, requested_date],
+    )
+
+    if effective_date is None:
+        return Response({
+            "source": {
+                "sales": "SecMaster",
+                "inventory": "all_platform_inventory",
+            },
+            "format": inventory_format,
+            "platform": slug,
+            "dashboard_title": f"{platform['label']} SOH/DOH Dashboard",
+            "requested_date": requested_date.isoformat(),
+            "effective_date": None,
+            "month_start": None,
+            "defaulted_to_latest": defaulted_to_latest,
+            "available_dates": _inventory_date_options(available_dates),
+            "rows": [],
+            "total": _blinkit_soh_doh_empty_total(),
+        })
+
+    month_start = effective_date.replace(day=1)
+    elapsed_day = max(1, effective_date.day)
+    rows = _dict_rows(
+        f"""
+        WITH sales AS (
+            SELECT
+                UPPER(TRIM(COALESCE("item"::text, ''))) AS item_key,
+                MIN(NULLIF(TRIM("item"::text), '')) AS item,
+                COALESCE(SUM("quantity"), 0)::numeric AS quantity,
+                COALESCE(SUM("ltr_sold"), 0)::numeric AS ltr_sold
+            FROM "SecMaster"
+            WHERE REGEXP_REPLACE(LOWER(TRIM("format"::text)), '[^a-z0-9]+', '', 'g') = %s
+              AND ({sale_date_expr}) >= %s
+              AND ({sale_date_expr}) <= %s
+            GROUP BY UPPER(TRIM(COALESCE("item"::text, '')))
+        ),
+        inventory AS (
+            SELECT
+                UPPER(TRIM(COALESCE(item::text, ''))) AS item_key,
+                MIN(NULLIF(TRIM(item::text), '')) AS inventory_item,
+                COALESCE(SUM(soh_unit), 0)::numeric AS soh_units,
+                COALESCE(SUM(soh_ltr), 0)::numeric AS soh_ltr
+            FROM all_platform_inventory
+            WHERE UPPER(TRIM(format::text)) = %s
+              AND inventory_date = %s
+            GROUP BY UPPER(TRIM(COALESCE(item::text, '')))
+        )
+        SELECT
+            COALESCE(NULLIF(s.item, ''), NULLIF(i.inventory_item, '')) AS item,
+            COALESCE(s.quantity, 0) AS quantity,
+            COALESCE(s.ltr_sold, 0) AS ltr_sold,
+            i.inventory_item,
+            COALESCE(i.soh_units, 0) AS soh_units,
+            COALESCE(i.soh_ltr, 0) AS soh_ltr
+        FROM sales s
+        FULL OUTER JOIN inventory i
+          ON s.item_key = i.item_key
+        WHERE COALESCE(s.item_key, i.item_key) <> ''
+        ORDER BY COALESCE(NULLIF(s.item, ''), NULLIF(i.inventory_item, '')) ASC NULLS LAST
+        """,
+        [sales_format, month_start, effective_date, inventory_format, effective_date],
+    )
+
+    normalized_rows = []
+    for row in rows:
+        quantity = _num(row.get("quantity"))
+        ltr_sold = _num(row.get("ltr_sold"))
+        soh_units = _num(row.get("soh_units"))
+        soh_ltr = _num(row.get("soh_ltr"))
+        drr_units = quantity / elapsed_day
+        drr_ltr = ltr_sold / elapsed_day
+        normalized_rows.append({
+            "item": row.get("item") or row.get("inventory_item") or "",
+            "quantity": quantity,
+            "ltr_sold": ltr_sold,
+            "inventory_item": row.get("inventory_item") or "",
+            "soh_units": soh_units,
+            "soh_ltr": soh_ltr,
+            "drr_ltr": drr_ltr,
+            "drr_units": drr_units,
+            "doh": ((soh_units / drr_units) - 2) if drr_units else 0.0,
+        })
+
+    total = _blinkit_soh_doh_total(normalized_rows, elapsed_day)
+
+    return Response({
+        "source": {
+                "sales": "SecMaster",
+                "inventory": "all_platform_inventory",
+            },
+        "format": inventory_format,
+        "platform": slug,
+        "dashboard_title": f"{platform['label']} SOH/DOH Dashboard",
+        "requested_date": requested_date.isoformat(),
+        "effective_date": effective_date.isoformat(),
+        "month_start": month_start.isoformat(),
+        "defaulted_to_latest": defaulted_to_latest,
+        "elapsed_day": elapsed_day,
+        "available_dates": _inventory_date_options(available_dates),
+        "rows": normalized_rows,
+        "total": total,
+    })
+
+
+def _inventory_date_options(rows: list[dict]) -> list[dict]:
+    options = []
+    for row in rows:
+        inventory_date = row.get("inventory_date")
+        options.append({
+            "date": inventory_date.isoformat()
+            if hasattr(inventory_date, "isoformat")
+            else inventory_date,
+            "rows": int(row.get("rows") or 0),
+        })
+    return options
+
+
+def _blinkit_soh_doh_empty_total() -> dict:
+    return {
+        "quantity": 0.0,
+        "ltr_sold": 0.0,
+        "soh_units": 0.0,
+        "soh_ltr": 0.0,
+        "drr_ltr": 0.0,
+        "drr_units": 0.0,
+        "doh": None,
+    }
+
+
+def _blinkit_soh_doh_total(rows: list[dict], elapsed_day: int) -> dict:
+    total = _blinkit_soh_doh_empty_total()
+    total["quantity"] = sum(_num(row.get("quantity")) for row in rows)
+    total["ltr_sold"] = sum(_num(row.get("ltr_sold")) for row in rows)
+    total["soh_units"] = sum(_num(row.get("soh_units")) for row in rows)
+    total["soh_ltr"] = sum(_num(row.get("soh_ltr")) for row in rows)
+    if elapsed_day > 0:
+        total["drr_units"] = total["quantity"] / elapsed_day
+        total["drr_ltr"] = total["ltr_sold"] / elapsed_day
+    return total
+
+
+def _amazon_soh_month_name(raw_value) -> str | None:
+    value = str(raw_value or "").strip()
+    if not value:
+        return None
+    if value.isdigit():
+        month_num = int(value)
+        if month_num < 1 or month_num > 12:
+            raise ValidationError("`month` must be between 1 and 12.")
+        return date(2000, month_num, 1).strftime("%B").upper()
+
+    key = _norm_sec_key(value)
+    for month_num in range(1, 13):
+        full = date(2000, month_num, 1).strftime("%B").upper()
+        short = date(2000, month_num, 1).strftime("%b").upper()
+        if key in {full, short}:
+            return full
+    raise ValidationError("`month` must be a valid month name or number.")
+
+
+def _amazon_soh_year(raw_value) -> int | None:
+    value = str(raw_value or "").strip()
+    if not value:
+        return None
+    try:
+        year = int(value)
+    except ValueError as exc:
+        raise ValidationError("`year` must be a number.") from exc
+    if year < 2000 or year > 2100:
+        raise ValidationError("`year` must be between 2000 and 2100.")
+    return year
+
+
+def _amazon_soh_empty_total() -> dict:
+    return {
+        "units_sold": 0.0,
+        "ltr_sold": 0.0,
+        "soh_unit": 0.0,
+        "soh_ltr": 0.0,
+        "drr_unit": 0.0,
+        "drr_ltr": 0.0,
+        "doh": 0.0,
+    }
+
+
+def _amazon_soh_total(rows: list[dict], elapsed_day: int) -> dict:
+    total = _amazon_soh_empty_total()
+    total["units_sold"] = sum(_num(row.get("units_sold")) for row in rows)
+    total["ltr_sold"] = sum(_num(row.get("ltr_sold")) for row in rows)
+    total["soh_unit"] = sum(_num(row.get("soh_unit")) for row in rows)
+    total["soh_ltr"] = sum(_num(row.get("soh_ltr")) for row in rows)
+    if elapsed_day > 0:
+        total["drr_unit"] = total["units_sold"] / elapsed_day
+        total["drr_ltr"] = total["ltr_sold"] / elapsed_day
+    total["doh"] = (
+        (total["soh_unit"] / total["drr_unit"]) - 2
+        if total["drr_unit"]
+        else 0.0
+    )
+    return total
+
+
+def _amazon_soh_normalize_rows(rows: list[dict], elapsed_day: int) -> list[dict]:
+    normalized = []
+    for row in rows:
+        units_sold = _num(row.get("units_sold"))
+        ltr_sold = _num(row.get("ltr_sold"))
+        soh_unit = _num(row.get("soh_unit"))
+        soh_ltr = _num(row.get("soh_ltr"))
+        drr_unit = units_sold / elapsed_day if elapsed_day > 0 else 0.0
+        drr_ltr = ltr_sold / elapsed_day if elapsed_day > 0 else 0.0
+        normalized_row = dict(row)
+        normalized_row.update({
+            "units_sold": units_sold,
+            "ltr_sold": ltr_sold,
+            "soh_unit": soh_unit,
+            "soh_ltr": soh_ltr,
+            "drr_unit": drr_unit,
+            "drr_ltr": drr_ltr,
+            "doh": ((soh_unit / drr_unit) - 2) if drr_unit else 0.0,
+        })
+        normalized.append(normalized_row)
+    return normalized
+
+
+def _amazon_soh_empty_payload(
+    *,
+    requested_date,
+    month_name: str | None,
+    year: int | None,
+    defaulted_to_latest: bool,
+    available_dates: list[dict],
+    notes: list[str] | None = None,
+) -> dict:
+    empty_total = _amazon_soh_empty_total()
+    return {
+        "source": {
+            "sales": "amazon_sec_range_master_view",
+            "inventory": "amazon_master_inventory",
+        },
+        "format": "AMAZON",
+        "platform": "amazon",
+        "dashboard_title": "Amazon SOH/DOH Dashboard",
+        "requested_date": requested_date.isoformat()
+        if hasattr(requested_date, "isoformat")
+        else requested_date,
+        "effective_date": None,
+        "effective_inventory_date": None,
+        "month_start": None,
+        "month": month_name,
+        "year": year,
+        "month_day": None,
+        "defaulted_to_latest": defaulted_to_latest,
+        "elapsed_day": 0,
+        "available_dates": _inventory_date_options(available_dates),
+        "dashboards": {
+            "item_head": [],
+            "asin": [],
+            "category": [],
+            "category_sub_category": [],
+        },
+        "totals": {
+            "item_head": empty_total,
+            "asin": empty_total,
+            "category": empty_total,
+            "category_sub_category": empty_total,
+        },
+        "notes": notes or [],
+    }
+
+
+def _amazon_soh_doh_dashboard(request):
+    raw_month = request.query_params.get("month", "")
+    raw_year = request.query_params.get("year", "")
+    raw_date = request.query_params.get("date", "")
+    month_name = _amazon_soh_month_name(raw_month)
+    year = _amazon_soh_year(raw_year)
+    requested_date = _parse_price_upload_date(raw_date)
+    defaulted_to_latest = not raw_month and not raw_year and not raw_date
+
+    if requested_date is not None:
+        month_name = month_name or requested_date.strftime("%B").upper()
+        year = year or requested_date.year
+
+    available_dates = _dict_rows(
+        """
+        SELECT inventory_date, COUNT(*) AS rows
+        FROM amazon_master_inventory
+        WHERE inventory_date IS NOT NULL
+        GROUP BY inventory_date
+        ORDER BY inventory_date DESC
+        LIMIT 30
+        """,
+        [],
+    )
+
+    period_where = ["inventory_date IS NOT NULL"]
+    period_params: list = []
+    if month_name:
+        period_where.append("UPPER(TRIM(\"month\"::text)) = %s")
+        period_params.append(month_name)
+    if year is not None:
+        period_where.append("\"year\" = %s")
+        period_params.append(year)
+    if requested_date is not None:
+        period_where.append("inventory_date <= %s")
+        period_params.append(requested_date)
+
+    effective_date = _scalar(
+        f"""
+        SELECT MAX(inventory_date)
+        FROM amazon_master_inventory
+        WHERE {" AND ".join(period_where)}
+        """,
+        period_params,
+    )
+
+    if effective_date is None:
+        return Response(_amazon_soh_empty_payload(
+            requested_date=requested_date,
+            month_name=month_name,
+            year=year,
+            defaulted_to_latest=defaulted_to_latest,
+            available_dates=available_dates,
+            notes=["No Amazon inventory rows found for the selected period."],
+        ))
+
+    month_name = month_name or effective_date.strftime("%B").upper()
+    year = year or effective_date.year
+    month_start = effective_date.replace(day=1)
+    elapsed_day = max(1, effective_date.day)
+    month_day = f"{effective_date.day:02d}-{month_name}"
+
+    common_params = [year, month_name, month_day, year, month_name, effective_date]
+
+    item_head_rows = _dict_rows(
+        """
+        WITH expected(item_key, item_head, sort_order) AS (
+            VALUES
+                ('PREMIUM', 'PREMIUM', 1),
+                ('COMMODITY', 'COMMODITY', 2),
+                ('OTHER', 'OTHER', 3)
+        ),
+        sales AS (
+            SELECT
+                UPPER(TRIM(COALESCE(item_head::text, ''))) AS item_key,
+                MIN(NULLIF(TRIM(item_head::text), '')) AS item_head,
+                COALESCE(SUM(shipped_units), 0)::numeric AS units_sold,
+                COALESCE(SUM(shipped_litres), 0)::numeric AS ltr_sold
+            FROM amazon_sec_range_master_view
+            WHERE "year" = %s
+              AND UPPER(TRIM("month"::text)) = %s
+              AND UPPER(TRIM(month_day::text)) = %s
+            GROUP BY UPPER(TRIM(COALESCE(item_head::text, '')))
+        ),
+        inventory AS (
+            SELECT
+                UPPER(TRIM(COALESCE(item_head::text, ''))) AS item_key,
+                MIN(NULLIF(TRIM(item_head::text), '')) AS item_head,
+                COALESCE(SUM(sellable_on_hand_units), 0)::numeric AS soh_unit,
+                COALESCE(SUM(soh_ltr), 0)::numeric AS soh_ltr
+            FROM amazon_master_inventory
+            WHERE "year" = %s
+              AND UPPER(TRIM("month"::text)) = %s
+              AND inventory_date = %s
+            GROUP BY UPPER(TRIM(COALESCE(item_head::text, '')))
+        ),
+        keys AS (
+            SELECT
+                item_key,
+                MIN(item_head) AS item_head,
+                MIN(sort_order) AS sort_order
+            FROM (
+                SELECT item_key, item_head, sort_order FROM expected
+                UNION ALL
+                SELECT item_key, item_head, 99 FROM sales WHERE item_key <> ''
+                UNION ALL
+                SELECT item_key, item_head, 99 FROM inventory WHERE item_key <> ''
+            ) k
+            GROUP BY item_key
+        )
+        SELECT
+            %s::date AS max_updated_date,
+            COALESCE(NULLIF(k.item_head, ''), NULLIF(s.item_head, ''), NULLIF(i.item_head, '')) AS item_head,
+            COALESCE(s.units_sold, 0) AS units_sold,
+            COALESCE(s.ltr_sold, 0) AS ltr_sold,
+            COALESCE(i.soh_unit, 0) AS soh_unit,
+            COALESCE(i.soh_ltr, 0) AS soh_ltr
+        FROM keys k
+        LEFT JOIN sales s ON s.item_key = k.item_key
+        LEFT JOIN inventory i ON i.item_key = k.item_key
+        ORDER BY k.sort_order, COALESCE(NULLIF(k.item_head, ''), NULLIF(s.item_head, ''), NULLIF(i.item_head, ''))
+        """,
+        common_params + [effective_date],
+    )
+
+    asin_rows = _dict_rows(
+        """
+        WITH row_list AS (
+            SELECT
+                UPPER(TRIM(COALESCE(asin::text, ''))) AS asin_key,
+                MIN(NULLIF(TRIM(item_head::text), '')) AS type,
+                MIN(NULLIF(TRIM(category::text), '')) AS category,
+                MIN(NULLIF(TRIM(sub_category::text), '')) AS sub_category,
+                MIN(NULLIF(TRIM(brand_2::text), '')) AS brand,
+                MIN(NULLIF(TRIM(per_unit::text), '')) AS per_unit,
+                MIN(NULLIF(TRIM(asin::text), '')) AS asin
+            FROM amazon_master_inventory
+            WHERE "year" = %s
+              AND UPPER(TRIM("month"::text)) = %s
+              AND NULLIF(TRIM(COALESCE(asin::text, '')), '') IS NOT NULL
+            GROUP BY UPPER(TRIM(COALESCE(asin::text, '')))
+        ),
+        sales AS (
+            SELECT
+                UPPER(TRIM(COALESCE(asin::text, ''))) AS asin_key,
+                COALESCE(SUM(shipped_units), 0)::numeric AS units_sold,
+                COALESCE(SUM(shipped_litres), 0)::numeric AS ltr_sold
+            FROM amazon_sec_range_master_view
+            WHERE "year" = %s
+              AND UPPER(TRIM("month"::text)) = %s
+              AND UPPER(TRIM(month_day::text)) = %s
+            GROUP BY UPPER(TRIM(COALESCE(asin::text, '')))
+        ),
+        inventory AS (
+            SELECT
+                UPPER(TRIM(COALESCE(asin::text, ''))) AS asin_key,
+                COALESCE(SUM(sellable_on_hand_units), 0)::numeric AS soh_unit,
+                COALESCE(SUM(soh_ltr), 0)::numeric AS soh_ltr
+            FROM amazon_master_inventory
+            WHERE "year" = %s
+              AND UPPER(TRIM("month"::text)) = %s
+              AND inventory_date = %s
+            GROUP BY UPPER(TRIM(COALESCE(asin::text, '')))
+        )
+        SELECT
+            r.type,
+            r.category,
+            r.sub_category,
+            r.brand,
+            r.per_unit,
+            r.asin,
+            COALESCE(s.units_sold, 0) AS units_sold,
+            COALESCE(s.ltr_sold, 0) AS ltr_sold,
+            COALESCE(i.soh_unit, 0) AS soh_unit,
+            COALESCE(i.soh_ltr, 0) AS soh_ltr
+        FROM row_list r
+        LEFT JOIN sales s ON s.asin_key = r.asin_key
+        LEFT JOIN inventory i ON i.asin_key = r.asin_key
+        ORDER BY r.type DESC NULLS LAST, r.category ASC NULLS LAST, r.sub_category ASC NULLS LAST, r.asin ASC NULLS LAST
+        """,
+        [year, month_name, year, month_name, month_day, year, month_name, effective_date],
+    )
+
+    category_rows = _dict_rows(
+        """
+        WITH sales AS (
+            SELECT
+                UPPER(TRIM(COALESCE(item_head::text, ''))) AS type_key,
+                UPPER(TRIM(COALESCE(category::text, ''))) AS category_key,
+                MIN(NULLIF(TRIM(item_head::text), '')) AS type,
+                MIN(NULLIF(TRIM(category::text), '')) AS category,
+                COALESCE(SUM(shipped_units), 0)::numeric AS units_sold,
+                COALESCE(SUM(shipped_litres), 0)::numeric AS ltr_sold
+            FROM amazon_sec_range_master_view
+            WHERE "year" = %s
+              AND UPPER(TRIM("month"::text)) = %s
+              AND UPPER(TRIM(month_day::text)) = %s
+            GROUP BY
+                UPPER(TRIM(COALESCE(item_head::text, ''))),
+                UPPER(TRIM(COALESCE(category::text, '')))
+        ),
+        inventory AS (
+            SELECT
+                UPPER(TRIM(COALESCE(item_head::text, ''))) AS type_key,
+                UPPER(TRIM(COALESCE(category::text, ''))) AS category_key,
+                MIN(NULLIF(TRIM(item_head::text), '')) AS type,
+                MIN(NULLIF(TRIM(category::text), '')) AS category,
+                COALESCE(SUM(sellable_on_hand_units), 0)::numeric AS soh_unit,
+                COALESCE(SUM(soh_ltr), 0)::numeric AS soh_ltr
+            FROM amazon_master_inventory
+            WHERE "year" = %s
+              AND UPPER(TRIM("month"::text)) = %s
+              AND inventory_date = %s
+            GROUP BY
+                UPPER(TRIM(COALESCE(item_head::text, ''))),
+                UPPER(TRIM(COALESCE(category::text, '')))
+        ),
+        keys AS (
+            SELECT type_key, category_key FROM sales
+            UNION
+            SELECT type_key, category_key FROM inventory
+        )
+        SELECT
+            'AMAZON' AS format,
+            COALESCE(NULLIF(s.type, ''), NULLIF(i.type, '')) AS type,
+            COALESCE(NULLIF(s.category, ''), NULLIF(i.category, '')) AS category,
+            COALESCE(s.units_sold, 0) AS units_sold,
+            COALESCE(s.ltr_sold, 0) AS ltr_sold,
+            COALESCE(i.soh_unit, 0) AS soh_unit,
+            COALESCE(i.soh_ltr, 0) AS soh_ltr
+        FROM keys k
+        LEFT JOIN sales s ON s.type_key = k.type_key AND s.category_key = k.category_key
+        LEFT JOIN inventory i ON i.type_key = k.type_key AND i.category_key = k.category_key
+        WHERE COALESCE(k.type_key, '') <> '' OR COALESCE(k.category_key, '') <> ''
+        ORDER BY type DESC NULLS LAST, category ASC NULLS LAST
+        """,
+        common_params,
+    )
+
+    category_sub_category_rows = _dict_rows(
+        """
+        WITH sales AS (
+            SELECT
+                UPPER(TRIM(COALESCE(item_head::text, ''))) AS type_key,
+                UPPER(TRIM(COALESCE(category::text, ''))) AS category_key,
+                UPPER(TRIM(COALESCE(sub_category::text, ''))) AS sub_category_key,
+                MIN(NULLIF(TRIM(item_head::text), '')) AS type,
+                MIN(NULLIF(TRIM(category::text), '')) AS category,
+                MIN(NULLIF(TRIM(sub_category::text), '')) AS sub_category,
+                COALESCE(SUM(shipped_units), 0)::numeric AS units_sold,
+                COALESCE(SUM(shipped_litres), 0)::numeric AS ltr_sold
+            FROM amazon_sec_range_master_view
+            WHERE "year" = %s
+              AND UPPER(TRIM("month"::text)) = %s
+              AND UPPER(TRIM(month_day::text)) = %s
+            GROUP BY
+                UPPER(TRIM(COALESCE(item_head::text, ''))),
+                UPPER(TRIM(COALESCE(category::text, ''))),
+                UPPER(TRIM(COALESCE(sub_category::text, '')))
+        ),
+        inventory AS (
+            SELECT
+                UPPER(TRIM(COALESCE(item_head::text, ''))) AS type_key,
+                UPPER(TRIM(COALESCE(category::text, ''))) AS category_key,
+                UPPER(TRIM(COALESCE(sub_category::text, ''))) AS sub_category_key,
+                MIN(NULLIF(TRIM(item_head::text), '')) AS type,
+                MIN(NULLIF(TRIM(category::text), '')) AS category,
+                MIN(NULLIF(TRIM(sub_category::text), '')) AS sub_category,
+                COALESCE(SUM(sellable_on_hand_units), 0)::numeric AS soh_unit,
+                COALESCE(SUM(soh_ltr), 0)::numeric AS soh_ltr
+            FROM amazon_master_inventory
+            WHERE "year" = %s
+              AND UPPER(TRIM("month"::text)) = %s
+              AND inventory_date = %s
+            GROUP BY
+                UPPER(TRIM(COALESCE(item_head::text, ''))),
+                UPPER(TRIM(COALESCE(category::text, ''))),
+                UPPER(TRIM(COALESCE(sub_category::text, '')))
+        ),
+        keys AS (
+            SELECT type_key, category_key, sub_category_key FROM sales
+            UNION
+            SELECT type_key, category_key, sub_category_key FROM inventory
+        )
+        SELECT
+            'AMAZON' AS format,
+            COALESCE(NULLIF(s.type, ''), NULLIF(i.type, '')) AS type,
+            COALESCE(NULLIF(s.category, ''), NULLIF(i.category, '')) AS category,
+            COALESCE(NULLIF(s.sub_category, ''), NULLIF(i.sub_category, '')) AS sub_category,
+            COALESCE(s.units_sold, 0) AS units_sold,
+            COALESCE(s.ltr_sold, 0) AS ltr_sold,
+            COALESCE(i.soh_unit, 0) AS soh_unit,
+            COALESCE(i.soh_ltr, 0) AS soh_ltr
+        FROM keys k
+        LEFT JOIN sales s
+          ON s.type_key = k.type_key
+         AND s.category_key = k.category_key
+         AND s.sub_category_key = k.sub_category_key
+        LEFT JOIN inventory i
+          ON i.type_key = k.type_key
+         AND i.category_key = k.category_key
+         AND i.sub_category_key = k.sub_category_key
+        WHERE COALESCE(k.type_key, '') <> ''
+           OR COALESCE(k.category_key, '') <> ''
+           OR COALESCE(k.sub_category_key, '') <> ''
+        ORDER BY type DESC NULLS LAST, category ASC NULLS LAST, sub_category ASC NULLS LAST
+        """,
+        common_params,
+    )
+
+    dashboards = {
+        "item_head": _amazon_soh_normalize_rows(item_head_rows, elapsed_day),
+        "asin": _amazon_soh_normalize_rows(asin_rows, elapsed_day),
+        "category": _amazon_soh_normalize_rows(category_rows, elapsed_day),
+        "category_sub_category": _amazon_soh_normalize_rows(category_sub_category_rows, elapsed_day),
+    }
+    totals = {
+        key: _amazon_soh_total(rows, elapsed_day)
+        for key, rows in dashboards.items()
+    }
+
+    notes = []
+    if totals["asin"]["units_sold"] == 0 and totals["asin"]["soh_unit"] > 0:
+        notes.append(
+            "Inventory is available for the selected snapshot, but no SEC range sales rows match the derived month-day."
+        )
+
+    return Response({
+        "source": {
+            "sales": "amazon_sec_range_master_view",
+            "inventory": "amazon_master_inventory",
+        },
+        "format": "AMAZON",
+        "platform": "amazon",
+        "dashboard_title": "Amazon SOH/DOH Dashboard",
+        "requested_date": requested_date.isoformat()
+        if hasattr(requested_date, "isoformat")
+        else None,
+        "effective_date": effective_date.isoformat(),
+        "effective_inventory_date": effective_date.isoformat(),
+        "month_start": month_start.isoformat(),
+        "month": month_name,
+        "year": year,
+        "month_day": month_day,
+        "defaulted_to_latest": defaulted_to_latest,
+        "elapsed_day": elapsed_day,
+        "available_dates": _inventory_date_options(available_dates),
+        "dashboards": dashboards,
+        "totals": totals,
+        "notes": notes,
+    })
+
+
 @api_view(["GET"])
 @permission_classes([require("platform.stats.view")])
 def amazon_price_dashboard(request, slug: str):
@@ -1238,6 +1956,7 @@ _FLIPKART_SEC_MONTHLY_CATEGORY_ROWS = (
 
 _FLIPKART_SEC_MONTHLY_ITEM_HEADS = ("PREMIUM", "COMMODITY")
 
+_BLINKIT_DRR_SALES_OF = ("ALL", "PREMIUM", "COMMODITY", "OTHER")
 _FLIPKART_MP_DRR_SALES_OF = ("ALL", "PREMIUM", "COMMODITY", "OTHER")
 _AMAZON_DRR_ITEM_HEADS = ("ALL", "PREMIUM", "COMMODITY", "OTHER")
 _AMAZON_DRR_SALES_MODES = ("ORDERED", "SHIPPED")
@@ -4318,15 +5037,33 @@ def _zepto_sku_analysis_dashboard_response(request):
 
 
 @api_view(["GET"])
+@permission_classes([require("platform.inventory.view")])
+def blinkit_drr_dashboard(request):
+    _ensure_scope(request.user, "blinkit")
+    return _blinkit_drr_dashboard_response(request)
+
+
+@api_view(["GET"])
+@permission_classes([require("platform.inventory.view")])
+def zepto_drr_dashboard(request):
+    _ensure_scope(request.user, "zepto")
+    return _zepto_drr_dashboard_response(request)
+
+
+@api_view(["GET"])
 @permission_classes([require("platform.secondary.view")])
 def flipkart_grocery_drr_dashboard(request, slug: str):
     _ensure_scope(request.user, slug)
     if slug == "amazon":
         return _amazon_drr_dashboard_response(request)
+    if slug == "blinkit":
+        return _blinkit_drr_dashboard_response(request)
+    if slug == "zepto":
+        return _zepto_drr_dashboard_response(request)
     if slug == "flipkart":
         return _flipkart_mp_drr_dashboard_response(request)
     if slug != "flipkart_grocery":
-        raise ValidationError("DRR Dashboard is available only for Amazon, Flipkart and Flipkart Grocery.")
+        raise ValidationError("DRR Dashboard is available only for Amazon, Blinkit, Zepto, Flipkart and Flipkart Grocery.")
 
     month, year, defaulted_to_latest = _parse_sec_month_year(request.query_params)
     sales_of = str(request.query_params.get("sales_of") or "ALL").strip().upper() or "ALL"
@@ -4441,6 +5178,522 @@ def flipkart_grocery_drr_dashboard(request, slug: str):
         "daily_groups": [daily[i:i + 9] for i in range(0, len(daily), 9)],
         "items": items,
         "totals": totals,
+    })
+
+
+def _blinkit_drr_empty_total() -> dict:
+    return {
+        "qty": 0.0,
+        "ltr": 0.0,
+        "liters": 0.0,
+        "value": 0.0,
+        "landing_amt": 0.0,
+        "drr_qty": 0.0,
+        "drr_ltr": 0.0,
+        "drr_liters": 0.0,
+        "drr_value": 0.0,
+        "cur_day_soh_units": 0.0,
+        "cur_day_soh_ltr": 0.0,
+        "doh": None,
+    }
+
+
+def _blinkit_drr_total(rows: list[dict], elapsed_days: int) -> dict:
+    total = _blinkit_drr_empty_total()
+    total["qty"] = sum(_num(row.get("qty")) for row in rows)
+    total["ltr"] = sum(_num(row.get("ltr")) for row in rows)
+    total["liters"] = total["ltr"]
+    total["value"] = sum(_num(row.get("value")) for row in rows)
+    total["landing_amt"] = total["value"]
+    total["cur_day_soh_units"] = sum(_num(row.get("cur_day_soh_units")) for row in rows)
+    total["cur_day_soh_ltr"] = sum(_num(row.get("cur_day_soh_ltr")) for row in rows)
+    if elapsed_days > 0:
+        total["drr_qty"] = total["qty"] / elapsed_days
+        total["drr_ltr"] = total["ltr"] / elapsed_days
+        total["drr_liters"] = total["drr_ltr"]
+        total["drr_value"] = total["value"] / elapsed_days
+    return total
+
+
+def _blinkit_drr_daily_groups(daily: list[dict]) -> list[dict]:
+    ranges = ((1, 9), (10, 18), (19, 27), (28, 31))
+    groups = []
+    for start, end in ranges:
+        days = daily[start - 1:end]
+        if not days:
+            continue
+        groups.append({
+            "label": f"{start}-{end}",
+            "days": days,
+        })
+    return groups
+
+
+def _blinkit_drr_dashboard_response(request):
+    month, year, defaulted_to_latest = _parse_sec_month_year(
+        request.query_params,
+        latest_source="secmaster_blinkit",
+    )
+    month_name = _month_name(month)
+    days_in_month = monthrange(year, month)[1]
+    month_start = date(year, month, 1)
+
+    sales_of = str(request.query_params.get("sales_of") or "ALL").strip().upper() or "ALL"
+    if sales_of not in _BLINKIT_DRR_SALES_OF:
+        raise ValidationError(
+            "`sales_of` must be one of ALL, PREMIUM, COMMODITY or OTHER."
+        )
+
+    max_date = _scalar(
+        """
+        SELECT MAX("date"::date)
+        FROM "SecMaster"
+        WHERE REGEXP_REPLACE(LOWER(TRIM("format"::text)), '[^a-z0-9]+', '', 'g') = 'blinkit'
+          AND UPPER(TRIM("month"::text)) = %s
+          AND "year"::numeric = %s
+        """,
+        [month_name, year],
+    )
+    elapsed_days = _sec_elapsed_day(max_date)
+
+    empty_response = {
+        "source": {
+            "sales": "SecMaster",
+            "inventory": "all_platform_inventory",
+        },
+        "format": "BLINKIT",
+        "defaulted_to_latest": defaulted_to_latest,
+        "month": month,
+        "month_name": month_name,
+        "year": year,
+        "sales_of": sales_of,
+        "sales_of_options": list(_BLINKIT_DRR_SALES_OF),
+        "max_date": None,
+        "sales_max_date": None,
+        "inventory_effective_date": None,
+        "elapsed_day": 0,
+        "elapsed_days": 0,
+        "days_in_month": days_in_month,
+        "daily": [],
+        "daily_groups": [],
+        "rows": [],
+        "items": [],
+        "total": _blinkit_drr_empty_total(),
+        "totals": _blinkit_drr_empty_total(),
+        "show_blinkit_drr": True,
+        "show_value_column": False,
+    }
+    if max_date is None:
+        return Response(empty_response)
+
+    inventory_effective_date = _scalar(
+        """
+        SELECT MAX(inventory_date)
+        FROM all_platform_inventory
+        WHERE format = 'BLINKIT'
+          AND inventory_date <= %s
+        """,
+        [max_date],
+    )
+
+    daily_sales_of_filter = ""
+    daily_params = [month_name, year, max_date]
+    if sales_of != "ALL":
+        daily_sales_of_filter = 'AND UPPER(TRIM("item_head"::text)) = %s'
+        daily_params.append(sales_of)
+
+    daily_raw = _dict_rows(
+        f"""
+        SELECT
+            "date"::date AS sale_date,
+            COALESCE(SUM("sales_amt_exc"), 0) AS ops,
+            COALESCE(SUM("ltr_sold"), 0) AS ltr
+        FROM "SecMaster"
+        WHERE REGEXP_REPLACE(LOWER(TRIM("format"::text)), '[^a-z0-9]+', '', 'g') = 'blinkit'
+          AND UPPER(TRIM("month"::text)) = %s
+          AND "year"::numeric = %s
+          AND "date"::date <= %s
+          {daily_sales_of_filter}
+        GROUP BY "date"::date
+        ORDER BY "date"::date
+        """,
+        daily_params,
+    )
+    daily_by_date = {row["sale_date"]: row for row in daily_raw}
+    daily = []
+    for day in range(1, days_in_month + 1):
+        current_date = date(year, month, day)
+        row = daily_by_date.get(current_date, {}) if current_date <= max_date else {}
+        daily.append({
+            "date": current_date.isoformat(),
+            "display_date": current_date.strftime("%d-%m-%Y"),
+            "day": day,
+            "ops": _num(row.get("ops")),
+            "ltr": _num(row.get("ltr")),
+        })
+
+    item_rows = _dict_rows(
+        """
+        WITH sales AS (
+            SELECT
+                UPPER(TRIM(COALESCE("item"::text, ''))) AS item_key,
+                MIN(NULLIF(TRIM("item"::text), '')) AS product,
+                COALESCE(MIN(NULLIF(UPPER(TRIM("item_head"::text)), '')), 'OTHER') AS item_head,
+                COALESCE(SUM("quantity"), 0)::numeric AS qty,
+                COALESCE(SUM("ltr_sold"), 0)::numeric AS ltr,
+                COALESCE(SUM("sales_amt_exc"), 0)::numeric AS value
+            FROM "SecMaster"
+            WHERE REGEXP_REPLACE(LOWER(TRIM("format"::text)), '[^a-z0-9]+', '', 'g') = 'blinkit'
+              AND "date"::date >= %s
+              AND "date"::date <= %s
+            GROUP BY UPPER(TRIM(COALESCE("item"::text, '')))
+        ),
+        inventory AS (
+            SELECT
+                UPPER(TRIM(COALESCE(item::text, ''))) AS item_key,
+                MIN(NULLIF(TRIM(item::text), '')) AS inventory_item,
+                COALESCE(MIN(NULLIF(UPPER(TRIM(item_head::text)), '')), 'OTHER') AS inventory_item_head,
+                COALESCE(SUM(soh_unit), 0)::numeric AS cur_day_soh_units,
+                COALESCE(SUM(soh_ltr), 0)::numeric AS cur_day_soh_ltr
+            FROM all_platform_inventory
+            WHERE format = 'BLINKIT'
+              AND inventory_date = %s
+            GROUP BY UPPER(TRIM(COALESCE(item::text, '')))
+        )
+        SELECT
+            COALESCE(NULLIF(s.item_head, ''), NULLIF(i.inventory_item_head, ''), 'OTHER') AS item_head,
+            COALESCE(NULLIF(s.product, ''), NULLIF(i.inventory_item, '')) AS product,
+            i.inventory_item,
+            COALESCE(s.qty, 0) AS qty,
+            COALESCE(s.ltr, 0) AS ltr,
+            COALESCE(s.value, 0) AS value,
+            COALESCE(i.cur_day_soh_units, 0) AS cur_day_soh_units,
+            COALESCE(i.cur_day_soh_ltr, 0) AS cur_day_soh_ltr
+        FROM sales s
+        FULL OUTER JOIN inventory i
+          ON s.item_key = i.item_key
+        WHERE COALESCE(s.item_key, i.item_key) <> ''
+        ORDER BY
+            CASE COALESCE(NULLIF(s.item_head, ''), NULLIF(i.inventory_item_head, ''), 'OTHER')
+                WHEN 'PREMIUM' THEN 1
+                WHEN 'COMMODITY' THEN 2
+                WHEN 'OTHER' THEN 3
+                ELSE 4
+            END,
+            COALESCE(NULLIF(s.product, ''), NULLIF(i.inventory_item, '')) ASC NULLS LAST
+        """,
+        [month_start, max_date, inventory_effective_date],
+    )
+
+    items = []
+    for row in item_rows:
+        qty = _num(row.get("qty"))
+        ltr = _num(row.get("ltr"))
+        value = _num(row.get("value"))
+        soh_units = _num(row.get("cur_day_soh_units"))
+        soh_ltr = _num(row.get("cur_day_soh_ltr"))
+        drr_qty = _safe_div(qty, elapsed_days)
+        drr_ltr = _safe_div(ltr, elapsed_days)
+        drr_value = _safe_div(value, elapsed_days)
+        product = row.get("product") or row.get("inventory_item") or ""
+        items.append({
+            "item_head": row.get("item_head") or "OTHER",
+            "product": product,
+            "item": product,
+            "inventory_item": row.get("inventory_item") or "",
+            "qty": qty,
+            "ltr": ltr,
+            "liters": ltr,
+            "value": value,
+            "landing_amt": value,
+            "drr_qty": drr_qty,
+            "drr_ltr": drr_ltr,
+            "drr_liters": drr_ltr,
+            "drr_value": drr_value,
+            "cur_day_soh_units": soh_units,
+            "cur_day_soh_ltr": soh_ltr,
+            "doh": _safe_div(soh_units, drr_qty),
+        })
+
+    total = _blinkit_drr_total(items, elapsed_days)
+    daily_total = {
+        "ops": sum(_num(row.get("ops")) for row in daily),
+        "ltr": sum(_num(row.get("ltr")) for row in daily),
+    }
+
+    return Response({
+        "source": {
+            "sales": "SecMaster",
+            "inventory": "all_platform_inventory",
+        },
+        "format": "BLINKIT",
+        "defaulted_to_latest": defaulted_to_latest,
+        "month": month,
+        "month_name": month_name,
+        "year": year,
+        "sales_of": sales_of,
+        "sales_of_options": list(_BLINKIT_DRR_SALES_OF),
+        "max_date": max_date.isoformat(),
+        "sales_max_date": max_date.isoformat(),
+        "inventory_effective_date": (
+            inventory_effective_date.isoformat()
+            if hasattr(inventory_effective_date, "isoformat")
+            else inventory_effective_date
+        ),
+        "elapsed_day": elapsed_days,
+        "elapsed_days": elapsed_days,
+        "days_in_month": days_in_month,
+        "daily": daily,
+        "daily_groups": _blinkit_drr_daily_groups(daily),
+        "daily_total": daily_total,
+        "rows": items,
+        "items": items,
+        "total": total,
+        "totals": total,
+        "show_blinkit_drr": True,
+        "show_value_column": False,
+        "value_source_note": "VALUE and OPS use SecMaster.sales_amt_exc to match DRR DATABASE column S.",
+        "doh_note": "DOH follows the DRR sheet: current SOH units divided by DRR qty.",
+    })
+
+
+def _zepto_drr_dashboard_response(request):
+    platform = _INVENTORY_DASHBOARD_PLATFORMS["zepto"]
+    month, year, defaulted_to_latest = _parse_sec_month_year(
+        request.query_params,
+        latest_source=platform["latest_source"],
+    )
+    month_name = _month_name(month)
+    days_in_month = monthrange(year, month)[1]
+    month_start = date(year, month, 1)
+    sale_date_expr = _secmaster_inventory_date_expr("zepto")
+    sales_format = platform["sales_format"]
+    inventory_format = platform["format"]
+
+    sales_of = str(request.query_params.get("sales_of") or "ALL").strip().upper() or "ALL"
+    if sales_of not in _BLINKIT_DRR_SALES_OF:
+        raise ValidationError(
+            "`sales_of` must be one of ALL, PREMIUM, COMMODITY or OTHER."
+        )
+
+    max_date = _scalar(
+        f"""
+        SELECT MAX({sale_date_expr})
+        FROM "SecMaster"
+        WHERE REGEXP_REPLACE(LOWER(TRIM("format"::text)), '[^a-z0-9]+', '', 'g') = %s
+          AND UPPER(TRIM("month"::text)) = %s
+          AND "year"::numeric = %s
+          AND ({sale_date_expr}) IS NOT NULL
+        """,
+        [sales_format, month_name, year],
+    )
+    elapsed_days = _sec_elapsed_day(max_date)
+
+    empty_response = {
+        "source": {
+            "sales": "SecMaster",
+            "inventory": "all_platform_inventory",
+        },
+        "format": inventory_format,
+        "platform": "zepto",
+        "dashboard_title": "Zepto DRR Dashboard",
+        "defaulted_to_latest": defaulted_to_latest,
+        "month": month,
+        "month_name": month_name,
+        "year": year,
+        "sales_of": sales_of,
+        "sales_of_options": list(_BLINKIT_DRR_SALES_OF),
+        "max_date": None,
+        "sales_max_date": None,
+        "inventory_effective_date": None,
+        "elapsed_day": 0,
+        "elapsed_days": 0,
+        "days_in_month": days_in_month,
+        "daily": [],
+        "daily_groups": [],
+        "rows": [],
+        "items": [],
+        "total": _blinkit_drr_empty_total(),
+        "totals": _blinkit_drr_empty_total(),
+        "show_blinkit_drr": True,
+        "show_inventory_drr": True,
+        "show_value_column": False,
+    }
+    if max_date is None:
+        return Response(empty_response)
+
+    inventory_effective_date = _scalar(
+        """
+        SELECT MAX(inventory_date)
+        FROM all_platform_inventory
+        WHERE UPPER(TRIM(format::text)) = %s
+          AND inventory_date <= %s
+        """,
+        [inventory_format, max_date],
+    )
+
+    daily_sales_of_filter = ""
+    daily_params = [sales_format, month_name, year, max_date]
+    if sales_of != "ALL":
+        daily_sales_of_filter = 'AND UPPER(TRIM("item_head"::text)) = %s'
+        daily_params.append(sales_of)
+
+    daily_raw = _dict_rows(
+        f"""
+        SELECT
+            {sale_date_expr} AS sale_date,
+            COALESCE(SUM("sales_amt_exc"), 0) AS ops,
+            COALESCE(SUM("ltr_sold"), 0) AS ltr
+        FROM "SecMaster"
+        WHERE REGEXP_REPLACE(LOWER(TRIM("format"::text)), '[^a-z0-9]+', '', 'g') = %s
+          AND UPPER(TRIM("month"::text)) = %s
+          AND "year"::numeric = %s
+          AND ({sale_date_expr}) <= %s
+          AND ({sale_date_expr}) IS NOT NULL
+          {daily_sales_of_filter}
+        GROUP BY {sale_date_expr}
+        ORDER BY {sale_date_expr}
+        """,
+        daily_params,
+    )
+    daily_by_date = {row["sale_date"]: row for row in daily_raw}
+    daily = []
+    for day in range(1, days_in_month + 1):
+        current_date = date(year, month, day)
+        row = daily_by_date.get(current_date, {}) if current_date <= max_date else {}
+        daily.append({
+            "date": current_date.isoformat(),
+            "display_date": current_date.strftime("%d-%m-%Y"),
+            "day": day,
+            "ops": _num(row.get("ops")),
+            "ltr": _num(row.get("ltr")),
+        })
+
+    item_rows = _dict_rows(
+        f"""
+        WITH sales AS (
+            SELECT
+                UPPER(TRIM(COALESCE("item"::text, ''))) AS item_key,
+                MIN(NULLIF(TRIM("item"::text), '')) AS product,
+                COALESCE(MIN(NULLIF(UPPER(TRIM("item_head"::text)), '')), 'OTHER') AS item_head,
+                COALESCE(SUM("quantity"), 0)::numeric AS qty,
+                COALESCE(SUM("ltr_sold"), 0)::numeric AS ltr,
+                COALESCE(SUM("sales_amt_exc"), 0)::numeric AS value
+            FROM "SecMaster"
+            WHERE REGEXP_REPLACE(LOWER(TRIM("format"::text)), '[^a-z0-9]+', '', 'g') = %s
+              AND ({sale_date_expr}) >= %s
+              AND ({sale_date_expr}) <= %s
+            GROUP BY UPPER(TRIM(COALESCE("item"::text, '')))
+        ),
+        inventory AS (
+            SELECT
+                UPPER(TRIM(COALESCE(item::text, ''))) AS item_key,
+                MIN(NULLIF(TRIM(item::text), '')) AS inventory_item,
+                COALESCE(MIN(NULLIF(UPPER(TRIM(item_head::text)), '')), 'OTHER') AS inventory_item_head,
+                COALESCE(SUM(soh_unit), 0)::numeric AS cur_day_soh_units,
+                COALESCE(SUM(soh_ltr), 0)::numeric AS cur_day_soh_ltr
+            FROM all_platform_inventory
+            WHERE UPPER(TRIM(format::text)) = %s
+              AND inventory_date = %s
+            GROUP BY UPPER(TRIM(COALESCE(item::text, '')))
+        )
+        SELECT
+            COALESCE(NULLIF(s.item_head, ''), NULLIF(i.inventory_item_head, ''), 'OTHER') AS item_head,
+            COALESCE(NULLIF(s.product, ''), NULLIF(i.inventory_item, '')) AS product,
+            i.inventory_item,
+            COALESCE(s.qty, 0) AS qty,
+            COALESCE(s.ltr, 0) AS ltr,
+            COALESCE(s.value, 0) AS value,
+            COALESCE(i.cur_day_soh_units, 0) AS cur_day_soh_units,
+            COALESCE(i.cur_day_soh_ltr, 0) AS cur_day_soh_ltr
+        FROM sales s
+        FULL OUTER JOIN inventory i
+          ON s.item_key = i.item_key
+        WHERE COALESCE(s.item_key, i.item_key) <> ''
+        ORDER BY
+            CASE COALESCE(NULLIF(s.item_head, ''), NULLIF(i.inventory_item_head, ''), 'OTHER')
+                WHEN 'PREMIUM' THEN 1
+                WHEN 'COMMODITY' THEN 2
+                WHEN 'OTHER' THEN 3
+                ELSE 4
+            END,
+            COALESCE(NULLIF(s.product, ''), NULLIF(i.inventory_item, '')) ASC NULLS LAST
+        """,
+        [sales_format, month_start, max_date, inventory_format, inventory_effective_date],
+    )
+
+    items = []
+    for row in item_rows:
+        qty = _num(row.get("qty"))
+        ltr = _num(row.get("ltr"))
+        value = _num(row.get("value"))
+        soh_units = _num(row.get("cur_day_soh_units"))
+        soh_ltr = _num(row.get("cur_day_soh_ltr"))
+        drr_qty = _safe_div(qty, elapsed_days)
+        drr_ltr = _safe_div(ltr, elapsed_days)
+        drr_value = _safe_div(value, elapsed_days)
+        product = row.get("product") or row.get("inventory_item") or ""
+        items.append({
+            "item_head": row.get("item_head") or "OTHER",
+            "product": product,
+            "item": product,
+            "inventory_item": row.get("inventory_item") or "",
+            "qty": qty,
+            "ltr": ltr,
+            "liters": ltr,
+            "value": value,
+            "landing_amt": value,
+            "drr_qty": drr_qty,
+            "drr_ltr": drr_ltr,
+            "drr_liters": drr_ltr,
+            "drr_value": drr_value,
+            "cur_day_soh_units": soh_units,
+            "cur_day_soh_ltr": soh_ltr,
+            "doh": _safe_div(soh_units, drr_qty),
+        })
+
+    total = _blinkit_drr_total(items, elapsed_days)
+    daily_total = {
+        "ops": sum(_num(row.get("ops")) for row in daily),
+        "ltr": sum(_num(row.get("ltr")) for row in daily),
+    }
+
+    return Response({
+        "source": {
+            "sales": "SecMaster",
+            "inventory": "all_platform_inventory",
+        },
+        "format": inventory_format,
+        "platform": "zepto",
+        "dashboard_title": "Zepto DRR Dashboard",
+        "defaulted_to_latest": defaulted_to_latest,
+        "month": month,
+        "month_name": month_name,
+        "year": year,
+        "sales_of": sales_of,
+        "sales_of_options": list(_BLINKIT_DRR_SALES_OF),
+        "max_date": max_date.isoformat(),
+        "sales_max_date": max_date.isoformat(),
+        "inventory_effective_date": (
+            inventory_effective_date.isoformat()
+            if hasattr(inventory_effective_date, "isoformat")
+            else inventory_effective_date
+        ),
+        "elapsed_day": elapsed_days,
+        "elapsed_days": elapsed_days,
+        "days_in_month": days_in_month,
+        "daily": daily,
+        "daily_groups": _blinkit_drr_daily_groups(daily),
+        "daily_total": daily_total,
+        "rows": items,
+        "items": items,
+        "total": total,
+        "totals": total,
+        "show_blinkit_drr": True,
+        "show_inventory_drr": True,
+        "show_value_column": False,
+        "value_source_note": "VALUE and OPS use SecMaster.sales_amt_exc to match the DRR workbook.",
+        "doh_note": "DOH follows the DRR sheet: current SOH units divided by DRR qty.",
     })
 
 

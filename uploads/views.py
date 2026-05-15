@@ -794,7 +794,7 @@ def fk_grocery_master_upload(request):
     rows = []
     failed = 0
     missing_master = set()
-    missing_price = set()
+    missing_landing_rate = set()
     master_cache = {}
     price_cache = {}
 
@@ -826,12 +826,12 @@ def fk_grocery_master_upload(request):
                         cur, sku_id, product_name, real_date
                     )
                 price = price_cache[price_key]
-                if not price:
-                    missing_price.add(sku_id)
 
                 per_ltr = _as_decimal(master[9] if master else None)
                 landing_rate = _as_decimal(price[0] if price else None)
                 basic_rate = _as_decimal(price[1] if price else None)
+                if not price or landing_rate == Decimal("0"):
+                    missing_landing_rate.add(sku_id)
 
                 rows.append(
                     (
@@ -908,7 +908,9 @@ def fk_grocery_master_upload(request):
                 "failed": failed,
                 "error": None,
                 "missing_master": len(missing_master),
-                "missing_price": len(missing_price),
+                "missing_landing_rate": len(missing_landing_rate),
+                "missing_landing_rate_skus": sorted(missing_landing_rate),
+                "missing_price": len(missing_landing_rate),
                 "table": "flipkart_grocery_master",
             }
         )

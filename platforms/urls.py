@@ -14,6 +14,9 @@ urlpatterns = [
     path("<slug:slug>/stats", views.platform_stats, name="platform-stats"),
     path("<slug:slug>/pos", views.platform_pos, name="platform-pos"),
     path("<slug:slug>/inventory-match", views.inventory_match, name="platform-inventory-match"),
+    path("<slug:slug>/soh-doh-dashboard", views.blinkit_soh_doh_dashboard, name="platform-blinkit-soh-doh-dashboard"),
+    path("blinkit/drr-dashboard", views.blinkit_drr_dashboard, name="platform-blinkit-drr-dashboard"),
+    path("zepto/drr-dashboard", views.zepto_drr_dashboard, name="platform-zepto-drr-dashboard"),
     path(
         "zepto/primary-dashboard",
         views.primary_dashboard,
