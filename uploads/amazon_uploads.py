@@ -3334,6 +3334,8 @@ def amazon_po_matrix(request):
                 COALESCE(NULLIF(TRIM(item_head::text), ''), 'OTHER')       AS item_head,
                 COALESCE(NULLIF(TRIM(category::text), ''), 'Unknown')       AS category,
                 COALESCE(NULLIF(TRIM(sub_category::text), ''), 'Unknown')   AS sub_category,
+                COALESCE(NULLIF(TRIM(brand::text), ''), '')                  AS brand,
+                COALESCE(NULLIF(TRIM(per_ltr_unit::text), ''), '')           AS per_unit,
                 MAX(order_date)                                              AS max_date,
                 COALESCE(SUM(total_received_cost), 0)                        AS done_value,
                 COALESCE(SUM(total_delivered_liters), 0)                     AS done_ltrs,
@@ -3345,8 +3347,8 @@ def amazon_po_matrix(request):
                 COALESCE(SUM(order_ltrs_cl)        FILTER (WHERE po_status IN ('CANCELLED', 'MOV')), 0) AS cancelled_ltrs
             FROM reporting."Amazon PO"
             WHERE {where_sql}
-            GROUP BY 1, 2, 3
-            ORDER BY 1, 2, 3
+            GROUP BY 1, 2, 3, 4, 5
+            ORDER BY 1, 2, 3, 4, 5
             """,
             params,
         )
