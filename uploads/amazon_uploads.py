@@ -3112,7 +3112,11 @@ def amazon_po_report(request):
     _add_ilike(where, params, "fulfillment_center", q.get("fulfillment_center"))
     _add_ilike(where, params, "vendor", q.get("vendor"))
     _add_ilike(where, params, "category", q.get("category"))
-    _add_ilike(where, params, "item_head", q.get("item_head"))
+    item_head_val = str(q.get("item_head") or "").strip()
+    if item_head_val:
+        normalized_item_head = "OTHER" if item_head_val.upper() == "OTHERS" else item_head_val
+        where.append("UPPER(TRIM(COALESCE(item_head, ''))) = %s")
+        params.append(normalized_item_head.upper())
     _add_ilike(where, params, "state", q.get("state"))
     _add_ilike(where, params, "city", q.get("city"))
     month_val = str(q.get("month") or q.get("po_month") or "").strip()
@@ -3680,7 +3684,7 @@ def amazon_po_summary(request):
         )
         sub_category_breakdown = _rows_to_dicts(cur)
 
-        # Classification KPIs: PREMIUM / COMMODITY / OTHERS by item_head
+        # Classification KPIs: PREMIUM / COMMODITY / OTHER by item_head
         cur.execute(
             """
             SELECT
@@ -3692,7 +3696,7 @@ def amazon_po_summary(request):
                     ELSE 0
                 END AS fill_rate_pct
             FROM reporting."Amazon PO"
-            WHERE UPPER(TRIM(COALESCE(item_head, ''))) IN ('PREMIUM', 'COMMODITY', 'OTHERS')
+            WHERE UPPER(TRIM(COALESCE(item_head, ''))) IN ('PREMIUM', 'COMMODITY', 'OTHER')
             GROUP BY UPPER(TRIM(COALESCE(item_head, '')))
             """
         )
@@ -3700,7 +3704,7 @@ def amazon_po_summary(request):
         classification_kpis = {
             "premium":   classification_rows.get("PREMIUM",   {"count": 0, "order_value": 0, "fill_rate_pct": 0}),
             "commodity": classification_rows.get("COMMODITY", {"count": 0, "order_value": 0, "fill_rate_pct": 0}),
-            "others":    classification_rows.get("OTHERS",    {"count": 0, "order_value": 0, "fill_rate_pct": 0}),
+            "others":    classification_rows.get("OTHER",     {"count": 0, "order_value": 0, "fill_rate_pct": 0}),
         }
 
         # Expiry urgency: active POs expiring within 7 days
