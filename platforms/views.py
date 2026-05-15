@@ -414,6 +414,320 @@ def inventory_match(request, slug: str):
     return Response({"match": rows[0] if rows else None})
 
 
+_PRIMARY_METRIC_SQL = """
+    COALESCE(SUM(CASE WHEN status_key = 'COMPLETED'
+        THEN COALESCE(total_delivered_amt_exclusive, 0) ELSE 0 END), 0) AS done_value,
+    COALESCE(SUM(CASE WHEN status_key = 'COMPLETED'
+        THEN COALESCE(total_delivered_liters, 0) ELSE 0 END), 0) AS done_ltrs,
+    COALESCE(SUM(CASE WHEN status_key = 'COMPLETED'
+        THEN COALESCE(delivered_qty, 0) ELSE 0 END), 0) AS done_qty,
+    COALESCE(SUM(CASE WHEN status_key IN ('PENDING', 'APPOINTMENT DONE')
+        THEN COALESCE(total_order_amt_exclusive, 0) ELSE 0 END), 0) AS pending_value,
+    COALESCE(SUM(CASE WHEN status_key IN ('PENDING', 'APPOINTMENT DONE')
+        THEN COALESCE(total_order_liters, 0) ELSE 0 END), 0) AS pending_ltrs,
+    COALESCE(SUM(CASE WHEN status_key = 'EXPIRED'
+        THEN COALESCE(total_order_amt_exclusive, 0) ELSE 0 END), 0) AS expired_value,
+    COALESCE(SUM(CASE WHEN status_key = 'EXPIRED'
+        THEN COALESCE(total_order_liters, 0) ELSE 0 END), 0) AS expired_ltrs,
+    COALESCE(SUM(CASE WHEN status_key = 'CANCELLED'
+        THEN COALESCE(total_order_amt_exclusive, 0) ELSE 0 END), 0) AS cancelled_value,
+    COALESCE(SUM(CASE WHEN status_key = 'CANCELLED'
+        THEN COALESCE(total_order_liters, 0) ELSE 0 END), 0) AS cancelled_ltrs,
+    COALESCE(SUM(COALESCE(total_order_amt_exclusive, 0)), 0) AS order_value,
+    COALESCE(SUM(COALESCE(total_order_liters, 0)), 0) AS order_ltrs,
+    COALESCE(SUM(COALESCE(order_qty, 0)), 0) AS order_qty
+"""
+
+
+_PRIMARY_TREND_METRIC_SQL = """
+    COALESCE(SUM(CASE WHEN status_key = 'COMPLETED'
+        THEN COALESCE(total_delivered_amt_exclusive, 0) ELSE 0 END), 0) AS done_value,
+    COALESCE(SUM(CASE WHEN status_key = 'COMPLETED'
+        THEN COALESCE(total_delivered_liters, 0) ELSE 0 END), 0) AS done_ltrs,
+    COALESCE(SUM(CASE WHEN status_key = 'COMPLETED'
+        THEN COALESCE(delivered_qty, 0) ELSE 0 END), 0) AS done_qty,
+    COALESCE(SUM(CASE WHEN status_key IN ('PENDING', 'APPOINTMENT DONE')
+        THEN COALESCE(total_order_amt_exclusive, 0) ELSE 0 END), 0) AS pending_value,
+    COALESCE(SUM(CASE WHEN status_key IN ('PENDING', 'APPOINTMENT DONE')
+        THEN COALESCE(total_order_liters, 0) ELSE 0 END), 0) AS pending_ltrs,
+    COALESCE(SUM(CASE WHEN status_key IN ('PENDING', 'APPOINTMENT DONE')
+        THEN COALESCE(order_qty, 0) ELSE 0 END), 0) AS pending_qty,
+    COALESCE(SUM(COALESCE(total_order_amt_exclusive, 0)), 0) AS order_value,
+    COALESCE(SUM(COALESCE(total_order_liters, 0)), 0) AS order_ltrs,
+    COALESCE(SUM(COALESCE(order_qty, 0)), 0) AS order_qty
+"""
+
+
+@api_view(["GET"])
+@permission_classes([require("platform.stats.view")])
+def primary_dashboard(request, slug: str):
+    _ensure_scope(request.user, slug)
+    if slug != "zepto":
+        raise ValidationError("Primary Dashboard is available only for Zepto.")
+
+    mode, month, year, defaulted_to_latest = _parse_primary_dashboard_params(request.query_params)
+    month_name = _month_name(month)
+    period_filter = _primary_period_filter(mode)
+    period_params = [month_name, year]
+
+    # This mirrors PRIMARY DASHBOARD!D2 in the workbook:
+    # MAXIFS(PRIMARY!BM:BM, PRIMARY!AG:AG, month, PRIMARY!AI:AI, year)
+    max_date = _scalar(
+        f"""
+        {_PRIM_MASTER_PO_CTE}
+        SELECT MAX(po_dt)
+        FROM normalized
+        WHERE po_month_key = %s
+          AND po_year = %s
+        """,
+        [month_name, year],
+    )
+
+    summary_raw = _dict_rows(
+        f"""
+        {_PRIM_MASTER_PO_CTE}
+        SELECT
+            item_head_key AS item_head,
+            {_PRIMARY_METRIC_SQL}
+        FROM normalized
+        WHERE {period_filter}
+          AND item_head_key IN ('PREMIUM', 'COMMODITY', 'OTHER')
+        GROUP BY item_head_key
+        """,
+        period_params,
+    )
+    summary_by_head = {_norm_sec_key(row.get("item_head")): row for row in summary_raw}
+    summary = []
+    for item_head in _ZEPTO_PRIMARY_ITEM_HEADS:
+        metrics = _primary_metrics(summary_by_head.get(item_head))
+        summary.append({"item_head": item_head, **metrics})
+
+    detail_raw = _dict_rows(
+        f"""
+        {_PRIM_MASTER_PO_CTE}
+        SELECT
+            sub_category_key,
+            per_ltr_key,
+            MIN(item_head_key) AS item_head_key,
+            MIN(category_key) AS category_key,
+            {_PRIMARY_METRIC_SQL}
+        FROM normalized
+        WHERE {period_filter}
+        GROUP BY sub_category_key, per_ltr_key
+        """,
+        period_params,
+    )
+    detail_by_key = {
+        (_norm_sec_key(row.get("sub_category_key")), _norm_sec_key(row.get("per_ltr_key"))): row
+        for row in detail_raw
+    }
+
+    details = []
+    fixed_detail_keys = set()
+    for fmt, item_head, category, sub_category, per_ltr in _ZEPTO_PRIMARY_DETAIL_ROWS:
+        detail_key = (_norm_sec_key(sub_category), _norm_sec_key(per_ltr))
+        fixed_detail_keys.add(detail_key)
+        metrics = _primary_metrics(
+            detail_by_key.get(detail_key)
+        )
+        details.append({
+            "format": fmt,
+            "item_head": item_head,
+            "category": category,
+            "sub_category": sub_category,
+            "per_ltr": per_ltr,
+            "value_per_ltr": None if metrics["done_ltrs"] == 0 else metrics["done_value"] / metrics["done_ltrs"],
+            **metrics,
+        })
+
+    # The workbook has a fixed display list, but the database can receive new
+    # pack sizes before the sheet template is updated. Include those live rows
+    # so sub-category dashboard totals do not silently miss valid sales.
+    for detail_key, row in detail_by_key.items():
+        if detail_key in fixed_detail_keys:
+            continue
+        metrics = _primary_metrics(row)
+        if not any(_num(metrics.get(key)) for key in metrics):
+            continue
+        details.append({
+            "format": "ZEPTO",
+            "item_head": row.get("item_head_key") or "OTHER",
+            "category": row.get("category_key") or row.get("sub_category_key") or "OTHER",
+            "sub_category": row.get("sub_category_key") or "OTHER",
+            "per_ltr": row.get("per_ltr_key") or "-",
+            "value_per_ltr": None if metrics["done_ltrs"] == 0 else metrics["done_value"] / metrics["done_ltrs"],
+            **metrics,
+        })
+
+    top_item_raw = _dict_rows(
+        f"""
+        {_PRIM_MASTER_PO_CTE},
+        item_agg AS (
+            SELECT
+                item_key AS item,
+                {_PRIMARY_METRIC_SQL}
+            FROM normalized
+            WHERE {period_filter}
+            GROUP BY item_key
+        )
+        SELECT *
+        FROM item_agg
+        WHERE COALESCE(done_value, 0) <> 0
+           OR COALESCE(done_ltrs, 0) <> 0
+           OR COALESCE(done_qty, 0) <> 0
+        ORDER BY done_value DESC, done_ltrs DESC, done_qty DESC
+        LIMIT 10
+        """,
+        period_params,
+    )
+    top_items = [
+        {"item": row.get("item") or "OTHER", **_primary_metrics(row)}
+        for row in top_item_raw
+    ]
+
+    detail_total = _primary_total(details)
+    summary_total = _primary_total(summary)
+    trend_date_col = "delivery_dt" if mode == "DEL MONTH" else "po_dt"
+    period_start = date(year, month, 1)
+    period_end = date(year, month, monthrange(year, month)[1])
+
+    daily_trend = _primary_trend_rows(_dict_rows(
+        f"""
+        {_PRIM_MASTER_PO_CTE},
+        trend_days AS (
+            SELECT generate_series(%s::date, %s::date, interval '1 day')::date AS period
+        ),
+        agg AS (
+            SELECT
+                {trend_date_col}::date AS period,
+                {_PRIMARY_TREND_METRIC_SQL}
+            FROM normalized
+            WHERE {period_filter}
+              AND {trend_date_col} IS NOT NULL
+            GROUP BY {trend_date_col}::date
+        )
+        SELECT
+            d.period,
+            TO_CHAR(d.period, 'DD Mon') AS label,
+            COALESCE(a.done_value, 0) AS done_value,
+            COALESCE(a.done_ltrs, 0) AS done_ltrs,
+            COALESCE(a.done_qty, 0) AS done_qty,
+            COALESCE(a.pending_value, 0) AS pending_value,
+            COALESCE(a.pending_ltrs, 0) AS pending_ltrs,
+            COALESCE(a.pending_qty, 0) AS pending_qty
+        FROM trend_days d
+        LEFT JOIN agg a ON a.period = d.period
+        ORDER BY d.period
+        """,
+        [period_start, period_end] + period_params,
+    ))
+    monthly_trend = _primary_trend_rows(_dict_rows(
+        f"""
+        {_PRIM_MASTER_PO_CTE},
+        bounds AS (
+            SELECT
+                make_date(%s::integer, 1, 1) AS start_month,
+                COALESCE(
+                    DATE_TRUNC('month', MAX({trend_date_col}))::date,
+                    make_date(%s::integer, 12, 1)
+                ) AS end_month
+            FROM normalized
+            WHERE {trend_date_col} IS NOT NULL
+              AND EXTRACT(YEAR FROM {trend_date_col})::integer = %s
+        ),
+        trend_months AS (
+            SELECT generate_series(start_month, end_month, interval '1 month')::date AS period
+            FROM bounds
+            WHERE start_month IS NOT NULL
+        ),
+        agg AS (
+            SELECT
+                DATE_TRUNC('month', {trend_date_col})::date AS period,
+                {_PRIMARY_TREND_METRIC_SQL}
+            FROM normalized
+            WHERE {trend_date_col} IS NOT NULL
+              AND EXTRACT(YEAR FROM {trend_date_col})::integer = %s
+            GROUP BY DATE_TRUNC('month', {trend_date_col})::date
+        )
+        SELECT
+            m.period,
+            TO_CHAR(m.period, 'Mon YYYY') AS label,
+            COALESCE(a.done_value, 0) AS done_value,
+            COALESCE(a.done_ltrs, 0) AS done_ltrs,
+            COALESCE(a.done_qty, 0) AS done_qty,
+            COALESCE(a.pending_value, 0) AS pending_value,
+            COALESCE(a.pending_ltrs, 0) AS pending_ltrs,
+            COALESCE(a.pending_qty, 0) AS pending_qty
+        FROM trend_months m
+        LEFT JOIN agg a ON a.period = m.period
+        ORDER BY m.period
+        """,
+        [year, year, year, year],
+    ))
+    yearly_trend = _primary_trend_rows(_dict_rows(
+        f"""
+        {_PRIM_MASTER_PO_CTE},
+        bounds AS (
+            SELECT
+                MIN(EXTRACT(YEAR FROM {trend_date_col})::integer) AS start_year,
+                MAX(EXTRACT(YEAR FROM {trend_date_col})::integer) AS end_year
+            FROM normalized
+            WHERE {trend_date_col} IS NOT NULL
+        ),
+        trend_years AS (
+            SELECT generate_series(start_year, end_year)::integer AS period
+            FROM bounds
+            WHERE start_year IS NOT NULL
+        ),
+        agg AS (
+            SELECT
+                EXTRACT(YEAR FROM {trend_date_col})::integer AS period,
+                {_PRIMARY_TREND_METRIC_SQL}
+            FROM normalized
+            WHERE {trend_date_col} IS NOT NULL
+            GROUP BY EXTRACT(YEAR FROM {trend_date_col})::integer
+        )
+        SELECT
+            y.period,
+            y.period::text AS label,
+            COALESCE(a.done_value, 0) AS done_value,
+            COALESCE(a.done_ltrs, 0) AS done_ltrs,
+            COALESCE(a.done_qty, 0) AS done_qty,
+            COALESCE(a.pending_value, 0) AS pending_value,
+            COALESCE(a.pending_ltrs, 0) AS pending_ltrs,
+            COALESCE(a.pending_qty, 0) AS pending_qty
+        FROM trend_years y
+        LEFT JOIN agg a ON a.period = y.period
+        ORDER BY y.period
+        """,
+        [],
+    ))
+
+    return Response({
+        "source": "prim_master_po",
+        "format": "ZEPTO",
+        "dashboard_title": "Zepto Primary Dashboard",
+        "mode": mode,
+        "month": month,
+        "month_name": month_name,
+        "year": year,
+        "defaulted_to_latest": defaulted_to_latest,
+        "max_date": max_date.isoformat() if hasattr(max_date, "isoformat") else max_date,
+        "summary": summary,
+        "summary_total": summary_total,
+        "details": details,
+        "detail_total": detail_total,
+        "top_items": top_items,
+        "trends": {
+            "day": daily_trend,
+            "month": monthly_trend,
+            "year": yearly_trend,
+        },
+        "detail_rows_fixed": False,
+        "extra_detail_rows_included": True,
+    })
+
+
 def _parse_price_upload_date(value: str) -> date | None:
     value = str(value or "").strip()
     if not value:
@@ -721,6 +1035,45 @@ _ZEPTO_SEC_DETAIL_ROWS = (
     ("OTHER", "DRINKS", "MANGO", "500 MLS"),
     ("OTHER", "DRINKS", "MOJITO", "200 MLS"),
     ("OTHER", "DRINKS", "SODA", "750 MLS"),
+)
+
+_ZEPTO_PRIMARY_ITEM_HEADS = ("PREMIUM", "COMMODITY", "OTHER")
+
+_ZEPTO_PRIMARY_DETAIL_ROWS = (
+    ("ZEPTO", "PREMIUM", "BLENDED", "SO OLIVE", "1 LTR"),
+    ("ZEPTO", "PREMIUM", "BLENDED", "SO OLIVE", "5 LTR"),
+    ("ZEPTO", "PREMIUM", "CANOLA", "CANOLA", "1 LTR"),
+    ("ZEPTO", "PREMIUM", "CANOLA", "CANOLA", "15 LTR"),
+    ("ZEPTO", "PREMIUM", "CANOLA", "CANOLA", "2 LTR"),
+    ("ZEPTO", "PREMIUM", "CANOLA", "CANOLA", "5 LTR"),
+    ("ZEPTO", "PREMIUM", "GHEE", "A2 GHEE", "1 LTR"),
+    ("ZEPTO", "PREMIUM", "GHEE", "A2 GHEE", "500 MLS"),
+    ("ZEPTO", "PREMIUM", "GROUNDNUT", "GROUNDNUT", "1 LTR"),
+    ("ZEPTO", "PREMIUM", "GROUNDNUT", "GROUNDNUT", "5 LTR"),
+    ("ZEPTO", "PREMIUM", "OLIVE", "EXTRA LIGHT", "1 LTR"),
+    ("ZEPTO", "PREMIUM", "OLIVE", "EXTRA LIGHT", "2 LTR"),
+    ("ZEPTO", "PREMIUM", "OLIVE", "EXTRA LIGHT", "5 LTR"),
+    ("ZEPTO", "PREMIUM", "OLIVE", "EXTRA VIRGIN", "1 LTR"),
+    ("ZEPTO", "PREMIUM", "OLIVE", "EXTRA VIRGIN", "5 LTR"),
+    ("ZEPTO", "PREMIUM", "OLIVE", "JIVO POMACE", "1 LTR"),
+    ("ZEPTO", "PREMIUM", "OLIVE", "JIVO POMACE", "2 LTR"),
+    ("ZEPTO", "PREMIUM", "OLIVE", "JIVO POMACE", "5 LTR"),
+    ("ZEPTO", "COMMODITY", "BLENDED", "GOLD", "1 LTR"),
+    ("ZEPTO", "COMMODITY", "BLENDED", "GOLD", "5 LTR"),
+    ("ZEPTO", "COMMODITY", "MUSTARD", "MUSTARD KACCHI GHANI", "1 LTR"),
+    ("ZEPTO", "COMMODITY", "MUSTARD", "MUSTARD KACCHI GHANI", "15 LTR"),
+    ("ZEPTO", "COMMODITY", "MUSTARD", "MUSTARD KACCHI GHANI", "5 LTR"),
+    ("ZEPTO", "COMMODITY", "RICE BRAN", "RICE BRAN", "1 LTR"),
+    ("ZEPTO", "COMMODITY", "RICE BRAN", "RICE BRAN", "5 LTR"),
+    ("ZEPTO", "COMMODITY", "SOYABEAN", "SOYABEAN", "15 LTR"),
+    ("ZEPTO", "COMMODITY", "SUNFLOWER", "SUNFLOWER", "1 LTR"),
+    ("ZEPTO", "COMMODITY", "SUNFLOWER", "SUNFLOWER", "15 LTR"),
+    ("ZEPTO", "COMMODITY", "SUNFLOWER", "SUNFLOWER", "5 LTR"),
+    ("ZEPTO", "OTHER", "DRINKS", "ENERGY DRINK SF", "200 MLS"),
+    ("ZEPTO", "OTHER", "DRINKS", "JEERA", "160 MLS"),
+    ("ZEPTO", "OTHER", "DRINKS", "MANGO", "500 MLS"),
+    ("ZEPTO", "OTHER", "DRINKS", "MOJITO", "200 MLS"),
+    ("ZEPTO", "OTHER", "DRINKS", "SODA", "750 MLS"),
 )
 
 _BIGBASKET_SEC_ITEM_HEADS = ("PREMIUM", "COMMODITY", "OTHER")
@@ -1281,16 +1634,22 @@ def _parse_month_name_param(raw_value, *, param_name: str = "month") -> str | No
     return month_name
 
 
-def _primary_text_date_expr(column_name: str) -> str:
+def _prim_safe_date_expr(column: str, alias: str | None = None) -> str:
+    prefix = f"{alias}." if alias else ""
+    expr = f'{prefix}"{column}"'
     return f"""
         CASE
-            WHEN TRIM("{column_name}"::text) ~ '^\\d{{2}}-\\d{{2}}-\\d{{4}}$'
-                THEN TO_DATE(TRIM("{column_name}"::text), 'DD-MM-YYYY')
-            WHEN TRIM("{column_name}"::text) ~ '^\\d{{4}}-\\d{{2}}-\\d{{2}}$'
-                THEN TRIM("{column_name}"::text)::date
+            WHEN TRIM({expr}::text) ~ '^\\d{{2}}-\\d{{2}}-\\d{{4}}$'
+                THEN TO_DATE(TRIM({expr}::text), 'DD-MM-YYYY')
+            WHEN TRIM({expr}::text) ~ '^\\d{{4}}-\\d{{2}}-\\d{{2}}$'
+                THEN TRIM({expr}::text)::date
             ELSE NULL
         END
     """
+
+
+def _primary_text_date_expr(column_name: str) -> str:
+    return _prim_safe_date_expr(column_name)
 
 
 def _parse_bigbasket_primary_period(params, platform_format: str) -> tuple[str, str, str, str, int, bool]:
@@ -1336,6 +1695,179 @@ def _parse_bigbasket_primary_period(params, platform_format: str) -> tuple[str, 
 
     today = date.today()
     return month_type, month_col, date_col, _month_name(today.month), today.year, True
+
+
+_PRIM_PO_DATE_EXPR = _prim_safe_date_expr("po_date")
+_PRIM_PO_EXPIRY_DATE_EXPR = _prim_safe_date_expr("po_expiry_date")
+_PRIM_DELIVERY_DATE_EXPR = _prim_safe_date_expr("delivery_date")
+
+_PRIM_MASTER_PO_CTE = f"""
+WITH base AS (
+    SELECT
+        p.*,
+        {_PRIM_PO_DATE_EXPR} AS po_dt,
+        {_PRIM_PO_EXPIRY_DATE_EXPR} AS expiry_dt,
+        {_PRIM_DELIVERY_DATE_EXPR} AS delivery_dt
+    FROM public.prim_master_po p
+    WHERE REGEXP_REPLACE(LOWER(TRIM(p.format::text)), '[^a-z0-9]+', '', 'g') = 'zepto'
+),
+normalized AS (
+    SELECT
+        *,
+        COALESCE(NULLIF(UPPER(TRIM(po_status::text)), ''), 'OTHER') AS status_key,
+        COALESCE(NULLIF(UPPER(TRIM(item_head::text)), ''), 'OTHER') AS item_head_key,
+        COALESCE(NULLIF(UPPER(TRIM(item::text)), ''), NULLIF(UPPER(TRIM(sku_name::text)), ''), 'OTHER') AS item_key,
+        COALESCE(NULLIF(UPPER(TRIM(category::text)), ''), 'OTHER') AS category_key,
+        COALESCE(NULLIF(UPPER(TRIM(sub_category::text)), ''), 'OTHER') AS sub_category_key,
+        UPPER(TRIM(po_month::text)) AS po_month_key,
+        UPPER(TRIM(delivery_month::text)) AS delivery_month_key,
+        COALESCE("year", EXTRACT(YEAR FROM po_dt)::integer) AS po_year,
+        EXTRACT(YEAR FROM expiry_dt)::integer AS expiry_year,
+        CASE
+            WHEN per_liter IS NULL THEN UPPER(TRIM(unit_of_measure::text))
+            WHEN per_liter < 1
+                THEN UPPER(TRIM(TO_CHAR(per_liter * 1000, 'FM999999990.###'))) || ' MLS'
+            ELSE UPPER(TRIM(TO_CHAR(per_liter, 'FM999999990.###'))) || ' LTR'
+        END AS per_ltr_key
+    FROM base
+)
+"""
+
+
+def _parse_primary_dashboard_params(params) -> tuple[str, int, int, bool]:
+    mode = _norm_sec_key(params.get("mode") or params.get("month_type") or "DEL MONTH")
+    if mode not in {"DEL MONTH", "PO MONTH"}:
+        raise ValidationError("`mode` must be DEL MONTH or PO MONTH.")
+
+    raw_month = str(params.get("month") or "").strip()
+    raw_year = str(params.get("year") or "").strip()
+    defaulted_to_latest = False
+
+    iso_month = re.fullmatch(r"(\d{4})-(\d{2})", raw_month)
+    if iso_month and not raw_year:
+        raw_year = iso_month.group(1)
+        raw_month = iso_month.group(2)
+
+    if not raw_month or not raw_year:
+        order_date = "delivery_dt" if mode == "DEL MONTH" else "po_dt"
+        latest = _dict_rows(
+            f"""
+            {_PRIM_MASTER_PO_CTE}
+            SELECT
+                {order_date} AS period_date,
+                COALESCE(expiry_year, EXTRACT(YEAR FROM delivery_dt)::integer, po_year) AS del_year,
+                po_year
+            FROM normalized
+            WHERE {order_date} IS NOT NULL
+            ORDER BY {order_date} DESC
+            LIMIT 1
+            """,
+            [],
+        )
+        if latest:
+            period_date = latest[0].get("period_date")
+            if hasattr(period_date, "month"):
+                raw_month = str(period_date.month)
+                raw_year = str(latest[0].get("del_year" if mode == "DEL MONTH" else "po_year") or period_date.year)
+                defaulted_to_latest = True
+
+    raw_month = raw_month or str(date.today().month)
+    raw_year = raw_year or str(date.today().year)
+
+    if raw_month.isdigit():
+        month = int(raw_month)
+        if not 1 <= month <= 12:
+            raise ValidationError("`month` must be 1-12 or a month name.")
+    else:
+        month_name = _norm_sec_key(raw_month)
+        if month_name not in _MONTH_NAME_TO_NUM:
+            raise ValidationError("`month` must be 1-12 or a month name.")
+        month = _MONTH_NAME_TO_NUM[month_name]
+
+    try:
+        year = int(raw_year)
+    except ValueError:
+        raise ValidationError("`year` must be numeric.")
+    if year < 2000 or year > 2100:
+        raise ValidationError("`year` looks out of range.")
+
+    return mode, month, year, defaulted_to_latest
+
+
+def _primary_period_filter(mode: str) -> str:
+    if mode == "PO MONTH":
+        return "po_month_key = %s AND po_year = %s"
+    return "delivery_month_key = %s AND expiry_year = %s"
+
+
+def _primary_zero_metrics() -> dict:
+    return {
+        "done_value": 0.0,
+        "done_ltrs": 0.0,
+        "done_qty": 0.0,
+        "pending_value": 0.0,
+        "pending_ltrs": 0.0,
+        "dp_value": 0.0,
+        "dp_ltrs": 0.0,
+        "expired_value": 0.0,
+        "expired_ltrs": 0.0,
+        "cancelled_value": 0.0,
+        "cancelled_ltrs": 0.0,
+        "order_value": 0.0,
+        "order_ltrs": 0.0,
+        "order_qty": 0.0,
+    }
+
+
+def _primary_metrics(row: dict | None) -> dict:
+    metrics = _primary_zero_metrics()
+    if row:
+        for key in (
+            "done_value",
+            "done_ltrs",
+            "done_qty",
+            "pending_value",
+            "pending_ltrs",
+            "expired_value",
+            "expired_ltrs",
+            "cancelled_value",
+            "cancelled_ltrs",
+            "order_value",
+            "order_ltrs",
+            "order_qty",
+        ):
+            metrics[key] = _num(row.get(key))
+    metrics["dp_value"] = metrics["done_value"] + metrics["pending_value"]
+    metrics["dp_ltrs"] = metrics["done_ltrs"] + metrics["pending_ltrs"]
+    return metrics
+
+
+def _primary_total(rows: list[dict]) -> dict:
+    total = _primary_zero_metrics()
+    for row in rows:
+        for key in total:
+            total[key] += _num(row.get(key))
+    return total
+
+
+def _primary_trend_rows(rows: list[dict]) -> list[dict]:
+    trend_rows = []
+    for row in rows:
+        period = row.get("period")
+        trend_rows.append({
+            "period": period.isoformat() if hasattr(period, "isoformat") else period,
+            "label": row.get("label") or str(period or ""),
+            "done_value": _num(row.get("done_value")),
+            "done_ltrs": _num(row.get("done_ltrs")),
+            "done_qty": _num(row.get("done_qty")),
+            "pending_value": _num(row.get("pending_value")),
+            "pending_ltrs": _num(row.get("pending_ltrs")),
+            "pending_qty": _num(row.get("pending_qty")),
+            "order_value": _num(row.get("order_value")),
+            "order_ltrs": _num(row.get("order_ltrs")),
+            "order_qty": _num(row.get("order_qty")),
+        })
+    return trend_rows
 
 
 _AMAZON_SEC_ITEM_HEADS = ("PREMIUM", "COMMODITY", "OTHER")
