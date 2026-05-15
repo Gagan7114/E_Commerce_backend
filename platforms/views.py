@@ -896,6 +896,12 @@ _INVENTORY_DASHBOARD_PLATFORMS = {
         "sales_format": "swiggy",
         "latest_source": "secmaster_swiggy",
     },
+    "bigbasket": {
+        "label": "BigBasket",
+        "format": "BIG BASKET",
+        "sales_format": "bigbasket",
+        "latest_source": "secmaster_bigbasket",
+    },
 }
 
 
@@ -903,7 +909,7 @@ def _inventory_dashboard_platform(slug: str, dashboard_name: str) -> dict:
     config = _INVENTORY_DASHBOARD_PLATFORMS.get(slug)
     if not config:
         raise ValidationError(
-            f"{dashboard_name} is available only for Blinkit, Zepto and Swiggy."
+            f"{dashboard_name} is available only for Blinkit, Zepto, Swiggy and BigBasket."
         )
     return config
 
@@ -962,6 +968,8 @@ def blinkit_soh_doh_dashboard(request, slug: str):
             "dashboard_title": f"{platform['label']} SOH/DOH Dashboard",
             "requested_date": None,
             "effective_date": None,
+            "max_sales_date": None,
+            "sales_max_date": None,
             "month_start": None,
             "defaulted_to_latest": defaulted_to_latest,
             "available_dates": [],
@@ -990,6 +998,8 @@ def blinkit_soh_doh_dashboard(request, slug: str):
             "dashboard_title": f"{platform['label']} SOH/DOH Dashboard",
             "requested_date": requested_date.isoformat(),
             "effective_date": None,
+            "max_sales_date": None,
+            "sales_max_date": None,
             "month_start": None,
             "defaulted_to_latest": defaulted_to_latest,
             "available_dates": _inventory_date_options(available_dates),
@@ -998,7 +1008,24 @@ def blinkit_soh_doh_dashboard(request, slug: str):
         })
 
     month_start = effective_date.replace(day=1)
-    elapsed_day = max(1, effective_date.day)
+    max_sales_date = _scalar(
+        f"""
+        SELECT MAX({sale_date_expr})
+        FROM "SecMaster"
+        WHERE REGEXP_REPLACE(LOWER(TRIM("format"::text)), '[^a-z0-9]+', '', 'g') = %s
+          AND ({sale_date_expr}) >= %s
+          AND ({sale_date_expr}) <= %s
+          AND ({sale_date_expr}) IS NOT NULL
+        """,
+        [sales_format, month_start, effective_date],
+    )
+    sales_end_date = max_sales_date or effective_date
+    sales_max_date_value = (
+        max_sales_date.isoformat()
+        if hasattr(max_sales_date, "isoformat")
+        else max_sales_date
+    )
+    elapsed_day = _sec_elapsed_day(max_sales_date)
     rows = _dict_rows(
         f"""
         WITH sales AS (
@@ -1037,7 +1064,7 @@ def blinkit_soh_doh_dashboard(request, slug: str):
         WHERE COALESCE(s.item_key, i.item_key) <> ''
         ORDER BY COALESCE(NULLIF(s.item, ''), NULLIF(i.inventory_item, '')) ASC NULLS LAST
         """,
-        [sales_format, month_start, effective_date, inventory_format, effective_date],
+        [sales_format, month_start, sales_end_date, inventory_format, effective_date],
     )
 
     normalized_rows = []
@@ -1046,8 +1073,8 @@ def blinkit_soh_doh_dashboard(request, slug: str):
         ltr_sold = _num(row.get("ltr_sold"))
         soh_units = _num(row.get("soh_units"))
         soh_ltr = _num(row.get("soh_ltr"))
-        drr_units = quantity / elapsed_day
-        drr_ltr = ltr_sold / elapsed_day
+        drr_units = _safe_div(quantity, elapsed_day)
+        drr_ltr = _safe_div(ltr_sold, elapsed_day)
         normalized_rows.append({
             "item": row.get("item") or row.get("inventory_item") or "",
             "quantity": quantity,
@@ -1057,7 +1084,7 @@ def blinkit_soh_doh_dashboard(request, slug: str):
             "soh_ltr": soh_ltr,
             "drr_ltr": drr_ltr,
             "drr_units": drr_units,
-            "doh": ((soh_units / drr_units) - 2) if drr_units else 0.0,
+            "doh": _safe_div(soh_units, drr_units),
         })
 
     total = _blinkit_soh_doh_total(normalized_rows, elapsed_day)
@@ -1072,6 +1099,8 @@ def blinkit_soh_doh_dashboard(request, slug: str):
         "dashboard_title": f"{platform['label']} SOH/DOH Dashboard",
         "requested_date": requested_date.isoformat(),
         "effective_date": effective_date.isoformat(),
+        "max_sales_date": sales_max_date_value,
+        "sales_max_date": sales_max_date_value,
         "month_start": month_start.isoformat(),
         "defaulted_to_latest": defaulted_to_latest,
         "elapsed_day": elapsed_day,
@@ -1102,7 +1131,7 @@ def _blinkit_soh_doh_empty_total() -> dict:
         "soh_ltr": 0.0,
         "drr_ltr": 0.0,
         "drr_units": 0.0,
-        "doh": None,
+        "doh": 0.0,
     }
 
 
@@ -1115,6 +1144,7 @@ def _blinkit_soh_doh_total(rows: list[dict], elapsed_day: int) -> dict:
     if elapsed_day > 0:
         total["drr_units"] = total["quantity"] / elapsed_day
         total["drr_ltr"] = total["ltr_sold"] / elapsed_day
+    total["doh"] = _safe_div(total["soh_units"], total["drr_units"])
     return total
 
 
@@ -2881,6 +2911,70 @@ def _sum_mom_rows(rows: list[dict]) -> dict:
     return {key: sum(_num(row.get(key)) for row in rows) for key in keys}
 
 
+def _top_ltr_items_from_secmaster(
+    format_key: str,
+    month_name: str,
+    year: int,
+    date_filter: str = "",
+    date_params: list | None = None,
+    value_column: str = '"sales_amt_exc"',
+) -> list[dict]:
+    return _dict_rows(
+        f"""
+        SELECT
+            COALESCE(NULLIF(TRIM("item"::text), ''), '-') AS item,
+            COALESCE(NULLIF(UPPER(TRIM("item_head"::text)), ''), 'OTHER') AS item_head,
+            COALESCE(SUM("quantity"), 0) AS shipped_units,
+            COALESCE(SUM("ltr_sold"), 0) AS shipped_ltr,
+            COALESCE(SUM({value_column}), 0) AS shipped_value
+        FROM "SecMaster"
+        WHERE REGEXP_REPLACE(LOWER(TRIM("format"::text)), '[^a-z0-9]+', '', 'g') = %s
+          AND UPPER(TRIM("month"::text)) = %s
+          AND "year"::numeric = %s
+          {date_filter}
+          AND NULLIF(TRIM("item"::text), '') IS NOT NULL
+        GROUP BY 1, 2
+        ORDER BY COALESCE(SUM("ltr_sold"), 0) DESC
+        LIMIT 8
+        """,
+        [format_key, month_name, year, *(date_params or [])],
+    )
+
+
+def _top_ltr_items_from_table(
+    table_name: str,
+    month_column: str,
+    year_column: str,
+    item_column: str,
+    units_column: str,
+    ltr_column: str,
+    value_column: str,
+    month_value,
+    year_value,
+    date_filter: str = "",
+    date_params: list | None = None,
+) -> list[dict]:
+    return _dict_rows(
+        f"""
+        SELECT
+            COALESCE(NULLIF(TRIM({item_column}::text), ''), '-') AS item,
+            COALESCE(NULLIF(UPPER(TRIM("item_head"::text)), ''), 'OTHER') AS item_head,
+            COALESCE(SUM({units_column}), 0) AS shipped_units,
+            COALESCE(SUM({ltr_column}), 0) AS shipped_ltr,
+            COALESCE(SUM({value_column}), 0) AS shipped_value
+        FROM "{table_name}"
+        WHERE {month_column} = %s
+          AND {year_column} = %s
+          {date_filter}
+          AND NULLIF(TRIM({item_column}::text), '') IS NOT NULL
+        GROUP BY 1, 2
+        ORDER BY COALESCE(SUM({ltr_column}), 0) DESC
+        LIMIT 8
+        """,
+        [month_value, year_value, *(date_params or [])],
+    )
+
+
 @api_view(["GET"])
 @permission_classes([require("platform.secondary.view")])
 def flipkart_grocery_sec_dashboard(request, slug: str):
@@ -2986,6 +3080,20 @@ def flipkart_grocery_sec_dashboard(request, slug: str):
             "per_liter_shpd": _per_liter_shpd(shipped_units, shipped_ltr),
         })
 
+    top_items = _top_ltr_items_from_table(
+        table_name="flipkart_grocery_master",
+        month_column='"month"',
+        year_column='"year"',
+        item_column='"item"',
+        units_column='"qty"',
+        ltr_column='"ltr_sold"',
+        value_column='"sale_amt_exclusive"',
+        month_value=month,
+        year_value=year,
+        date_filter=date_filter,
+        date_params=date_params,
+    )
+
     return Response({
         "source": "flipkart_grocery_master",
         "detail_rows_fixed": True,
@@ -2998,6 +3106,7 @@ def flipkart_grocery_sec_dashboard(request, slug: str):
         "summary_total": _sec_total(summary),
         "details": details,
         "detail_total": _sec_total(details),
+        "top_items": top_items,
     })
 
 
@@ -3897,6 +4006,13 @@ def _bigbasket_sec_dashboard_response(request):
         detail_total["shipped_value"],
         detail_total["shipped_ltr"],
     )
+    top_items = _top_ltr_items_from_secmaster(
+        "bigbasket",
+        month_name,
+        year,
+        date_filter,
+        date_params,
+    )
 
     return Response({
         "source": "SecMaster",
@@ -3913,6 +4029,7 @@ def _bigbasket_sec_dashboard_response(request):
         "summary_total": summary_total,
         "details": details,
         "detail_total": detail_total,
+        "top_items": top_items,
         "show_format_column": True,
         "show_sec_planning_columns": True,
         "dashboard_title": "Big Basket SEC Dashboard",
@@ -4068,6 +4185,19 @@ def _flipkart_sec_dashboard_response(request):
         detail_total["shipped_value"],
         detail_total["shipped_ltr"],
     )
+    top_items = _top_ltr_items_from_table(
+        table_name="flipkart_secondary_all",
+        month_column='UPPER(TRIM("month"::text))',
+        year_column='"year"',
+        item_column='"item"',
+        units_column='"Final Sale Units"',
+        ltr_column='"ltr_sold"',
+        value_column='"Final Sale Amount"',
+        month_value=month_name,
+        year_value=year,
+        date_filter=date_filter,
+        date_params=date_params,
+    )
 
     return Response({
         "source": "flipkart_secondary_all",
@@ -4082,6 +4212,7 @@ def _flipkart_sec_dashboard_response(request):
         "summary_total": summary_total,
         "details": details,
         "detail_total": detail_total,
+        "top_items": top_items,
         "elapsed_day": elapsed_day,
         "days_in_month": days_in_month,
         "show_flipkart_excel_columns": True,
@@ -4417,6 +4548,13 @@ def _blinkit_sec_dashboard_response(request):
         detail_total["shipped_units"],
     )
     detail_total["last_month"] = sum(_num(r.get("last_month")) for r in details)
+    top_items = _top_ltr_items_from_secmaster(
+        "blinkit",
+        month_name,
+        year,
+        date_filter,
+        date_params,
+    )
 
     return Response({
         "source": "SecMaster",
@@ -4431,6 +4569,7 @@ def _blinkit_sec_dashboard_response(request):
         "summary_total": summary_total,
         "details": details,
         "detail_total": detail_total,
+        "top_items": top_items,
         "show_format_column": True,
         "show_last_month": True,
         "dashboard_title": "Blinkit Secondary Dashboard",
@@ -4568,6 +4707,14 @@ def _swiggy_sec_dashboard_response(request):
         detail_total["shipped_ltr"],
     )
     detail_total["last_month"] = sum(_num(r.get("last_month")) for r in details)
+    top_items = _top_ltr_items_from_secmaster(
+        "swiggy",
+        month_name,
+        year,
+        date_filter,
+        date_params,
+        value_column='"sales_amt"',
+    )
 
     return Response({
         "source": "SecMaster",
@@ -4584,6 +4731,7 @@ def _swiggy_sec_dashboard_response(request):
         "summary_total": summary_total,
         "details": details,
         "detail_total": detail_total,
+        "top_items": top_items,
         "show_format_column": False,
         "show_last_month": True,
         "show_ratio_column": False,
@@ -4717,6 +4865,13 @@ def _zepto_sec_dashboard_response(request):
     detail_total["per_liter_shpd"] = sum(
         _num(row.get("per_liter_shpd")) for row in excel_total_rows
     )
+    top_items = _top_ltr_items_from_secmaster(
+        "zepto",
+        month_name,
+        year,
+        date_filter,
+        date_params,
+    )
 
     return Response({
         "source": "SecMaster",
@@ -4731,6 +4886,7 @@ def _zepto_sec_dashboard_response(request):
         "summary_total": summary_total,
         "details": details,
         "detail_total": detail_total,
+        "top_items": top_items,
         "show_format_column": True,
         "dashboard_title": "Zepto SEC Dashboard",
         "detail_subtitle": "Excel rows 14-47; grand total follows rows 14-42",
@@ -5194,6 +5350,13 @@ def swiggy_drr_dashboard(request):
 
 
 @api_view(["GET"])
+@permission_classes([require("platform.inventory.view")])
+def bigbasket_drr_dashboard(request):
+    _ensure_scope(request.user, "bigbasket")
+    return _bigbasket_drr_dashboard_response(request)
+
+
+@api_view(["GET"])
 @permission_classes([require("platform.secondary.view")])
 def flipkart_grocery_drr_dashboard(request, slug: str):
     _ensure_scope(request.user, slug)
@@ -5606,6 +5769,10 @@ def _zepto_drr_dashboard_response(request):
 
 def _swiggy_drr_dashboard_response(request):
     return _inventory_drr_dashboard_response(request, "swiggy")
+
+
+def _bigbasket_drr_dashboard_response(request):
+    return _inventory_drr_dashboard_response(request, "bigbasket")
 
 
 def _inventory_drr_dashboard_response(request, slug: str):

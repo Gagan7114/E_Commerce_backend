@@ -117,6 +117,23 @@ def _upload_table_columns(table: str) -> set[str]:
         return {row[0] for row in cur.fetchall()}
 
 
+def _sync_table_id_sequence(table: str, table_columns: set[str], upload_columns: list[str]) -> None:
+    if "id" not in table_columns or "id" in upload_columns:
+        return
+    with connection.cursor() as cur:
+        cur.execute("SELECT pg_get_serial_sequence(%s, 'id')", [table])
+        result = cur.fetchone()
+        sequence_name = result[0] if result else None
+        if not sequence_name:
+            return
+        cur.execute(f"SELECT COALESCE(MAX(\"id\"), 0) FROM {_quote_ident(table)}")
+        max_id = cur.fetchone()[0] or 0
+        cur.execute(f"SELECT last_value FROM {sequence_name}")
+        last_value = cur.fetchone()[0] or 0
+        if max_id > last_value:
+            cur.execute("SELECT setval(%s, %s, true)", [sequence_name, max_id])
+
+
 def _master_sheet_select_columns() -> str:
     quoted = ", ".join(_quote_ident(col) for col in MASTER_SHEET_COLUMNS)
     return f'ctid::text AS "row_id", {quoted}'
@@ -146,6 +163,130 @@ def _master_sheet_payload(data) -> dict:
         if column in data:
             row[column] = _coerce_master_sheet_value(column, data.get(column))
     return row
+
+
+def _master_sheet_sku_key(value) -> str:
+    return str(value or "").strip().upper()
+
+
+def _master_sheet_existing_by_sku(sku_keys: list[str]) -> dict[str, dict]:
+    keys = sorted({key for key in sku_keys if key})
+    if not keys:
+        return {}
+
+    with connection.cursor() as cur:
+        cur.execute(
+            f"""
+            SELECT DISTINCT ON (UPPER(TRIM(format_sku_code::text)))
+                   {_master_sheet_select_columns()},
+                   UPPER(TRIM(format_sku_code::text)) AS norm_sku
+            FROM master_sheet
+            WHERE UPPER(TRIM(format_sku_code::text)) = ANY(%s)
+            ORDER BY UPPER(TRIM(format_sku_code::text)), ctid::text
+            """,
+            [keys],
+        )
+        cols = [c[0] for c in cur.description]
+        rows = []
+        for values in cur.fetchall():
+            row = dict(zip(cols, values))
+            norm_sku = row.pop("norm_sku", "")
+            rows.append((norm_sku, row))
+    return {norm_sku: row for norm_sku, row in rows}
+
+
+def _master_sheet_bulk_rows(data) -> list[dict]:
+    rows = (data or {}).get("rows") if isinstance(data, dict) else None
+    if not isinstance(rows, list):
+        raise ValueError("rows must be a list.")
+
+    parsed = []
+    for index, raw in enumerate(rows, start=1):
+        if not isinstance(raw, dict):
+            parsed.append({
+                "index": index,
+                "sku": "",
+                "sku_key": "",
+                "row": {},
+                "valid": False,
+                "reason": "Row must be an object.",
+            })
+            continue
+
+        try:
+            payload = _master_sheet_payload(raw)
+        except ValueError as exc:
+            parsed.append({
+                "index": index,
+                "sku": str(raw.get("format_sku_code") or "").strip(),
+                "sku_key": _master_sheet_sku_key(raw.get("format_sku_code")),
+                "row": raw,
+                "valid": False,
+                "reason": str(exc),
+            })
+            continue
+
+        sku = str(payload.get("format_sku_code") or "").strip()
+        if not sku:
+            parsed.append({
+                "index": index,
+                "sku": "",
+                "sku_key": "",
+                "row": payload,
+                "valid": False,
+                "reason": "format_sku_code is required.",
+            })
+            continue
+
+        payload["format_sku_code"] = sku
+        parsed.append({
+            "index": index,
+            "sku": sku,
+            "sku_key": _master_sheet_sku_key(sku),
+            "row": payload,
+            "valid": True,
+            "reason": "",
+        })
+    return parsed
+
+
+def _master_sheet_bulk_preview_payload(parsed_rows: list[dict]) -> dict:
+    existing = _master_sheet_existing_by_sku([row["sku_key"] for row in parsed_rows if row.get("valid")])
+    seen_new = set()
+    preview_rows = []
+    summary = {"insert": 0, "update": 0, "invalid": 0, "total": len(parsed_rows)}
+
+    for row in parsed_rows:
+        if not row.get("valid"):
+            summary["invalid"] += 1
+            preview_rows.append({
+                "index": row["index"],
+                "action": "invalid",
+                "sku": row.get("sku", ""),
+                "reason": row.get("reason", "Invalid row."),
+                "row": row.get("row", {}),
+            })
+            continue
+
+        sku_key = row["sku_key"]
+        action = "update" if sku_key in existing or sku_key in seen_new else "insert"
+        if action == "insert":
+            seen_new.add(sku_key)
+        summary[action] += 1
+        preview_rows.append({
+            "index": row["index"],
+            "action": action,
+            "sku": row["sku"],
+            "reason": "",
+            "row": row["row"],
+            "existing": existing.get(sku_key),
+        })
+
+    return {
+        "columns": MASTER_SHEET_COLUMNS,
+        "summary": summary,
+        "rows": preview_rows,
+    }
 
 
 def _master_sheet_row_by_id(row_id: str):
@@ -239,6 +380,112 @@ def master_sheet_list(request):
         "total": total,
         "page": page,
         "page_size": page_size,
+    })
+
+
+@api_view(["POST"])
+@permission_classes([require("upload.use")])
+def master_sheet_bulk_preview(request):
+    try:
+        parsed_rows = _master_sheet_bulk_rows(request.data or {})
+    except ValueError as exc:
+        return Response({"detail": str(exc)}, status=400)
+
+    return Response(_master_sheet_bulk_preview_payload(parsed_rows))
+
+
+@api_view(["POST"])
+@permission_classes([require("upload.use")])
+def master_sheet_bulk_upsert(request):
+    try:
+        parsed_rows = _master_sheet_bulk_rows(request.data or {})
+    except ValueError as exc:
+        return Response({"detail": str(exc)}, status=400)
+
+    existing = _master_sheet_existing_by_sku([row["sku_key"] for row in parsed_rows if row.get("valid")])
+    result_rows = []
+    summary = {"inserted": 0, "updated": 0, "invalid": 0, "total": len(parsed_rows)}
+
+    with transaction.atomic(), connection.cursor() as cur:
+        for parsed in parsed_rows:
+            if not parsed.get("valid"):
+                summary["invalid"] += 1
+                result_rows.append({
+                    "index": parsed["index"],
+                    "action": "invalid",
+                    "sku": parsed.get("sku", ""),
+                    "reason": parsed.get("reason", "Invalid row."),
+                    "row": parsed.get("row", {}),
+                })
+                continue
+
+            sku_key = parsed["sku_key"]
+            row = parsed["row"]
+            existing_row = existing.get(sku_key)
+
+            if existing_row:
+                update_columns = [
+                    col for col in MASTER_SHEET_COLUMNS
+                    if col != "format_sku_code" and col in row and row[col] is not None
+                ]
+                if update_columns:
+                    assignments = ", ".join(f"{_quote_ident(col)} = %s" for col in update_columns)
+                    values = [row[col] for col in update_columns]
+                    cur.execute(
+                        f"""
+                        UPDATE master_sheet
+                        SET {assignments}
+                        WHERE ctid = %s::tid
+                        RETURNING {_master_sheet_select_columns()}
+                        """,
+                        [*values, existing_row["row_id"]],
+                    )
+                    cols = [c[0] for c in cur.description]
+                    saved_row = dict(zip(cols, cur.fetchone()))
+                else:
+                    saved_row = existing_row
+
+                existing[sku_key] = saved_row
+                summary["updated"] += 1
+                result_rows.append({
+                    "index": parsed["index"],
+                    "action": "update",
+                    "sku": parsed["sku"],
+                    "reason": "",
+                    "row": saved_row,
+                })
+                continue
+
+            insert_columns = [
+                col for col in MASTER_SHEET_COLUMNS
+                if col in row and (row[col] is not None or col == "format_sku_code")
+            ]
+            placeholders = ", ".join(["%s"] * len(insert_columns))
+            cur.execute(
+                f"""
+                INSERT INTO master_sheet ({", ".join(_quote_ident(col) for col in insert_columns)})
+                VALUES ({placeholders})
+                RETURNING {_master_sheet_select_columns()}
+                """,
+                [row[col] for col in insert_columns],
+            )
+            cols = [c[0] for c in cur.description]
+            saved_row = dict(zip(cols, cur.fetchone()))
+            existing[sku_key] = saved_row
+            summary["inserted"] += 1
+            result_rows.append({
+                "index": parsed["index"],
+                "action": "insert",
+                "sku": parsed["sku"],
+                "reason": "",
+                "row": saved_row,
+            })
+
+    return Response({
+        "ok": True,
+        "columns": MASTER_SHEET_COLUMNS,
+        "summary": summary,
+        "rows": result_rows,
     })
 
 
@@ -374,6 +621,7 @@ def _batch_upload(body, *, forced_table: str | None = None):
             {"detail": f"Unknown columns for table '{table}': {invalid}"},
             status=400,
         )
+    _sync_table_id_sequence(table, table_columns, columns)
 
     quoted_cols = [_quote_ident(c) for c in columns]
     col_list = ", ".join(quoted_cols)
