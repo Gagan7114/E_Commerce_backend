@@ -1046,7 +1046,7 @@ def _has_errors(issues: list[dict[str, Any]]) -> bool:
 def _upload_exception_message(default: str, exc: Exception) -> str:
     if settings.DEBUG:
         return f"{default} Details: {exc}"
-    return default
+    return f"{default} ({type(exc).__name__})"
 
 
 def _request_bool(data: Any, *names: str, default: bool = False) -> bool:
@@ -2254,7 +2254,29 @@ def _ensure_amazon_access(user) -> None:
 @permission_classes([require("upload.use")])
 def uploads_collection(request):
     if request.method == "POST":
-        payload, http_status = process_upload(request)
+        try:
+            payload, http_status = process_upload(request)
+        except Exception as exc:
+            logger.exception("Unhandled error in process_upload")
+            return Response(
+                {
+                    "status": "failed",
+                    "error_count": 1,
+                    "warning_count": 0,
+                    "errors": [
+                        {
+                            "severity": "error",
+                            "error_type": "internal_error",
+                            "error_message": _upload_exception_message(
+                                "Upload failed due to an unexpected server error. Please try again or contact support.",
+                                exc,
+                            ),
+                        }
+                    ],
+                    "warnings": [],
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
         return Response(payload, status=http_status)
 
     report_type = str(request.query_params.get("report_type") or "").strip().upper()
