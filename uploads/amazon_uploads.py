@@ -6,6 +6,7 @@ import io
 import json
 import logging
 import re
+import threading
 import uuid
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
@@ -15,7 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from django.conf import settings
-from django.db import connection, transaction
+from django.db import close_old_connections, connection, transaction
 from django.utils import timezone
 from rest_framework import status
 from rest_framework.decorators import api_view, permission_classes
@@ -35,6 +36,16 @@ ALLOWED_EXTENSIONS = {".csv", ".xlsx"}
 UPLOAD_DIR = Path(settings.BASE_DIR) / "uploaded_files" / "amazon"
 logger = logging.getLogger(__name__)
 SYNC_BUSINESS_WARNING_ROW_LIMIT = 1000
+ASYNC_UPLOAD_ROW_THRESHOLD = 5000
+ACTIVE_DUPLICATE_STATUSES = (
+    "completed",
+    "partially_successful",
+    "staged",
+    "uploaded",
+    "validating",
+    "queued",
+    "processing",
+)
 MONTH_OPTIONS = (
     (1, "January"),
     (2, "February"),
@@ -1625,6 +1636,525 @@ def _response_payload(
     }
 
 
+def _estimate_csv_row_count(content: bytes) -> int | None:
+    try:
+        text = content.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        try:
+            text = content.decode("latin-1")
+        except UnicodeDecodeError:
+            return None
+    return max(sum(1 for line in text.splitlines() if line.strip()) - 1, 0)
+
+
+def _should_queue_upload(*, config: ReportConfig, content: bytes, extension: str) -> tuple[bool, int | None]:
+    estimated_rows = _estimate_csv_row_count(content) if extension == ".csv" else None
+    return (
+        config.report_type == "AMAZON_PO"
+        and estimated_rows is not None
+        and estimated_rows >= ASYNC_UPLOAD_ROW_THRESHOLD,
+        estimated_rows,
+    )
+
+
+def _find_duplicate_upload(cur, *, config: ReportConfig, file_hash: str) -> tuple[int, str] | None:
+    placeholders = ", ".join(["%s"] * len(ACTIVE_DUPLICATE_STATUSES))
+    cur.execute(
+        f"""
+        SELECT upload_id, status
+          FROM raw.upload_file
+         WHERE file_hash = %s
+           AND main_table_name = %s
+           AND raw_file_name = %s
+           AND status IN ({placeholders})
+         ORDER BY uploaded_at DESC
+         LIMIT 1
+        """,
+        [
+            file_hash,
+            config.main_table_name,
+            config.raw_file_name,
+            *ACTIVE_DUPLICATE_STATUSES,
+        ],
+    )
+    row = cur.fetchone()
+    return (int(row[0]), str(row[1])) if row else None
+
+
+def _analyze_amazon_transform_tables() -> None:
+    try:
+        with connection.cursor() as cur:
+            cur.execute('ANALYZE staging."amazon data"')
+            cur.execute('ANALYZE reporting."Amazon PO"')
+            cur.execute("ANALYZE public.master_sheet")
+            cur.execute("ANALYZE public.amazon_asin_margin")
+            cur.execute("ANALYZE public.fc_city_state_channel_master")
+            cur.execute("ANALYZE master.fc_master")
+    except Exception:
+        logger.exception("Could not refresh planner statistics before Amazon PO transform")
+
+
+def _process_existing_upload(
+    *,
+    upload_id: int,
+    config: ReportConfig,
+    content: bytes,
+    extension: str,
+) -> dict[str, Any]:
+    rows_inserted_staging = 0
+    rows_received = 0
+    inserted = 0
+    updated = 0
+    issues: list[dict[str, Any]] = []
+    status_value = "failed"
+
+    with transaction.atomic():
+        with connection.cursor() as cur:
+            _update_upload_file(
+                cur,
+                upload_id=upload_id,
+                status_value="validating",
+                row_count=0,
+                error_count=0,
+                warning_count=0,
+            )
+
+    try:
+        rows, issues, rows_received = parse_uploaded_file(
+            config=config,
+            content=content,
+            extension=extension,
+        )
+    except ValueError as exc:
+        rows = []
+        rows_received = 0
+        issues = [
+            {
+                "row_number": None,
+                "field_name": None,
+                "error_type": "parse_failed",
+                "error_message": str(exc),
+                "severity": "error",
+            }
+        ]
+
+    if rows_received == 0 and not any(
+        issue.get("error_type") in {"empty_file", "parse_failed"} for issue in issues
+    ):
+        issues.append(
+            {
+                "row_number": None,
+                "field_name": None,
+                "error_type": "no_data_rows",
+                "error_message": (
+                    "No data rows were found. Paste the header row first, "
+                    "then at least one data row copied from Excel or Sheets."
+                ),
+                "severity": "error",
+            }
+        )
+    elif rows_received > 0 and not rows:
+        issues.append(
+            {
+                "row_number": None,
+                "field_name": None,
+                "error_type": "no_valid_rows",
+                "error_message": (
+                    "No usable rows were parsed. Check that the first pasted row "
+                    "contains the column headers for the selected report type."
+                ),
+                "severity": "error",
+            }
+        )
+
+    with transaction.atomic():
+        with connection.cursor() as cur:
+            try:
+                with transaction.atomic():
+                    rows_inserted_staging = _insert_staging_rows(
+                        cur,
+                        upload_id=upload_id,
+                        config=config,
+                        rows=rows,
+                    )
+            except Exception as exc:
+                logger.exception("Could not insert staging rows for upload_id=%s", upload_id)
+                rows_inserted_staging = 0
+                issues.append(
+                    {
+                        "row_number": None,
+                        "field_name": None,
+                        "error_type": "staging_insert_failed",
+                        "error_message": _upload_exception_message(
+                            "Could not insert rows into the staging table.",
+                            exc,
+                        ),
+                        "severity": "error",
+                    }
+                )
+            if rows_inserted_staging != len(rows) and not any(
+                i.get("error_type") == "staging_insert_failed" for i in issues
+            ):
+                issues.append(
+                    {
+                        "row_number": None,
+                        "field_name": None,
+                        "error_type": "staging_row_count_mismatch",
+                        "error_message": "Parser row count did not match staging insert count.",
+                        "severity": "error",
+                    }
+                )
+            if rows_received <= SYNC_BUSINESS_WARNING_ROW_LIMIT:
+                try:
+                    with transaction.atomic():
+                        issues.extend(
+                            _add_business_warnings(
+                                cur,
+                                config=config,
+                                upload_id=upload_id,
+                            )
+                        )
+                except Exception as exc:
+                    logger.exception("Could not add upload business warnings for upload_id=%s", upload_id)
+                    issues.append(
+                        {
+                            "row_number": None,
+                            "field_name": None,
+                            "error_type": "business_warning_check_failed",
+                            "error_message": _upload_exception_message(
+                                "Could not complete master-data warning checks.",
+                                exc,
+                            ),
+                            "severity": "warning",
+                        }
+                    )
+
+            _insert_validation_issues_best_effort(
+                cur,
+                upload_id=upload_id,
+                config=config,
+                issues=issues,
+            )
+            error_count = sum(1 for issue in issues if issue.get("severity") == "error")
+            warning_count = sum(1 for issue in issues if issue.get("severity") == "warning")
+
+            if _has_errors(issues):
+                status_value = "failed"
+                valid_rows = max(rows_received - _count_issue_rows(issues, "error"), 0)
+                _upsert_summary(
+                    cur,
+                    upload_id=upload_id,
+                    config=config,
+                    total_rows=rows_received,
+                    valid_rows=valid_rows,
+                    error_rows=_count_issue_rows(issues, "error"),
+                    warning_rows=_count_issue_rows(issues, "warning"),
+                    inserted=0,
+                    updated=0,
+                    status_value=status_value,
+                )
+                _update_upload_file(
+                    cur,
+                    upload_id=upload_id,
+                    status_value=status_value,
+                    row_count=rows_received,
+                    error_count=error_count,
+                    warning_count=warning_count,
+                    metadata={"rows_inserted_staging": rows_inserted_staging},
+                )
+                return _response_payload(
+                    upload_id=upload_id,
+                    config=config,
+                    status_value=status_value,
+                    rows_received=rows_received,
+                    rows_inserted_staging=rows_inserted_staging,
+                    inserted=0,
+                    updated=0,
+                    issues=issues,
+                )
+
+            _update_upload_file(
+                cur,
+                upload_id=upload_id,
+                status_value="processing",
+                row_count=rows_received,
+                error_count=error_count,
+                warning_count=warning_count,
+                metadata={"rows_inserted_staging": rows_inserted_staging},
+            )
+
+    if config.report_type == "AMAZON_PO":
+        _analyze_amazon_transform_tables()
+
+    try:
+        with transaction.atomic():
+            with connection.cursor() as cur:
+                inserted, updated = _run_transform(
+                    cur,
+                    config=config,
+                    upload_id=upload_id,
+                )
+        warning_count = sum(1 for issue in issues if issue.get("severity") == "warning")
+        status_value = "partially_successful" if warning_count else "completed"
+    except Exception as exc:
+        logger.exception("Could not transform upload_id=%s", upload_id)
+        issues.append(
+            {
+                "row_number": None,
+                "field_name": None,
+                "error_type": "transform_failed",
+                "error_message": _upload_exception_message(
+                    "Could not transform staged rows into the reporting table.",
+                    exc,
+                ),
+                "severity": "error",
+            }
+        )
+        status_value = "failed"
+        with transaction.atomic():
+            with connection.cursor() as cur:
+                _insert_validation_issues_best_effort(
+                    cur,
+                    upload_id=upload_id,
+                    config=config,
+                    issues=[issues[-1]],
+                )
+
+    error_count = sum(1 for issue in issues if issue.get("severity") == "error")
+    warning_count = sum(1 for issue in issues if issue.get("severity") == "warning")
+    valid_rows = max(rows_received - _count_issue_rows(issues, "error"), 0)
+    with transaction.atomic():
+        with connection.cursor() as cur:
+            _upsert_summary(
+                cur,
+                upload_id=upload_id,
+                config=config,
+                total_rows=rows_received,
+                valid_rows=valid_rows,
+                error_rows=_count_issue_rows(issues, "error"),
+                warning_rows=_count_issue_rows(issues, "warning"),
+                inserted=inserted,
+                updated=updated,
+                status_value=status_value,
+            )
+            _update_upload_file(
+                cur,
+                upload_id=upload_id,
+                status_value=status_value,
+                row_count=rows_received,
+                error_count=error_count,
+                warning_count=warning_count,
+                metadata={
+                    "rows_inserted_staging": rows_inserted_staging,
+                    "rows_inserted_final": inserted,
+                    "rows_updated_final": updated,
+                },
+            )
+
+    return _response_payload(
+        upload_id=upload_id,
+        config=config,
+        status_value=status_value,
+        rows_received=rows_received,
+        rows_inserted_staging=rows_inserted_staging,
+        inserted=inserted,
+        updated=updated,
+        issues=issues,
+    )
+
+
+def _mark_upload_internal_failure(
+    *,
+    upload_id: int,
+    config: ReportConfig,
+    exc: Exception,
+) -> None:
+    issue = {
+        "row_number": None,
+        "field_name": None,
+        "error_type": "internal_error",
+        "error_message": _upload_exception_message(
+            "Upload failed due to an unexpected server error. Please try again or contact support.",
+            exc,
+        ),
+        "severity": "error",
+    }
+    with transaction.atomic():
+        with connection.cursor() as cur:
+            _insert_validation_issues_best_effort(
+                cur,
+                upload_id=upload_id,
+                config=config,
+                issues=[issue],
+            )
+            _upsert_summary(
+                cur,
+                upload_id=upload_id,
+                config=config,
+                total_rows=0,
+                valid_rows=0,
+                error_rows=1,
+                warning_rows=0,
+                inserted=0,
+                updated=0,
+                status_value="failed",
+            )
+            _update_upload_file(
+                cur,
+                upload_id=upload_id,
+                status_value="failed",
+                row_count=0,
+                error_count=1,
+                warning_count=0,
+            )
+
+
+def _background_upload_target(
+    *,
+    upload_id: int,
+    config: ReportConfig,
+    content: bytes,
+    extension: str,
+) -> None:
+    close_old_connections()
+    try:
+        _process_existing_upload(
+            upload_id=upload_id,
+            config=config,
+            content=content,
+            extension=extension,
+        )
+    except Exception as exc:
+        logger.exception("Unhandled background upload error for upload_id=%s", upload_id)
+        _mark_upload_internal_failure(upload_id=upload_id, config=config, exc=exc)
+    finally:
+        close_old_connections()
+
+
+def _start_background_upload(
+    *,
+    upload_id: int,
+    config: ReportConfig,
+    content: bytes,
+    extension: str,
+) -> None:
+    thread = threading.Thread(
+        target=_background_upload_target,
+        kwargs={
+            "upload_id": upload_id,
+            "config": config,
+            "content": content,
+            "extension": extension,
+        },
+        name=f"amazon-upload-{upload_id}",
+        daemon=True,
+    )
+    thread.start()
+
+
+def _queue_upload(
+    *,
+    config: ReportConfig,
+    original_name: str,
+    stored_file_path: str,
+    file_hash: str,
+    extension: str,
+    uploaded_by: str,
+    base_metadata: dict[str, Any],
+    reprocess_duplicate: bool,
+    content: bytes,
+    estimated_rows: int | None,
+) -> tuple[dict[str, Any], int]:
+    with transaction.atomic():
+        with connection.cursor() as cur:
+            duplicate = _find_duplicate_upload(cur, config=config, file_hash=file_hash)
+            metadata = dict(base_metadata)
+            if duplicate:
+                metadata = {
+                    **metadata,
+                    "duplicate_of": duplicate[0],
+                    "duplicate_processed": reprocess_duplicate,
+                }
+                if not reprocess_duplicate:
+                    upload_id = _insert_upload_file(
+                        cur,
+                        config=config,
+                        original_file_name=original_name,
+                        stored_file_path=stored_file_path,
+                        file_hash=file_hash,
+                        file_extension=extension,
+                        uploaded_by=uploaded_by,
+                        status_value="duplicate",
+                        metadata=metadata,
+                    )
+                    issues = [
+                        {
+                            "row_number": None,
+                            "field_name": "file_hash",
+                            "error_type": "duplicate_file",
+                            "error_message": (
+                                f"This exact file was already uploaded as upload_id {duplicate[0]}."
+                            ),
+                            "severity": "warning",
+                        }
+                    ]
+                    _insert_validation_issues_best_effort(
+                        cur,
+                        upload_id=upload_id,
+                        config=config,
+                        issues=issues,
+                    )
+                    payload = _response_payload(
+                        upload_id=upload_id,
+                        config=config,
+                        status_value="duplicate",
+                        rows_received=0,
+                        rows_inserted_staging=0,
+                        inserted=0,
+                        updated=0,
+                        issues=issues,
+                    )
+                    payload["duplicate_of"] = duplicate[0]
+                    return payload, status.HTTP_200_OK
+
+            upload_id = _insert_upload_file(
+                cur,
+                config=config,
+                original_file_name=original_name,
+                stored_file_path=stored_file_path,
+                file_hash=file_hash,
+                file_extension=extension,
+                uploaded_by=uploaded_by,
+                status_value="queued",
+                metadata={
+                    **metadata,
+                    "estimated_rows": estimated_rows,
+                    "async_processing": True,
+                },
+            )
+            transaction.on_commit(
+                lambda: _start_background_upload(
+                    upload_id=upload_id,
+                    config=config,
+                    content=content,
+                    extension=extension,
+                )
+            )
+
+    payload = _response_payload(
+        upload_id=upload_id,
+        config=config,
+        status_value="queued",
+        rows_received=estimated_rows or 0,
+        rows_inserted_staging=0,
+        inserted=0,
+        updated=0,
+        issues=[],
+    )
+    payload["processing"] = True
+    return payload, status.HTTP_202_ACCEPTED
+
+
 def process_upload(request) -> tuple[dict[str, Any], int]:
     report_type = str(request.data.get("report_type") or "").strip().upper()
     config = REPORTS.get(report_type)
@@ -1669,36 +2199,35 @@ def process_upload(request) -> tuple[dict[str, Any], int]:
         "reprocess_duplicate",
         "reprocess_duplicates",
         "reprocessDuplicate",
+        "reprocess",
         default=True,
     )
     base_metadata = {
         "report_type": config.report_type,
         "upload_source": upload_source,
     }
+    should_queue, estimated_rows = _should_queue_upload(
+        config=config,
+        content=content,
+        extension=extension,
+    )
+    if should_queue:
+        return _queue_upload(
+            config=config,
+            original_name=original_name,
+            stored_file_path=stored_file_path,
+            file_hash=file_hash,
+            extension=extension,
+            uploaded_by=uploaded_by,
+            base_metadata=base_metadata,
+            reprocess_duplicate=reprocess_duplicate,
+            content=content,
+            estimated_rows=estimated_rows,
+        )
 
     with transaction.atomic():
         with connection.cursor() as cur:
-            cur.execute(
-                """
-                SELECT upload_id, status
-                  FROM raw.upload_file
-                 WHERE file_hash = %s
-                   AND main_table_name = %s
-                   AND raw_file_name = %s
-                   AND status IN (
-                       'completed', 'partially_successful', 'staged',
-                       'uploaded', 'validating'
-                   )
-                 ORDER BY uploaded_at DESC
-                 LIMIT 1
-                """,
-                [
-                    file_hash,
-                    config.main_table_name,
-                    config.raw_file_name,
-                ],
-            )
-            duplicate = cur.fetchone()
+            duplicate = _find_duplicate_upload(cur, config=config, file_hash=file_hash)
             if duplicate:
                 base_metadata = {
                     **base_metadata,
