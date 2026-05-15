@@ -2614,6 +2614,118 @@ def amazon_po_filter_options(request):
 
 @api_view(["GET"])
 @permission_classes([require("platform.po.view")])
+def amazon_po_matrix(request):
+    _ensure_amazon_access(request.user)
+    q = request.query_params
+    month = q.get("month")
+    year = q.get("year")
+    fc = str(q.get("fc") or "").strip()
+    channel = str(q.get("channel") or "").strip().upper()
+    asin = str(q.get("asin") or "").strip()
+
+    if not month or not year:
+        return Response({"error": "month and year are required"}, status=400)
+
+    where = ["po_month = %s", "year = %s"]
+    params: list[Any] = [int(month), int(year)]
+    if fc:
+        where.append("fulfillment_center = %s")
+        params.append(fc)
+    if channel:
+        where.append("UPPER(TRIM(core_fresh_now::text)) = %s")
+        params.append(channel)
+    if asin:
+        where.append("sku_code = %s")
+        params.append(asin)
+
+    where_sql = " AND ".join(where)
+
+    with connection.cursor() as cur:
+        cur.execute(
+            f"""
+            SELECT
+                COALESCE(NULLIF(TRIM(item_head::text), ''), 'OTHER')       AS item_head,
+                COALESCE(NULLIF(TRIM(category::text), ''), 'Unknown')       AS category,
+                COALESCE(NULLIF(TRIM(sub_category::text), ''), 'Unknown')   AS sub_category,
+                MAX(order_date)                                              AS max_date,
+                COALESCE(SUM(total_received_cost), 0)                        AS done_value,
+                COALESCE(SUM(total_delivered_liters), 0)                     AS done_ltrs,
+                COALESCE(SUM(total_requested_cost) FILTER (WHERE po_status = 'PENDING'), 0)  AS pending_value,
+                COALESCE(SUM(order_ltrs_cl)        FILTER (WHERE po_status = 'PENDING'), 0)  AS pending_ltrs,
+                COALESCE(SUM(total_requested_cost) FILTER (WHERE po_status = 'EXPIRED'), 0)  AS expired_value,
+                COALESCE(SUM(order_ltrs_cl)        FILTER (WHERE po_status = 'EXPIRED'), 0)  AS expired_ltrs,
+                COALESCE(SUM(total_requested_cost) FILTER (WHERE po_status IN ('CANCELLED', 'MOV')), 0) AS cancelled_value,
+                COALESCE(SUM(order_ltrs_cl)        FILTER (WHERE po_status IN ('CANCELLED', 'MOV')), 0) AS cancelled_ltrs
+            FROM reporting."Amazon PO"
+            WHERE {where_sql}
+            GROUP BY 1, 2, 3
+            ORDER BY 1, 2, 3
+            """,
+            params,
+        )
+        rows = _rows_to_dicts(cur)
+
+        # Filter options for month/year/FC/channel dropdowns
+        cur.execute(
+            """
+            SELECT DISTINCT po_month
+              FROM reporting."Amazon PO"
+             WHERE po_month IS NOT NULL
+             ORDER BY po_month ASC
+            """
+        )
+        month_values = {int(r[0]) for r in cur.fetchall() if r[0]}
+        months = [
+            {"value": str(v), "label": lbl}
+            for v, lbl in MONTH_OPTIONS
+            if v in month_values
+        ]
+
+        cur.execute(
+            """
+            SELECT DISTINCT year
+              FROM reporting."Amazon PO"
+             WHERE year IS NOT NULL
+             ORDER BY year DESC
+            """
+        )
+        years = [str(r[0]) for r in cur.fetchall()]
+
+        cur.execute(
+            """
+            SELECT DISTINCT NULLIF(TRIM(fulfillment_center::text), '') AS fc
+              FROM reporting."Amazon PO"
+             WHERE fulfillment_center IS NOT NULL AND TRIM(fulfillment_center::text) != ''
+             ORDER BY fc ASC
+            """
+        )
+        fcs = [r[0] for r in cur.fetchall() if r[0]]
+
+        cur.execute(
+            """
+            SELECT DISTINCT UPPER(TRIM(core_fresh_now::text)) AS ch
+              FROM reporting."Amazon PO"
+             WHERE core_fresh_now IS NOT NULL AND TRIM(core_fresh_now::text) != ''
+             ORDER BY ch ASC
+            """
+        )
+        channels_opts = [r[0] for r in cur.fetchall() if r[0]]
+
+    return Response(
+        {
+            "rows": rows,
+            "filter_options": {
+                "months": months,
+                "years": years,
+                "fcs": fcs,
+                "channels": channels_opts,
+            },
+        }
+    )
+
+
+@api_view(["GET"])
+@permission_classes([require("platform.po.view")])
 def appointment_report(request):
     _ensure_amazon_access(request.user)
     page, page_size, offset = _page_params(request)
