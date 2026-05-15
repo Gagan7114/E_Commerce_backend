@@ -588,51 +588,39 @@ def primary_dashboard(request, slug: str):
         f"""
         {_PRIM_MASTER_PO_CTE}
         SELECT
-            COALESCE(
-                NULLIF(UPPER(TRIM(vendor_new::text)), ''),
-                NULLIF(UPPER(TRIM(vendor_name::text)), ''),
-                'UNMAPPED'
-            ) AS vendor,
-            COALESCE(SUM(COALESCE(total_order_amt_exclusive, 0)), 0) AS order_value,
-            COALESCE(SUM(COALESCE(total_delivered_amt_exclusive, 0)), 0) AS delivered_value,
-            COALESCE(SUM(GREATEST(
-                COALESCE(total_order_amt_exclusive, 0)
-                - COALESCE(total_delivered_amt_exclusive, 0),
-                0
-            )), 0) AS pending_value,
-            COALESCE(SUM(COALESCE(total_order_liters, 0)), 0) AS order_ltrs,
-            COALESCE(SUM(COALESCE(total_delivered_liters, 0)), 0) AS delivered_ltrs,
-            COALESCE(SUM(GREATEST(
-                COALESCE(total_order_liters, 0)
-                - COALESCE(total_delivered_liters, 0),
-                0
-            )), 0) AS pending_ltrs,
-            COALESCE(SUM(COALESCE(order_qty, 0)), 0) AS order_qty,
-            COALESCE(SUM(COALESCE(delivered_qty, 0)), 0) AS delivered_qty,
-            COALESCE(SUM(GREATEST(
-                COALESCE(order_qty, 0)
-                - COALESCE(delivered_qty, 0),
-                0
-            )), 0) AS pending_qty
-        FROM normalized
-        WHERE UPPER(TRIM(COALESCE(open_close::text, ''))) = 'OPEN'
+            vendor,
+            COALESCE(SUM(order_value_row), 0) AS order_value,
+            COALESCE(SUM(delivered_value_row), 0) AS delivered_value,
+            COALESCE(SUM(GREATEST(order_value_row - delivered_value_row, 0)), 0) AS pending_value,
+            COALESCE(SUM(order_ltrs_row), 0) AS order_ltrs,
+            COALESCE(SUM(delivered_ltrs_row), 0) AS delivered_ltrs,
+            COALESCE(SUM(GREATEST(order_ltrs_row - delivered_ltrs_row, 0)), 0) AS pending_ltrs,
+            COALESCE(SUM(order_qty_row), 0) AS order_qty,
+            COALESCE(SUM(delivered_qty_row), 0) AS delivered_qty,
+            COALESCE(SUM(GREATEST(order_qty_row - delivered_qty_row, 0)), 0) AS pending_qty
+        FROM (
+            SELECT
+                COALESCE(
+                    NULLIF(UPPER(TRIM(vendor_new::text)), ''),
+                    NULLIF(UPPER(TRIM(vendor_name::text)), ''),
+                    'UNMAPPED'
+                ) AS vendor,
+                COALESCE(total_order_amt_exclusive, 0) AS order_value_row,
+                CASE
+                    WHEN COALESCE(total_delivered_amt_exclusive, 0) <> 0
+                        THEN COALESCE(total_delivered_amt_exclusive, 0)
+                    WHEN COALESCE(delivered_qty, 0) <> 0
+                        THEN COALESCE(delivered_qty, 0) * COALESCE(basic_rate, 0)
+                    ELSE 0
+                END AS delivered_value_row,
+                COALESCE(total_order_liters, 0) AS order_ltrs_row,
+                COALESCE(total_delivered_liters, 0) AS delivered_ltrs_row,
+                COALESCE(order_qty, 0) AS order_qty_row,
+                COALESCE(delivered_qty, 0) AS delivered_qty_row
+            FROM normalized
+        ) vendor_rows
         GROUP BY 1
-        HAVING COALESCE(SUM(GREATEST(
-            COALESCE(total_order_amt_exclusive, 0)
-            - COALESCE(total_delivered_amt_exclusive, 0),
-            0
-        )), 0) > 0
-        OR COALESCE(SUM(GREATEST(
-            COALESCE(total_order_liters, 0)
-            - COALESCE(total_delivered_liters, 0),
-            0
-        )), 0) > 0
-        OR COALESCE(SUM(GREATEST(
-            COALESCE(order_qty, 0)
-            - COALESCE(delivered_qty, 0),
-            0
-        )), 0) > 0
-        ORDER BY pending_value DESC, vendor
+        ORDER BY pending_value DESC, order_value DESC, vendor
         """,
         [],
     )
