@@ -599,13 +599,37 @@ def primary_dashboard(request, slug: str):
                 COALESCE(total_order_amt_exclusive, 0)
                 - COALESCE(total_delivered_amt_exclusive, 0),
                 0
-            )), 0) AS pending_value
+            )), 0) AS pending_value,
+            COALESCE(SUM(COALESCE(total_order_liters, 0)), 0) AS order_ltrs,
+            COALESCE(SUM(COALESCE(total_delivered_liters, 0)), 0) AS delivered_ltrs,
+            COALESCE(SUM(GREATEST(
+                COALESCE(total_order_liters, 0)
+                - COALESCE(total_delivered_liters, 0),
+                0
+            )), 0) AS pending_ltrs,
+            COALESCE(SUM(COALESCE(order_qty, 0)), 0) AS order_qty,
+            COALESCE(SUM(COALESCE(delivered_qty, 0)), 0) AS delivered_qty,
+            COALESCE(SUM(GREATEST(
+                COALESCE(order_qty, 0)
+                - COALESCE(delivered_qty, 0),
+                0
+            )), 0) AS pending_qty
         FROM normalized
         WHERE UPPER(TRIM(COALESCE(open_close::text, ''))) = 'OPEN'
         GROUP BY 1
         HAVING COALESCE(SUM(GREATEST(
             COALESCE(total_order_amt_exclusive, 0)
             - COALESCE(total_delivered_amt_exclusive, 0),
+            0
+        )), 0) > 0
+        OR COALESCE(SUM(GREATEST(
+            COALESCE(total_order_liters, 0)
+            - COALESCE(total_delivered_liters, 0),
+            0
+        )), 0) > 0
+        OR COALESCE(SUM(GREATEST(
+            COALESCE(order_qty, 0)
+            - COALESCE(delivered_qty, 0),
             0
         )), 0) > 0
         ORDER BY pending_value DESC, vendor
