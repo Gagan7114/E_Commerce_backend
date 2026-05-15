@@ -6,7 +6,11 @@
       "Bash(python -m py_compile sap/views.py sap/service.py sap/router.py)",
       "Bash(python -m py_compile dashboard/views.py uploads/views.py)",
       "Bash(python -c \"import django; django.setup\\(\\)\")",
-      "Bash(python -c ' *)"
+      "Bash(python -c ' *)",
+      "Bash(Get-ChildItem -Path \"C:\\\\Users\\\\Udaykaran\\\\Documents\\\\backend\" -Recurse -Directory)",
+      "Bash(Select-Object -ExpandProperty FullName)",
+      "Bash(grep -n \"KPI grid\\\\|amd-kpi-grid\\\\|amd-kpi {\" C:/Users/Udaykaran/Documents/frontend/src/App.css | head -10)",
+      "Read(//c/Users/Udaykaran/Documents/frontend/src/**)"
     ]
   }
 }
