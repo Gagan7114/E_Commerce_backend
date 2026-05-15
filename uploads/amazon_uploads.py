@@ -35,6 +35,25 @@ ALLOWED_EXTENSIONS = {".csv", ".xlsx"}
 UPLOAD_DIR = Path(settings.BASE_DIR) / "uploaded_files" / "amazon"
 logger = logging.getLogger(__name__)
 SYNC_BUSINESS_WARNING_ROW_LIMIT = 1000
+MONTH_OPTIONS = (
+    (1, "January"),
+    (2, "February"),
+    (3, "March"),
+    (4, "April"),
+    (5, "May"),
+    (6, "June"),
+    (7, "July"),
+    (8, "August"),
+    (9, "September"),
+    (10, "October"),
+    (11, "November"),
+    (12, "December"),
+)
+MONTH_NAME_TO_NUMBER = {
+    name.lower(): value for value, name in MONTH_OPTIONS
+} | {
+    name[:3].lower(): value for value, name in MONTH_OPTIONS
+}
 
 
 @dataclass(frozen=True)
@@ -2143,6 +2162,23 @@ def _add_date_range(
         params.append(end)
 
 
+def _add_int_filter(
+    where: list[str],
+    params: list[Any],
+    column_sql: str,
+    value: str | None,
+) -> None:
+    text = str(value or "").strip()
+    if not text:
+        return
+    try:
+        parsed = int(text)
+    except ValueError:
+        return
+    where.append(f"{column_sql} = %s")
+    params.append(parsed)
+
+
 def _paginated_select(
     *,
     table_sql: str,
@@ -2397,6 +2433,22 @@ def amazon_po_report(request):
     _add_ilike(where, params, "item_head", q.get("item_head"))
     _add_ilike(where, params, "state", q.get("state"))
     _add_ilike(where, params, "city", q.get("city"))
+    month_val = str(q.get("month") or q.get("po_month") or "").strip()
+    if month_val:
+        month_number = MONTH_NAME_TO_NUMBER.get(month_val.lower())
+        if month_number is None:
+            try:
+                month_number = int(month_val)
+            except ValueError:
+                month_number = None
+        if month_number is not None:
+            where.append("po_month = %s")
+            params.append(month_number)
+    _add_int_filter(where, params, '"year"', q.get("year"))
+    channel_val = str(q.get("channel") or q.get("core_fresh_now") or "").strip().upper()
+    if channel_val:
+        where.append("UPPER(TRIM(COALESCE(core_fresh_now, ''))) = %s")
+        params.append(channel_val)
     po_status_val = str(q.get("po_status") or "").strip().upper()
     if po_status_val:
         where.append("po_status = %s")
@@ -2511,11 +2563,50 @@ def amazon_po_filter_options(request):
         )
         po_statuses = [row[0] for row in cur.fetchall()]
 
+        cur.execute(
+            """
+            SELECT DISTINCT po_month
+              FROM reporting."Amazon PO"
+             WHERE po_month IS NOT NULL
+             ORDER BY po_month ASC
+            """
+        )
+        month_values = {int(row[0]) for row in cur.fetchall() if row[0]}
+        months = [
+            {"value": str(value), "label": label}
+            for value, label in MONTH_OPTIONS
+            if value in month_values
+        ]
+
+        cur.execute(
+            """
+            SELECT DISTINCT year
+              FROM reporting."Amazon PO"
+             WHERE year IS NOT NULL
+             ORDER BY year DESC
+            """
+        )
+        years = [str(row[0]) for row in cur.fetchall()]
+
+        cur.execute(
+            """
+            SELECT DISTINCT UPPER(TRIM(core_fresh_now::text)) AS channel
+              FROM reporting."Amazon PO"
+             WHERE core_fresh_now IS NOT NULL
+               AND TRIM(core_fresh_now::text) != ''
+             ORDER BY channel ASC
+            """
+        )
+        channels = [row[0] for row in cur.fetchall()]
+
     return Response(
         {
             "asins": asins,
             "fulfillment_centers": fulfillment_centers,
             "po_statuses": po_statuses,
+            "months": months,
+            "years": years,
+            "channels": channels,
             "item_heads": ["PREMIUM", "COMMODITY", "OTHER"],
         }
     )

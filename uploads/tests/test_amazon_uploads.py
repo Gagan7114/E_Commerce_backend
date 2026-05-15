@@ -768,6 +768,26 @@ class AmazonUploadTests(TransactionTestCase):
             )
             self.assertEqual(cur.fetchone(), (1, Decimal("90"), "EXT2", "MSKU2"))
 
+        filter_response = self.client.get("/api/reports/amazon-po/filter-options")
+        self.assertEqual(filter_response.status_code, 200, filter_response.data)
+        self.assertIn({"value": "5", "label": "May"}, filter_response.data["months"])
+        self.assertIn("2026", filter_response.data["years"])
+        self.assertIn("CORE", filter_response.data["channels"])
+
+        report_response = self.client.get(
+            "/api/reports/amazon-po",
+            {"month": "5", "year": "2026", "channel": "CORE"},
+        )
+        self.assertEqual(report_response.status_code, 200, report_response.data)
+        self.assertEqual(report_response.data["count"], 1)
+
+        empty_response = self.client.get(
+            "/api/reports/amazon-po",
+            {"month": "May", "year": "2026", "channel": "FRESH"},
+        )
+        self.assertEqual(empty_response.status_code, 200, empty_response.data)
+        self.assertEqual(empty_response.data["count"], 0)
+
     def test_amazon_po_status_uses_excel_formula_order(self):
         with connection.cursor() as cur:
             cur.execute(
