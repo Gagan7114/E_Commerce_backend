@@ -1355,7 +1355,7 @@ def _transform_amazon_po(cur, upload_id: int) -> tuple[int, int]:
         ),
         calculated AS (
             SELECT e.*,
-                   COALESCE(e.cancellation_deadline, e.window_end, e.expected_date) AS expiry_calc,
+                   e.cancellation_deadline AS expiry_calc,
                    CASE
                        WHEN e.vendor_code = '0M7KK' THEN 'RK WORLD'
                        ELSE e.vendor_code
@@ -1373,55 +1373,103 @@ def _transform_amazon_po(cur, upload_id: int) -> tuple[int, int]:
             SELECT c.*,
                    GREATEST((c.expiry_calc - CURRENT_DATE)::int, 0) AS days_to_expiry_calc,
                    CASE
-                       WHEN TRIM(COALESCE(c.availability, '')) = 'AC - Accepted: In stock'
-                            AND COALESCE(c.received_quantity, 0) = 0
+                       -- GS-1: Unconfirmed + AC + accepted=0 received=0 cancelled=0 + expiry past
+                       WHEN TRIM(COALESCE(c.status, '')) = 'Unconfirmed'
+                            AND TRIM(COALESCE(c.availability, '')) = 'AC - Accepted: In stock'
                             AND COALESCE(c.accepted_quantity, 0) = 0
+                            AND COALESCE(c.received_quantity, 0) = 0
                             AND COALESCE(c.cancelled_quantity, 0) = 0
                             AND c.expiry_calc IS NOT NULL
                             AND c.expiry_calc < CURRENT_DATE THEN 'EXPIRED'
-                       WHEN TRIM(COALESCE(c.availability, '')) = 'AC - Accepted: In stock'
-                            AND TRIM(COALESCE(c.status, '')) = 'Confirmed'
+                       -- GS-2: Confirmed + AC + accepted>0 received=0 cancelled=0 + expiry past
+                       WHEN TRIM(COALESCE(c.status, '')) = 'Confirmed'
+                            AND TRIM(COALESCE(c.availability, '')) = 'AC - Accepted: In stock'
                             AND COALESCE(c.accepted_quantity, 0) > 0
                             AND COALESCE(c.received_quantity, 0) = 0
                             AND COALESCE(c.cancelled_quantity, 0) = 0
                             AND c.expiry_calc IS NOT NULL
                             AND c.expiry_calc < CURRENT_DATE THEN 'EXPIRED'
+                       -- GS-3: Confirmed + AC + requested>0 accepted=0 received=0 cancelled=0 + expiry past
+                       WHEN TRIM(COALESCE(c.status, '')) = 'Confirmed'
+                            AND TRIM(COALESCE(c.availability, '')) = 'AC - Accepted: In stock'
+                            AND COALESCE(c.requested_quantity, 0) > 0
+                            AND COALESCE(c.accepted_quantity, 0) = 0
+                            AND COALESCE(c.received_quantity, 0) = 0
+                            AND COALESCE(c.cancelled_quantity, 0) = 0
+                            AND c.expiry_calc IS NOT NULL
+                            AND c.expiry_calc < CURRENT_DATE THEN 'EXPIRED'
+                       -- GS-4: Confirmed + OS + accepted=0 received=0 cancelled=0
                        WHEN TRIM(COALESCE(c.status, '')) = 'Confirmed'
                             AND TRIM(COALESCE(c.availability, '')) = 'OS - Cancelled: Out of stock'
                             AND COALESCE(c.accepted_quantity, 0) = 0
                             AND COALESCE(c.received_quantity, 0) = 0
                             AND COALESCE(c.cancelled_quantity, 0) = 0 THEN 'MOV'
+                       -- GS-5: Confirmed + AC + accepted>0 received>0
+                       WHEN TRIM(COALESCE(c.status, '')) = 'Confirmed'
+                            AND TRIM(COALESCE(c.availability, '')) = 'AC - Accepted: In stock'
+                            AND COALESCE(c.accepted_quantity, 0) > 0
+                            AND COALESCE(c.received_quantity, 0) > 0 THEN 'COMPLETED'
+                       -- GS-6: Closed + OS + accepted=0 received=0 cancelled=0
                        WHEN TRIM(COALESCE(c.status, '')) = 'Closed'
                             AND TRIM(COALESCE(c.availability, '')) = 'OS - Cancelled: Out of stock'
                             AND COALESCE(c.accepted_quantity, 0) = 0
                             AND COALESCE(c.received_quantity, 0) = 0
                             AND COALESCE(c.cancelled_quantity, 0) = 0 THEN 'CANCELLED'
-                       WHEN TRIM(COALESCE(c.availability, '')) = 'AC - Accepted: In stock'
-                            AND COALESCE(c.accepted_quantity, 0) > 0
-                            AND COALESCE(c.received_quantity, 0) > 0 THEN 'COMPLETED'
-                       WHEN TRIM(COALESCE(c.availability, '')) = 'AC - Accepted: In stock'
-                            AND TRIM(COALESCE(c.status, '')) = 'Closed'
-                            AND COALESCE(c.received_quantity, 0) > 0 THEN 'COMPLETED'
-                       WHEN TRIM(COALESCE(c.availability, '')) = 'AC - Accepted: In stock'
-                            AND COALESCE(c.cancelled_quantity, 0) > 0
-                            AND COALESCE(c.received_quantity, 0) = 0 THEN 'CANCELLED'
-                       WHEN TRIM(COALESCE(c.availability, '')) = 'AC - Accepted: In stock'
-                            AND TRIM(COALESCE(c.status, '')) = 'Unconfirmed'
+                       -- GS-7: Closed + AC + accepted=0 received=0 cancelled>0
+                       WHEN TRIM(COALESCE(c.status, '')) = 'Closed'
+                            AND TRIM(COALESCE(c.availability, '')) = 'AC - Accepted: In stock'
+                            AND COALESCE(c.accepted_quantity, 0) = 0
+                            AND COALESCE(c.received_quantity, 0) = 0
+                            AND COALESCE(c.cancelled_quantity, 0) > 0 THEN 'CANCELLED'
+                       -- GS-8: Unconfirmed + AC + accepted=0 received=0 cancelled=0
+                       WHEN TRIM(COALESCE(c.status, '')) = 'Unconfirmed'
+                            AND TRIM(COALESCE(c.availability, '')) = 'AC - Accepted: In stock'
                             AND COALESCE(c.accepted_quantity, 0) = 0
                             AND COALESCE(c.received_quantity, 0) = 0
                             AND COALESCE(c.cancelled_quantity, 0) = 0 THEN 'PENDING'
-                       WHEN TRIM(COALESCE(c.availability, '')) = 'AC - Accepted: In stock'
-                            AND TRIM(COALESCE(c.status, '')) = 'Confirmed'
+                       -- GS-9: Confirmed + AC + accepted>0 received=0 cancelled=0
+                       WHEN TRIM(COALESCE(c.status, '')) = 'Confirmed'
+                            AND TRIM(COALESCE(c.availability, '')) = 'AC - Accepted: In stock'
                             AND COALESCE(c.accepted_quantity, 0) > 0
                             AND COALESCE(c.received_quantity, 0) = 0
                             AND COALESCE(c.cancelled_quantity, 0) = 0 THEN 'PENDING'
-                       WHEN TRIM(COALESCE(c.availability, '')) = 'AC - Accepted: In stock'
-                            AND TRIM(COALESCE(c.status, '')) = 'Confirmed'
+                       -- GS-10: Closed + AC + accepted>0 received=0 cancelled>0
+                       WHEN TRIM(COALESCE(c.status, '')) = 'Closed'
+                            AND TRIM(COALESCE(c.availability, '')) = 'AC - Accepted: In stock'
+                            AND COALESCE(c.accepted_quantity, 0) > 0
+                            AND COALESCE(c.received_quantity, 0) = 0
+                            AND COALESCE(c.cancelled_quantity, 0) > 0 THEN 'CANCELLED'
+                       -- GS-11: Closed + AC + accepted>0 received>0 cancelled=0
+                       WHEN TRIM(COALESCE(c.status, '')) = 'Closed'
+                            AND TRIM(COALESCE(c.availability, '')) = 'AC - Accepted: In stock'
+                            AND COALESCE(c.accepted_quantity, 0) > 0
+                            AND COALESCE(c.received_quantity, 0) > 0
+                            AND COALESCE(c.cancelled_quantity, 0) = 0 THEN 'COMPLETED'
+                       -- GS-12: Closed + AC + accepted>0 received>0 cancelled>0
+                       WHEN TRIM(COALESCE(c.status, '')) = 'Closed'
+                            AND TRIM(COALESCE(c.availability, '')) = 'AC - Accepted: In stock'
+                            AND COALESCE(c.accepted_quantity, 0) > 0
+                            AND COALESCE(c.received_quantity, 0) > 0
+                            AND COALESCE(c.cancelled_quantity, 0) > 0 THEN 'COMPLETED'
+                       -- GS-13: Closed + AC + accepted=0 received>0 cancelled>0
+                       WHEN TRIM(COALESCE(c.status, '')) = 'Closed'
+                            AND TRIM(COALESCE(c.availability, '')) = 'AC - Accepted: In stock'
+                            AND COALESCE(c.accepted_quantity, 0) = 0
+                            AND COALESCE(c.received_quantity, 0) > 0
+                            AND COALESCE(c.cancelled_quantity, 0) > 0 THEN 'COMPLETED'
+                       -- GS-14: Confirmed + AC + accepted>0 received=0 cancelled>0
+                       WHEN TRIM(COALESCE(c.status, '')) = 'Confirmed'
+                            AND TRIM(COALESCE(c.availability, '')) = 'AC - Accepted: In stock'
+                            AND COALESCE(c.accepted_quantity, 0) > 0
+                            AND COALESCE(c.received_quantity, 0) = 0
+                            AND COALESCE(c.cancelled_quantity, 0) > 0 THEN 'CANCELLED'
+                       -- GS-15: Confirmed + AC + requested>0 accepted=0 received=0 cancelled=0
+                       WHEN TRIM(COALESCE(c.status, '')) = 'Confirmed'
+                            AND TRIM(COALESCE(c.availability, '')) = 'AC - Accepted: In stock'
                             AND COALESCE(c.requested_quantity, 0) > 0
                             AND COALESCE(c.accepted_quantity, 0) = 0
                             AND COALESCE(c.received_quantity, 0) = 0
                             AND COALESCE(c.cancelled_quantity, 0) = 0 THEN 'PENDING'
-                       WHEN COALESCE(c.received_quantity, 0) > 0 THEN 'COMPLETED'
                        ELSE ''
                    END AS po_status_calc
               FROM calculated c
@@ -1469,11 +1517,11 @@ def _transform_amazon_po(cur, upload_id: int) -> tuple[int, int]:
             (expiry_calc - order_date)::int AS po_window,
             po_status_calc AS po_status,
             CASE
-                WHEN po_status_calc = 'COMPLETED' AND COALESCE(received_quantity, 0) >= COALESCE(requested_quantity, 0)
-                    THEN 'FULL SUPPLIED'
                 WHEN po_status_calc = 'COMPLETED' AND COALESCE(received_quantity, 0) < COALESCE(requested_quantity, 0)
                     THEN 'SHORT SUPPLIED'
-                ELSE NULL
+                WHEN po_status_calc = 'COMPLETED'
+                    THEN 'FULL SUPPLIED'
+                ELSE ''
             END AS item_status,
             item,
             sap_sku_name,
