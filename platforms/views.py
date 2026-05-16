@@ -3559,6 +3559,7 @@ def _amazon_sec_totals(rows: list[dict], *, include_projection: bool = True) -> 
     total = {
         "order_value": sum(_num(row.get("order_value")) for row in rows),
         "order_ltr": sum(_num(row.get("order_ltr")) for row in rows),
+        "order_units": sum(_num(row.get("order_units")) for row in rows),
         "shipped_value": sum(_num(row.get("shipped_value")) for row in rows),
         "shipped_ltr": sum(_num(row.get("shipped_ltr")) for row in rows),
         "return_value": sum(_num(row.get("return_value")) for row in rows),
@@ -4078,6 +4079,7 @@ def _amazon_sec_dashboard_response(request):
             {sub_category_key_expr} AS sub_category_key,
             COALESCE(SUM("ordered_revenue"), 0) AS order_value,
             COALESCE(SUM("ordered_litres"), 0) AS order_ltr,
+            COALESCE(SUM("ordered_units"), 0) AS order_units,
             COALESCE(SUM("calculated_shipped_revenue"), 0) AS shipped_value,
             COALESCE(SUM("shipped_litres"), 0) AS shipped_ltr,
             COALESCE(SUM("return_value"), 0) AS return_value,
@@ -4123,6 +4125,7 @@ def _amazon_sec_dashboard_response(request):
             "sub_category": sub_category,
             "order_value": _num(row.get("order_value")),
             "order_ltr": _num(row.get("order_ltr")),
+            "order_units": _num(row.get("order_units")),
             "shipped_value": shipped_value,
             "shipped_ltr": shipped_ltr,
             "return_value": _num(row.get("return_value")),
@@ -4150,6 +4153,7 @@ def _amazon_sec_dashboard_response(request):
             UPPER(TRIM("item_head"::text)) AS item_head,
             COALESCE(SUM("ordered_revenue"), 0) AS order_value,
             COALESCE(SUM("ordered_litres"), 0) AS order_ltr,
+            COALESCE(SUM("ordered_units"), 0) AS order_units,
             COALESCE(SUM("calculated_shipped_revenue"), 0) AS shipped_value,
             COALESCE(SUM("shipped_litres"), 0) AS shipped_ltr,
             COALESCE(SUM("return_value"), 0) AS return_value,
@@ -4190,6 +4194,7 @@ def _amazon_sec_dashboard_response(request):
             "item_head": item_head,
             "order_value": _num(row.get("order_value")),
             "order_ltr": _num(row.get("order_ltr")),
+            "order_units": _num(row.get("order_units")),
             "shipped_value": shipped_value,
             "shipped_ltr": shipped_ltr,
             "shipped_units": _num(row.get("shipped_units")),
@@ -4228,6 +4233,7 @@ def _amazon_sec_dashboard_response(request):
             TRIM("asin"::text) AS asin,
             COALESCE(SUM("ordered_revenue"), 0) AS order_value,
             COALESCE(SUM("ordered_litres"), 0) AS order_ltr,
+            COALESCE(SUM("ordered_units"), 0) AS order_units,
             COALESCE(SUM("calculated_shipped_revenue"), 0) AS shipped_value,
             COALESCE(SUM("shipped_litres"), 0) AS shipped_ltr,
             COALESCE(SUM("return_value"), 0) AS return_value,
@@ -4256,6 +4262,7 @@ def _amazon_sec_dashboard_response(request):
     for row in sku_details:
         row["order_value"] = _num(row.get("order_value"))
         row["order_ltr"] = _num(row.get("order_ltr"))
+        row["order_units"] = _num(row.get("order_units"))
         row["shipped_value"] = _num(row.get("shipped_value"))
         row["shipped_ltr"] = _num(row.get("shipped_ltr"))
         row["return_value"] = _num(row.get("return_value"))
@@ -4274,6 +4281,340 @@ def _amazon_sec_dashboard_response(request):
         "return_value": sum(_num(row.get("return_value")) for row in rk_world_returns),
         "return_ltr": sum(_num(row.get("return_ltr")) for row in rk_world_returns),
         "return_units": sum(_num(row.get("return_units")) for row in rk_world_returns),
+    }
+
+    visual_total_rows = _dict_rows(
+        f"""
+        SELECT
+            COALESCE(SUM("ordered_revenue"), 0) AS order_value,
+            COALESCE(SUM("ordered_litres"), 0) AS order_ltr,
+            COALESCE(SUM("ordered_units"), 0) AS order_units,
+            COALESCE(SUM("calculated_shipped_revenue"), 0) AS shipped_value,
+            COALESCE(SUM("shipped_litres"), 0) AS shipped_ltr,
+            COALESCE(SUM("shipped_units"), 0) AS shipped_units,
+            COALESCE(SUM("return_value"), 0) AS return_value,
+            COALESCE(SUM("return_litres"), 0) AS return_ltr,
+            COALESCE(SUM("return_units"), 0) AS return_units
+        FROM "amazon_sec_range_master_view"
+        {base_where}
+        """,
+        base_params,
+    )
+    visual_total = visual_total_rows[0] if visual_total_rows else {}
+
+    def visual_metric_bundle(row: dict) -> dict:
+        return {
+            "values": {
+                "order": _num(row.get("order_value")),
+                "deliver": _num(row.get("shipped_value")),
+                "return": _num(row.get("return_value")),
+            },
+            "ltrs": {
+                "order": _num(row.get("order_ltr")),
+                "deliver": _num(row.get("shipped_ltr")),
+                "return": _num(row.get("return_ltr")),
+            },
+            "quantity": {
+                "order": _num(row.get("order_units")),
+                "deliver": _num(row.get("shipped_units")),
+                "return": _num(row.get("return_units")),
+            },
+        }
+
+    item_head_split = [
+        {
+            "item_head": row.get("item_head"),
+            "label": row.get("item_head"),
+            **visual_metric_bundle(row),
+        }
+        for row in rk_world_summary
+    ]
+
+    top_sku_raw = _dict_rows(
+        f"""
+        SELECT
+            UPPER(TRIM("item_head"::text)) AS item_head,
+            TRIM("asin"::text) AS asin,
+            COALESCE(
+                NULLIF(
+                    TRIM(
+                        CONCAT_WS(
+                            ' ',
+                            NULLIF(TRIM("sub_category"::text), ''),
+                            NULLIF(TRIM("per_unit"::text), '')
+                        )
+                    ),
+                    ''
+                ),
+                NULLIF(TRIM("asin"::text), ''),
+                'UNMAPPED'
+            ) AS label,
+            COALESCE(SUM("ordered_revenue"), 0) AS order_value,
+            COALESCE(SUM("ordered_litres"), 0) AS order_ltr,
+            COALESCE(SUM("ordered_units"), 0) AS order_units,
+            COALESCE(SUM("calculated_shipped_revenue"), 0) AS shipped_value,
+            COALESCE(SUM("shipped_litres"), 0) AS shipped_ltr,
+            COALESCE(SUM("shipped_units"), 0) AS shipped_units,
+            COALESCE(SUM("return_value"), 0) AS return_value,
+            COALESCE(SUM("return_litres"), 0) AS return_ltr,
+            COALESCE(SUM("return_units"), 0) AS return_units
+        FROM "amazon_sec_range_master_view"
+        {base_where}
+          AND NULLIF(TRIM("asin"::text), '') IS NOT NULL
+        GROUP BY
+            UPPER(TRIM("item_head"::text)),
+            TRIM("asin"::text),
+            COALESCE(
+                NULLIF(
+                    TRIM(
+                        CONCAT_WS(
+                            ' ',
+                            NULLIF(TRIM("sub_category"::text), ''),
+                            NULLIF(TRIM("per_unit"::text), '')
+                        )
+                    ),
+                    ''
+                ),
+                NULLIF(TRIM("asin"::text), ''),
+                'UNMAPPED'
+            )
+        """,
+        base_params,
+    )
+
+    metric_fields = (
+        "order_value",
+        "order_ltr",
+        "order_units",
+        "shipped_value",
+        "shipped_ltr",
+        "shipped_units",
+        "return_value",
+        "return_ltr",
+        "return_units",
+    )
+
+    def aggregate_metric_rows(rows, key_fields):
+        aggregated = {}
+        for row in rows:
+            key = tuple(row.get(field) or "" for field in key_fields)
+            if key not in aggregated:
+                aggregated[key] = {field: row.get(field) for field in key_fields}
+                for metric_field in metric_fields:
+                    aggregated[key][metric_field] = 0.0
+            for metric_field in metric_fields:
+                aggregated[key][metric_field] += _num(row.get(metric_field))
+        return list(aggregated.values())
+
+    def rows_for_item_head(rows, item_head):
+        if item_head == "all":
+            return rows
+        item_head_key = item_head.upper()
+        return [
+            row
+            for row in rows
+            if _norm_sec_key(row.get("item_head")) == item_head_key
+        ]
+
+    def build_top_sku_rows(metric_field, item_head="all"):
+        source_rows = aggregate_metric_rows(
+            rows_for_item_head(top_sku_raw, item_head),
+            ("asin", "label"),
+        )
+        sorted_rows = sorted(
+            source_rows,
+            key=lambda row: (
+                -_num(row.get(metric_field)),
+                str(row.get("label") or row.get("asin") or ""),
+            ),
+        )[:10]
+        return [
+            {
+                "asin": row.get("asin"),
+                "label": row.get("label"),
+                **visual_metric_bundle(row),
+            }
+            for row in sorted_rows
+        ]
+
+    top_10_sku = {
+        item_head: {
+            "values": build_top_sku_rows("shipped_value", item_head),
+            "ltrs": build_top_sku_rows("shipped_ltr", item_head),
+            "quantity": build_top_sku_rows("shipped_units", item_head),
+        }
+        for item_head in ("all", "premium", "commodity")
+    }
+
+    sub_category_mix_raw = _dict_rows(
+        f"""
+        SELECT
+            UPPER(TRIM("item_head"::text)) AS item_head,
+            COALESCE(NULLIF(UPPER(TRIM("sub_category"::text)), ''), 'UNMAPPED') AS label,
+            COALESCE(SUM("ordered_revenue"), 0) AS order_value,
+            COALESCE(SUM("ordered_litres"), 0) AS order_ltr,
+            COALESCE(SUM("ordered_units"), 0) AS order_units,
+            COALESCE(SUM("calculated_shipped_revenue"), 0) AS shipped_value,
+            COALESCE(SUM("shipped_litres"), 0) AS shipped_ltr,
+            COALESCE(SUM("shipped_units"), 0) AS shipped_units,
+            COALESCE(SUM("return_value"), 0) AS return_value,
+            COALESCE(SUM("return_litres"), 0) AS return_ltr,
+            COALESCE(SUM("return_units"), 0) AS return_units
+        FROM "amazon_sec_range_master_view"
+        {base_where}
+        GROUP BY
+            UPPER(TRIM("item_head"::text)),
+            COALESCE(NULLIF(UPPER(TRIM("sub_category"::text)), ''), 'UNMAPPED')
+        """,
+        base_params,
+    )
+
+    def build_sub_category_mix_rows(metric_field, item_head="all"):
+        source_rows = aggregate_metric_rows(
+            rows_for_item_head(sub_category_mix_raw, item_head),
+            ("label",),
+        )
+        sorted_rows = sorted(
+            source_rows,
+            key=lambda row: (
+                -_num(row.get(metric_field)),
+                str(row.get("label") or ""),
+            ),
+        )
+        return [
+            {
+                "label": row.get("label"),
+                "sub_category": row.get("label"),
+                **visual_metric_bundle(row),
+            }
+            for row in sorted_rows
+        ]
+
+    sub_category_mix = {
+        item_head: {
+            "values": build_sub_category_mix_rows("shipped_value", item_head),
+            "ltrs": build_sub_category_mix_rows("shipped_ltr", item_head),
+            "quantity": build_sub_category_mix_rows("shipped_units", item_head),
+        }
+        for item_head in ("all", "premium", "commodity")
+    }
+
+    daily_raw = _dict_rows(
+        """
+        SELECT
+            "to_date"::date AS sale_date,
+            COALESCE(SUM("ordered_revenue"), 0) AS order_value,
+            COALESCE(SUM("ordered_litres"), 0) AS order_ltr,
+            COALESCE(SUM("ordered_units"), 0) AS order_units,
+            COALESCE(SUM("shipped_revenue_2"), 0) AS shipped_value,
+            COALESCE(SUM("shipped_litres"), 0) AS shipped_ltr,
+            COALESCE(SUM("shipped_units"), 0) AS shipped_units,
+            COALESCE(SUM("return_value"), 0) AS return_value,
+            COALESCE(SUM("return_litres"), 0) AS return_ltr,
+            COALESCE(SUM("return_units"), 0) AS return_units
+        FROM "amazon_sec_daily_master_view"
+        WHERE UPPER(TRIM("month"::text)) = %s
+          AND "year" = %s
+          AND "to_date" IS NOT NULL
+        GROUP BY "to_date"::date
+        ORDER BY "to_date"::date
+        """,
+        [month_name, year],
+    )
+    daily_by_date = {row["sale_date"]: row for row in daily_raw}
+    trend_rows = []
+    for day in range(1, days_in_month + 1):
+        current_date = date(year, month, day)
+        row = daily_by_date.get(current_date, {}) if max_date and current_date <= max_date else {}
+        trend_rows.append({
+            "date": current_date.isoformat(),
+            "period": current_date.isoformat(),
+            "label": f"{day:02d}",
+            "day": day,
+            **visual_metric_bundle(row),
+        })
+
+    monthly_raw = _dict_rows(
+        """
+        SELECT
+            DATE_TRUNC('month', "to_date")::date AS period,
+            COALESCE(SUM("ordered_revenue"), 0) AS order_value,
+            COALESCE(SUM("ordered_litres"), 0) AS order_ltr,
+            COALESCE(SUM("ordered_units"), 0) AS order_units,
+            COALESCE(SUM("shipped_revenue_2"), 0) AS shipped_value,
+            COALESCE(SUM("shipped_litres"), 0) AS shipped_ltr,
+            COALESCE(SUM("shipped_units"), 0) AS shipped_units,
+            COALESCE(SUM("return_value"), 0) AS return_value,
+            COALESCE(SUM("return_litres"), 0) AS return_ltr,
+            COALESCE(SUM("return_units"), 0) AS return_units
+        FROM "amazon_sec_daily_master_view"
+        WHERE "to_date" IS NOT NULL
+          AND EXTRACT(YEAR FROM "to_date")::integer = %s
+        GROUP BY DATE_TRUNC('month', "to_date")::date
+        ORDER BY DATE_TRUNC('month', "to_date")::date
+        """,
+        [year],
+    )
+    monthly_by_period = {row["period"]: row for row in monthly_raw}
+    latest_month_period = max(monthly_by_period.keys(), default=date(year, month, 1))
+    monthly_trend_rows = []
+    for month_number in range(1, latest_month_period.month + 1):
+        month_period = date(year, month_number, 1)
+        row = monthly_by_period.get(month_period, {})
+        monthly_trend_rows.append({
+            "period": month_period.isoformat(),
+            "label": month_period.strftime("%b").upper(),
+            "month": month_number,
+            **visual_metric_bundle(row),
+        })
+
+    yearly_raw = _dict_rows(
+        """
+        SELECT
+            EXTRACT(YEAR FROM "to_date")::integer AS period_year,
+            COALESCE(SUM("ordered_revenue"), 0) AS order_value,
+            COALESCE(SUM("ordered_litres"), 0) AS order_ltr,
+            COALESCE(SUM("ordered_units"), 0) AS order_units,
+            COALESCE(SUM("shipped_revenue_2"), 0) AS shipped_value,
+            COALESCE(SUM("shipped_litres"), 0) AS shipped_ltr,
+            COALESCE(SUM("shipped_units"), 0) AS shipped_units,
+            COALESCE(SUM("return_value"), 0) AS return_value,
+            COALESCE(SUM("return_litres"), 0) AS return_ltr,
+            COALESCE(SUM("return_units"), 0) AS return_units
+        FROM "amazon_sec_daily_master_view"
+        WHERE "to_date" IS NOT NULL
+        GROUP BY EXTRACT(YEAR FROM "to_date")::integer
+        ORDER BY EXTRACT(YEAR FROM "to_date")::integer
+        """,
+        [],
+    )
+    yearly_by_period = {int(row["period_year"]): row for row in yearly_raw if row.get("period_year")}
+    if yearly_by_period:
+        year_start = min(yearly_by_period)
+        year_end = max(yearly_by_period)
+    else:
+        year_start = year_end = year
+    yearly_trend_rows = []
+    for period_year in range(year_start, year_end + 1):
+        row = yearly_by_period.get(period_year, {})
+        yearly_trend_rows.append({
+            "period": str(period_year),
+            "label": str(period_year),
+            "year": period_year,
+            **visual_metric_bundle(row),
+        })
+
+    visual_dashboard = {
+        "show_by_options": ["values", "ltrs", "quantity"],
+        "cards": visual_metric_bundle(visual_total),
+        "trend": {
+            "day": trend_rows,
+            "month": monthly_trend_rows,
+            "year": yearly_trend_rows,
+        },
+        "item_head_split": item_head_split,
+        "top_10_sku": top_10_sku,
+        "sub_category_mix": sub_category_mix,
     }
 
     notes = []
@@ -4305,6 +4646,7 @@ def _amazon_sec_dashboard_response(request):
         "rk_world_return_total": rk_return_total,
         "sku_details": sku_details,
         "sku_total": sku_total,
+        "visual_dashboard": visual_dashboard,
         "notes": notes,
         "show_amazon_excel_columns": True,
         "summary": rk_world_summary,
