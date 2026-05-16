@@ -206,6 +206,7 @@ _PRIMARY_DASHBOARD_FORMATS = {
     "bigbasket": "BIG BASKET",
     "blinkit": "BLINKIT",
     "citymall": "CITY MALL",
+    "flipkart": "FLIPKART GROCERY",
     "flipkart_grocery": "FLIPKART GROCERY",
     "swiggy": "SWIGGY",
     "zomato": "ZOMATO",
@@ -217,6 +218,8 @@ _PRIMARY_DASHBOARD_DONE_VALUE_COLUMNS = {
     ("blinkit", "PO MONTH"): "total_delivered_amt_exclusive",
     ("citymall", "DEL MONTH"): "total_delivered_amt_exclusive",
     ("citymall", "PO MONTH"): "total_delivered_amt_exclusive",
+    ("flipkart", "DEL MONTH"): "total_delivered_amt_exclusive",
+    ("flipkart", "PO MONTH"): "total_delivered_amt_exclusive",
     ("flipkart_grocery", "DEL MONTH"): "total_delivered_amt_exclusive",
     ("flipkart_grocery", "PO MONTH"): "total_delivered_amt_exclusive",
     ("swiggy", "DEL MONTH"): "total_delivered_amt_exclusive",
@@ -473,10 +476,456 @@ _PRIMARY_TREND_METRIC_SQL = """
 """
 
 
+_AMAZON_PRIMARY_METRIC_SQL = """
+    COALESCE(SUM(COALESCE(total_received_cost, 0)), 0) AS done_value,
+    COALESCE(SUM(COALESCE(total_delivered_liters, 0)), 0) AS done_ltrs,
+    COALESCE(SUM(COALESCE(received_qty, 0)), 0) AS done_qty,
+    COALESCE(SUM(CASE WHEN status_key = 'PENDING'
+        THEN COALESCE(total_requested_cost, 0) ELSE 0 END), 0) AS pending_value,
+    COALESCE(SUM(CASE WHEN status_key = 'PENDING'
+        THEN COALESCE(order_ltrs_cl, total_order_liters, 0) ELSE 0 END), 0) AS pending_ltrs,
+    COALESCE(SUM(CASE WHEN status_key = 'PENDING'
+        THEN COALESCE(order_unit_cl, requested_qty, 0) ELSE 0 END), 0) AS pending_qty,
+    COALESCE(SUM(CASE WHEN status_key = 'EXPIRED'
+        THEN COALESCE(total_requested_cost, 0) ELSE 0 END), 0) AS expired_value,
+    COALESCE(SUM(CASE WHEN status_key IN ('CANCELLED', 'MOV')
+        THEN COALESCE(total_requested_cost, 0) ELSE 0 END), 0) AS cancelled_value,
+    COALESCE(SUM(CASE WHEN status_key = 'EXPIRED'
+        THEN COALESCE(order_ltrs_cl, total_order_liters, 0) ELSE 0 END), 0) AS expired_ltrs,
+    COALESCE(SUM(CASE WHEN status_key IN ('CANCELLED', 'MOV')
+        THEN COALESCE(order_ltrs_cl, total_order_liters, 0) ELSE 0 END), 0) AS cancelled_ltrs,
+    COALESCE(SUM(COALESCE(total_requested_cost, 0)), 0) AS order_value,
+    COALESCE(SUM(COALESCE(order_ltrs_cl, total_order_liters, 0)), 0) AS order_ltrs,
+    COALESCE(SUM(COALESCE(order_unit_cl, requested_qty, 0)), 0) AS order_qty
+"""
+
+
+def _amazon_primary_po_cte() -> str:
+    return """
+WITH base AS (
+    SELECT
+        p.*,
+        p.order_date::date AS period_dt
+    FROM reporting."Amazon PO" p
+),
+normalized AS (
+    SELECT
+        *,
+        COALESCE(
+            NULLIF(UPPER(TRIM(po_status::text)), ''),
+            NULLIF(UPPER(TRIM(status::text)), ''),
+            'OTHER'
+        ) AS status_key,
+        CASE
+            WHEN UPPER(TRIM(item_head::text)) IN ('PREMIUM', 'COMMODITY', 'OTHER')
+                THEN UPPER(TRIM(item_head::text))
+            WHEN UPPER(TRIM(item_head::text)) = 'OTHERS'
+                THEN 'OTHER'
+            ELSE 'OTHER'
+        END AS item_head_key,
+        COALESCE(NULLIF(UPPER(TRIM(item::text)), ''), NULLIF(UPPER(TRIM(sku_name::text)), ''), 'OTHER') AS item_key,
+        COALESCE(NULLIF(UPPER(TRIM(category::text)), ''), 'OTHER') AS category_key,
+        COALESCE(NULLIF(UPPER(TRIM(sub_category::text)), ''), 'OTHER') AS sub_category_key,
+        CASE
+            WHEN po_month IS NOT NULL
+                THEN UPPER(TRIM(TO_CHAR(MAKE_DATE(2000, po_month::integer, 1), 'FMMONTH')))
+            WHEN period_dt IS NOT NULL
+                THEN UPPER(TRIM(TO_CHAR(period_dt, 'FMMONTH')))
+            ELSE NULL
+        END AS po_month_key,
+        COALESCE("year"::integer, EXTRACT(YEAR FROM period_dt)::integer) AS po_year,
+        COALESCE(
+            NULLIF(UPPER(TRIM(per_ltr_unit::text)), ''),
+            CASE
+                WHEN per_liter IS NULL THEN NULL
+                WHEN per_liter < 1
+                    THEN UPPER(TRIM(TO_CHAR(per_liter * 1000, 'FM999999990.###'))) || ' MLS'
+                ELSE UPPER(TRIM(TO_CHAR(per_liter, 'FM999999990.###'))) || ' LTR'
+            END,
+            '-'
+        ) AS per_ltr_key
+    FROM base
+)
+"""
+
+
+def _parse_amazon_primary_dashboard_params(params) -> tuple[str, int, int, bool]:
+    mode = _norm_sec_key(params.get("mode") or params.get("month_type") or "DEL MONTH")
+    if mode not in {"DEL MONTH", "PO MONTH"}:
+        raise ValidationError("`mode` must be DEL MONTH or PO MONTH.")
+
+    raw_month = str(params.get("month") or "").strip()
+    raw_year = str(params.get("year") or "").strip()
+    defaulted_to_latest = False
+
+    iso_month = re.fullmatch(r"(\d{4})-(\d{2})", raw_month)
+    if iso_month and not raw_year:
+        raw_year = iso_month.group(1)
+        raw_month = iso_month.group(2)
+
+    if not raw_month or not raw_year:
+        latest = _dict_rows(
+            """
+            SELECT po_month, "year", MAX(order_date::date) AS max_date
+            FROM reporting."Amazon PO"
+            WHERE po_month IS NOT NULL
+              AND "year" IS NOT NULL
+            GROUP BY po_month, "year"
+            ORDER BY max_date DESC NULLS LAST, "year" DESC, po_month DESC
+            LIMIT 1
+            """,
+            [],
+        )
+        if latest:
+            raw_month = str(latest[0].get("po_month") or "")
+            raw_year = str(latest[0].get("year") or "")
+            defaulted_to_latest = True
+
+    raw_month = raw_month or str(date.today().month)
+    raw_year = raw_year or str(date.today().year)
+
+    if raw_month.isdigit():
+        month = int(raw_month)
+        if not 1 <= month <= 12:
+            raise ValidationError("`month` must be 1-12 or a month name.")
+    else:
+        month_name = _norm_sec_key(raw_month)
+        if month_name not in _MONTH_NAME_TO_NUM:
+            raise ValidationError("`month` must be 1-12 or a month name.")
+        month = _MONTH_NAME_TO_NUM[month_name]
+
+    try:
+        year = int(raw_year)
+    except ValueError:
+        raise ValidationError("`year` must be numeric.")
+    if year < 2000 or year > 2100:
+        raise ValidationError("`year` looks out of range.")
+
+    return mode, month, year, defaulted_to_latest
+
+
+def _amazon_primary_dashboard_response(request):
+    mode, month, year, defaulted_to_latest = _parse_amazon_primary_dashboard_params(
+        request.query_params
+    )
+    month_name = _month_name(month)
+    amazon_cte = _amazon_primary_po_cte()
+    period_filter = "po_month_key = %s AND po_year = %s"
+    period_params = [month_name, year]
+
+    max_date = _scalar(
+        f"""
+        {amazon_cte}
+        SELECT MAX(period_dt)
+        FROM normalized
+        WHERE {period_filter}
+        """,
+        period_params,
+    )
+
+    summary_raw = _dict_rows(
+        f"""
+        {amazon_cte}
+        SELECT
+            item_head_key AS item_head,
+            {_AMAZON_PRIMARY_METRIC_SQL}
+        FROM normalized
+        WHERE {period_filter}
+          AND item_head_key IN ('PREMIUM', 'COMMODITY', 'OTHER')
+        GROUP BY item_head_key
+        """,
+        period_params,
+    )
+    summary_by_head = {_norm_sec_key(row.get("item_head")): row for row in summary_raw}
+    summary = []
+    for item_head in _BIGBASKET_PRIMARY_ITEM_HEADS:
+        metrics = _primary_metrics(summary_by_head.get(item_head))
+        summary.append({"item_head": item_head, **metrics})
+
+    detail_raw = _dict_rows(
+        f"""
+        {amazon_cte}
+        SELECT
+            sub_category_key,
+            per_ltr_key,
+            MIN(item_head_key) AS item_head_key,
+            MIN(category_key) AS category_key,
+            {_AMAZON_PRIMARY_METRIC_SQL}
+        FROM normalized
+        WHERE {period_filter}
+        GROUP BY sub_category_key, per_ltr_key
+        """,
+        period_params,
+    )
+    details = []
+    for row in detail_raw:
+        metrics = _primary_metrics(row)
+        if not any(_num(metrics.get(key)) for key in metrics):
+            continue
+        details.append({
+            "format": "AMAZON",
+            "item_head": row.get("item_head_key") or "OTHER",
+            "category": row.get("category_key") or row.get("sub_category_key") or "OTHER",
+            "sub_category": row.get("sub_category_key") or "OTHER",
+            "per_ltr": row.get("per_ltr_key") or "-",
+            "value_per_ltr": None if metrics["done_ltrs"] == 0 else metrics["done_value"] / metrics["done_ltrs"],
+            **metrics,
+        })
+
+    top_item_raw = _dict_rows(
+        f"""
+        {amazon_cte},
+        item_agg AS (
+            SELECT
+                item_key AS item,
+                {_AMAZON_PRIMARY_METRIC_SQL}
+            FROM normalized
+            WHERE {period_filter}
+            GROUP BY item_key
+        )
+        SELECT *
+        FROM item_agg
+        WHERE COALESCE(done_value, 0) <> 0
+           OR COALESCE(done_ltrs, 0) <> 0
+           OR COALESCE(done_qty, 0) <> 0
+        ORDER BY done_value DESC, done_ltrs DESC, done_qty DESC
+        """,
+        period_params,
+    )
+    top_items = [
+        {"item": row.get("item") or "OTHER", **_primary_metrics(row)}
+        for row in top_item_raw
+    ]
+
+    vendor_rows = _dict_rows(
+        f"""
+        {amazon_cte}
+        SELECT
+            COALESCE(NULLIF(UPPER(TRIM(vendor::text)), ''), 'UNMAPPED') AS vendor,
+            COALESCE(SUM(COALESCE(total_requested_cost, 0)), 0) AS order_value,
+            COALESCE(SUM(COALESCE(total_received_cost, 0)), 0) AS delivered_value,
+            COALESCE(SUM(CASE WHEN status_key = 'PENDING'
+                THEN COALESCE(total_requested_cost, 0) ELSE 0 END), 0) AS pending_value,
+            COALESCE(SUM(COALESCE(order_ltrs_cl, total_order_liters, 0)), 0) AS order_ltrs,
+            COALESCE(SUM(COALESCE(total_delivered_liters, 0)), 0) AS delivered_ltrs,
+            COALESCE(SUM(CASE WHEN status_key = 'PENDING'
+                THEN COALESCE(order_ltrs_cl, total_order_liters, 0) ELSE 0 END), 0) AS pending_ltrs,
+            COALESCE(SUM(COALESCE(order_unit_cl, requested_qty, 0)), 0) AS order_qty,
+            COALESCE(SUM(COALESCE(received_qty, 0)), 0) AS delivered_qty,
+            COALESCE(SUM(CASE WHEN status_key = 'PENDING'
+                THEN COALESCE(order_unit_cl, requested_qty, 0) ELSE 0 END), 0) AS pending_qty
+        FROM normalized
+        WHERE {period_filter}
+        GROUP BY 1
+        HAVING
+            COALESCE(SUM(COALESCE(total_requested_cost, 0)), 0) <> 0
+            OR COALESCE(SUM(COALESCE(total_received_cost, 0)), 0) <> 0
+            OR COALESCE(SUM(COALESCE(order_ltrs_cl, total_order_liters, 0)), 0) <> 0
+            OR COALESCE(SUM(COALESCE(received_qty, 0)), 0) <> 0
+        ORDER BY pending_value DESC, order_value DESC, vendor
+        """,
+        period_params,
+    )
+    open_vendor_pending_value = sorted(
+        vendor_rows,
+        key=lambda row: (
+            _num(row.get("pending_value")),
+            _num(row.get("order_value")),
+            _num(row.get("delivered_value")),
+        ),
+        reverse=True,
+    )
+    open_vendor_pending_ltrs = sorted(
+        vendor_rows,
+        key=lambda row: (
+            _num(row.get("pending_ltrs")),
+            _num(row.get("order_ltrs")),
+            _num(row.get("delivered_ltrs")),
+        ),
+        reverse=True,
+    )
+    open_vendor_pending_qty = sorted(
+        vendor_rows,
+        key=lambda row: (
+            _num(row.get("pending_qty")),
+            _num(row.get("order_qty")),
+            _num(row.get("delivered_qty")),
+        ),
+        reverse=True,
+    )
+    open_vendor_pending_order = sorted(
+        vendor_rows,
+        key=lambda row: (
+            _num(row.get("order_value")),
+            _num(row.get("order_ltrs")),
+            _num(row.get("order_qty")),
+        ),
+        reverse=True,
+    )
+
+    period_start = date(year, month, 1)
+    period_end = date(year, month, monthrange(year, month)[1])
+    daily_trend = _primary_trend_rows(_dict_rows(
+        f"""
+        {amazon_cte},
+        trend_days AS (
+            SELECT generate_series(%s::date, %s::date, interval '1 day')::date AS period
+        ),
+        agg AS (
+            SELECT
+                period_dt::date AS period,
+                {_AMAZON_PRIMARY_METRIC_SQL}
+            FROM normalized
+            WHERE {period_filter}
+              AND period_dt IS NOT NULL
+            GROUP BY period_dt::date
+        )
+        SELECT
+            d.period,
+            TO_CHAR(d.period, 'DD Mon') AS label,
+            COALESCE(a.done_value, 0) AS done_value,
+            COALESCE(a.done_ltrs, 0) AS done_ltrs,
+            COALESCE(a.done_qty, 0) AS done_qty,
+            COALESCE(a.pending_value, 0) AS pending_value,
+            COALESCE(a.pending_ltrs, 0) AS pending_ltrs,
+            COALESCE(a.pending_qty, 0) AS pending_qty,
+            COALESCE(a.order_value, 0) AS order_value,
+            COALESCE(a.order_ltrs, 0) AS order_ltrs,
+            COALESCE(a.order_qty, 0) AS order_qty
+        FROM trend_days d
+        LEFT JOIN agg a ON a.period = d.period
+        ORDER BY d.period
+        """,
+        [period_start, period_end] + period_params,
+    ))
+    monthly_trend = _primary_trend_rows(_dict_rows(
+        f"""
+        {amazon_cte},
+        bounds AS (
+            SELECT
+                make_date(%s::integer, 1, 1) AS start_month,
+                COALESCE(
+                    DATE_TRUNC('month', MAX(period_dt))::date,
+                    make_date(%s::integer, 12, 1)
+                ) AS end_month
+            FROM normalized
+            WHERE period_dt IS NOT NULL
+              AND EXTRACT(YEAR FROM period_dt)::integer = %s
+        ),
+        trend_months AS (
+            SELECT generate_series(start_month, end_month, interval '1 month')::date AS period
+            FROM bounds
+            WHERE start_month IS NOT NULL
+        ),
+        agg AS (
+            SELECT
+                DATE_TRUNC('month', period_dt)::date AS period,
+                {_AMAZON_PRIMARY_METRIC_SQL}
+            FROM normalized
+            WHERE period_dt IS NOT NULL
+              AND EXTRACT(YEAR FROM period_dt)::integer = %s
+            GROUP BY DATE_TRUNC('month', period_dt)::date
+        )
+        SELECT
+            m.period,
+            TO_CHAR(m.period, 'Mon YYYY') AS label,
+            COALESCE(a.done_value, 0) AS done_value,
+            COALESCE(a.done_ltrs, 0) AS done_ltrs,
+            COALESCE(a.done_qty, 0) AS done_qty,
+            COALESCE(a.pending_value, 0) AS pending_value,
+            COALESCE(a.pending_ltrs, 0) AS pending_ltrs,
+            COALESCE(a.pending_qty, 0) AS pending_qty,
+            COALESCE(a.order_value, 0) AS order_value,
+            COALESCE(a.order_ltrs, 0) AS order_ltrs,
+            COALESCE(a.order_qty, 0) AS order_qty
+        FROM trend_months m
+        LEFT JOIN agg a ON a.period = m.period
+        ORDER BY m.period
+        """,
+        [year, year, year, year],
+    ))
+    yearly_trend = _primary_trend_rows(_dict_rows(
+        f"""
+        {amazon_cte},
+        bounds AS (
+            SELECT
+                MIN(EXTRACT(YEAR FROM period_dt)::integer) AS start_year,
+                MAX(EXTRACT(YEAR FROM period_dt)::integer) AS end_year
+            FROM normalized
+            WHERE period_dt IS NOT NULL
+        ),
+        trend_years AS (
+            SELECT generate_series(start_year, end_year)::integer AS period
+            FROM bounds
+            WHERE start_year IS NOT NULL
+        ),
+        agg AS (
+            SELECT
+                EXTRACT(YEAR FROM period_dt)::integer AS period,
+                {_AMAZON_PRIMARY_METRIC_SQL}
+            FROM normalized
+            WHERE period_dt IS NOT NULL
+            GROUP BY EXTRACT(YEAR FROM period_dt)::integer
+        )
+        SELECT
+            y.period,
+            y.period::text AS label,
+            COALESCE(a.done_value, 0) AS done_value,
+            COALESCE(a.done_ltrs, 0) AS done_ltrs,
+            COALESCE(a.done_qty, 0) AS done_qty,
+            COALESCE(a.pending_value, 0) AS pending_value,
+            COALESCE(a.pending_ltrs, 0) AS pending_ltrs,
+            COALESCE(a.pending_qty, 0) AS pending_qty,
+            COALESCE(a.order_value, 0) AS order_value,
+            COALESCE(a.order_ltrs, 0) AS order_ltrs,
+            COALESCE(a.order_qty, 0) AS order_qty
+        FROM trend_years y
+        LEFT JOIN agg a ON a.period = y.period
+        ORDER BY y.period
+        """,
+        [],
+    ))
+
+    detail_total = _primary_total(details)
+    summary_total = _primary_total(summary)
+
+    return Response({
+        "source": 'reporting."Amazon PO"',
+        "format": "AMAZON",
+        "dashboard_title": "AMAZON Primary Dashboard",
+        "mode": mode,
+        "month": month,
+        "month_name": month_name,
+        "year": year,
+        "defaulted_to_latest": defaulted_to_latest,
+        "max_date": max_date.isoformat() if hasattr(max_date, "isoformat") else max_date,
+        "summary": summary,
+        "summary_total": summary_total,
+        "details": details,
+        "detail_total": detail_total,
+        "top_items": top_items,
+        "open_vendor_pending": open_vendor_pending_value,
+        "open_vendor_pending_value": open_vendor_pending_value,
+        "open_vendor_pending_ltrs": open_vendor_pending_ltrs,
+        "open_vendor_pending_qty": open_vendor_pending_qty,
+        "open_vendor_pending_order": open_vendor_pending_order,
+        "trends": {
+            "day": daily_trend,
+            "month": monthly_trend,
+            "year": yearly_trend,
+        },
+        "detail_rows_fixed": False,
+        "extra_detail_rows_included": True,
+    })
+
+
 @api_view(["GET"])
 @permission_classes([require("platform.stats.view")])
 def primary_dashboard(request, slug: str):
     _ensure_scope(request.user, slug)
+    if slug == "amazon":
+        return _amazon_primary_dashboard_response(request)
+
     platform_format = _PRIMARY_DASHBOARD_FORMATS.get(slug)
     if not platform_format:
         raise ValidationError(
@@ -490,18 +939,10 @@ def primary_dashboard(request, slug: str):
     )
     month_name = _month_name(month)
     period_filter = _primary_period_filter(mode)
-    period_params = (
-        [month_name, year]
-        if mode == "PO MONTH"
-        else [month_name, year, month_name, year]
-    )
+    period_params = [month_name, year]
     vendor_metric_filter = _primary_vendor_metric_filter(mode)
     vendor_pending_filter = _primary_vendor_pending_filter(mode)
-    vendor_period_params = (
-        [month_name, year, month_name, year]
-        if mode == "PO MONTH"
-        else [month_name, year, month_name, year, month_name, year]
-    )
+    vendor_period_params = [month_name, year, month_name, year]
 
     # This mirrors PRIMARY DASHBOARD!D2 in the workbook:
     # MAXIFS(PRIMARY!BM:BM, PRIMARY!AG:AG, month, PRIMARY!AI:AI, year)
@@ -2699,12 +3140,7 @@ def _parse_primary_dashboard_params(params, platform_format: str = "ZEPTO") -> t
 def _primary_period_filter(mode: str) -> str:
     if mode == "PO MONTH":
         return "po_month_key = %s AND po_year = %s"
-    return """
-        (
-            (delivery_month_key = %s AND expiry_year = %s)
-            OR (open_close_key = 'OPEN' AND po_month_key = %s AND po_year = %s)
-        )
-    """
+    return "delivery_month_key = %s AND delivery_year = %s"
 
 
 def _primary_vendor_metric_filter(mode: str) -> str:
@@ -2716,12 +3152,7 @@ def _primary_vendor_metric_filter(mode: str) -> str:
 def _primary_vendor_pending_filter(mode: str) -> str:
     if mode == "PO MONTH":
         return "po_month_key = %s AND po_year = %s"
-    return """
-        (
-            (po_month_key = %s AND po_year = %s)
-            OR (expiry_month_key = %s AND expiry_year = %s)
-        )
-    """
+    return "delivery_month_key = %s AND delivery_year = %s"
 
 
 def _primary_zero_metrics() -> dict:

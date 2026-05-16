@@ -98,6 +98,162 @@ UPLOAD_FORCED_UNIQUE_KEYS = {
     ),
 }
 
+PRIMARY_MASTER_TABLES = {
+    "zepto_prim",
+    "blinkit_prim",
+    "bigbasket_prim",
+    "swiggy_prim",
+    "flipkart_grocery_prim",
+    "zomato_prim",
+    "citymall_prim",
+}
+
+PRIMARY_MASTER_FORMATS = {
+    "zepto_prim": "ZEPTO",
+    "blinkit_prim": "BLINKIT",
+    "bigbasket_prim": "BIG BASKET",
+    "swiggy_prim": "SWIGGY",
+    "flipkart_grocery_prim": "FLIPKART GROCERY",
+    "zomato_prim": "ZOMATO",
+    "citymall_prim": "CITY MALL",
+}
+
+PRIMARY_MASTER_FIELD_MAP = {
+    "zepto_prim": {
+        "po_number": "po_no",
+        "sku_code": "sku_code",
+        "sku_code_fallbacks": ("sku_code", "sku"),
+        "po_date": "po_date",
+        "po_expiry_date": "po_expiry_date",
+        "delivery_date": "grn_date",
+        "vendor_name": "vendor_name",
+        "status": "status",
+        "sku_name": "sku_desc",
+        "order_qty": "qty",
+        "delivered_qty": "grn_quantity",
+        "basic_rate": "unit_base_cost",
+        "landing_rate": "landing_cost",
+        "location": "del_location",
+    },
+    "blinkit_prim": {
+        "po_number": "po_number",
+        "sku_code": "item_id",
+        "po_date": "order_date",
+        "po_expiry_date": "expiry_date",
+        "delivery_date": "appointment_date",
+        "vendor_name": "vendor_name",
+        "status": "po_state",
+        "sku_name": "name",
+        "order_qty": "units_ordered",
+        "delivered_qty": "delivered_qty",
+        "basic_rate": "cost_price",
+        "landing_rate": "landing_rate",
+        "location": "facility_name",
+    },
+    "bigbasket_prim": {
+        "po_number": "po_number",
+        "sku_code": "sku_code",
+        "po_date": "po_date",
+        "po_expiry_date": "po_expiry_date",
+        "delivery_date": "delivery_date",
+        "vendor_name": "vendor",
+        "status": "status",
+        "remarks": "remarks",
+        "sku_name": "sku_name",
+        "order_qty": "order_qty",
+        "delivered_qty": "delivered_qty",
+        "basic_rate": "basic_cost",
+        "landing_rate": "landing_cost",
+        "location": "location",
+    },
+    "swiggy_prim": {
+        "po_number": "po_number",
+        "sku_code": "sku_code",
+        "po_date": "po_created_at",
+        "po_expiry_date": "po_expiry_date",
+        "delivery_date": "expected_delivery_date",
+        "vendor_name": "vendor_name",
+        "status": "status",
+        "sku_name": "sku_description",
+        "order_qty": "ordered_qty",
+        "delivered_qty": "received_qty",
+        "basic_rate": "unit_based_cost",
+        "landing_rate": "landing_rate",
+        "location": "facility_name",
+    },
+    "flipkart_grocery_prim": {
+        "po_number": "po_number",
+        "sku_code": "sku_code",
+        "po_date": "po_date",
+        "po_expiry_date": "po_expiry_date",
+        "delivery_date": "delivery_date",
+        "vendor_name": "vendor",
+        "status": "status",
+        "remarks": "remark",
+        "sku_name": "sku_name",
+        "order_qty": "order_qty",
+        "delivered_qty": "delivered_qty",
+        "basic_rate": "basic_rate",
+        "landing_rate": "landing_rate",
+        "location": "location",
+    },
+    "zomato_prim": {
+        "po_number": "po_number",
+        "sku_code": "sku_code",
+        "po_date": "po_date",
+        "po_expiry_date": "po_expiry_date",
+        "delivery_date": ("delivery_date", "appointment_date"),
+        "vendor_name": "vendor",
+        "status": "status",
+        "remarks": "remark",
+        "sku_name": "sku_name",
+        "order_qty": "order_qty",
+        "delivered_qty": "delivered_qty",
+        "basic_rate": "basic_rate",
+        "landing_rate": "landing_rate",
+        "location": "location",
+    },
+    "citymall_prim": {
+        "po_number": "po_number",
+        "sku_code": "sku_code",
+        "po_date": "po_date",
+        "po_expiry_date": "po_expiry_date",
+        "delivery_date": "delivery_date",
+        "vendor_name": "vendor",
+        "status": "status",
+        "remarks": "remark",
+        "sku_name": "sku_name",
+        "order_qty": "order_qty",
+        "delivered_qty": "delivered_qty",
+        "basic_rate": "base_cost_price",
+        "landing_rate": "landing_rate",
+        "location": "location",
+    },
+}
+
+PRIMARY_MASTER_DATE_COLUMNS = {"po_date", "po_expiry_date", "delivery_date"}
+PRIMARY_MASTER_NUMERIC_COLUMNS = {
+    "order_qty",
+    "delivered_qty",
+    "basic_rate",
+    "landing_rate",
+}
+PRIMARY_MASTER_UPDATE_COLUMNS = [
+    "po_date",
+    "po_expiry_date",
+    "delivery_date",
+    "vendor_name",
+    "status",
+    "remarks",
+    "sku_name",
+    "order_qty",
+    "delivered_qty",
+    "basic_rate",
+    "landing_rate",
+    "location",
+    "format",
+]
+
 
 def _quote_ident(name: str) -> str:
     return '"' + str(name).replace('"', '""') + '"'
@@ -587,6 +743,135 @@ def batch_upload(request):
     return _batch_upload(request.data or {})
 
 
+def _is_blank(value) -> bool:
+    return value is None or (isinstance(value, str) and value.strip() == "")
+
+
+def _row_value(row: dict, source):
+    if isinstance(source, (tuple, list)):
+        for key in source:
+            value = row.get(key)
+            if not _is_blank(value):
+                return value
+        return None
+    return row.get(source)
+
+
+def _primary_delivered_qty(table: str, row: dict):
+    if table == "blinkit_prim":
+        delivered = row.get("delivered_qty")
+        if not _is_blank(delivered):
+            return _as_decimal(delivered)
+        units = row.get("units_ordered")
+        remaining = row.get("remaining_quantity")
+        if not _is_blank(units) and not _is_blank(remaining):
+            return _as_decimal(units) - _as_decimal(remaining)
+        return Decimal("0")
+
+    source = PRIMARY_MASTER_FIELD_MAP[table].get("delivered_qty")
+    value = _row_value(row, source)
+    if _is_blank(value):
+        return Decimal("0")
+    return _as_decimal(value)
+
+
+def _primary_master_value(table: str, row: dict, column: str):
+    if column == "format":
+        return PRIMARY_MASTER_FORMATS[table]
+    if column == "delivered_qty":
+        return _primary_delivered_qty(table, row)
+
+    source = PRIMARY_MASTER_FIELD_MAP[table].get(column)
+    if source is None:
+        return None
+    value = _row_value(row, source)
+    if _is_blank(value):
+        return None
+    if column in PRIMARY_MASTER_DATE_COLUMNS:
+        return _parse_date(value)
+    if column in PRIMARY_MASTER_NUMERIC_COLUMNS:
+        return _as_decimal(value, default=None)
+    return str(value).strip()
+
+
+def _primary_master_payload(table: str, row: dict):
+    mapping = PRIMARY_MASTER_FIELD_MAP[table]
+    po_number = _row_value(row, mapping["po_number"])
+    sku_sources = mapping.get("sku_code_fallbacks") or (mapping["sku_code"],)
+    sku_code = _row_value(row, sku_sources)
+
+    if _is_blank(po_number) or _is_blank(sku_code):
+        return None, []
+
+    payload = {
+        "po_number": str(po_number).strip(),
+        "sku_code": str(sku_code).strip(),
+    }
+    for column in PRIMARY_MASTER_UPDATE_COLUMNS:
+        value = _primary_master_value(table, row, column)
+        if value is not None:
+            payload[column] = value
+
+    lookup_skus = []
+    for source in sku_sources:
+        candidate = _row_value(row, source)
+        if _is_blank(candidate):
+            continue
+        candidate = str(candidate).strip()
+        if candidate not in lookup_skus:
+            lookup_skus.append(candidate)
+    if payload["sku_code"] not in lookup_skus:
+        lookup_skus.insert(0, payload["sku_code"])
+    return payload, lookup_skus
+
+
+def _find_master_po_sku(cur, po_number: str, sku_candidates: list[str]):
+    for sku_code in sku_candidates:
+        cur.execute(
+            """
+            SELECT sku_code
+            FROM public.master_po
+            WHERE po_number = %s
+              AND sku_code = %s
+            LIMIT 1
+            """,
+            [po_number, sku_code],
+        )
+        found = cur.fetchone()
+        if found:
+            return found[0]
+    return None
+
+
+def _update_master_po_if_present(cur, table: str, row: dict) -> str | None:
+    if table not in PRIMARY_MASTER_TABLES:
+        return None
+
+    payload, lookup_skus = _primary_master_payload(table, row)
+    if not payload:
+        return None
+
+    existing_sku = _find_master_po_sku(cur, payload["po_number"], lookup_skus)
+    if not existing_sku:
+        return None
+
+    update_columns = [col for col in PRIMARY_MASTER_UPDATE_COLUMNS if col in payload]
+    if not update_columns:
+        return "skipped"
+
+    assignments = ", ".join(f"{_quote_ident(col)} = %s" for col in update_columns)
+    cur.execute(
+        f"""
+        UPDATE public.master_po
+        SET {assignments}
+        WHERE po_number = %s
+          AND sku_code = %s
+        """,
+        [*[payload[col] for col in update_columns], payload["po_number"], existing_sku],
+    )
+    return "updated"
+
+
 def _batch_upload(body, *, forced_table: str | None = None):
     body = body or {}
     table = forced_table or body.get("table")
@@ -658,6 +943,10 @@ def _batch_upload(body, *, forced_table: str | None = None):
     created = 0
     updated = 0
     skipped = 0
+    master_updated = 0
+    platform_created = 0
+    platform_updated = 0
+    platform_skipped = 0
     failed = 0
     last_error: str | None = None
 
@@ -666,17 +955,31 @@ def _batch_upload(body, *, forced_table: str | None = None):
             batch = data[i : i + BATCH_SIZE]
             for row in batch:
                 try:
+                    master_result = _update_master_po_if_present(cur, table, row)
+                    if master_result:
+                        success += 1
+                        if master_result == "updated":
+                            updated += 1
+                            master_updated += 1
+                        else:
+                            skipped += 1
+                        continue
+
                     cur.execute(sql, [row.get(c) for c in columns])
                     if tracks_upsert_counts:
                         result = cur.fetchone()
                         if result is None:
                             skipped += 1
+                            platform_skipped += 1
                         elif result[0]:
                             created += 1
+                            platform_created += 1
                         else:
                             updated += 1
+                            platform_updated += 1
                     else:
                         created += 1
+                        platform_created += 1
                     success += 1
                 except Exception as e:
                     failed += 1
@@ -688,6 +991,10 @@ def _batch_upload(body, *, forced_table: str | None = None):
             "created": created,
             "updated": updated,
             "skipped": skipped,
+            "master_updated": master_updated,
+            "platform_created": platform_created,
+            "platform_updated": platform_updated,
+            "platform_skipped": platform_skipped,
             "duplicates": updated + skipped,
             "failed": failed,
             "error": last_error,
