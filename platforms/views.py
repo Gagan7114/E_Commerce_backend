@@ -495,9 +495,10 @@ def primary_dashboard(request, slug: str):
         if mode == "PO MONTH"
         else [month_name, year, month_name, year]
     )
-    vendor_period_filter = _primary_vendor_period_filter(mode)
+    vendor_metric_filter = _primary_vendor_metric_filter(mode)
+    vendor_pending_filter = _primary_vendor_pending_filter(mode)
     vendor_period_params = (
-        [month_name, year]
+        [month_name, year, month_name, year]
         if mode == "PO MONTH"
         else [month_name, year, month_name, year, month_name, year]
     )
@@ -619,30 +620,15 @@ def primary_dashboard(request, slug: str):
     open_vendor_pending = _dict_rows(
         f"""
         {primary_cte}
-        SELECT
-            vendor,
-            COALESCE(SUM(order_value_row), 0) AS order_value,
-            COALESCE(SUM(delivered_value_row), 0) AS delivered_value,
-            COALESCE(SUM(CASE WHEN open_close_key = 'OPEN'
-                THEN GREATEST(order_value_row - delivered_value_row, 0)
-                ELSE 0 END), 0) AS pending_value,
-            COALESCE(SUM(order_ltrs_row), 0) AS order_ltrs,
-            COALESCE(SUM(delivered_ltrs_row), 0) AS delivered_ltrs,
-            COALESCE(SUM(CASE WHEN open_close_key = 'OPEN'
-                THEN GREATEST(order_ltrs_row - delivered_ltrs_row, 0)
-                ELSE 0 END), 0) AS pending_ltrs,
-            COALESCE(SUM(order_qty_row), 0) AS order_qty,
-            COALESCE(SUM(delivered_qty_row), 0) AS delivered_qty,
-            COALESCE(SUM(CASE WHEN open_close_key = 'OPEN'
-                THEN GREATEST(order_qty_row - delivered_qty_row, 0)
-                ELSE 0 END), 0) AS pending_qty
-        FROM (
+        , vendor_rows AS (
             SELECT
                 COALESCE(
                     NULLIF(UPPER(TRIM(vendor_new::text)), ''),
                     NULLIF(UPPER(TRIM(vendor_name::text)), ''),
                     'UNMAPPED'
                 ) AS vendor,
+                ({vendor_metric_filter}) AS in_metric_period,
+                ({vendor_pending_filter}) AS in_pending_period,
                 COALESCE(total_order_amt_exclusive, 0) AS order_value_row,
                 CASE
                     WHEN COALESCE(total_delivered_amt_exclusive, 0) <> 0
@@ -657,9 +643,39 @@ def primary_dashboard(request, slug: str):
                 COALESCE(delivered_qty, 0) AS delivered_qty_row,
                 COALESCE(NULLIF(UPPER(TRIM(open_close::text)), ''), 'CLOSED') AS open_close_key
             FROM normalized
-            WHERE {vendor_period_filter}
-        ) vendor_rows
-        GROUP BY 1
+        ),
+        vendor_agg AS (
+            SELECT
+                vendor,
+                COALESCE(SUM(CASE WHEN in_metric_period THEN order_value_row ELSE 0 END), 0) AS order_value,
+                COALESCE(SUM(CASE WHEN in_metric_period THEN delivered_value_row ELSE 0 END), 0) AS delivered_value,
+                COALESCE(SUM(CASE WHEN open_close_key = 'OPEN' AND in_pending_period
+                    THEN GREATEST(order_value_row - delivered_value_row, 0)
+                    ELSE 0 END), 0) AS pending_value,
+                COALESCE(SUM(CASE WHEN in_metric_period THEN order_ltrs_row ELSE 0 END), 0) AS order_ltrs,
+                COALESCE(SUM(CASE WHEN in_metric_period THEN delivered_ltrs_row ELSE 0 END), 0) AS delivered_ltrs,
+                COALESCE(SUM(CASE WHEN open_close_key = 'OPEN' AND in_pending_period
+                    THEN GREATEST(order_ltrs_row - delivered_ltrs_row, 0)
+                    ELSE 0 END), 0) AS pending_ltrs,
+                COALESCE(SUM(CASE WHEN in_metric_period THEN order_qty_row ELSE 0 END), 0) AS order_qty,
+                COALESCE(SUM(CASE WHEN in_metric_period THEN delivered_qty_row ELSE 0 END), 0) AS delivered_qty,
+                COALESCE(SUM(CASE WHEN open_close_key = 'OPEN' AND in_pending_period
+                    THEN GREATEST(order_qty_row - delivered_qty_row, 0)
+                    ELSE 0 END), 0) AS pending_qty
+            FROM vendor_rows
+            GROUP BY 1
+        )
+        SELECT *
+        FROM vendor_agg
+        WHERE order_value <> 0
+           OR delivered_value <> 0
+           OR pending_value <> 0
+           OR order_ltrs <> 0
+           OR delivered_ltrs <> 0
+           OR pending_ltrs <> 0
+           OR order_qty <> 0
+           OR delivered_qty <> 0
+           OR pending_qty <> 0
         ORDER BY pending_value DESC, order_value DESC, vendor
         """,
         vendor_period_params,
@@ -2573,6 +2589,7 @@ normalized AS (
         UPPER(TRIM(delivery_month::text)) AS delivery_month_key,
         UPPER(TRIM(TO_CHAR(expiry_dt, 'FMMONTH'))) AS expiry_month_key,
         COALESCE("year", EXTRACT(YEAR FROM po_dt)::integer) AS po_year,
+        EXTRACT(YEAR FROM delivery_dt)::integer AS delivery_year,
         EXTRACT(YEAR FROM expiry_dt)::integer AS expiry_year,
         CASE
             WHEN per_liter IS NULL THEN UPPER(TRIM(unit_of_measure::text))
@@ -2660,13 +2677,18 @@ def _primary_period_filter(mode: str) -> str:
     """
 
 
-def _primary_vendor_period_filter(mode: str) -> str:
+def _primary_vendor_metric_filter(mode: str) -> str:
+    if mode == "PO MONTH":
+        return "po_month_key = %s AND po_year = %s"
+    return "delivery_month_key = %s AND delivery_year = %s"
+
+
+def _primary_vendor_pending_filter(mode: str) -> str:
     if mode == "PO MONTH":
         return "po_month_key = %s AND po_year = %s"
     return """
         (
-            (delivery_month_key = %s AND expiry_year = %s)
-            OR (po_month_key = %s AND po_year = %s)
+            (po_month_key = %s AND po_year = %s)
             OR (expiry_month_key = %s AND expiry_year = %s)
         )
     """
