@@ -782,21 +782,7 @@ def _master_warning_for_amazon(cur, row: dict[str, Any]) -> list[dict[str, Any]]
     cur.execute(
         """
         SELECT format_sku_code, case_pack,
-               COALESCE(
-                   NULLIF(per_unit_value::numeric, 0),
-                   CASE
-                       WHEN NULLIF(TRIM(per_unit::text), '') IS NULL THEN NULL
-                       WHEN substring(per_unit::text from '([0-9]+(?:\.[0-9]+)?)') IS NULL THEN NULL
-                       WHEN UPPER(COALESCE(uom, '')) IN ('ML', 'MLS')
-                            OR UPPER(per_unit::text) LIKE '%%ML%%'
-                            THEN substring(per_unit::text from '([0-9]+(?:\.[0-9]+)?)')::numeric / 1000
-                       WHEN UPPER(COALESCE(uom, '')) IN ('LTR', 'LITRE', 'LITRES')
-                            OR UPPER(per_unit::text) LIKE '%%LTR%%'
-                            OR UPPER(per_unit::text) LIKE '%%LITRE%%'
-                            THEN substring(per_unit::text from '([0-9]+(?:\.[0-9]+)?)')::numeric
-                       ELSE NULL
-                   END
-               ) AS per_unit_value,
+               NULLIF(per_unit_value::numeric, 0) AS per_unit_value,
                per_unit,
                uom, sku_sap_name, sku_sap_code
           FROM public.master_sheet
@@ -931,21 +917,7 @@ def _add_business_warnings(
               FROM src s
               LEFT JOIN LATERAL (
                   SELECT format_sku_code, case_pack,
-                         COALESCE(
-                             NULLIF(per_unit_value::numeric, 0),
-                             CASE
-                                 WHEN NULLIF(TRIM(per_unit::text), '') IS NULL THEN NULL
-                                 WHEN substring(per_unit::text from '([0-9]+(?:\.[0-9]+)?)') IS NULL THEN NULL
-                                 WHEN UPPER(COALESCE(uom, '')) IN ('ML', 'MLS')
-                                      OR UPPER(per_unit::text) LIKE '%%ML%%'
-                                      THEN substring(per_unit::text from '([0-9]+(?:\.[0-9]+)?)')::numeric / 1000
-                                 WHEN UPPER(COALESCE(uom, '')) IN ('LTR', 'LITRE', 'LITRES')
-                                      OR UPPER(per_unit::text) LIKE '%%LTR%%'
-                                      OR UPPER(per_unit::text) LIKE '%%LITRE%%'
-                                      THEN substring(per_unit::text from '([0-9]+(?:\.[0-9]+)?)')::numeric
-                                 ELSE NULL
-                             END
-                         ) AS per_unit_value,
+                         NULLIF(per_unit_value::numeric, 0) AS per_unit_value,
                          per_unit,
                          uom, sku_sap_name, sku_sap_code
                     FROM public.master_sheet pm
