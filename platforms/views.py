@@ -202,6 +202,7 @@ def _bigbasket_primary_total(rows: list[dict], *, include_cancelled: bool = True
 
 
 _PRIMARY_DASHBOARD_FORMATS = {
+    "zepto": "ZEPTO",
     "bigbasket": "BIG BASKET",
     "blinkit": "BLINKIT",
     "citymall": "CITY MALL",
@@ -415,16 +416,24 @@ def inventory_match(request, slug: str):
 
 
 _PRIMARY_METRIC_SQL = """
-    COALESCE(SUM(CASE WHEN status_key = 'COMPLETED'
-        THEN COALESCE(total_delivered_amt_exclusive, 0) ELSE 0 END), 0) AS done_value,
-    COALESCE(SUM(CASE WHEN status_key = 'COMPLETED'
-        THEN COALESCE(total_delivered_liters, 0) ELSE 0 END), 0) AS done_ltrs,
-    COALESCE(SUM(CASE WHEN status_key = 'COMPLETED'
-        THEN COALESCE(delivered_qty, 0) ELSE 0 END), 0) AS done_qty,
-    COALESCE(SUM(CASE WHEN status_key IN ('PENDING', 'APPOINTMENT DONE')
-        THEN COALESCE(total_order_amt_exclusive, 0) ELSE 0 END), 0) AS pending_value,
-    COALESCE(SUM(CASE WHEN status_key IN ('PENDING', 'APPOINTMENT DONE')
-        THEN COALESCE(total_order_liters, 0) ELSE 0 END), 0) AS pending_ltrs,
+    COALESCE(SUM(COALESCE(total_delivered_amt_exclusive, 0)), 0) AS done_value,
+    COALESCE(SUM(COALESCE(total_delivered_liters, 0)), 0) AS done_ltrs,
+    COALESCE(SUM(COALESCE(delivered_qty, 0)), 0) AS done_qty,
+    COALESCE(SUM(CASE WHEN open_close_key = 'OPEN'
+        THEN GREATEST(
+            COALESCE(total_order_amt_exclusive, 0) - COALESCE(total_delivered_amt_exclusive, 0),
+            0
+        ) ELSE 0 END), 0) AS pending_value,
+    COALESCE(SUM(CASE WHEN open_close_key = 'OPEN'
+        THEN GREATEST(
+            COALESCE(total_order_liters, 0) - COALESCE(total_delivered_liters, 0),
+            0
+        ) ELSE 0 END), 0) AS pending_ltrs,
+    COALESCE(SUM(CASE WHEN open_close_key = 'OPEN'
+        THEN GREATEST(
+            COALESCE(order_qty, 0) - COALESCE(delivered_qty, 0),
+            0
+        ) ELSE 0 END), 0) AS pending_qty,
     COALESCE(SUM(CASE WHEN status_key = 'EXPIRED'
         THEN COALESCE(total_order_amt_exclusive, 0) ELSE 0 END), 0) AS expired_value,
     COALESCE(SUM(CASE WHEN status_key = 'EXPIRED'
@@ -440,18 +449,24 @@ _PRIMARY_METRIC_SQL = """
 
 
 _PRIMARY_TREND_METRIC_SQL = """
-    COALESCE(SUM(CASE WHEN status_key = 'COMPLETED'
-        THEN COALESCE(total_delivered_amt_exclusive, 0) ELSE 0 END), 0) AS done_value,
-    COALESCE(SUM(CASE WHEN status_key = 'COMPLETED'
-        THEN COALESCE(total_delivered_liters, 0) ELSE 0 END), 0) AS done_ltrs,
-    COALESCE(SUM(CASE WHEN status_key = 'COMPLETED'
-        THEN COALESCE(delivered_qty, 0) ELSE 0 END), 0) AS done_qty,
-    COALESCE(SUM(CASE WHEN status_key IN ('PENDING', 'APPOINTMENT DONE')
-        THEN COALESCE(total_order_amt_exclusive, 0) ELSE 0 END), 0) AS pending_value,
-    COALESCE(SUM(CASE WHEN status_key IN ('PENDING', 'APPOINTMENT DONE')
-        THEN COALESCE(total_order_liters, 0) ELSE 0 END), 0) AS pending_ltrs,
-    COALESCE(SUM(CASE WHEN status_key IN ('PENDING', 'APPOINTMENT DONE')
-        THEN COALESCE(order_qty, 0) ELSE 0 END), 0) AS pending_qty,
+    COALESCE(SUM(COALESCE(total_delivered_amt_exclusive, 0)), 0) AS done_value,
+    COALESCE(SUM(COALESCE(total_delivered_liters, 0)), 0) AS done_ltrs,
+    COALESCE(SUM(COALESCE(delivered_qty, 0)), 0) AS done_qty,
+    COALESCE(SUM(CASE WHEN open_close_key = 'OPEN'
+        THEN GREATEST(
+            COALESCE(total_order_amt_exclusive, 0) - COALESCE(total_delivered_amt_exclusive, 0),
+            0
+        ) ELSE 0 END), 0) AS pending_value,
+    COALESCE(SUM(CASE WHEN open_close_key = 'OPEN'
+        THEN GREATEST(
+            COALESCE(total_order_liters, 0) - COALESCE(total_delivered_liters, 0),
+            0
+        ) ELSE 0 END), 0) AS pending_ltrs,
+    COALESCE(SUM(CASE WHEN open_close_key = 'OPEN'
+        THEN GREATEST(
+            COALESCE(order_qty, 0) - COALESCE(delivered_qty, 0),
+            0
+        ) ELSE 0 END), 0) AS pending_qty,
     COALESCE(SUM(COALESCE(total_order_amt_exclusive, 0)), 0) AS order_value,
     COALESCE(SUM(COALESCE(total_order_liters, 0)), 0) AS order_ltrs,
     COALESCE(SUM(COALESCE(order_qty, 0)), 0) AS order_qty
@@ -462,19 +477,36 @@ _PRIMARY_TREND_METRIC_SQL = """
 @permission_classes([require("platform.stats.view")])
 def primary_dashboard(request, slug: str):
     _ensure_scope(request.user, slug)
-    if slug != "zepto":
-        raise ValidationError("Primary Dashboard is available only for Zepto.")
+    platform_format = _PRIMARY_DASHBOARD_FORMATS.get(slug)
+    if not platform_format:
+        raise ValidationError(
+            "Primary Dashboard is available only for primary sales platforms."
+        )
 
-    mode, month, year, defaulted_to_latest = _parse_primary_dashboard_params(request.query_params)
+    primary_cte = _primary_master_po_cte(platform_format)
+    mode, month, year, defaulted_to_latest = _parse_primary_dashboard_params(
+        request.query_params,
+        platform_format,
+    )
     month_name = _month_name(month)
     period_filter = _primary_period_filter(mode)
-    period_params = [month_name, year]
+    period_params = (
+        [month_name, year]
+        if mode == "PO MONTH"
+        else [month_name, year, month_name, year]
+    )
+    vendor_period_filter = _primary_vendor_period_filter(mode)
+    vendor_period_params = (
+        [month_name, year]
+        if mode == "PO MONTH"
+        else [month_name, year, month_name, year, month_name, year]
+    )
 
     # This mirrors PRIMARY DASHBOARD!D2 in the workbook:
     # MAXIFS(PRIMARY!BM:BM, PRIMARY!AG:AG, month, PRIMARY!AI:AI, year)
     max_date = _scalar(
         f"""
-        {_PRIM_MASTER_PO_CTE}
+        {primary_cte}
         SELECT MAX(po_dt)
         FROM normalized
         WHERE po_month_key = %s
@@ -485,7 +517,7 @@ def primary_dashboard(request, slug: str):
 
     summary_raw = _dict_rows(
         f"""
-        {_PRIM_MASTER_PO_CTE}
+        {primary_cte}
         SELECT
             item_head_key AS item_head,
             {_PRIMARY_METRIC_SQL}
@@ -504,7 +536,7 @@ def primary_dashboard(request, slug: str):
 
     detail_raw = _dict_rows(
         f"""
-        {_PRIM_MASTER_PO_CTE}
+        {primary_cte}
         SELECT
             sub_category_key,
             per_ltr_key,
@@ -524,21 +556,22 @@ def primary_dashboard(request, slug: str):
 
     details = []
     fixed_detail_keys = set()
-    for fmt, item_head, category, sub_category, per_ltr in _ZEPTO_PRIMARY_DETAIL_ROWS:
-        detail_key = (_norm_sec_key(sub_category), _norm_sec_key(per_ltr))
-        fixed_detail_keys.add(detail_key)
-        metrics = _primary_metrics(
-            detail_by_key.get(detail_key)
-        )
-        details.append({
-            "format": fmt,
-            "item_head": item_head,
-            "category": category,
-            "sub_category": sub_category,
-            "per_ltr": per_ltr,
-            "value_per_ltr": None if metrics["done_ltrs"] == 0 else metrics["done_value"] / metrics["done_ltrs"],
-            **metrics,
-        })
+    if slug == "zepto":
+        for fmt, item_head, category, sub_category, per_ltr in _ZEPTO_PRIMARY_DETAIL_ROWS:
+            detail_key = (_norm_sec_key(sub_category), _norm_sec_key(per_ltr))
+            fixed_detail_keys.add(detail_key)
+            metrics = _primary_metrics(
+                detail_by_key.get(detail_key)
+            )
+            details.append({
+                "format": fmt,
+                "item_head": item_head,
+                "category": category,
+                "sub_category": sub_category,
+                "per_ltr": per_ltr,
+                "value_per_ltr": None if metrics["done_ltrs"] == 0 else metrics["done_value"] / metrics["done_ltrs"],
+                **metrics,
+            })
 
     # The workbook has a fixed display list, but the database can receive new
     # pack sizes before the sheet template is updated. Include those live rows
@@ -550,7 +583,7 @@ def primary_dashboard(request, slug: str):
         if not any(_num(metrics.get(key)) for key in metrics):
             continue
         details.append({
-            "format": "ZEPTO",
+            "format": platform_format,
             "item_head": row.get("item_head_key") or "OTHER",
             "category": row.get("category_key") or row.get("sub_category_key") or "OTHER",
             "sub_category": row.get("sub_category_key") or "OTHER",
@@ -561,7 +594,7 @@ def primary_dashboard(request, slug: str):
 
     top_item_raw = _dict_rows(
         f"""
-        {_PRIM_MASTER_PO_CTE},
+        {primary_cte},
         item_agg AS (
             SELECT
                 item_key AS item,
@@ -576,7 +609,6 @@ def primary_dashboard(request, slug: str):
            OR COALESCE(done_ltrs, 0) <> 0
            OR COALESCE(done_qty, 0) <> 0
         ORDER BY done_value DESC, done_ltrs DESC, done_qty DESC
-        LIMIT 10
         """,
         period_params,
     )
@@ -586,18 +618,24 @@ def primary_dashboard(request, slug: str):
     ]
     open_vendor_pending = _dict_rows(
         f"""
-        {_PRIM_MASTER_PO_CTE}
+        {primary_cte}
         SELECT
             vendor,
             COALESCE(SUM(order_value_row), 0) AS order_value,
             COALESCE(SUM(delivered_value_row), 0) AS delivered_value,
-            COALESCE(SUM(GREATEST(order_value_row - delivered_value_row, 0)), 0) AS pending_value,
+            COALESCE(SUM(CASE WHEN open_close_key = 'OPEN'
+                THEN GREATEST(order_value_row - delivered_value_row, 0)
+                ELSE 0 END), 0) AS pending_value,
             COALESCE(SUM(order_ltrs_row), 0) AS order_ltrs,
             COALESCE(SUM(delivered_ltrs_row), 0) AS delivered_ltrs,
-            COALESCE(SUM(GREATEST(order_ltrs_row - delivered_ltrs_row, 0)), 0) AS pending_ltrs,
+            COALESCE(SUM(CASE WHEN open_close_key = 'OPEN'
+                THEN GREATEST(order_ltrs_row - delivered_ltrs_row, 0)
+                ELSE 0 END), 0) AS pending_ltrs,
             COALESCE(SUM(order_qty_row), 0) AS order_qty,
             COALESCE(SUM(delivered_qty_row), 0) AS delivered_qty,
-            COALESCE(SUM(GREATEST(order_qty_row - delivered_qty_row, 0)), 0) AS pending_qty
+            COALESCE(SUM(CASE WHEN open_close_key = 'OPEN'
+                THEN GREATEST(order_qty_row - delivered_qty_row, 0)
+                ELSE 0 END), 0) AS pending_qty
         FROM (
             SELECT
                 COALESCE(
@@ -616,13 +654,51 @@ def primary_dashboard(request, slug: str):
                 COALESCE(total_order_liters, 0) AS order_ltrs_row,
                 COALESCE(total_delivered_liters, 0) AS delivered_ltrs_row,
                 COALESCE(order_qty, 0) AS order_qty_row,
-                COALESCE(delivered_qty, 0) AS delivered_qty_row
+                COALESCE(delivered_qty, 0) AS delivered_qty_row,
+                COALESCE(NULLIF(UPPER(TRIM(open_close::text)), ''), 'CLOSED') AS open_close_key
             FROM normalized
+            WHERE {vendor_period_filter}
         ) vendor_rows
         GROUP BY 1
         ORDER BY pending_value DESC, order_value DESC, vendor
         """,
-        [],
+        vendor_period_params,
+    )
+    open_vendor_pending_value = sorted(
+        open_vendor_pending,
+        key=lambda row: (
+            _num(row.get("pending_value")),
+            _num(row.get("order_value")),
+            _num(row.get("delivered_value")),
+        ),
+        reverse=True,
+    )
+    open_vendor_pending_ltrs = sorted(
+        open_vendor_pending,
+        key=lambda row: (
+            _num(row.get("pending_ltrs")),
+            _num(row.get("order_ltrs")),
+            _num(row.get("delivered_ltrs")),
+        ),
+        reverse=True,
+    )
+    open_vendor_pending_qty = sorted(
+        open_vendor_pending,
+        key=lambda row: (
+            _num(row.get("pending_qty")),
+            _num(row.get("order_qty")),
+            _num(row.get("delivered_qty")),
+        ),
+        reverse=True,
+    )
+    open_vendor_pending_order = sorted(
+        open_vendor_pending,
+        key=lambda row: (
+            _num(row.get("order_value")),
+            _num(row.get("order_ltrs")),
+            _num(row.get("order_qty")),
+        ),
+        reverse=True,
     )
 
     detail_total = _primary_total(details)
@@ -633,7 +709,7 @@ def primary_dashboard(request, slug: str):
 
     daily_trend = _primary_trend_rows(_dict_rows(
         f"""
-        {_PRIM_MASTER_PO_CTE},
+        {primary_cte},
         trend_days AS (
             SELECT generate_series(%s::date, %s::date, interval '1 day')::date AS period
         ),
@@ -663,7 +739,7 @@ def primary_dashboard(request, slug: str):
     ))
     monthly_trend = _primary_trend_rows(_dict_rows(
         f"""
-        {_PRIM_MASTER_PO_CTE},
+        {primary_cte},
         bounds AS (
             SELECT
                 make_date(%s::integer, 1, 1) AS start_month,
@@ -706,7 +782,7 @@ def primary_dashboard(request, slug: str):
     ))
     yearly_trend = _primary_trend_rows(_dict_rows(
         f"""
-        {_PRIM_MASTER_PO_CTE},
+        {primary_cte},
         bounds AS (
             SELECT
                 MIN(EXTRACT(YEAR FROM {trend_date_col})::integer) AS start_year,
@@ -745,8 +821,8 @@ def primary_dashboard(request, slug: str):
 
     return Response({
         "source": "prim_master_po",
-        "format": "ZEPTO",
-        "dashboard_title": "Zepto Primary Dashboard",
+        "format": platform_format,
+        "dashboard_title": f"{platform_format} Primary Dashboard",
         "mode": mode,
         "month": month,
         "month_name": month_name,
@@ -758,13 +834,17 @@ def primary_dashboard(request, slug: str):
         "details": details,
         "detail_total": detail_total,
         "top_items": top_items,
-        "open_vendor_pending": open_vendor_pending,
+        "open_vendor_pending": open_vendor_pending_value,
+        "open_vendor_pending_value": open_vendor_pending_value,
+        "open_vendor_pending_ltrs": open_vendor_pending_ltrs,
+        "open_vendor_pending_qty": open_vendor_pending_qty,
+        "open_vendor_pending_order": open_vendor_pending_order,
         "trends": {
             "day": daily_trend,
             "month": monthly_trend,
             "year": yearly_trend,
         },
-        "detail_rows_fixed": False,
+        "detail_rows_fixed": slug == "zepto",
         "extra_detail_rows_included": True,
     })
 
@@ -2467,7 +2547,10 @@ _PRIM_PO_DATE_EXPR = _prim_safe_date_expr("po_date")
 _PRIM_PO_EXPIRY_DATE_EXPR = _prim_safe_date_expr("po_expiry_date")
 _PRIM_DELIVERY_DATE_EXPR = _prim_safe_date_expr("delivery_date")
 
-_PRIM_MASTER_PO_CTE = f"""
+def _primary_master_po_cte(platform_format: str = "ZEPTO") -> str:
+    format_key = re.sub(r"[^a-z0-9]+", "", str(platform_format or "ZEPTO").strip().lower())
+    format_key = format_key.replace("'", "''")
+    return f"""
 WITH base AS (
     SELECT
         p.*,
@@ -2475,7 +2558,7 @@ WITH base AS (
         {_PRIM_PO_EXPIRY_DATE_EXPR} AS expiry_dt,
         {_PRIM_DELIVERY_DATE_EXPR} AS delivery_dt
     FROM public.prim_master_po p
-    WHERE REGEXP_REPLACE(LOWER(TRIM(p.format::text)), '[^a-z0-9]+', '', 'g') = 'zepto'
+    WHERE REGEXP_REPLACE(LOWER(TRIM(p.format::text)), '[^a-z0-9]+', '', 'g') = '{format_key}'
 ),
 normalized AS (
     SELECT
@@ -2485,8 +2568,10 @@ normalized AS (
         COALESCE(NULLIF(UPPER(TRIM(item::text)), ''), NULLIF(UPPER(TRIM(sku_name::text)), ''), 'OTHER') AS item_key,
         COALESCE(NULLIF(UPPER(TRIM(category::text)), ''), 'OTHER') AS category_key,
         COALESCE(NULLIF(UPPER(TRIM(sub_category::text)), ''), 'OTHER') AS sub_category_key,
+        COALESCE(NULLIF(UPPER(TRIM(open_close::text)), ''), 'CLOSED') AS open_close_key,
         UPPER(TRIM(po_month::text)) AS po_month_key,
         UPPER(TRIM(delivery_month::text)) AS delivery_month_key,
+        UPPER(TRIM(TO_CHAR(expiry_dt, 'FMMONTH'))) AS expiry_month_key,
         COALESCE("year", EXTRACT(YEAR FROM po_dt)::integer) AS po_year,
         EXTRACT(YEAR FROM expiry_dt)::integer AS expiry_year,
         CASE
@@ -2500,7 +2585,10 @@ normalized AS (
 """
 
 
-def _parse_primary_dashboard_params(params) -> tuple[str, int, int, bool]:
+_PRIM_MASTER_PO_CTE = _primary_master_po_cte("ZEPTO")
+
+
+def _parse_primary_dashboard_params(params, platform_format: str = "ZEPTO") -> tuple[str, int, int, bool]:
     mode = _norm_sec_key(params.get("mode") or params.get("month_type") or "DEL MONTH")
     if mode not in {"DEL MONTH", "PO MONTH"}:
         raise ValidationError("`mode` must be DEL MONTH or PO MONTH.")
@@ -2516,9 +2604,10 @@ def _parse_primary_dashboard_params(params) -> tuple[str, int, int, bool]:
 
     if not raw_month or not raw_year:
         order_date = "delivery_dt" if mode == "DEL MONTH" else "po_dt"
+        primary_cte = _primary_master_po_cte(platform_format)
         latest = _dict_rows(
             f"""
-            {_PRIM_MASTER_PO_CTE}
+            {primary_cte}
             SELECT
                 {order_date} AS period_date,
                 COALESCE(expiry_year, EXTRACT(YEAR FROM delivery_dt)::integer, po_year) AS del_year,
@@ -2563,7 +2652,24 @@ def _parse_primary_dashboard_params(params) -> tuple[str, int, int, bool]:
 def _primary_period_filter(mode: str) -> str:
     if mode == "PO MONTH":
         return "po_month_key = %s AND po_year = %s"
-    return "delivery_month_key = %s AND expiry_year = %s"
+    return """
+        (
+            (delivery_month_key = %s AND expiry_year = %s)
+            OR (open_close_key = 'OPEN' AND po_month_key = %s AND po_year = %s)
+        )
+    """
+
+
+def _primary_vendor_period_filter(mode: str) -> str:
+    if mode == "PO MONTH":
+        return "po_month_key = %s AND po_year = %s"
+    return """
+        (
+            (delivery_month_key = %s AND expiry_year = %s)
+            OR (po_month_key = %s AND po_year = %s)
+            OR (expiry_month_key = %s AND expiry_year = %s)
+        )
+    """
 
 
 def _primary_zero_metrics() -> dict:
@@ -2573,6 +2679,7 @@ def _primary_zero_metrics() -> dict:
         "done_qty": 0.0,
         "pending_value": 0.0,
         "pending_ltrs": 0.0,
+        "pending_qty": 0.0,
         "dp_value": 0.0,
         "dp_ltrs": 0.0,
         "expired_value": 0.0,
@@ -2594,6 +2701,7 @@ def _primary_metrics(row: dict | None) -> dict:
             "done_qty",
             "pending_value",
             "pending_ltrs",
+            "pending_qty",
             "expired_value",
             "expired_ltrs",
             "cancelled_value",
