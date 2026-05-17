@@ -478,11 +478,12 @@ _PRIMARY_TREND_METRIC_SQL = """
 
 _AMAZON_PRIMARY_METRIC_SQL = """
     COALESCE(SUM(COALESCE(total_received_cost, 0)), 0) AS done_value,
-    COALESCE(SUM(COALESCE(total_delivered_liters, 0)), 0) AS done_ltrs,
+    COALESCE(SUM(CASE WHEN item_head_key = 'OTHER'
+        THEN 0 ELSE COALESCE(total_delivered_liters, 0) END), 0) AS done_ltrs,
     COALESCE(SUM(COALESCE(received_qty, 0)), 0) AS done_qty,
     COALESCE(SUM(CASE WHEN status_key = 'PENDING'
         THEN COALESCE(total_requested_cost, 0) ELSE 0 END), 0) AS pending_value,
-    COALESCE(SUM(CASE WHEN status_key = 'PENDING'
+    COALESCE(SUM(CASE WHEN status_key = 'PENDING' AND item_head_key <> 'OTHER'
         THEN COALESCE(order_ltrs_cl, total_order_liters, 0) ELSE 0 END), 0) AS pending_ltrs,
     COALESCE(SUM(CASE WHEN status_key = 'PENDING'
         THEN COALESCE(order_unit_cl, requested_qty, 0) ELSE 0 END), 0) AS pending_qty,
@@ -490,13 +491,13 @@ _AMAZON_PRIMARY_METRIC_SQL = """
         THEN COALESCE(total_requested_cost, 0) ELSE 0 END), 0) AS expired_value,
     COALESCE(SUM(CASE WHEN status_key IN ('CANCELLED', 'MOV')
         THEN COALESCE(total_requested_cost, 0) ELSE 0 END), 0) AS cancelled_value,
-    COALESCE(SUM(CASE WHEN status_key = 'EXPIRED'
+    COALESCE(SUM(CASE WHEN status_key = 'EXPIRED' AND item_head_key <> 'OTHER'
         THEN COALESCE(order_ltrs_cl, total_order_liters, 0) ELSE 0 END), 0) AS expired_ltrs,
-    COALESCE(SUM(CASE WHEN status_key IN ('CANCELLED', 'MOV')
+    COALESCE(SUM(CASE WHEN status_key IN ('CANCELLED', 'MOV') AND item_head_key <> 'OTHER'
         THEN COALESCE(order_ltrs_cl, total_order_liters, 0) ELSE 0 END), 0) AS cancelled_ltrs,
     COALESCE(SUM(CASE WHEN status_key NOT IN ('CANCELLED', 'CANCELED', 'CANCEL', 'MOV')
         THEN COALESCE(total_requested_cost, 0) ELSE 0 END), 0) AS order_value,
-    COALESCE(SUM(CASE WHEN status_key NOT IN ('CANCELLED', 'CANCELED', 'CANCEL', 'MOV')
+    COALESCE(SUM(CASE WHEN status_key NOT IN ('CANCELLED', 'CANCELED', 'CANCEL', 'MOV') AND item_head_key <> 'OTHER'
         THEN COALESCE(order_ltrs_cl, total_order_liters, 0) ELSE 0 END), 0) AS order_ltrs,
     COALESCE(SUM(CASE WHEN status_key NOT IN ('CANCELLED', 'CANCELED', 'CANCEL', 'MOV')
         THEN COALESCE(order_unit_cl, requested_qty, 0) ELSE 0 END), 0) AS order_qty
@@ -524,7 +525,7 @@ normalized AS (
                 THEN UPPER(TRIM(item_head::text))
             WHEN UPPER(TRIM(item_head::text)) = 'OTHERS'
                 THEN 'OTHER'
-            ELSE 'OTHER'
+            ELSE 'UNMAPPED'
         END AS item_head_key,
         CASE
             WHEN UPPER(TRIM(core_fresh_now::text)) LIKE '%%FRESH%%' THEN 'FRESH'
@@ -672,6 +673,7 @@ def _amazon_primary_dashboard_response(request):
             {_AMAZON_PRIMARY_METRIC_SQL}
         FROM normalized
         WHERE {period_filter}{channel_filter}
+          AND item_head_key IN ('PREMIUM', 'COMMODITY', 'OTHER')
         GROUP BY sub_category_key, per_ltr_key
         """,
         with_channel(period_params),
@@ -701,6 +703,7 @@ def _amazon_primary_dashboard_response(request):
                 {_AMAZON_PRIMARY_METRIC_SQL}
             FROM normalized
             WHERE {period_filter}{channel_filter}
+              AND item_head_key IN ('PREMIUM', 'COMMODITY', 'OTHER')
             GROUP BY item_key, item_head_key
         )
         SELECT *
@@ -743,6 +746,7 @@ def _amazon_primary_dashboard_response(request):
                 THEN COALESCE(order_unit_cl, requested_qty, 0) ELSE 0 END), 0) AS pending_qty
         FROM normalized
         WHERE {period_filter}{channel_filter}
+          AND item_head_key IN ('PREMIUM', 'COMMODITY', 'OTHER')
         GROUP BY 1
         HAVING
             COALESCE(SUM(CASE WHEN status_key NOT IN ('CANCELLED', 'CANCELED', 'CANCEL', 'MOV')
@@ -806,6 +810,7 @@ def _amazon_primary_dashboard_response(request):
                 {_AMAZON_PRIMARY_METRIC_SQL}
             FROM normalized
             WHERE {period_filter}{channel_filter}
+              AND item_head_key IN ('PREMIUM', 'COMMODITY', 'OTHER')
               AND period_dt IS NOT NULL
             GROUP BY period_dt::date
         )
@@ -840,6 +845,7 @@ def _amazon_primary_dashboard_response(request):
             FROM normalized
             WHERE period_dt IS NOT NULL
               AND EXTRACT(YEAR FROM period_dt)::integer = %s{channel_filter}
+              AND item_head_key IN ('PREMIUM', 'COMMODITY', 'OTHER')
         ),
         trend_months AS (
             SELECT generate_series(start_month, end_month, interval '1 month')::date AS period
@@ -853,6 +859,7 @@ def _amazon_primary_dashboard_response(request):
             FROM normalized
             WHERE period_dt IS NOT NULL
               AND EXTRACT(YEAR FROM period_dt)::integer = %s{channel_filter}
+              AND item_head_key IN ('PREMIUM', 'COMMODITY', 'OTHER')
             GROUP BY DATE_TRUNC('month', period_dt)::date
         )
         SELECT
@@ -882,6 +889,7 @@ def _amazon_primary_dashboard_response(request):
                 MAX(EXTRACT(YEAR FROM period_dt)::integer) AS end_year
             FROM normalized
             WHERE period_dt IS NOT NULL{channel_filter}
+              AND item_head_key IN ('PREMIUM', 'COMMODITY', 'OTHER')
         ),
         trend_years AS (
             SELECT generate_series(start_year, end_year)::integer AS period
@@ -894,6 +902,7 @@ def _amazon_primary_dashboard_response(request):
                 {_AMAZON_PRIMARY_METRIC_SQL}
             FROM normalized
             WHERE period_dt IS NOT NULL{channel_filter}
+              AND item_head_key IN ('PREMIUM', 'COMMODITY', 'OTHER')
             GROUP BY EXTRACT(YEAR FROM period_dt)::integer
         )
         SELECT
