@@ -724,6 +724,65 @@ def _amazon_primary_dashboard_response(request):
         for row in top_item_raw
     ]
 
+    sku_detail_raw = _dict_rows(
+        f"""
+        {amazon_cte},
+        sku_agg AS (
+            SELECT
+                COALESCE(NULLIF(UPPER(TRIM(sku_code::text)), ''), '-') AS asin,
+                item_key AS item,
+                item_head_key AS item_head,
+                category_key AS category,
+                sub_category_key AS sub_category,
+                per_ltr_key AS per_ltr,
+                COALESCE(NULLIF(UPPER(TRIM(brand::text)), ''), '-') AS brand,
+                {_AMAZON_PRIMARY_METRIC_SQL}
+            FROM normalized
+            WHERE {period_filter}{channel_filter}
+              AND item_head_key IN ('PREMIUM', 'COMMODITY', 'OTHER')
+            GROUP BY
+                COALESCE(NULLIF(UPPER(TRIM(sku_code::text)), ''), '-'),
+                item_key,
+                item_head_key,
+                category_key,
+                sub_category_key,
+                per_ltr_key,
+                COALESCE(NULLIF(UPPER(TRIM(brand::text)), ''), '-')
+        )
+        SELECT *
+        FROM sku_agg
+        WHERE COALESCE(order_value, 0) <> 0
+           OR COALESCE(done_value, 0) <> 0
+           OR COALESCE(pending_value, 0) <> 0
+           OR COALESCE(cancelled_value, 0) <> 0
+        ORDER BY
+            CASE item_head
+                WHEN 'PREMIUM' THEN 1
+                WHEN 'COMMODITY' THEN 2
+                WHEN 'OTHER' THEN 3
+                ELSE 4
+            END,
+            category,
+            sub_category,
+            item,
+            asin
+        """,
+        with_channel(period_params),
+    )
+    sku_details = [
+        {
+            "asin": row.get("asin") or "-",
+            "item": row.get("item") or "OTHER",
+            "item_head": row.get("item_head") or "OTHER",
+            "category": row.get("category") or "OTHER",
+            "sub_category": row.get("sub_category") or "OTHER",
+            "per_ltr": row.get("per_ltr") or "-",
+            "brand": row.get("brand") or "-",
+            **_primary_metrics(row),
+        }
+        for row in sku_detail_raw
+    ]
+
     vendor_rows = _dict_rows(
         f"""
         {amazon_cte}
@@ -943,6 +1002,7 @@ def _amazon_primary_dashboard_response(request):
         "details": details,
         "detail_total": detail_total,
         "top_items": top_items,
+        "sku_details": sku_details,
         "open_vendor_pending": open_vendor_pending_value,
         "open_vendor_pending_value": open_vendor_pending_value,
         "open_vendor_pending_ltrs": open_vendor_pending_ltrs,
