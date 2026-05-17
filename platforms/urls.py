@@ -10,6 +10,11 @@ urlpatterns = [
         monthly_targets.month_targets_dashboard,
         name="month-targets-dashboard",
     ),
+    path(
+        "month-targets/refresh",
+        monthly_targets.month_targets_refresh_all,
+        name="month-targets-refresh-all",
+    ),
 
     path("<slug:slug>/stats", views.platform_stats, name="platform-stats"),
     path("<slug:slug>/pos", views.platform_pos, name="platform-pos"),
@@ -49,6 +54,11 @@ urlpatterns = [
         "<slug:slug>/month-targets/add",
         monthly_targets.month_targets_create,
         name="platform-month-targets-add",
+    ),
+    path(
+        "<slug:slug>/month-targets/refresh",
+        monthly_targets.month_targets_refresh_platform,
+        name="platform-month-targets-refresh-platform",
     ),
     path(
         "<slug:slug>/month-targets/<int:row_id>/refresh",

@@ -131,6 +131,17 @@ def _parse_month_year(body_or_params) -> tuple[int, int]:
     return month, year
 
 
+def _parse_month_year_or_current(body_or_params) -> tuple[int, int]:
+    """Accept month/year when supplied, otherwise default to the current month."""
+    raw_month = body_or_params.get("month") if body_or_params else None
+    raw_year = body_or_params.get("year") if body_or_params else None
+    if raw_month or raw_year:
+        return _parse_month_year(body_or_params)
+
+    today = date.today()
+    return today.month, today.year
+
+
 def _prev_month(month: int, year: int) -> tuple[int, int]:
     return (12, year - 1) if month == 1 else (month - 1, year)
 
@@ -450,6 +461,122 @@ def _select_rows(where_sql: str, params: list, order_sql: str = "") -> list[dict
 
 # ─── Endpoints: per-platform ───
 
+_REFRESH_UPDATE_SQL = """
+    UPDATE month_targets
+       SET "date"       = %s,
+           done_ltrs    = %s,
+           done_value   = %s,
+           achieved_pct = %s,
+           est_ltr      = %s,
+           est_value    = %s,
+           est_ltr_pct  = %s,
+           growth       = %s,
+           growth_pct   = %s,
+           updated_at   = NOW()
+     WHERE id = %s
+"""
+
+
+def _refresh_existing_row(slug: str, row: dict, fmt: str | None = None) -> dict:
+    """Refresh derived columns for one already-loaded month_targets row."""
+    row_id = int(row["id"])
+    month = int(row["month"])
+    year = int(row["year"])
+    item_head = str(row["item_head"] or "").strip().upper()
+    source_format = fmt or str(row.get("format") or "").strip()
+
+    source = _read_source(slug, source_format, item_head, month, year)
+    derived = _compute_derived(
+        targets=Decimal(str(row["targets"] or 0)),
+        done_ltrs=source["done_ltrs"],
+        done_value=source["done_value"],
+        latest_date=source["latest_date"],
+        last_month=Decimal(str(row["last_month"] or 0)),
+        month=month,
+        year=year,
+    )
+
+    with connection.cursor() as cur:
+        cur.execute(
+            _REFRESH_UPDATE_SQL,
+            [
+                derived["date"],
+                derived["done_ltrs"], derived["done_value"], derived["achieved_pct"],
+                derived["est_ltr"], derived["est_value"], derived["est_ltr_pct"],
+                derived["growth"], derived["growth_pct"],
+                row_id,
+            ],
+        )
+
+    return _select_row("WHERE id = %s", [row_id])
+
+
+def _refresh_platform_rows(slug: str, platform: PlatformConfig, month: int, year: int) -> list[dict]:
+    """Refresh all monthly-target rows for one platform/month."""
+    fmt = _format_for(platform)
+    rows = _select_rows(
+        """WHERE LOWER(TRIM("format")) = LOWER(TRIM(%s))
+             AND month = %s AND year = %s""",
+        [fmt, month, year],
+        'ORDER BY UPPER(TRIM(item_head)) ASC',
+    )
+    return [_refresh_existing_row(slug, row, fmt) for row in rows]
+
+
+@api_view(["POST"])
+@permission_classes([require("platform.month_targets.edit")])
+def month_targets_refresh_all(request):
+    """POST /api/platform/month-targets/refresh
+
+    Refreshes derived columns for every authorized platform row in the
+    selected current month. Targets and last_month stay locked.
+    """
+    body = request.data if request.data else request.query_params
+    month, year = _parse_month_year_or_current(body)
+    if not _is_current_month(month, year):
+        raise ValidationError(
+            f"{month:02d}-{year} is closed. Refresh only applies to the "
+            "current calendar month."
+        )
+
+    allowed_slugs = set(user_platform_slugs(request.user)) & set(IN_SCOPE_SLUGS)
+    if not allowed_slugs:
+        return Response({
+            "ok": True,
+            "month": month,
+            "year": year,
+            "updated": 0,
+            "platforms": {},
+            "rows": [],
+        })
+
+    ordered_slugs = [slug for slug in IN_SCOPE_SLUGS if slug in allowed_slugs]
+    platforms = {
+        p.slug: p for p in PlatformConfig.objects.filter(slug__in=ordered_slugs)
+    }
+
+    refreshed_rows: list[dict] = []
+    platform_counts: dict[str, int] = {}
+    with transaction.atomic():
+        for slug in ordered_slugs:
+            _source_for(slug)
+            platform = platforms.get(slug)
+            if not platform:
+                continue
+            rows = _refresh_platform_rows(slug, platform, month, year)
+            refreshed_rows.extend(rows)
+            platform_counts[slug] = len(rows)
+
+    return Response({
+        "ok": True,
+        "month": month,
+        "year": year,
+        "updated": len(refreshed_rows),
+        "platforms": platform_counts,
+        "rows": refreshed_rows,
+    })
+
+
 @api_view(["GET"])
 @permission_classes([require("platform.month_targets.view")])
 def month_targets_list(request, slug: str):
@@ -584,6 +711,43 @@ def month_targets_create(request, slug: str):
 
 @api_view(["POST"])
 @permission_classes([require("platform.month_targets.edit")])
+def month_targets_refresh_platform(request, slug: str):
+    """POST /api/platform/<slug>/month-targets/refresh
+
+    Refreshes derived columns for all rows on one platform in the selected
+    current month. Targets and last_month stay locked.
+    """
+    _ensure_scope(request.user, slug)
+    if slug in SKIPPED_SLUGS:
+        raise ValidationError(f"Platform '{slug}' is out of scope for Monthly Targets.")
+    _source_for(slug)
+    p = _get_platform(slug)
+
+    body = request.data if request.data else request.query_params
+    month, year = _parse_month_year_or_current(body)
+    if not _is_current_month(month, year):
+        raise ValidationError(
+            f"{month:02d}-{year} is closed. Refresh only applies to the "
+            "current calendar month."
+        )
+
+    with transaction.atomic():
+        rows = _refresh_platform_rows(slug, p, month, year)
+
+    return Response({
+        "ok": True,
+        "month": month,
+        "year": year,
+        "updated": len(rows),
+        "rows": rows,
+        "format": _format_for(p),
+        "type": p.sales_type,
+        "source": _source_for(slug),
+    })
+
+
+@api_view(["POST"])
+@permission_classes([require("platform.month_targets.edit")])
 def month_targets_refresh(request, slug: str, row_id: int):
     """POST /api/platform/<slug>/month-targets/<id>/refresh
 
@@ -608,7 +772,6 @@ def month_targets_refresh(request, slug: str, row_id: int):
 
     month = int(existing["month"])
     year = int(existing["year"])
-    item_head = str(existing["item_head"] or "").strip().upper()
 
     if not _is_current_month(month, year):
         raise ValidationError(
@@ -616,44 +779,7 @@ def month_targets_refresh(request, slug: str, row_id: int):
             "Refresh only applies to rows in the current calendar month."
         )
 
-    source = _read_source(slug, fmt, item_head, month, year)
-    last_month = Decimal(existing["last_month"] or 0)  # locked, re-use stored
-    targets = Decimal(existing["targets"] or 0)        # locked, re-use stored
-
-    derived = _compute_derived(
-        targets=targets,
-        done_ltrs=source["done_ltrs"],
-        done_value=source["done_value"],
-        latest_date=source["latest_date"],
-        last_month=last_month,
-        month=month,
-        year=year,
-    )
-
-    update_sql = """
-        UPDATE month_targets
-           SET "date"       = %s,
-               done_ltrs    = %s,
-               done_value   = %s,
-               achieved_pct = %s,
-               est_ltr      = %s,
-               est_value    = %s,
-               est_ltr_pct  = %s,
-               growth       = %s,
-               growth_pct   = %s,
-               updated_at   = NOW()
-         WHERE id = %s
-    """
-    with connection.cursor() as cur:
-        cur.execute(update_sql, [
-            derived["date"],
-            derived["done_ltrs"], derived["done_value"], derived["achieved_pct"],
-            derived["est_ltr"], derived["est_value"], derived["est_ltr_pct"],
-            derived["growth"], derived["growth_pct"],
-            row_id,
-        ])
-
-    row = _select_row("WHERE id = %s", [row_id])
+    row = _refresh_existing_row(slug, existing, fmt)
     return Response({"ok": True, "row": row})
 
 

@@ -1,6 +1,6 @@
 import re
 from calendar import monthrange
-from datetime import date
+from datetime import date, timedelta
 from decimal import Decimal, InvalidOperation
 
 from django.db import connection, transaction
@@ -2853,22 +2853,36 @@ def _parse_sec_month_year(params, *, latest_source: str = "flipkart_grocery") ->
         )
     elif latest_source.startswith("secmaster_"):
         source_format = latest_source.replace("secmaster_", "", 1)
-        date_expr = (
-            _secmaster_zepto_date_expr()
-            if source_format == "zepto"
-            else '"date"'
-        )
-        latest = _dict_rows(
-            f"""
-            SELECT "month", "year"
-            FROM "SecMaster"
-            WHERE REGEXP_REPLACE(LOWER(TRIM("format"::text)), '[^a-z0-9]+', '', 'g') = %s
-              AND ({date_expr}) IS NOT NULL
-            ORDER BY ({date_expr}) DESC
-            LIMIT 1
-            """,
-            [source_format],
-        )
+        if source_format == "swiggy":
+            latest = _dict_rows(
+                """
+                SELECT
+                    TRIM(TO_CHAR("ORDERED_DATE"::timestamp, 'MONTH')) AS "month",
+                    EXTRACT(year FROM "ORDERED_DATE") AS "year"
+                FROM "swiggySec"
+                WHERE "ORDERED_DATE" IS NOT NULL
+                ORDER BY "ORDERED_DATE" DESC
+                LIMIT 1
+                """,
+                [],
+            )
+        else:
+            date_expr = (
+                _secmaster_zepto_date_expr()
+                if source_format == "zepto"
+                else '"date"'
+            )
+            latest = _dict_rows(
+                f"""
+                SELECT "month", "year"
+                FROM "SecMaster"
+                WHERE REGEXP_REPLACE(LOWER(TRIM("format"::text)), '[^a-z0-9]+', '', 'g') = %s
+                  AND ({date_expr}) IS NOT NULL
+                ORDER BY ({date_expr}) DESC
+                LIMIT 1
+                """,
+                [source_format],
+            )
     else:
         latest = _dict_rows(
             """
@@ -5455,41 +5469,118 @@ def _swiggy_sec_dashboard_response(request):
         latest_source="secmaster_swiggy",
     )
     selected_date = _parse_sec_selected_date(request.query_params)
-    date_filter, date_params = _sec_date_filter(selected_date)
-    month_name = _month_name(month)
     prev_month, prev_year = _shift_month(month, year, -1)
-    prev_month_name = _month_name(prev_month)
 
-    max_date = _scalar(
-        f"""
-        SELECT MAX("date")
-        FROM "SecMaster"
-        WHERE REGEXP_REPLACE(LOWER(TRIM("format"::text)), '[^a-z0-9]+', '', 'g') = 'swiggy'
-          AND UPPER(TRIM("month"::text)) = %s
-          AND "year"::numeric = %s
-          {date_filter}
-        """,
-        [month_name, year, *date_params],
-    )
+    month_start = date(year, month, 1)
+    next_month, next_year = _shift_month(month, year, 1)
+    month_end = date(next_year, next_month, 1)
+    prev_month_start = date(prev_year, prev_month, 1)
+    current_start = selected_date or month_start
+    current_end = (selected_date + timedelta(days=1)) if selected_date else month_end
+    current_rate_month = month_start.isoformat()
+    prev_rate_month = prev_month_start.isoformat()
 
-    summary_raw = _dict_rows(
-        f"""
+    aggregate_raw = _dict_rows(
+        """
+        WITH rates AS (
+            SELECT DISTINCT ON (UPPER(TRIM(sku_code::text)), month::text)
+                   UPPER(TRIM(sku_code::text)) AS sku_key,
+                   month::text AS month_key,
+                   landing_rate
+              FROM monthly_landing_rate
+             WHERE REGEXP_REPLACE(LOWER(TRIM(format::text)), '[^a-z0-9]+', '', 'g') = 'swiggy'
+               AND month::text IN (%s, %s)
+             ORDER BY UPPER(TRIM(sku_code::text)), month::text, created_at DESC
+        ),
+        base AS (
+            SELECT
+                s."ORDERED_DATE" AS ordered_date,
+                COALESCE(NULLIF(UPPER(TRIM(m.item_head::text)), ''), 'OTHER') AS item_head,
+                UPPER(TRIM(m.sub_category::text)) AS sub_category_key,
+                UPPER(TRIM(m.per_unit::text)) AS per_ltr_key,
+                COALESCE(s."COMBO_UNITS_SOLD", 0) + COALESCE(s."UNITS_SOLD", 0) AS quantity,
+                CASE
+                    WHEN m.is_litre = 'Y'::text
+                        THEN COALESCE(s."UNITS_SOLD", 0)::double precision * m.per_unit_value
+                    ELSE NULL::double precision
+                END AS ltr_sold,
+                COALESCE(
+                    r.landing_rate
+                    * (COALESCE(s."COMBO_UNITS_SOLD", 0) + COALESCE(s."UNITS_SOLD", 0))::numeric,
+                    0::numeric
+                ) AS sales_amt,
+                DATE_TRUNC('month', s."ORDERED_DATE"::timestamp)::date AS month_start
+            FROM "swiggySec" s
+            LEFT JOIN master_sheet m
+                   ON m.format_sku_code::text = s."ITEM_CODE"
+            LEFT JOIN rates r
+                   ON r.sku_key = UPPER(TRIM(s."ITEM_CODE"::text))
+                  AND r.month_key = TO_CHAR(
+                        DATE_TRUNC('month', s."ORDERED_DATE"::timestamp),
+                        'YYYY-MM-DD'
+                  )
+            WHERE (
+                    s."ORDERED_DATE" >= %s
+                AND s."ORDERED_DATE" < %s
+            ) OR (
+                    s."ORDERED_DATE" >= %s
+                AND s."ORDERED_DATE" < %s
+            )
+        )
         SELECT
-            UPPER(TRIM("item_head"::text)) AS item_head,
-            COALESCE(SUM("quantity"), 0) AS shipped_units,
-            COALESCE(SUM("ltr_sold"), 0) AS shipped_ltr,
-            COALESCE(SUM("sales_amt"), 0) AS shipped_value
-        FROM "SecMaster"
-        WHERE REGEXP_REPLACE(LOWER(TRIM("format"::text)), '[^a-z0-9]+', '', 'g') = 'swiggy'
-          AND UPPER(TRIM("month"::text)) = %s
-          AND "year"::numeric = %s
-          {date_filter}
-          AND UPPER(TRIM("item_head"::text)) IN ('PREMIUM', 'COMMODITY', 'OTHER')
-        GROUP BY UPPER(TRIM("item_head"::text))
+            item_head,
+            sub_category_key,
+            per_ltr_key,
+            COALESCE(SUM(quantity) FILTER (WHERE month_start = %s), 0) AS shipped_units,
+            COALESCE(SUM(ltr_sold) FILTER (WHERE month_start = %s), 0) AS shipped_ltr,
+            COALESCE(SUM(sales_amt) FILTER (WHERE month_start = %s), 0) AS shipped_value,
+            COALESCE(SUM(ltr_sold) FILTER (WHERE month_start = %s), 0) AS last_month,
+            MAX(ordered_date) FILTER (WHERE month_start = %s) AS max_date
+        FROM base
+        GROUP BY item_head, sub_category_key, per_ltr_key
         """,
-        [month_name, year, *date_params],
+        [
+            current_rate_month,
+            prev_rate_month,
+            current_start,
+            current_end,
+            prev_month_start,
+            month_start,
+            month_start,
+            month_start,
+            month_start,
+            prev_month_start,
+            month_start,
+        ],
     )
-    summary_by_head = {_norm_sec_key(r.get("item_head")): r for r in summary_raw}
+
+    max_date = None
+    detail_by_key = {}
+    summary_by_head = {}
+    for row in aggregate_raw:
+        row_max_date = row.get("max_date")
+        if row_max_date and (max_date is None or row_max_date > max_date):
+            max_date = row_max_date
+
+        item_head = _norm_sec_key(row.get("item_head")) or "OTHER"
+        summary_row = summary_by_head.setdefault(
+            item_head,
+            {"shipped_units": 0, "shipped_ltr": 0, "shipped_value": 0},
+        )
+        summary_row["shipped_units"] += _num(row.get("shipped_units"))
+        summary_row["shipped_ltr"] += _num(row.get("shipped_ltr"))
+        summary_row["shipped_value"] += _num(row.get("shipped_value"))
+
+        key = (_norm_sec_key(row.get("sub_category_key")), _norm_sec_key(row.get("per_ltr_key")))
+        detail_row = detail_by_key.setdefault(
+            key,
+            {"shipped_value": 0, "shipped_units": 0, "shipped_ltr": 0, "last_month": 0},
+        )
+        detail_row["shipped_value"] += _num(row.get("shipped_value"))
+        detail_row["shipped_units"] += _num(row.get("shipped_units"))
+        detail_row["shipped_ltr"] += _num(row.get("shipped_ltr"))
+        detail_row["last_month"] += _num(row.get("last_month"))
+
     summary = []
     for item_head in _SWIGGY_SEC_ITEM_HEADS:
         row = summary_by_head.get(item_head, {})
@@ -5503,56 +5594,10 @@ def _swiggy_sec_dashboard_response(request):
             "per_liter_shpd": _value_per_ltr_zero(shipped_value, shipped_ltr),
         })
 
-    detail_raw = _dict_rows(
-        f"""
-        SELECT
-            UPPER(TRIM("sub_category"::text)) AS sub_category_key,
-            UPPER(TRIM("per_ltr_unit"::text)) AS per_ltr_key,
-            COALESCE(SUM("sales_amt"), 0) AS shipped_value,
-            COALESCE(SUM("quantity"), 0) AS shipped_units,
-            COALESCE(SUM("ltr_sold"), 0) AS shipped_ltr
-        FROM "SecMaster"
-        WHERE REGEXP_REPLACE(LOWER(TRIM("format"::text)), '[^a-z0-9]+', '', 'g') = 'swiggy'
-          AND UPPER(TRIM("month"::text)) = %s
-          AND "year"::numeric = %s
-          {date_filter}
-        GROUP BY
-            UPPER(TRIM("sub_category"::text)),
-            UPPER(TRIM("per_ltr_unit"::text))
-        """,
-        [month_name, year, *date_params],
-    )
-    detail_by_key = {
-        (_norm_sec_key(r.get("sub_category_key")), _norm_sec_key(r.get("per_ltr_key"))): r
-        for r in detail_raw
-    }
-
-    last_month_raw = _dict_rows(
-        """
-        SELECT
-            UPPER(TRIM("sub_category"::text)) AS sub_category_key,
-            UPPER(TRIM("per_ltr_unit"::text)) AS per_ltr_key,
-            COALESCE(SUM("ltr_sold"), 0) AS last_month
-        FROM "SecMaster"
-        WHERE REGEXP_REPLACE(LOWER(TRIM("format"::text)), '[^a-z0-9]+', '', 'g') = 'swiggy'
-          AND UPPER(TRIM("month"::text)) = %s
-          AND "year"::numeric = %s
-        GROUP BY
-            UPPER(TRIM("sub_category"::text)),
-            UPPER(TRIM("per_ltr_unit"::text))
-        """,
-        [prev_month_name, prev_year],
-    )
-    last_month_by_key = {
-        (_norm_sec_key(r.get("sub_category_key")), _norm_sec_key(r.get("per_ltr_key"))): r
-        for r in last_month_raw
-    }
-
     details = []
     for item_head, category, sub_category, per_ltr in _SWIGGY_SEC_DETAIL_ROWS:
         key = (_norm_sec_key(sub_category), _norm_sec_key(per_ltr))
         row = detail_by_key.get(key, {})
-        last_month_row = last_month_by_key.get(key, {})
         shipped_value = _num(row.get("shipped_value"))
         shipped_ltr = _num(row.get("shipped_ltr"))
         details.append({
@@ -5565,7 +5610,7 @@ def _swiggy_sec_dashboard_response(request):
             "shipped_units": _num(row.get("shipped_units")),
             "shipped_ltr": shipped_ltr,
             "per_liter_shpd": _value_per_ltr_zero(shipped_value, shipped_ltr),
-            "last_month": _num(last_month_row.get("last_month")),
+            "last_month": _num(row.get("last_month")),
         })
 
     summary_total = _sec_total(summary)
@@ -5579,13 +5624,72 @@ def _swiggy_sec_dashboard_response(request):
         detail_total["shipped_ltr"],
     )
     detail_total["last_month"] = sum(_num(r.get("last_month")) for r in details)
-    top_items = _top_ltr_items_from_secmaster(
-        "swiggy",
-        month_name,
-        year,
-        date_filter,
-        date_params,
-        value_column='"sales_amt"',
+    top_items = _dict_rows(
+        """
+        WITH rates AS (
+            SELECT DISTINCT ON (UPPER(TRIM(sku_code::text)), month::text)
+                   UPPER(TRIM(sku_code::text)) AS sku_key,
+                   month::text AS month_key,
+                   landing_rate
+              FROM monthly_landing_rate
+             WHERE REGEXP_REPLACE(LOWER(TRIM(format::text)), '[^a-z0-9]+', '', 'g') = 'swiggy'
+               AND month::text = %s
+             ORDER BY UPPER(TRIM(sku_code::text)), month::text, created_at DESC
+        )
+        SELECT
+            COALESCE(
+                NULLIF(TRIM(m.item::text), ''),
+                COALESCE(NULLIF(TRIM(s."PRODUCT_NAME"::text), ''), '-')
+            ) AS item,
+            COALESCE(NULLIF(UPPER(TRIM(m.item_head::text)), ''), 'OTHER') AS item_head,
+            COALESCE(SUM(COALESCE(s."COMBO_UNITS_SOLD", 0) + COALESCE(s."UNITS_SOLD", 0)), 0) AS shipped_units,
+            COALESCE(
+                SUM(
+                    CASE
+                        WHEN m.is_litre = 'Y'::text
+                            THEN COALESCE(s."UNITS_SOLD", 0)::double precision * m.per_unit_value
+                        ELSE NULL::double precision
+                    END
+                ),
+                0
+            ) AS shipped_ltr,
+            COALESCE(
+                SUM(
+                    COALESCE(
+                        r.landing_rate
+                        * (COALESCE(s."COMBO_UNITS_SOLD", 0) + COALESCE(s."UNITS_SOLD", 0))::numeric,
+                        0::numeric
+                    )
+                ),
+                0
+            ) AS shipped_value
+        FROM "swiggySec" s
+        LEFT JOIN master_sheet m
+               ON m.format_sku_code::text = s."ITEM_CODE"
+        LEFT JOIN rates r
+               ON r.sku_key = UPPER(TRIM(s."ITEM_CODE"::text))
+              AND r.month_key = TO_CHAR(
+                    DATE_TRUNC('month', s."ORDERED_DATE"::timestamp),
+                    'YYYY-MM-DD'
+              )
+        WHERE s."ORDERED_DATE" >= %s
+          AND s."ORDERED_DATE" < %s
+          AND NULLIF(TRIM(COALESCE(m.item::text, s."PRODUCT_NAME"::text)), '') IS NOT NULL
+        GROUP BY 1, 2
+        ORDER BY
+            COALESCE(
+                SUM(
+                    CASE
+                        WHEN m.is_litre = 'Y'::text
+                            THEN COALESCE(s."UNITS_SOLD", 0)::double precision * m.per_unit_value
+                        ELSE NULL::double precision
+                    END
+                ),
+                0
+            ) DESC
+        LIMIT 8
+        """,
+        [current_rate_month, current_start, current_end],
     )
 
     return Response({
