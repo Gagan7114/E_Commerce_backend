@@ -68,6 +68,20 @@ def select(sql: str, params: list | tuple | None = None) -> list[dict]:
     return [dict(zip(cols, r)) for r in rows]
 
 
+def report_sales_analysis(from_date: str, to_date: str) -> list[dict]:
+    """Run the allow-listed SAP HANA sales analysis procedure."""
+    with hana_connection() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            'CALL "JIVO_OIL_HANADB"."REPORT_SALES_ANALYSIS"(?, ?)',
+            [from_date, to_date],
+        )
+        cols = [d[0] for d in cur.description] if cur.description else []
+        rows = cur.fetchall() if cur.description else []
+        cur.close()
+    return [dict(zip(cols, r)) for r in rows]
+
+
 def scalar(sql: str, params: list | tuple | None = None):
     rows = select(sql, params)
     if not rows:

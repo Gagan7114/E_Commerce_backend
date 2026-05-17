@@ -1,12 +1,16 @@
 """SAP B1 (HANA) read endpoints. Mirrors FastAPI routes/sap.py."""
 
+import re
+from datetime import date
+from decimal import InvalidOperation
+
 from rest_framework.decorators import api_view, permission_classes
-from rest_framework.exceptions import NotFound, APIException
+from rest_framework.exceptions import NotFound, APIException, ValidationError
 from rest_framework.response import Response
 
 from accounts.permissions import require
 
-from .service import select
+from .service import report_sales_analysis, select
 
 
 # Platform slug → SAP U_Chain values + CardName patterns
@@ -55,6 +59,130 @@ def _count_of(sql: str, params: list | tuple | None = None) -> int:
 
 
 # ─── /distributors ───
+_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_SALES_ANALYSIS_FILTERS = {
+    "main_group": "U_Main_Group",
+    "chain": "U_Chain",
+    "state": "State",
+    "type": "Type",
+    "brand": "Brand",
+    "location": "Location",
+    "item_head": "U_TYPE",
+    "sub_group": "U_Sub_Group",
+    "sales_person": "U_SALES_PERSON",
+}
+_SALES_ANALYSIS_SEARCH_COLS = (
+    "CardCode",
+    "CardName",
+    "ItemCode",
+    "ItemName",
+    "SKU",
+    "U_Main_Group",
+    "U_Chain",
+    "State",
+    "Brand",
+    "Location",
+    "U_SALES_PERSON",
+)
+
+
+def _date_param(request, key: str) -> str:
+    raw = str(request.query_params.get(key) or "").strip()
+    if not _DATE_RE.match(raw):
+        raise ValidationError(f"`{key}` must be YYYY-MM-DD.")
+    try:
+        date.fromisoformat(raw)
+    except ValueError:
+        raise ValidationError(f"`{key}` must be a valid calendar date.")
+    return raw
+
+
+def _num(value) -> float:
+    if value is None or value == "":
+        return 0.0
+    try:
+        return float(value)
+    except (TypeError, ValueError, InvalidOperation):
+        return 0.0
+
+
+def _row_matches(row: dict, query: str, filters: dict[str, str]) -> bool:
+    for param, column in _SALES_ANALYSIS_FILTERS.items():
+        selected = filters.get(param)
+        if selected and str(row.get(column) or "").strip().lower() != selected.lower():
+            return False
+
+    if not query:
+        return True
+    haystack = " ".join(str(row.get(col) or "") for col in _SALES_ANALYSIS_SEARCH_COLS)
+    return query.lower() in haystack.lower()
+
+
+def _filter_options(rows: list[dict]) -> dict:
+    result = {}
+    for param, column in _SALES_ANALYSIS_FILTERS.items():
+        values = sorted({
+            str(row.get(column)).strip()
+            for row in rows
+            if row.get(column) is not None and str(row.get(column)).strip()
+        })
+        result[param] = values[:300]
+    return result
+
+
+def _sales_analysis_summary(rows: list[dict]) -> dict:
+    customers = {row.get("CardCode") for row in rows if row.get("CardCode")}
+    items = {row.get("ItemCode") for row in rows if row.get("ItemCode")}
+    return {
+        "rows": len(rows),
+        "customers": len(customers),
+        "items": len(items),
+        "quantity": sum(_num(row.get("Quantity")) for row in rows),
+        "liter": sum(_num(row.get("Liter")) for row in rows),
+        "line_total": sum(_num(row.get("LineTotal")) for row in rows),
+        "scheme_sale_amt": sum(_num(row.get("SchemeSaleAmt")) for row in rows),
+        "scheme_amt": sum(_num(row.get("SchemeAmt")) for row in rows),
+        "cogs": sum(_num(row.get("COGS")) for row in rows),
+    }
+
+
+@api_view(["GET"])
+@permission_classes([require("sap.view")])
+def sales_analysis(request):
+    from_date = _date_param(request, "from_date")
+    to_date = _date_param(request, "to_date")
+    if date.fromisoformat(from_date) > date.fromisoformat(to_date):
+        raise ValidationError("`from_date` cannot be after `to_date`.")
+
+    page, page_size = _page(request)
+    query = str(request.query_params.get("search") or "").strip()
+    filters = {
+        param: str(request.query_params.get(param) or "").strip()
+        for param in _SALES_ANALYSIS_FILTERS
+    }
+
+    try:
+        rows = report_sales_analysis(from_date, to_date)
+    except Exception as e:
+        raise SAPError(f"SAP HANA procedure error: {e}")
+
+    columns = list(rows[0].keys()) if rows else []
+    filtered = [row for row in rows if _row_matches(row, query, filters)]
+    offset = page * page_size
+    return Response({
+        "data": filtered[offset:offset + page_size],
+        "count": len(filtered),
+        "page": page,
+        "page_size": page_size,
+        "columns": columns,
+        "filters": _filter_options(rows),
+        "summary": _sales_analysis_summary(filtered),
+        "procedure": "JIVO_OIL_HANADB.REPORT_SALES_ANALYSIS",
+        "from_date": from_date,
+        "to_date": to_date,
+    })
+
+
 @api_view(["GET"])
 @permission_classes([require("sap.view")])
 def distributors(request):
