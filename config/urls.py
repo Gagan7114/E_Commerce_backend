@@ -1,7 +1,14 @@
 from django.contrib import admin
 from django.urls import include, path
 
-from accounts.views import mark_all_read, notifications
+from accounts.views import (
+    generate_inventory_doh_notifications,
+    inventory_doh_sku_detail,
+    mark_all_read,
+    mark_notification_read,
+    notification_detail,
+    notifications,
+)
 from uploads import amazon_uploads
 
 urlpatterns = [
@@ -28,6 +35,10 @@ urlpatterns = [
     path("api/master/fcs", amazon_uploads.fc_master_lookup, name="fc-master-lookup"),
     path("api/notifications", notifications, name="notifications"),
     path("api/notifications/mark-all-read", mark_all_read, name="notifications-mark-read"),
+    path("api/notifications/generate-inventory-doh", generate_inventory_doh_notifications, name="notifications-generate-inventory-doh"),
+    path("api/notifications/<int:notification_id>", notification_detail, name="notification-detail"),
+    path("api/notifications/<int:notification_id>/mark-read", mark_notification_read, name="notification-mark-read"),
+    path("api/notifications/inventory-doh/<int:notification_id>", inventory_doh_sku_detail, name="notification-inventory-doh-detail"),
 ]
 
 admin.site.site_header = "ECMS Operations"

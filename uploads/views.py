@@ -118,6 +118,19 @@ PRIMARY_MASTER_FORMATS = {
     "citymall_prim": "CITY MALL",
 }
 
+INVENTORY_DOH_UPLOAD_PLATFORMS = {
+    "blinkit_inventory": "blinkit",
+    "zepto_inventory": "zepto",
+    "swiggy_inventory": "swiggy",
+    "bigbasket_inventory": "bigbasket",
+    "amazon_inventory": "amazon",
+    "blinkitSec": "blinkit",
+    "zeptoSec": "zepto",
+    "swiggySec": "swiggy",
+    "bigbasketSec": "bigbasket",
+    "amazon_sec_range": "amazon",
+}
+
 PRIMARY_MASTER_FIELD_MAP = {
     "zepto_prim": {
         "po_number": "po_no",
@@ -259,6 +272,10 @@ def _quote_ident(name: str) -> str:
     return '"' + str(name).replace('"', '""') + '"'
 
 
+def _public_table_regclass_name(table: str) -> str:
+    return f"public.{_quote_ident(table)}"
+
+
 def _upload_table_columns(table: str) -> set[str]:
     with connection.cursor() as cur:
         cur.execute(
@@ -277,7 +294,10 @@ def _sync_table_id_sequence(table: str, table_columns: set[str], upload_columns:
     if "id" not in table_columns or "id" in upload_columns:
         return
     with connection.cursor() as cur:
-        cur.execute("SELECT pg_get_serial_sequence(%s, 'id')", [table])
+        cur.execute(
+            "SELECT pg_get_serial_sequence(%s, 'id')",
+            [_public_table_regclass_name(table)],
+        )
         result = cur.fetchone()
         sequence_name = result[0] if result else None
         if not sequence_name:
@@ -985,26 +1005,37 @@ def _batch_upload(body, *, forced_table: str | None = None):
                     failed += 1
                     last_error = str(e)
 
-    return Response(
-        {
-            "success": success,
-            "created": created,
-            "updated": updated,
-            "skipped": skipped,
-            "master_updated": master_updated,
-            "platform_created": platform_created,
-            "platform_updated": platform_updated,
-            "platform_skipped": platform_skipped,
-            "duplicates": updated + skipped,
-            "failed": failed,
-            "error": last_error,
-            "warnings": [
-                f"Landing rate missing for {r['item']}, {r['month_label']} ({r['rows']} rows)"
-                for r in missing_rates
-            ],
-            "missing_rates": missing_rates,
-        }
-    )
+    notification_result = None
+    if success and table in INVENTORY_DOH_UPLOAD_PLATFORMS:
+        try:
+            from platforms.services.inventory_doh_alerts import upsert_low_doh_notifications
+
+            notification_result = upsert_low_doh_notifications(
+                platform_slug=INVENTORY_DOH_UPLOAD_PLATFORMS[table],
+                send_firebase=True,
+            )
+        except Exception as exc:
+            notification_result = {"error": str(exc)}
+
+    return Response({
+        "success": success,
+        "created": created,
+        "updated": updated,
+        "skipped": skipped,
+        "master_updated": master_updated,
+        "platform_created": platform_created,
+        "platform_updated": platform_updated,
+        "platform_skipped": platform_skipped,
+        "duplicates": updated + skipped,
+        "failed": failed,
+        "error": last_error,
+        "warnings": [
+            f"Landing rate missing for {r['item']}, {r['month_label']} ({r['rows']} rows)"
+            for r in missing_rates
+        ],
+        "missing_rates": missing_rates,
+        "inventory_doh_notifications": notification_result,
+    })
 
 
 @api_view(["POST"])

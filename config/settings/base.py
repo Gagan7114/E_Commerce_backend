@@ -7,6 +7,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent.parent
 
 env = environ.Env(
     DJANGO_DEBUG=(bool, False),
+    FIREBASE_NOTIFICATIONS_ENABLED=(bool, False),
 )
 environ.Env.read_env(BASE_DIR / ".env")
 
@@ -89,6 +90,10 @@ HANA = {
     "password": env("HANA_PASSWORD", default=""),
     "schema": env("HANA_SCHEMA", default=""),
 }
+
+FIREBASE_CREDENTIALS_FILE = env("FIREBASE_CREDENTIALS_FILE", default="")
+FIREBASE_NOTIFICATIONS_ENABLED = env.bool("FIREBASE_NOTIFICATIONS_ENABLED", default=False)
+FIREBASE_DOH_TOPIC = env("FIREBASE_DOH_TOPIC", default="inventory_doh_alerts")
 
 DATABASE_ROUTERS = ["sap.router.SAPReadOnlyRouter"]
 

@@ -1,4 +1,5 @@
 from django.contrib.auth import get_user_model
+from django.shortcuts import get_object_or_404
 from rest_framework import status
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import AllowAny, IsAuthenticated
@@ -6,6 +7,13 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework_simplejwt.tokens import RefreshToken
 
+from platforms.services.inventory_doh_alerts import (
+    ALERT_TYPE,
+    notification_to_payload,
+    upsert_low_doh_notifications,
+)
+
+from .models import InventoryDohNotification
 from .permissions import user_permission_codes
 from .serializers import MeSerializer
 
@@ -93,10 +101,108 @@ def change_password(request):
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def notifications(request):
-    return Response({"notifications": [], "unread_count": 0})
+    active_only = str(request.query_params.get("active_only", "true")).lower() not in {
+        "false",
+        "0",
+        "no",
+    }
+    queryset = InventoryDohNotification.objects.filter(alert_type=ALERT_TYPE)
+    if active_only:
+        queryset = queryset.filter(resolved_at__isnull=True)
+    platform_slug = (request.query_params.get("platform") or "").strip().lower()
+    if platform_slug:
+        queryset = queryset.filter(platform_slug=platform_slug)
+    format_name = (request.query_params.get("format") or "").strip().upper()
+    if format_name:
+        queryset = queryset.filter(format=format_name)
+    try:
+        limit = min(max(int(request.query_params.get("limit") or 50), 1), 200)
+    except (TypeError, ValueError):
+        limit = 50
+    page = list(queryset.order_by("is_read", "doh", "-last_seen_at")[:limit])
+    return Response({
+        "notifications": [notification_to_payload(item) for item in page],
+        "unread_count": queryset.filter(is_read=False).count(),
+        "count": queryset.count(),
+    })
 
 
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
 def mark_all_read(request):
-    return Response({"status": "ok"})
+    updated = InventoryDohNotification.objects.filter(
+        alert_type=ALERT_TYPE,
+        resolved_at__isnull=True,
+        is_read=False,
+    ).update(is_read=True)
+    return Response({"status": "ok", "updated": updated})
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def mark_notification_read(request, notification_id: int):
+    notification = get_object_or_404(InventoryDohNotification, id=notification_id)
+    if not notification.is_read:
+        notification.is_read = True
+        notification.save(update_fields=["is_read", "updated_at"])
+    return Response({"status": "ok", "notification": notification_to_payload(notification)})
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def notification_detail(request, notification_id: int):
+    notification = get_object_or_404(InventoryDohNotification, id=notification_id)
+    return Response({"notification": notification_to_payload(notification)})
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def inventory_doh_sku_detail(request, notification_id: int):
+    notification = get_object_or_404(InventoryDohNotification, id=notification_id)
+    payload = notification_to_payload(notification)
+    return Response({
+        "notification": payload,
+        "sku": {
+            "format": payload["format"],
+            "platform_slug": payload["platform_slug"],
+            "sku_code": payload["sku_code"],
+            "sku_name": payload["sku_name"],
+            "item": payload["item"],
+            "item_head": payload["item_head"],
+            "category": payload["category"],
+            "sub_category": payload["sub_category"],
+            "brand": payload["brand"],
+        },
+        "metrics": {
+            "inventory_date": payload["inventory_date"],
+            "sales_max_date": payload["sales_max_date"],
+            "month_start": payload["month_start"],
+            "units_sold": payload["units_sold"],
+            "ltr_sold": payload["ltr_sold"],
+            "soh_units": payload["soh_units"],
+            "soh_ltr": payload["soh_ltr"],
+            "drr_units": payload["drr_units"],
+            "drr_ltr": payload["drr_ltr"],
+            "doh": payload["doh"],
+            "threshold": payload["threshold"],
+        },
+    })
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def generate_inventory_doh_notifications(request):
+    try:
+        threshold = float(request.data.get("threshold", 10))
+    except (TypeError, ValueError):
+        return Response(
+            {"detail": "threshold must be a number."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    result = upsert_low_doh_notifications(
+        threshold=threshold,
+        platform_slug=request.data.get("platform"),
+        date_value=request.data.get("date"),
+        send_firebase=bool(request.data.get("send_firebase", True)),
+    )
+    return Response(result)

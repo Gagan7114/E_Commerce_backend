@@ -4,7 +4,7 @@ from django.contrib.auth.admin import UserAdmin as DjangoUserAdmin
 from django.contrib.auth.forms import UserChangeForm, UserCreationForm
 from django.contrib.auth.models import Group, Permission
 
-from .models import User
+from .models import InventoryDohNotification, User
 
 admin.site.unregister(Group)
 
@@ -102,3 +102,25 @@ class PermissionAdmin(admin.ModelAdmin):
 
     def has_delete_permission(self, request, obj=None):
         return False
+
+
+@admin.register(InventoryDohNotification)
+class InventoryDohNotificationAdmin(admin.ModelAdmin):
+    list_display = (
+        "format",
+        "sku_code",
+        "item",
+        "item_head",
+        "inventory_date",
+        "sales_max_date",
+        "doh",
+        "threshold",
+        "severity",
+        "is_read",
+        "resolved_at",
+        "last_seen_at",
+    )
+    list_filter = ("format", "platform_slug", "severity", "is_read", "resolved_at")
+    search_fields = ("sku_code", "sku_name", "item", "brand", "category", "sub_category")
+    readonly_fields = ("created_at", "updated_at", "first_seen_at", "last_seen_at")
+    ordering = ("-last_seen_at", "format", "sku_code")
