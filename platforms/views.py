@@ -6415,6 +6415,7 @@ def _blinkit_drr_dashboard_response(request):
     month_name = _month_name(month)
     days_in_month = monthrange(year, month)[1]
     month_start = date(year, month, 1)
+    month_end = date(year, month, days_in_month)
 
     sales_of = str(request.query_params.get("sales_of") or "ALL").strip().upper() or "ALL"
     if sales_of not in _BLINKIT_DRR_SALES_OF:
@@ -6468,10 +6469,11 @@ def _blinkit_drr_dashboard_response(request):
         """
         SELECT MAX(inventory_date)
         FROM all_platform_inventory
-        WHERE format = 'BLINKIT'
+        WHERE UPPER(TRIM(format::text)) = 'BLINKIT'
+          AND inventory_date >= %s
           AND inventory_date <= %s
         """,
-        [max_date],
+        [month_start, month_end],
     )
 
     daily_sales_of_filter = ""
@@ -6656,6 +6658,7 @@ def _inventory_drr_dashboard_response(request, slug: str):
     month_name = _month_name(month)
     days_in_month = monthrange(year, month)[1]
     month_start = date(year, month, 1)
+    month_end = date(year, month, days_in_month)
     sale_date_expr = _secmaster_inventory_date_expr(slug)
     sales_format = platform["sales_format"]
     inventory_format = platform["format"]
@@ -6718,9 +6721,10 @@ def _inventory_drr_dashboard_response(request, slug: str):
         SELECT MAX(inventory_date)
         FROM all_platform_inventory
         WHERE UPPER(TRIM(format::text)) = %s
+          AND inventory_date >= %s
           AND inventory_date <= %s
         """,
-        [inventory_format, max_date],
+        [inventory_format, month_start, month_end],
     )
 
     daily_sales_of_filter = ""
