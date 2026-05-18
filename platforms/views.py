@@ -1079,7 +1079,17 @@ def pendency_dashboard(request, slug: str):
             COALESCE(SUM("total_order_liters"), 0) AS open_ltrs,
             COUNT(DISTINCT "po_number") AS open_pos,
             COUNT(*) AS rows,
-            MAX("po_date") AS max_po_date
+            TO_CHAR(
+                MAX(
+                    CASE
+                        WHEN "po_date" ~ '^[0-9]{{2}}-[0-9]{{2}}-[0-9]{{4}}$'
+                            THEN TO_DATE("po_date", 'DD-MM-YYYY')
+                        WHEN "po_date" ~ '^[0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}$'
+                            THEN TO_DATE("po_date", 'YYYY-MM-DD')
+                    END
+                ),
+                'DD-MM-YYYY'
+            ) AS max_po_date
         FROM "prim_master_po"
         {full_where}
         ''',

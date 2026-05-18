@@ -22,7 +22,7 @@ REPORT_VIEW_CATALOG = {
     },
     "prim_master_po": {
         "date_column": "po_date",
-        "format_column": "platform",
+        "format_column": "format",
         "max_rows": 50000,
     },
     "SecMaster": {
