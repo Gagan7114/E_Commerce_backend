@@ -9,7 +9,7 @@ Row lifecycle (see MONTHLY_TARGETS_SPEC.md §2.1 and §3.4):
 
 Source routing:
   * SecMaster platforms: blinkit, swiggy, zepto, bigbasket, flipkart (B2C)
-  * master_po  platforms: zomato, citymall  (filter status = 'COMPLETED')
+  * prim_master_po platforms: zomato, citymall (filter status = 'COMPLETED')
   * Flipkart Grocery:     flipkart_grocery_master + monthly_landing_rate
   * Out of scope:         amazon, jiomart
 """
@@ -42,7 +42,7 @@ from .models import PlatformConfig
 # Platforms whose data lives in the SecMaster view.
 SECMASTER_SLUGS = {"blinkit", "swiggy", "zepto", "bigbasket", "flipkart"}
 
-# Platforms sourced from master_po (with status = 'COMPLETED').
+# Platforms sourced from prim_master_po (with status = 'COMPLETED').
 MASTER_PO_SLUGS = {"zomato", "citymall"}
 FLIPKART_GROCERY_SLUGS = {"flipkart_grocery"}
 
@@ -76,7 +76,7 @@ def _source_for(slug: str) -> str:
     if slug in SECMASTER_SLUGS:
         return "secmaster"
     if slug in MASTER_PO_SLUGS:
-        return "master_po"
+        return "prim_master_po"
     if slug in FLIPKART_GROCERY_SLUGS:
         return "flipkart_grocery"
     raise ValidationError(
@@ -211,7 +211,7 @@ def _read_secmaster(fmt: str, item_head: str, month: int, year: int) -> dict:
 
 
 def _read_master_po(fmt: str, item_head: str, month: int, year: int) -> dict:
-    """Read (done_ltrs, done_value, latest_date) from master_po for
+    """Read (done_ltrs, done_value, latest_date) from prim_master_po for
     Zomato / CityMall. Filters: status = 'COMPLETED', delivery_month = month,
     year = year, format = fmt, item_head = item_head.
 
@@ -224,7 +224,7 @@ def _read_master_po(fmt: str, item_head: str, month: int, year: int) -> dict:
             COALESCE(SUM("total_delivered_liters"), 0)        AS done_ltrs,
             COALESCE(SUM("total_delivered_amt_exclusive"), 0) AS done_value,
             MAX("delivery_date")                              AS latest_date
-        FROM "master_po"
+        FROM "prim_master_po"
         WHERE LOWER(TRIM("format"::text))          = LOWER(TRIM(%s))
           AND UPPER(TRIM("item_head"::text))       = UPPER(TRIM(%s))
           AND UPPER(TRIM("status"::text))          = 'COMPLETED'

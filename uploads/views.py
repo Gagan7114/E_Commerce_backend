@@ -251,6 +251,24 @@ PRIMARY_MASTER_NUMERIC_COLUMNS = {
     "basic_rate",
     "landing_rate",
 }
+PRIMARY_PENDING_STATUS_KEYS = {
+    "PENDING",
+    "CONFIRMED",
+    "SCHEDULED",
+    "APPOINTMENT DONE",
+    "PENDING_ACKNOWLEDGEMENT",
+    "PENDING_ASN_CREATION",
+    "PENDING_GRN",
+    "ASN_CREATED",
+}
+PRIMARY_COMPLETED_STATUS_KEYS = {
+    "COMPLETED",
+    "COMPLETE",
+    "FULFILLED",
+    "GRN DONE",
+    "GRN_DONE",
+    "EXPIRED",
+}
 PRIMARY_MASTER_UPDATE_COLUMNS = [
     "po_date",
     "po_expiry_date",
@@ -266,6 +284,168 @@ PRIMARY_MASTER_UPDATE_COLUMNS = [
     "location",
     "format",
 ]
+
+PRIMARY_MASTER_RECALC_SQL = """
+WITH source AS (
+    SELECT
+        *,
+        CASE
+            WHEN UPPER(COALESCE(vendor_new, vendor_name, '')) = 'KNOWTABLE ONLINE SERVICES PRIVATE LIMITED'
+                THEN CASE WHEN UPPER(COALESCE(city, location, '')) = 'BENGALURU' THEN 0.055 ELSE 0.065 END
+            WHEN UPPER(COALESCE(vendor_new, vendor_name, '')) = 'CHIRAG ENTERPRISES MUMBAI'
+                THEN CASE
+                    WHEN UPPER(COALESCE(item_head, '')) = 'PREMIUM' THEN 0.06
+                    WHEN UPPER(COALESCE(item_head, '')) = 'COMMODITY' THEN 0.04
+                    ELSE 0.045
+                END
+            WHEN UPPER(COALESCE(vendor_new, vendor_name, '')) = 'BABA LOKENATH TRADERS'
+                THEN CASE
+                    WHEN UPPER(COALESCE(item_head, '')) = 'PREMIUM' THEN 0.06
+                    WHEN UPPER(COALESCE(item_head, '')) = 'COMMODITY' THEN 0.03
+                    ELSE 0.045
+                END
+            WHEN UPPER(COALESCE(vendor_new, vendor_name, '')) = 'JIVO MART PRIVATE LIMITED' THEN 0.045
+            WHEN UPPER(COALESCE(vendor_new, vendor_name, '')) = 'EVARA ENTERPRISES'
+                THEN CASE
+                    WHEN UPPER(COALESCE(item_head, '')) = 'PREMIUM' THEN 0.045
+                    WHEN UPPER(COALESCE(item_head, '')) = 'COMMODITY' THEN 0.04
+                    ELSE 0.045
+                END
+            WHEN UPPER(COALESCE(vendor_new, vendor_name, '')) = 'SUSTAINQUEST PRIVATE LIMITED'
+                THEN CASE WHEN UPPER(COALESCE(item_head, '')) = 'PREMIUM' THEN 0.05 ELSE 0.045 END
+            WHEN UPPER(COALESCE(vendor_new, vendor_name, '')) = 'ANTIZE FOODS PVT LTD' THEN 0.055
+            ELSE COALESCE(distributor_margin, 0.045)
+        END AS margin_calc,
+        CASE
+            WHEN UPPER(COALESCE(format, '')) = 'BLINKIT'
+             AND UPPER(COALESCE(status, '')) = 'EXPIRED'
+             AND COALESCE(delivered_qty, 0) <> 0 THEN 'COMPLETED'
+            WHEN UPPER(COALESCE(format, '')) = 'BLINKIT'
+             AND UPPER(COALESCE(status, '')) = 'EXPIRED'
+             AND COALESCE(delivered_qty, 0) = 0 THEN 'EXPIRED'
+            WHEN UPPER(COALESCE(status, '')) IN ('COMPLETED', 'COMPLETE', 'FULFILLED', 'GRN DONE', 'GRN_DONE')
+                THEN 'COMPLETED'
+            WHEN UPPER(COALESCE(status, '')) IN ('CANCELLED', 'CANCELED', 'CANCEL') THEN 'CANCELLED'
+            WHEN UPPER(COALESCE(status, '')) IN (
+                'PENDING', 'CONFIRMED', 'SCHEDULED', 'APPOINTMENT DONE',
+                'PENDING_ACKNOWLEDGEMENT', 'PENDING_ASN_CREATION',
+                'PENDING_GRN', 'ASN_CREATED'
+            ) THEN 'PENDING'
+            WHEN UPPER(COALESCE(status, '')) = 'EXPIRED' THEN 'EXPIRED'
+            ELSE NULLIF(UPPER(COALESCE(status, '')), '')
+        END AS po_status_calc
+    FROM public.master_po
+    WHERE po_number = %s
+      AND sku_code = %s
+),
+calc AS (
+    SELECT
+        *,
+        COALESCE(order_qty, 0) * COALESCE(per_liter, 0) AS total_order_liters_calc,
+        COALESCE(delivered_qty, 0) * COALESCE(per_liter, 0) AS total_delivered_liters_calc,
+        COALESCE(order_qty, 0) * COALESCE(landing_rate, 0) AS total_order_amt_inclusive_calc,
+        COALESCE(delivered_qty, 0) * COALESCE(landing_rate, 0) AS total_deliver_amt_inclusive_calc,
+        COALESCE(order_qty, 0) * COALESCE(basic_rate, 0) AS total_order_amt_exclusive_calc,
+        COALESCE(delivered_qty, 0) * COALESCE(basic_rate, 0) AS total_delivered_amt_exclusive_calc,
+        CASE
+            WHEN po_status_calc = 'COMPLETED' AND COALESCE(delivered_qty, 0) < COALESCE(order_qty, 0)
+                THEN 'SHORT SUPPLIED'
+            WHEN po_status_calc = 'COMPLETED'
+                THEN 'FULL SUPPLIED'
+            ELSE po_status_calc
+        END AS item_status_calc
+    FROM source
+)
+UPDATE public.master_po AS m
+SET
+    lead_time = CASE
+        WHEN calc.delivery_date IS NOT NULL AND calc.po_date IS NOT NULL
+            THEN (calc.delivery_date - calc.po_date)::integer
+        ELSE NULL
+    END,
+    days_to_expiry = CASE
+        WHEN calc.po_expiry_date IS NOT NULL
+            THEN GREATEST((calc.po_expiry_date - CURRENT_DATE)::integer, 0)
+        ELSE NULL
+    END,
+    po_window = CASE
+        WHEN calc.po_expiry_date IS NOT NULL AND calc.po_date IS NOT NULL
+            THEN (calc.po_expiry_date - calc.po_date)::text
+        ELSE NULL
+    END,
+    po_status = calc.po_status_calc,
+    item_status = calc.item_status_calc,
+    vendor_new = COALESCE(NULLIF(calc.vendor_new, ''), calc.vendor_name),
+    total_order_liters = calc.total_order_liters_calc,
+    total_delivered_liters = calc.total_delivered_liters_calc,
+    total_order_amt_inclusive = calc.total_order_amt_inclusive_calc,
+    total_deliver_amt_inclusive = calc.total_deliver_amt_inclusive_calc,
+    total_order_amt_exclusive = calc.total_order_amt_exclusive_calc,
+    total_delivered_amt_exclusive = calc.total_delivered_amt_exclusive_calc,
+    total_order_amt_without_margin = calc.total_order_amt_exclusive_calc / NULLIF(1 + calc.margin_calc, 0),
+    total_delivered_amt_without_margin = calc.total_delivered_amt_exclusive_calc / NULLIF(1 + calc.margin_calc, 0),
+    po_month = CASE WHEN calc.po_date IS NULL THEN NULL ELSE UPPER(to_char(calc.po_date, 'FMMonth')) END,
+    delivery_month = CASE WHEN calc.delivery_date IS NULL THEN NULL ELSE UPPER(to_char(calc.delivery_date, 'FMMonth')) END,
+    year = EXTRACT(YEAR FROM calc.po_date)::integer,
+    city = COALESCE(NULLIF(calc.city, ''), calc.location),
+    distributor_margin = calc.margin_calc,
+    realise = CASE
+        WHEN COALESCE(calc.total_delivered_liters_calc, 0) = 0 THEN 0
+        ELSE (COALESCE(calc.basic_rate, 0) / NULLIF(1 + calc.margin_calc, 0)) / NULLIF(calc.per_liter, 0)
+    END,
+    distributor_commission_per_unit = CASE
+        WHEN COALESCE(calc.total_delivered_liters_calc, 0) = 0 THEN 0
+        ELSE COALESCE(calc.basic_rate, 0) * calc.margin_calc
+    END,
+    total_distributor_commission = CASE
+        WHEN COALESCE(calc.total_delivered_liters_calc, 0) = 0 THEN 0
+        ELSE COALESCE(calc.basic_rate, 0) * calc.margin_calc * COALESCE(calc.delivered_qty, 0)
+    END,
+    open_close = CASE
+        WHEN calc.po_status_calc IN ('PENDING', 'APPOINTMENT DONE') THEN 'OPEN'
+        ELSE 'CLOSED'
+    END,
+    missed_qty = CASE
+        WHEN calc.po_status_calc IN ('PENDING', 'CANCELLED', 'APPOINTMENT DONE') THEN 0
+        WHEN calc.po_status_calc IN ('COMPLETED', 'EXPIRED') THEN COALESCE(calc.order_qty, 0) - COALESCE(calc.delivered_qty, 0)
+        ELSE NULL
+    END,
+    filled_qty = COALESCE(calc.delivered_qty, 0),
+    missed_ltrs = CASE
+        WHEN calc.po_status_calc IN ('PENDING', 'CANCELLED', 'APPOINTMENT DONE') THEN 0
+        WHEN calc.po_status_calc IN ('COMPLETED', 'EXPIRED') THEN calc.total_order_liters_calc - calc.total_delivered_liters_calc
+        ELSE NULL
+    END,
+    filled_ltrs = calc.total_delivered_liters_calc,
+    missed_amt = CASE
+        WHEN calc.po_status_calc IN ('PENDING', 'CANCELLED', 'APPOINTMENT DONE') THEN 0
+        WHEN calc.po_status_calc IN ('COMPLETED', 'EXPIRED') THEN calc.total_order_amt_exclusive_calc - calc.total_delivered_amt_exclusive_calc
+        ELSE NULL
+    END,
+    filled_amt = calc.total_delivered_amt_exclusive_calc,
+    order_qty_cl = CASE WHEN calc.po_status_calc = 'CANCELLED' THEN 0 ELSE COALESCE(calc.order_qty, 0) END,
+    order_ltrs_cl = CASE WHEN calc.po_status_calc = 'CANCELLED' THEN 0 ELSE calc.total_order_liters_calc END,
+    order_amt_cl = CASE WHEN calc.po_status_calc = 'CANCELLED' THEN 0 ELSE calc.total_order_amt_exclusive_calc END,
+    qty_fill_rate_pct = COALESCE(calc.delivered_qty, 0) / NULLIF(CASE WHEN calc.po_status_calc = 'CANCELLED' THEN 0 ELSE calc.order_qty END, 0),
+    qty_miss_rate_pct = (
+        CASE
+            WHEN calc.po_status_calc IN ('PENDING', 'CANCELLED', 'APPOINTMENT DONE') THEN 0
+            WHEN calc.po_status_calc IN ('COMPLETED', 'EXPIRED') THEN COALESCE(calc.order_qty, 0) - COALESCE(calc.delivered_qty, 0)
+            ELSE NULL
+        END
+    ) / NULLIF(CASE WHEN calc.po_status_calc = 'CANCELLED' THEN 0 ELSE calc.order_qty END, 0),
+    ltrs_fill_rate_pct = calc.total_delivered_liters_calc / NULLIF(CASE WHEN calc.po_status_calc = 'CANCELLED' THEN 0 ELSE calc.total_order_liters_calc END, 0),
+    ltrs_miss_rate_pct = (
+        CASE
+            WHEN calc.po_status_calc IN ('PENDING', 'CANCELLED', 'APPOINTMENT DONE') THEN 0
+            WHEN calc.po_status_calc IN ('COMPLETED', 'EXPIRED') THEN calc.total_order_liters_calc - calc.total_delivered_liters_calc
+            ELSE NULL
+        END
+    ) / NULLIF(CASE WHEN calc.po_status_calc = 'CANCELLED' THEN 0 ELSE calc.total_order_liters_calc END, 0)
+FROM calc
+WHERE m.po_number = calc.po_number
+  AND m.sku_code = calc.sku_code
+"""
 
 
 def _quote_ident(name: str) -> str:
@@ -786,13 +966,34 @@ def _primary_delivered_qty(table: str, row: dict):
         remaining = row.get("remaining_quantity")
         if not _is_blank(units) and not _is_blank(remaining):
             return _as_decimal(units) - _as_decimal(remaining)
-        return Decimal("0")
+        return None
 
     source = PRIMARY_MASTER_FIELD_MAP[table].get("delivered_qty")
     value = _row_value(row, source)
     if _is_blank(value):
-        return Decimal("0")
+        return None
     return _as_decimal(value)
+
+
+def _primary_status_key(value) -> str:
+    return str(value or "").strip().upper()
+
+
+def _should_keep_existing_delivery_state(payload: dict, existing: dict) -> bool:
+    incoming_status = _primary_status_key(payload.get("status"))
+    existing_status = _primary_status_key(existing.get("po_status") or existing.get("status"))
+    existing_delivered_qty = existing.get("delivered_qty") or Decimal("0")
+
+    return (
+        incoming_status in PRIMARY_PENDING_STATUS_KEYS
+        and "delivered_qty" not in payload
+        and "delivery_date" not in payload
+        and (
+            existing_status in PRIMARY_COMPLETED_STATUS_KEYS
+            or existing_delivered_qty > 0
+            or existing.get("delivery_date") is not None
+        )
+    )
 
 
 def _primary_master_value(table: str, row: dict, column: str):
@@ -832,6 +1033,13 @@ def _primary_master_payload(table: str, row: dict):
         if value is not None:
             payload[column] = value
 
+    # Raw primary PO files often carry `0` delivered quantity while the actual
+    # receipt is maintained by GRN/sheet data. Do not wipe existing master PO
+    # delivery values unless the upload provides a delivery date or a non-zero
+    # delivered quantity.
+    if payload.get("delivered_qty") == 0 and "delivery_date" not in payload:
+        payload.pop("delivered_qty", None)
+
     lookup_skus = []
     for source in sku_sources:
         candidate = _row_value(row, source)
@@ -863,6 +1071,28 @@ def _find_master_po_sku(cur, po_number: str, sku_candidates: list[str]):
     return None
 
 
+def _master_po_existing_state(cur, po_number: str, sku_code: str) -> dict:
+    cur.execute(
+        """
+        SELECT status, po_status, delivered_qty, delivery_date
+        FROM public.master_po
+        WHERE po_number = %s
+          AND sku_code = %s
+        LIMIT 1
+        """,
+        [po_number, sku_code],
+    )
+    row = cur.fetchone()
+    if not row:
+        return {}
+    return {
+        "status": row[0],
+        "po_status": row[1],
+        "delivered_qty": row[2],
+        "delivery_date": row[3],
+    }
+
+
 def _update_master_po_if_present(cur, table: str, row: dict) -> str | None:
     if table not in PRIMARY_MASTER_TABLES:
         return None
@@ -874,6 +1104,10 @@ def _update_master_po_if_present(cur, table: str, row: dict) -> str | None:
     existing_sku = _find_master_po_sku(cur, payload["po_number"], lookup_skus)
     if not existing_sku:
         return None
+
+    existing = _master_po_existing_state(cur, payload["po_number"], existing_sku)
+    if _should_keep_existing_delivery_state(payload, existing):
+        payload.pop("status", None)
 
     update_columns = [col for col in PRIMARY_MASTER_UPDATE_COLUMNS if col in payload]
     if not update_columns:
@@ -889,6 +1123,7 @@ def _update_master_po_if_present(cur, table: str, row: dict) -> str | None:
         """,
         [*[payload[col] for col in update_columns], payload["po_number"], existing_sku],
     )
+    cur.execute(PRIMARY_MASTER_RECALC_SQL, [payload["po_number"], existing_sku])
     return "updated"
 
 

@@ -15,6 +15,7 @@ from .models import PlatformConfig
 
 _IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _LANDING_BASIC_DIVISOR = Decimal("1.05")
+PRIMARY_PO_VIEW = "prim_master_po"
 
 
 def _safe_ident(name: str) -> str:
@@ -69,7 +70,7 @@ def platform_stats(request, slug: str):
     p = _get_platform(slug)
     inv = _safe_ident(p.inventory_table) if p.inventory_table else None
     sec = _safe_ident(p.secondary_table) if p.secondary_table else None
-    master = _safe_ident(p.master_po_table or "master_po")
+    master = _safe_ident(PRIMARY_PO_VIEW)
 
     filter_col = _safe_col(p.po_filter_column or "platform") or "platform"
     filter_val = p.po_filter_value or p.slug
@@ -110,7 +111,7 @@ def platform_stats(request, slug: str):
 def platform_pos(request, slug: str):
     _ensure_scope(request.user, slug)
     p = _get_platform(slug)
-    master = _safe_ident(p.master_po_table or "master_po")
+    master = _safe_ident(PRIMARY_PO_VIEW)
     filter_col = _safe_col(p.po_filter_column or "platform") or "platform"
     filter_val = p.po_filter_value or p.slug
     search = request.query_params.get("search", "").strip()
@@ -419,60 +420,60 @@ def inventory_match(request, slug: str):
 
 
 _PRIMARY_METRIC_SQL = """
-    COALESCE(SUM(COALESCE(total_delivered_amt_exclusive, 0)), 0) AS done_value,
-    COALESCE(SUM(COALESCE(total_delivered_liters, 0)), 0) AS done_ltrs,
-    COALESCE(SUM(COALESCE(delivered_qty, 0)), 0) AS done_qty,
+    COALESCE(SUM(COALESCE(metric_delivered_value, 0)), 0) AS done_value,
+    COALESCE(SUM(COALESCE(metric_delivered_liters, 0)), 0) AS done_ltrs,
+    COALESCE(SUM(COALESCE(metric_delivered_qty, 0)), 0) AS done_qty,
     COALESCE(SUM(CASE WHEN open_close_key = 'OPEN'
         THEN GREATEST(
-            COALESCE(total_order_amt_exclusive, 0) - COALESCE(total_delivered_amt_exclusive, 0),
+            COALESCE(metric_order_value, 0) - COALESCE(metric_delivered_value, 0),
             0
         ) ELSE 0 END), 0) AS pending_value,
     COALESCE(SUM(CASE WHEN open_close_key = 'OPEN'
         THEN GREATEST(
-            COALESCE(total_order_liters, 0) - COALESCE(total_delivered_liters, 0),
+            COALESCE(metric_order_liters, 0) - COALESCE(metric_delivered_liters, 0),
             0
         ) ELSE 0 END), 0) AS pending_ltrs,
     COALESCE(SUM(CASE WHEN open_close_key = 'OPEN'
         THEN GREATEST(
-            COALESCE(order_qty, 0) - COALESCE(delivered_qty, 0),
+            COALESCE(metric_order_qty, 0) - COALESCE(metric_delivered_qty, 0),
             0
         ) ELSE 0 END), 0) AS pending_qty,
     COALESCE(SUM(CASE WHEN status_key = 'EXPIRED'
-        THEN COALESCE(total_order_amt_exclusive, 0) ELSE 0 END), 0) AS expired_value,
+        THEN COALESCE(metric_order_value, 0) ELSE 0 END), 0) AS expired_value,
     COALESCE(SUM(CASE WHEN status_key = 'EXPIRED'
-        THEN COALESCE(total_order_liters, 0) ELSE 0 END), 0) AS expired_ltrs,
+        THEN COALESCE(metric_order_liters, 0) ELSE 0 END), 0) AS expired_ltrs,
     COALESCE(SUM(CASE WHEN status_key = 'CANCELLED'
-        THEN COALESCE(total_order_amt_exclusive, 0) ELSE 0 END), 0) AS cancelled_value,
+        THEN COALESCE(metric_order_value, 0) ELSE 0 END), 0) AS cancelled_value,
     COALESCE(SUM(CASE WHEN status_key = 'CANCELLED'
-        THEN COALESCE(total_order_liters, 0) ELSE 0 END), 0) AS cancelled_ltrs,
-    COALESCE(SUM(COALESCE(total_order_amt_exclusive, 0)), 0) AS order_value,
-    COALESCE(SUM(COALESCE(total_order_liters, 0)), 0) AS order_ltrs,
-    COALESCE(SUM(COALESCE(order_qty, 0)), 0) AS order_qty
+        THEN COALESCE(metric_order_liters, 0) ELSE 0 END), 0) AS cancelled_ltrs,
+    COALESCE(SUM(COALESCE(metric_order_value, 0)), 0) AS order_value,
+    COALESCE(SUM(COALESCE(metric_order_liters, 0)), 0) AS order_ltrs,
+    COALESCE(SUM(COALESCE(metric_order_qty, 0)), 0) AS order_qty
 """
 
 
 _PRIMARY_TREND_METRIC_SQL = """
-    COALESCE(SUM(COALESCE(total_delivered_amt_exclusive, 0)), 0) AS done_value,
-    COALESCE(SUM(COALESCE(total_delivered_liters, 0)), 0) AS done_ltrs,
-    COALESCE(SUM(COALESCE(delivered_qty, 0)), 0) AS done_qty,
+    COALESCE(SUM(COALESCE(metric_delivered_value, 0)), 0) AS done_value,
+    COALESCE(SUM(COALESCE(metric_delivered_liters, 0)), 0) AS done_ltrs,
+    COALESCE(SUM(COALESCE(metric_delivered_qty, 0)), 0) AS done_qty,
     COALESCE(SUM(CASE WHEN open_close_key = 'OPEN'
         THEN GREATEST(
-            COALESCE(total_order_amt_exclusive, 0) - COALESCE(total_delivered_amt_exclusive, 0),
+            COALESCE(metric_order_value, 0) - COALESCE(metric_delivered_value, 0),
             0
         ) ELSE 0 END), 0) AS pending_value,
     COALESCE(SUM(CASE WHEN open_close_key = 'OPEN'
         THEN GREATEST(
-            COALESCE(total_order_liters, 0) - COALESCE(total_delivered_liters, 0),
+            COALESCE(metric_order_liters, 0) - COALESCE(metric_delivered_liters, 0),
             0
         ) ELSE 0 END), 0) AS pending_ltrs,
     COALESCE(SUM(CASE WHEN open_close_key = 'OPEN'
         THEN GREATEST(
-            COALESCE(order_qty, 0) - COALESCE(delivered_qty, 0),
+            COALESCE(metric_order_qty, 0) - COALESCE(metric_delivered_qty, 0),
             0
         ) ELSE 0 END), 0) AS pending_qty,
-    COALESCE(SUM(COALESCE(total_order_amt_exclusive, 0)), 0) AS order_value,
-    COALESCE(SUM(COALESCE(total_order_liters, 0)), 0) AS order_ltrs,
-    COALESCE(SUM(COALESCE(order_qty, 0)), 0) AS order_qty
+    COALESCE(SUM(COALESCE(metric_order_value, 0)), 0) AS order_value,
+    COALESCE(SUM(COALESCE(metric_order_liters, 0)), 0) AS order_ltrs,
+    COALESCE(SUM(COALESCE(metric_order_qty, 0)), 0) AS order_qty
 """
 
 
@@ -1169,18 +1170,12 @@ def primary_dashboard(request, slug: str):
                 ) AS vendor,
                 ({vendor_metric_filter}) AS in_metric_period,
                 ({vendor_pending_filter}) AS in_pending_period,
-                COALESCE(total_order_amt_exclusive, 0) AS order_value_row,
-                CASE
-                    WHEN COALESCE(total_delivered_amt_exclusive, 0) <> 0
-                        THEN COALESCE(total_delivered_amt_exclusive, 0)
-                    WHEN COALESCE(delivered_qty, 0) <> 0
-                        THEN COALESCE(delivered_qty, 0) * COALESCE(basic_rate, 0)
-                    ELSE 0
-                END AS delivered_value_row,
-                COALESCE(total_order_liters, 0) AS order_ltrs_row,
-                COALESCE(total_delivered_liters, 0) AS delivered_ltrs_row,
-                COALESCE(order_qty, 0) AS order_qty_row,
-                COALESCE(delivered_qty, 0) AS delivered_qty_row,
+                COALESCE(metric_order_value, 0) AS order_value_row,
+                COALESCE(metric_delivered_value, 0) AS delivered_value_row,
+                COALESCE(metric_order_liters, 0) AS order_ltrs_row,
+                COALESCE(metric_delivered_liters, 0) AS delivered_ltrs_row,
+                COALESCE(metric_order_qty, 0) AS order_qty_row,
+                COALESCE(metric_delivered_qty, 0) AS delivered_qty_row,
                 COALESCE(NULLIF(UPPER(TRIM(open_close::text)), ''), 'CLOSED') AS open_close_key
             FROM normalized
         ),
@@ -3160,6 +3155,65 @@ WITH base AS (
     FROM public.prim_master_po p
     WHERE REGEXP_REPLACE(LOWER(TRIM(p.format::text)), '[^a-z0-9]+', '', 'g') = '{format_key}'
 ),
+with_pack_text AS (
+    SELECT
+        *,
+        UPPER(CONCAT_WS(
+            ' ',
+            item::text,
+            sap_sku_name::text,
+            sku_name::text,
+            unit_of_measure::text
+        )) AS pack_text
+    FROM base
+),
+with_pack_matches AS (
+    SELECT
+        *,
+        regexp_match(
+            pack_text,
+            '([0-9]+(?:\.[0-9]+)?)\s*(?:LTR|LITRE|LITER|L)\s*\+\s*([0-9]+(?:\.[0-9]+)?)\s*(?:LTR|LITRE|LITER|L)(?:[^A-Z0-9]|$)'
+        ) AS combo_full_match,
+        regexp_match(
+            pack_text,
+            '([0-9]+(?:\.[0-9]+)?)\s*\+\s*([0-9]+(?:\.[0-9]+)?)\s*(?:LTR|LITRE|LITER|L)(?:[^A-Z0-9]|$)'
+        ) AS combo_compact_match,
+        regexp_match(
+            pack_text,
+            '([0-9]+(?:\.[0-9]+)?)\s*(?:ML|MLS|M)(?:[^A-Z0-9]|$)'
+        ) AS ml_match,
+        regexp_match(
+            pack_text,
+            '([0-9]+(?:\.[0-9]+)?)\s*(?:LTR|LITRE|LITER)(?:[^A-Z0-9]|$)'
+        ) AS ltr_match,
+        regexp_match(
+            pack_text,
+            '([0-9]+(?:\.[0-9]+)?)\s*L(?:[^A-Z0-9]|$)'
+        ) AS l_match
+    FROM with_pack_text
+),
+metric_base AS (
+    SELECT
+        *,
+        COALESCE(
+            CASE
+                WHEN combo_full_match IS NOT NULL
+                    THEN combo_full_match[1]::numeric + combo_full_match[2]::numeric
+                WHEN combo_compact_match IS NOT NULL
+                    THEN combo_compact_match[1]::numeric + combo_compact_match[2]::numeric
+                WHEN ml_match IS NOT NULL
+                    THEN ml_match[1]::numeric / 1000
+                WHEN ltr_match IS NOT NULL
+                    THEN ltr_match[1]::numeric
+                WHEN l_match IS NOT NULL
+                    THEN l_match[1]::numeric
+                ELSE NULL
+            END,
+            NULLIF(per_liter, 0),
+            1
+        ) AS effective_per_liter
+    FROM with_pack_matches
+),
 normalized AS (
     SELECT
         *,
@@ -3169,19 +3223,63 @@ normalized AS (
         COALESCE(NULLIF(UPPER(TRIM(category::text)), ''), 'OTHER') AS category_key,
         COALESCE(NULLIF(UPPER(TRIM(sub_category::text)), ''), 'OTHER') AS sub_category_key,
         COALESCE(NULLIF(UPPER(TRIM(open_close::text)), ''), 'CLOSED') AS open_close_key,
-        UPPER(TRIM(po_month::text)) AS po_month_key,
-        UPPER(TRIM(delivery_month::text)) AS delivery_month_key,
+        COALESCE(
+            NULLIF(UPPER(TRIM(po_month::text)), ''),
+            UPPER(TRIM(TO_CHAR(po_dt, 'FMMONTH')))
+        ) AS po_month_key,
+        COALESCE(
+            NULLIF(UPPER(TRIM(delivery_month::text)), ''),
+            UPPER(TRIM(TO_CHAR(delivery_dt, 'FMMONTH')))
+        ) AS delivery_month_key,
         UPPER(TRIM(TO_CHAR(expiry_dt, 'FMMONTH'))) AS expiry_month_key,
         COALESCE("year", EXTRACT(YEAR FROM po_dt)::integer) AS po_year,
         EXTRACT(YEAR FROM delivery_dt)::integer AS delivery_year,
         EXTRACT(YEAR FROM expiry_dt)::integer AS expiry_year,
         CASE
-            WHEN per_liter IS NULL THEN UPPER(TRIM(unit_of_measure::text))
-            WHEN per_liter < 1
-                THEN UPPER(TRIM(TO_CHAR(per_liter * 1000, 'FM999999990.###'))) || ' MLS'
-            ELSE UPPER(TRIM(TO_CHAR(per_liter, 'FM999999990.###'))) || ' LTR'
-        END AS per_ltr_key
-    FROM base
+            WHEN effective_per_liter IS NULL THEN UPPER(TRIM(unit_of_measure::text))
+            WHEN effective_per_liter < 1
+                THEN UPPER(TRIM(TO_CHAR(effective_per_liter * 1000, 'FM999999990.###'))) || ' MLS'
+            ELSE UPPER(TRIM(TO_CHAR(effective_per_liter, 'FM999999990.###'))) || ' LTR'
+        END AS per_ltr_key,
+        COALESCE(
+            total_order_liters,
+            CASE
+                WHEN order_qty IS NOT NULL
+                    THEN COALESCE(order_qty, 0) * COALESCE(effective_per_liter, 0)
+                ELSE NULL
+            END,
+            0
+        ) AS metric_order_liters,
+        COALESCE(
+            total_delivered_liters,
+            CASE
+                WHEN delivered_qty IS NOT NULL
+                    THEN COALESCE(delivered_qty, 0) * COALESCE(effective_per_liter, 0)
+                ELSE NULL
+            END,
+            0
+        ) AS metric_delivered_liters,
+        COALESCE(
+            total_order_amt_exclusive,
+            CASE
+                WHEN order_qty IS NOT NULL AND basic_rate IS NOT NULL
+                    THEN COALESCE(order_qty, 0) * COALESCE(basic_rate, 0)
+                ELSE NULL
+            END,
+            0
+        ) AS metric_order_value,
+        COALESCE(
+            total_delivered_amt_exclusive,
+            CASE
+                WHEN delivered_qty IS NOT NULL AND basic_rate IS NOT NULL
+                    THEN COALESCE(delivered_qty, 0) * COALESCE(basic_rate, 0)
+                ELSE NULL
+            END,
+            0
+        ) AS metric_delivered_value,
+        COALESCE(order_qty_cl, order_qty, 0) AS metric_order_qty,
+        COALESCE(filled_qty, delivered_qty, 0) AS metric_delivered_qty
+    FROM metric_base
 )
 """
 
