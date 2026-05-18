@@ -9,6 +9,7 @@ from accounts.views import (
     notification_detail,
     notifications,
 )
+from platforms import reports as platform_reports
 from uploads import amazon_uploads
 
 urlpatterns = [
@@ -20,6 +21,8 @@ urlpatterns = [
     path("api/upload/", include("uploads.urls")),
     path("api/uploads", amazon_uploads.uploads_collection, name="amazon-uploads"),
     path("api/uploads/<int:upload_id>", amazon_uploads.upload_detail, name="amazon-upload-detail"),
+    path("api/reports/raw", platform_reports.report_raw, name="reports-raw"),
+    path("api/reports/columns", platform_reports.report_columns, name="reports-columns"),
     path("api/reports/amazon-po/matrix", amazon_uploads.amazon_po_matrix, name="amazon-po-matrix"),
     path("api/reports/amazon-po", amazon_uploads.amazon_po_report, name="amazon-po-report"),
     path(
