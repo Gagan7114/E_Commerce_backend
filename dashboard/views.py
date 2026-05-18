@@ -152,7 +152,11 @@ def expiry_alerts(request, table_name: str):
             continue
         if isinstance(val, (date, datetime)):
             date_cols.append(col)
-        elif isinstance(val, str) and re.match(r"^\d{4}-\d{2}-\d{2}", val):
+        elif isinstance(val, str) and (
+            re.match(r"^\d{4}-\d{2}-\d{2}", val)
+            or re.match(r"^\d{1,2}-\d{1,2}-\d{4}", val)
+            or re.match(r"^\d{1,2}/\d{1,2}/\d{4}", val)
+        ):
             date_cols.append(col)
     if not date_cols:
         return Response({"alerts": []})
