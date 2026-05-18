@@ -1034,6 +1034,12 @@ def _amazon_primary_dashboard_response(request):
 
 _PENDENCY_DASHBOARD_FORMATS = {
     "zepto": "ZEPTO",
+    "swiggy": "SWIGGY",
+    "blinkit": "BLINKIT",
+    "bigbasket": "BIG BASKET",
+    "flipkart_grocery": "FLIPKART GROCERY",
+    "citymall": "CITY MALL",
+    "zomato": "ZOMATO",
 }
 
 
