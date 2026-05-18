@@ -1032,6 +1032,145 @@ def _amazon_primary_dashboard_response(request):
     })
 
 
+_PENDENCY_DASHBOARD_FORMATS = {
+    "zepto": "ZEPTO",
+}
+
+
+@api_view(["GET"])
+@permission_classes([require("platform.stats.view")])
+def pendency_dashboard(request, slug: str):
+    _ensure_scope(request.user, slug)
+    fmt = _PENDENCY_DASHBOARD_FORMATS.get(slug)
+    if not fmt:
+        raise ValidationError(
+            f"Pendency dashboard is not yet enabled for platform '{slug}'."
+        )
+
+    where_parts = ['UPPER(TRIM("format"::text)) = %s']
+    params: list = [fmt]
+
+    raw_year = (request.query_params.get("year") or "").strip()
+    if raw_year and raw_year.isdigit():
+        where_parts.append('"year" = %s')
+        params.append(int(raw_year))
+
+    raw_po_month = (request.query_params.get("po_month") or "").strip()
+    if raw_po_month:
+        where_parts.append('UPPER(TRIM("po_month"::text)) = %s')
+        params.append(raw_po_month.upper())
+
+    base_where = "WHERE " + " AND ".join(where_parts)
+    pending_filter = ' AND (COALESCE("missed_qty", 0) > 0 OR COALESCE("missed_ltrs", 0) > 0)'
+    full_where = base_where + pending_filter
+
+    totals_row = _dict_rows(
+        f'''
+        SELECT
+            COALESCE(SUM("missed_qty"), 0) AS pending_units,
+            COALESCE(SUM("missed_ltrs"), 0) AS pending_ltrs,
+            COALESCE(SUM("order_qty"), 0) AS open_units,
+            COALESCE(SUM("total_order_liters"), 0) AS open_ltrs,
+            COUNT(DISTINCT "po_number") AS open_pos,
+            COUNT(*) AS rows,
+            MAX("po_date") AS max_po_date
+        FROM "prim_master_po"
+        {full_where}
+        ''',
+        params,
+    )
+    totals = totals_row[0] if totals_row else {
+        "pending_units": 0,
+        "pending_ltrs": 0,
+        "open_units": 0,
+        "open_ltrs": 0,
+        "open_pos": 0,
+        "rows": 0,
+        "max_po_date": None,
+    }
+
+    metric_cols = '''
+        COALESCE(SUM("missed_qty"), 0) AS pending_units,
+        COALESCE(SUM("missed_ltrs"), 0) AS pending_ltrs,
+        COALESCE(SUM("order_qty"), 0) AS open_units,
+        COALESCE(SUM("total_order_liters"), 0) AS open_ltrs,
+        COUNT(DISTINCT "po_number") AS open_pos
+    '''
+    order_clause = "ORDER BY pending_ltrs DESC, pending_units DESC"
+
+    by_city = _dict_rows(
+        f'''
+        SELECT
+            COALESCE(NULLIF(TRIM("city"::text), ''), 'UNMAPPED') AS city,
+            {metric_cols}
+        FROM "prim_master_po"
+        {full_where}
+        GROUP BY 1
+        {order_clause}
+        ''',
+        params,
+    )
+
+    by_sku = _dict_rows(
+        f'''
+        SELECT
+            COALESCE(NULLIF(TRIM("sku_code"::text), ''), 'UNMAPPED') AS sku_code,
+            COALESCE(NULLIF(TRIM("sku_name"::text), ''), '-') AS sku_name,
+            COALESCE(NULLIF(TRIM("item"::text), ''), '-') AS item,
+            {metric_cols}
+        FROM "prim_master_po"
+        {full_where}
+        GROUP BY 1, 2, 3
+        {order_clause}
+        ''',
+        params,
+    )
+
+    by_warehouse = _dict_rows(
+        f'''
+        SELECT
+            COALESCE(NULLIF(TRIM("location"::text), ''), 'UNMAPPED') AS warehouse,
+            {metric_cols}
+        FROM "prim_master_po"
+        {full_where}
+        GROUP BY 1
+        {order_clause}
+        ''',
+        params,
+    )
+
+    by_distributor = _dict_rows(
+        f'''
+        SELECT
+            COALESCE(NULLIF(TRIM("vendor_new"::text), ''), 'UNMAPPED') AS distributor,
+            {metric_cols}
+        FROM "prim_master_po"
+        {full_where}
+        GROUP BY 1
+        {order_clause}
+        ''',
+        params,
+    )
+
+    return Response({
+        "platform": slug,
+        "format": fmt,
+        "totals": {
+            "pending_units": _num(totals.get("pending_units")),
+            "pending_ltrs": _num(totals.get("pending_ltrs")),
+            "open_units": _num(totals.get("open_units")),
+            "open_ltrs": _num(totals.get("open_ltrs")),
+            "open_pos": int(totals.get("open_pos") or 0),
+            "rows": int(totals.get("rows") or 0),
+        },
+        "max_po_date": totals.get("max_po_date"),
+        "by_city": by_city,
+        "by_sku": by_sku,
+        "by_warehouse": by_warehouse,
+        "by_distributor": by_distributor,
+    })
+
+
 @api_view(["GET"])
 @permission_classes([require("platform.stats.view")])
 def primary_dashboard(request, slug: str):
