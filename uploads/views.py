@@ -46,6 +46,8 @@ UPLOAD_ALLOWED_TABLES = {
     "swiggy_grn", "swiggy_prim",
     "zomato_prim",
     "citymall_prim",
+    # Ads
+    "blinkit_ads",
 }
 
 BATCH_SIZE = 50

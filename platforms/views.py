@@ -1057,24 +1057,74 @@ def pendency_dashboard(request, slug: str):
     params: list = [fmt]
 
     raw_year = (request.query_params.get("year") or "").strip()
-    if raw_year and raw_year.isdigit():
-        where_parts.append('"year" = %s')
-        params.append(int(raw_year))
-
     raw_po_month = (request.query_params.get("po_month") or "").strip()
+    resolved_month: str | None = None
+    resolved_year: int | None = None
+    defaulted_to_latest = False
+
+    if not raw_year and not raw_po_month:
+        latest = _dict_rows(
+            '''
+            SELECT
+                UPPER(TRIM("po_month"::text)) AS po_month,
+                "year" AS year,
+                MAX(
+                    CASE
+                        WHEN "po_date" ~ '^[0-9]{2}-[0-9]{2}-[0-9]{4}$'
+                            THEN TO_DATE("po_date", 'DD-MM-YYYY')
+                        WHEN "po_date" ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'
+                            THEN TO_DATE("po_date", 'YYYY-MM-DD')
+                    END
+                ) AS max_date
+            FROM "prim_master_po"
+            WHERE UPPER(TRIM("format"::text)) = %s
+              AND UPPER(TRIM("open_close"::text)) = 'OPEN'
+              AND "po_month" IS NOT NULL
+              AND "year" IS NOT NULL
+            GROUP BY 1, 2
+            ORDER BY max_date DESC NULLS LAST
+            LIMIT 1
+            ''',
+            [fmt],
+        )
+        if latest and latest[0].get("po_month") and latest[0].get("year") is not None:
+            resolved_month = latest[0]["po_month"]
+            resolved_year = int(latest[0]["year"])
+            defaulted_to_latest = True
+
     if raw_po_month:
+        resolved_month = raw_po_month.upper()
+    if raw_year and raw_year.isdigit():
+        resolved_year = int(raw_year)
+
+    if resolved_month:
         where_parts.append('UPPER(TRIM("po_month"::text)) = %s')
-        params.append(raw_po_month.upper())
+        params.append(resolved_month)
+    if resolved_year is not None:
+        where_parts.append('"year" = %s')
+        params.append(resolved_year)
 
     base_where = "WHERE " + " AND ".join(where_parts)
-    pending_filter = ' AND (COALESCE("missed_qty", 0) > 0 OR COALESCE("missed_ltrs", 0) > 0)'
+    # Match Primary Dashboard semantics: only OPEN POs, pending = max(order - delivered, 0).
+    pending_filter = " AND UPPER(TRIM(\"open_close\"::text)) = 'OPEN'"
     full_where = base_where + pending_filter
+
+    pending_units_expr = (
+        'COALESCE(SUM(GREATEST('
+        'COALESCE("order_qty", 0) - COALESCE("delivered_qty", 0), 0'
+        ')), 0)'
+    )
+    pending_ltrs_expr = (
+        'COALESCE(SUM(GREATEST('
+        'COALESCE("total_order_liters", 0) - COALESCE("total_delivered_liters", 0), 0'
+        ')), 0)'
+    )
 
     totals_row = _dict_rows(
         f'''
         SELECT
-            COALESCE(SUM("missed_qty"), 0) AS pending_units,
-            COALESCE(SUM("missed_ltrs"), 0) AS pending_ltrs,
+            {pending_units_expr} AS pending_units,
+            {pending_ltrs_expr} AS pending_ltrs,
             COALESCE(SUM("order_qty"), 0) AS open_units,
             COALESCE(SUM("total_order_liters"), 0) AS open_ltrs,
             COUNT(DISTINCT "po_number") AS open_pos,
@@ -1105,9 +1155,9 @@ def pendency_dashboard(request, slug: str):
         "max_po_date": None,
     }
 
-    metric_cols = '''
-        COALESCE(SUM("missed_qty"), 0) AS pending_units,
-        COALESCE(SUM("missed_ltrs"), 0) AS pending_ltrs,
+    metric_cols = f'''
+        {pending_units_expr} AS pending_units,
+        {pending_ltrs_expr} AS pending_ltrs,
         COALESCE(SUM("order_qty"), 0) AS open_units,
         COALESCE(SUM("total_order_liters"), 0) AS open_ltrs,
         COUNT(DISTINCT "po_number") AS open_pos
@@ -1171,6 +1221,9 @@ def pendency_dashboard(request, slug: str):
     return Response({
         "platform": slug,
         "format": fmt,
+        "po_month": resolved_month,
+        "year": resolved_year,
+        "defaulted_to_latest": defaulted_to_latest,
         "totals": {
             "pending_units": _num(totals.get("pending_units")),
             "pending_ltrs": _num(totals.get("pending_ltrs")),
