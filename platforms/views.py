@@ -2510,6 +2510,48 @@ def amazon_price_dashboard(request, slug: str):
     })
 
 
+@api_view(["GET"])
+@permission_classes([require("platform.stats.view")])
+def amazon_ads_dashboard(request, slug: str):
+    _ensure_scope(request.user, slug)
+    if slug != "amazon":
+        raise ValidationError("Amazon Ads Dashboard is available only for Amazon.")
+
+    summary_rows = _dict_rows(
+        """
+        SELECT
+            COALESCE(SUM(total_cost), 0)  AS total_cost,
+            COALESCE(SUM(units_sold), 0)  AS units_sold,
+            COALESCE(SUM(sales), 0)       AS sales
+        FROM amazon_ads_master
+        """,
+        [],
+    )
+
+    portfolio_rows = _dict_rows(
+        """
+        SELECT
+            COALESCE(NULLIF(TRIM(portfolio_name), ''), '(Unassigned)') AS portfolio_name,
+            COALESCE(SUM(total_cost), 0)  AS total_cost,
+            COALESCE(SUM(units_sold), 0)  AS units_sold,
+            COALESCE(SUM(sales), 0)       AS sales
+        FROM amazon_ads_master
+        GROUP BY COALESCE(NULLIF(TRIM(portfolio_name), ''), '(Unassigned)')
+        ORDER BY sales DESC NULLS LAST
+        """,
+        [],
+    )
+
+    return Response({
+        "source": "amazon_ads_master",
+        "dashboard_title": "Amazon Ads Dashboard",
+        "summary": summary_rows[0] if summary_rows else {
+            "total_cost": 0, "units_sold": 0, "sales": 0,
+        },
+        "portfolio_rows": portfolio_rows,
+    })
+
+
 # ─── Monthly Landing Rate ───
 # Single shared table `monthly_landing_rate` with columns:
 #   sku_code, sku_name, landing_rate, basic_rate, format, month

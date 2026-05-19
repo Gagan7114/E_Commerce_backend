@@ -48,6 +48,7 @@ UPLOAD_ALLOWED_TABLES = {
     "citymall_prim",
     # Ads
     "blinkit_ads",
+    "amazon_ads",
 }
 
 BATCH_SIZE = 50
