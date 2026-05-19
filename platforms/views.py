@@ -631,6 +631,14 @@ def _amazon_primary_dashboard_response(request):
     channel_filter = "" if channel == "ALL" else " AND channel_key = %s"
     channel_params = [] if channel == "ALL" else [channel]
 
+    # Optional `item_head` filter — only applied to the trend queries below so
+    # KPIs / SKUs / sub-categories / pie chart keep the full distribution.
+    item_head_raw = (request.query_params.get("item_head") or "").strip().upper()
+    if item_head_raw and item_head_raw not in {"PREMIUM", "COMMODITY", "OTHER"}:
+        raise ValidationError("`item_head` must be PREMIUM, COMMODITY, or OTHER.")
+    trend_head_filter = " AND item_head_key = %s" if item_head_raw else ""
+    trend_head_params = [item_head_raw] if item_head_raw else []
+
     def with_channel(params: list) -> list:
         return [*params, *channel_params]
 
@@ -872,6 +880,7 @@ def _amazon_primary_dashboard_response(request):
             WHERE {period_filter}{channel_filter}
               AND item_head_key IN ('PREMIUM', 'COMMODITY', 'OTHER')
               AND period_dt IS NOT NULL
+              {trend_head_filter}
             GROUP BY period_dt::date
         )
         SELECT
@@ -890,7 +899,7 @@ def _amazon_primary_dashboard_response(request):
         LEFT JOIN agg a ON a.period = d.period
         ORDER BY d.period
         """,
-        [period_start, period_end] + with_channel(period_params),
+        [period_start, period_end] + with_channel(period_params) + trend_head_params,
     ))
     monthly_trend = _primary_trend_rows(_dict_rows(
         f"""
@@ -906,6 +915,7 @@ def _amazon_primary_dashboard_response(request):
             WHERE period_dt IS NOT NULL
               AND EXTRACT(YEAR FROM period_dt)::integer = %s{channel_filter}
               AND item_head_key IN ('PREMIUM', 'COMMODITY', 'OTHER')
+              {trend_head_filter}
         ),
         trend_months AS (
             SELECT generate_series(start_month, end_month, interval '1 month')::date AS period
@@ -920,6 +930,7 @@ def _amazon_primary_dashboard_response(request):
             WHERE period_dt IS NOT NULL
               AND EXTRACT(YEAR FROM period_dt)::integer = %s{channel_filter}
               AND item_head_key IN ('PREMIUM', 'COMMODITY', 'OTHER')
+              {trend_head_filter}
             GROUP BY DATE_TRUNC('month', period_dt)::date
         )
         SELECT
@@ -938,7 +949,7 @@ def _amazon_primary_dashboard_response(request):
         LEFT JOIN agg a ON a.period = m.period
         ORDER BY m.period
         """,
-        [year, year, year] + channel_params + [year] + channel_params,
+        [year, year, year] + channel_params + trend_head_params + [year] + channel_params + trend_head_params,
     ))
     yearly_trend = _primary_trend_rows(_dict_rows(
         f"""
@@ -950,6 +961,7 @@ def _amazon_primary_dashboard_response(request):
             FROM normalized
             WHERE period_dt IS NOT NULL{channel_filter}
               AND item_head_key IN ('PREMIUM', 'COMMODITY', 'OTHER')
+              {trend_head_filter}
         ),
         trend_years AS (
             SELECT generate_series(start_year, end_year)::integer AS period
@@ -963,6 +975,7 @@ def _amazon_primary_dashboard_response(request):
             FROM normalized
             WHERE period_dt IS NOT NULL{channel_filter}
               AND item_head_key IN ('PREMIUM', 'COMMODITY', 'OTHER')
+              {trend_head_filter}
             GROUP BY EXTRACT(YEAR FROM period_dt)::integer
         )
         SELECT
@@ -981,7 +994,7 @@ def _amazon_primary_dashboard_response(request):
         LEFT JOIN agg a ON a.period = y.period
         ORDER BY y.period
         """,
-        channel_params + channel_params,
+        channel_params + trend_head_params + channel_params + trend_head_params,
     ))
 
     detail_total = _primary_total(details)
@@ -1043,6 +1056,15 @@ def primary_dashboard(request, slug: str):
     vendor_metric_filter = _primary_vendor_metric_filter(mode)
     vendor_pending_filter = _primary_vendor_pending_filter(mode)
     vendor_period_params = [month_name, year, month_name, year]
+
+    # Optional `item_head` filter — only applied to the trend queries, since
+    # the front-end already filters KPIs / SKUs / sub-categories client-side
+    # and the pie chart needs all three heads to render the split.
+    item_head_raw = (request.query_params.get("item_head") or "").strip().upper()
+    if item_head_raw and item_head_raw not in {"PREMIUM", "COMMODITY", "OTHER"}:
+        raise ValidationError("`item_head` must be PREMIUM, COMMODITY, or OTHER.")
+    trend_head_filter = " AND item_head_key = %s" if item_head_raw else ""
+    trend_head_params = [item_head_raw] if item_head_raw else []
 
     # This mirrors PRIMARY DASHBOARD!D2 in the workbook:
     # MAXIFS(PRIMARY!BM:BM, PRIMARY!AG:AG, month, PRIMARY!AI:AI, year)
@@ -1271,6 +1293,7 @@ def primary_dashboard(request, slug: str):
             FROM normalized
             WHERE {period_filter}
               AND {trend_date_col} IS NOT NULL
+              {trend_head_filter}
             GROUP BY {trend_date_col}::date
         )
         SELECT
@@ -1286,7 +1309,7 @@ def primary_dashboard(request, slug: str):
         LEFT JOIN agg a ON a.period = d.period
         ORDER BY d.period
         """,
-        [period_start, period_end] + period_params,
+        [period_start, period_end] + period_params + trend_head_params,
     ))
     monthly_trend = _primary_trend_rows(_dict_rows(
         f"""
@@ -1301,6 +1324,7 @@ def primary_dashboard(request, slug: str):
             FROM normalized
             WHERE {trend_date_col} IS NOT NULL
               AND EXTRACT(YEAR FROM {trend_date_col})::integer = %s
+              {trend_head_filter}
         ),
         trend_months AS (
             SELECT generate_series(start_month, end_month, interval '1 month')::date AS period
@@ -1314,6 +1338,7 @@ def primary_dashboard(request, slug: str):
             FROM normalized
             WHERE {trend_date_col} IS NOT NULL
               AND EXTRACT(YEAR FROM {trend_date_col})::integer = %s
+              {trend_head_filter}
             GROUP BY DATE_TRUNC('month', {trend_date_col})::date
         )
         SELECT
@@ -1329,7 +1354,7 @@ def primary_dashboard(request, slug: str):
         LEFT JOIN agg a ON a.period = m.period
         ORDER BY m.period
         """,
-        [year, year, year, year],
+        [year, year, year] + trend_head_params + [year] + trend_head_params,
     ))
     yearly_trend = _primary_trend_rows(_dict_rows(
         f"""
@@ -1340,6 +1365,7 @@ def primary_dashboard(request, slug: str):
                 MAX(EXTRACT(YEAR FROM {trend_date_col})::integer) AS end_year
             FROM normalized
             WHERE {trend_date_col} IS NOT NULL
+              {trend_head_filter}
         ),
         trend_years AS (
             SELECT generate_series(start_year, end_year)::integer AS period
@@ -1352,6 +1378,7 @@ def primary_dashboard(request, slug: str):
                 {_PRIMARY_TREND_METRIC_SQL}
             FROM normalized
             WHERE {trend_date_col} IS NOT NULL
+              {trend_head_filter}
             GROUP BY EXTRACT(YEAR FROM {trend_date_col})::integer
         )
         SELECT
@@ -1367,7 +1394,7 @@ def primary_dashboard(request, slug: str):
         LEFT JOIN agg a ON a.period = y.period
         ORDER BY y.period
         """,
-        [],
+        trend_head_params + trend_head_params,
     ))
 
     return Response({
@@ -5539,6 +5566,90 @@ def _blinkit_sec_dashboard_response(request):
         date_filter,
         date_params,
     )
+    days_in_month = monthrange(year, month)[1]
+    daily_raw = _dict_rows(
+        f"""
+        SELECT
+            "date"::date AS period,
+            COALESCE(SUM("sales_amt_exc"), 0) AS shipped_value,
+            COALESCE(SUM("ltr_sold"), 0) AS shipped_ltr,
+            COALESCE(SUM("quantity"), 0) AS shipped_units
+        FROM "SecMaster"
+        WHERE REGEXP_REPLACE(LOWER(TRIM("format"::text)), '[^a-z0-9]+', '', 'g') = 'blinkit'
+          AND UPPER(TRIM("month"::text)) = %s
+          AND "year"::numeric = %s
+          AND "date" IS NOT NULL
+          {date_filter}
+        GROUP BY "date"::date
+        ORDER BY "date"::date
+        """,
+        [month_name, year, *date_params],
+    )
+    daily_by_period = {row.get("period"): row for row in daily_raw}
+    daily_trend = []
+    for day in range(1, days_in_month + 1):
+        period = date(year, month, day)
+        row = daily_by_period.get(period, {})
+        daily_trend.append({
+            "period": period.isoformat(),
+            "label": f"{day:02d}",
+            "shipped_value": _num(row.get("shipped_value")),
+            "shipped_ltr": _num(row.get("shipped_ltr")),
+            "shipped_units": _num(row.get("shipped_units")),
+        })
+
+    monthly_raw = _dict_rows(
+        """
+        SELECT
+            DATE_TRUNC('month', "date")::date AS period,
+            COALESCE(SUM("sales_amt_exc"), 0) AS shipped_value,
+            COALESCE(SUM("ltr_sold"), 0) AS shipped_ltr,
+            COALESCE(SUM("quantity"), 0) AS shipped_units
+        FROM "SecMaster"
+        WHERE REGEXP_REPLACE(LOWER(TRIM("format"::text)), '[^a-z0-9]+', '', 'g') = 'blinkit'
+          AND "date" IS NOT NULL
+          AND EXTRACT(YEAR FROM "date")::integer = %s
+        GROUP BY DATE_TRUNC('month', "date")::date
+        ORDER BY DATE_TRUNC('month', "date")::date
+        """,
+        [year],
+    )
+    monthly_trend = [
+        {
+            "period": row["period"].isoformat() if hasattr(row.get("period"), "isoformat") else row.get("period"),
+            "label": row["period"].strftime("%b").upper() if hasattr(row.get("period"), "strftime") else str(row.get("period") or ""),
+            "shipped_value": _num(row.get("shipped_value")),
+            "shipped_ltr": _num(row.get("shipped_ltr")),
+            "shipped_units": _num(row.get("shipped_units")),
+        }
+        for row in monthly_raw
+    ]
+
+    yearly_raw = _dict_rows(
+        """
+        SELECT
+            EXTRACT(YEAR FROM "date")::integer AS period_year,
+            COALESCE(SUM("sales_amt_exc"), 0) AS shipped_value,
+            COALESCE(SUM("ltr_sold"), 0) AS shipped_ltr,
+            COALESCE(SUM("quantity"), 0) AS shipped_units
+        FROM "SecMaster"
+        WHERE REGEXP_REPLACE(LOWER(TRIM("format"::text)), '[^a-z0-9]+', '', 'g') = 'blinkit'
+          AND "date" IS NOT NULL
+        GROUP BY EXTRACT(YEAR FROM "date")::integer
+        ORDER BY EXTRACT(YEAR FROM "date")::integer
+        """,
+        [],
+    )
+    yearly_trend = [
+        {
+            "period": str(row.get("period_year") or ""),
+            "label": str(row.get("period_year") or ""),
+            "shipped_value": _num(row.get("shipped_value")),
+            "shipped_ltr": _num(row.get("shipped_ltr")),
+            "shipped_units": _num(row.get("shipped_units")),
+        }
+        for row in yearly_raw
+    ]
 
     return Response({
         "source": "SecMaster",
@@ -5558,6 +5669,11 @@ def _blinkit_sec_dashboard_response(request):
         "show_last_month": True,
         "dashboard_title": "Blinkit Secondary Dashboard",
         "detail_subtitle": "Excel rows 12-20 from SECONDARY DASHBOARD",
+        "trends": {
+            "day": daily_trend,
+            "month": monthly_trend,
+            "year": yearly_trend,
+        },
     })
 
 
