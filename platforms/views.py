@@ -2517,38 +2517,92 @@ def amazon_ads_dashboard(request, slug: str):
     if slug != "amazon":
         raise ValidationError("Amazon Ads Dashboard is available only for Amazon.")
 
+    year_param = (request.query_params.get("year") or "").strip()
+    month_param = (request.query_params.get("month") or "").strip().upper()
+
+    where_clauses: list[str] = []
+    params: list = []
+    if year_param:
+        try:
+            where_clauses.append("year = %s")
+            params.append(int(year_param))
+        except ValueError:
+            raise ValidationError(f"Invalid year value: {year_param!r}")
+    if month_param:
+        where_clauses.append("month = %s")
+        params.append(month_param)
+    where_sql = ("WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
+
     summary_rows = _dict_rows(
-        """
+        f"""
         SELECT
             COALESCE(SUM(total_cost), 0)  AS total_cost,
             COALESCE(SUM(units_sold), 0)  AS units_sold,
-            COALESCE(SUM(sales), 0)       AS sales
+            COALESCE(SUM(sales), 0)       AS sales,
+            MAX(date)                     AS max_date
         FROM amazon_ads_master
+        {where_sql}
         """,
-        [],
+        params,
     )
 
     portfolio_rows = _dict_rows(
-        """
+        f"""
         SELECT
             COALESCE(NULLIF(TRIM(portfolio_name), ''), '(Unassigned)') AS portfolio_name,
             COALESCE(SUM(total_cost), 0)  AS total_cost,
             COALESCE(SUM(units_sold), 0)  AS units_sold,
             COALESCE(SUM(sales), 0)       AS sales
         FROM amazon_ads_master
+        {where_sql}
         GROUP BY COALESCE(NULLIF(TRIM(portfolio_name), ''), '(Unassigned)')
         ORDER BY sales DESC NULLS LAST
         """,
-        [],
+        params,
     )
+
+    years = [
+        int(r["year"])
+        for r in _dict_rows(
+            "SELECT DISTINCT year FROM amazon_ads_master WHERE year IS NOT NULL ORDER BY year DESC",
+            [],
+        )
+    ]
+    months = [
+        r["month"]
+        for r in _dict_rows(
+            """
+            SELECT DISTINCT month, MIN(date) AS sort_date
+            FROM amazon_ads_master
+            WHERE month IS NOT NULL AND month <> ''
+            GROUP BY month
+            ORDER BY sort_date
+            """,
+            [],
+        )
+    ]
+
+    summary = summary_rows[0] if summary_rows else {
+        "total_cost": 0, "units_sold": 0, "sales": 0, "max_date": None,
+    }
+    max_date = summary.pop("max_date", None)
+    if hasattr(max_date, "isoformat"):
+        max_date = max_date.isoformat()
 
     return Response({
         "source": "amazon_ads_master",
-        "dashboard_title": "Amazon Ads Dashboard",
-        "summary": summary_rows[0] if summary_rows else {
-            "total_cost": 0, "units_sold": 0, "sales": 0,
-        },
+        "dashboard_title": "AMS ADS Dashboard",
+        "summary": summary,
+        "max_date": max_date,
         "portfolio_rows": portfolio_rows,
+        "filter_options": {
+            "years": years,
+            "months": months,
+        },
+        "filters": {
+            "year": year_param or None,
+            "month": month_param or None,
+        },
     })
 
 

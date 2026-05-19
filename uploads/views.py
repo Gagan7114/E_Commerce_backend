@@ -49,6 +49,7 @@ UPLOAD_ALLOWED_TABLES = {
     # Ads
     "blinkit_ads",
     "amazon_ads",
+    "swiggy_ads",
 }
 
 BATCH_SIZE = 50
@@ -601,6 +602,223 @@ def master_sheet_delete(request):
             "format_sku_code": deleted[0],
             "product_name": deleted[1],
             "format": deleted[2],
+        },
+    })
+
+
+# ─── ads_master_bs ───
+# Manual mapping table: (month, campaign_id, sku_id, item, format).
+# Unique key = (month, campaign_id, sku_id).
+
+ADS_MASTER_BS_COLUMNS = ["month", "campaign_id", "sku_id", "item", "format"]
+ADS_MASTER_BS_KEY_COLUMNS = ["month", "campaign_id", "sku_id"]
+ADS_MASTER_BS_SEARCH_COLUMNS = ["month", "campaign_id", "sku_id", "item", "format"]
+
+
+def _ads_master_bs_select_columns() -> str:
+    quoted = ", ".join(_quote_ident(col) for col in ADS_MASTER_BS_COLUMNS)
+    return f'ctid::text AS "row_id", {quoted}'
+
+
+def _ads_master_bs_payload(data) -> dict:
+    if not isinstance(data, dict):
+        raise ValueError("Row data is required.")
+    row = {}
+    for column in ADS_MASTER_BS_COLUMNS:
+        if column not in data:
+            continue
+        value = data.get(column)
+        if value is None:
+            row[column] = None
+        else:
+            text = str(value).strip()
+            row[column] = text if text else None
+    return row
+
+
+@api_view(["GET"])
+@permission_classes([require("upload.use")])
+def ads_master_bs_list(request):
+    query = str(request.query_params.get("search") or "").strip()
+    fmt = str(
+        request.query_params.get("format_name")
+        or request.query_params.get("platform_format")
+        or ""
+    ).strip()
+    try:
+        page = max(0, int(request.query_params.get("page", 0)))
+        page_size = min(100, max(1, int(request.query_params.get("page_size", 25))))
+    except ValueError:
+        page, page_size = 0, 25
+
+    where = []
+    params = []
+    if query:
+        like = f"%{query}%"
+        where.append(
+            "("
+            + " OR ".join(
+                f"CAST({_quote_ident(col)} AS text) ILIKE %s"
+                for col in ADS_MASTER_BS_SEARCH_COLUMNS
+            )
+            + ")"
+        )
+        params.extend([like] * len(ADS_MASTER_BS_SEARCH_COLUMNS))
+    if fmt:
+        where.append("UPPER(TRIM(format::text)) = UPPER(TRIM(%s))")
+        params.append(fmt)
+
+    where_sql = f"WHERE {' AND '.join(where)}" if where else ""
+    offset = page * page_size
+
+    with connection.cursor() as cur:
+        cur.execute(f"SELECT COUNT(*) FROM ads_master_bs {where_sql}", list(params))
+        total = cur.fetchone()[0]
+
+        cur.execute(
+            f"""
+            SELECT {_ads_master_bs_select_columns()}
+            FROM ads_master_bs
+            {where_sql}
+            ORDER BY COALESCE(month, ''), COALESCE(campaign_id, ''), COALESCE(sku_id, '')
+            LIMIT %s OFFSET %s
+            """,
+            [*params, page_size, offset],
+        )
+        cols = [c[0] for c in cur.description]
+        rows = [dict(zip(cols, row)) for row in cur.fetchall()]
+
+    return Response({
+        "columns": ADS_MASTER_BS_COLUMNS,
+        "rows": rows,
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+    })
+
+
+@api_view(["POST"])
+@permission_classes([require("upload.use")])
+def ads_master_bs_create(request):
+    try:
+        row = _ads_master_bs_payload(request.data or {})
+    except ValueError as exc:
+        return Response({"detail": str(exc)}, status=400)
+
+    missing = [col for col in ADS_MASTER_BS_KEY_COLUMNS if not row.get(col)]
+    if missing:
+        return Response(
+            {"detail": f"Required fields missing: {', '.join(missing)}."},
+            status=400,
+        )
+
+    # Normalize key columns to NOT NULL TEXT (Postgres treats NULL as distinct
+    # in unique indexes, so blanks must be empty strings, not NULL).
+    insert_row = dict(row)
+    for col in ADS_MASTER_BS_KEY_COLUMNS:
+        insert_row[col] = insert_row.get(col) or ""
+
+    columns = [col for col in ADS_MASTER_BS_COLUMNS if col in insert_row]
+    placeholders = ", ".join(["%s"] * len(columns))
+    values = [insert_row[col] for col in columns]
+
+    with transaction.atomic(), connection.cursor() as cur:
+        try:
+            cur.execute(
+                f"""
+                INSERT INTO ads_master_bs ({", ".join(_quote_ident(col) for col in columns)})
+                VALUES ({placeholders})
+                RETURNING {_ads_master_bs_select_columns()}
+                """,
+                values,
+            )
+        except Exception as exc:  # noqa: BLE001
+            msg = str(exc)
+            if "ads_master_bs_dedup_idx" in msg or "duplicate key" in msg.lower():
+                return Response(
+                    {"detail": "A row with the same month, campaign_id and sku_id already exists."},
+                    status=409,
+                )
+            return Response({"detail": msg}, status=400)
+        cols = [c[0] for c in cur.description]
+        created = dict(zip(cols, cur.fetchone()))
+
+    return Response({"ok": True, "row": created})
+
+
+@api_view(["POST"])
+@permission_classes([require("upload.use")])
+def ads_master_bs_update(request):
+    row_id = str((request.data or {}).get("row_id") or "").strip()
+    if not row_id:
+        return Response({"detail": "row_id is required."}, status=400)
+    try:
+        row = _ads_master_bs_payload((request.data or {}).get("row") or {})
+    except ValueError as exc:
+        return Response({"detail": str(exc)}, status=400)
+    if not row:
+        return Response({"detail": "No fields to update."}, status=400)
+
+    # Empty key columns must remain '' (NOT NULL) to keep the unique index sane.
+    for col in ADS_MASTER_BS_KEY_COLUMNS:
+        if col in row and row[col] is None:
+            row[col] = ""
+
+    assignments = ", ".join(f"{_quote_ident(col)} = %s" for col in row)
+    values = [row[col] for col in row]
+
+    with transaction.atomic(), connection.cursor() as cur:
+        try:
+            cur.execute(
+                f"""
+                UPDATE ads_master_bs
+                SET {assignments}, updated_at = NOW()
+                WHERE ctid = %s::tid
+                RETURNING {_ads_master_bs_select_columns()}
+                """,
+                [*values, row_id],
+            )
+        except Exception as exc:  # noqa: BLE001
+            msg = str(exc)
+            if "ads_master_bs_dedup_idx" in msg or "duplicate key" in msg.lower():
+                return Response(
+                    {"detail": "Another row with the same month, campaign_id and sku_id already exists."},
+                    status=409,
+                )
+            return Response({"detail": msg}, status=400)
+        updated_row = cur.fetchone()
+        if not updated_row:
+            return Response({"detail": "Row was not found. Please search again."}, status=404)
+        cols = [c[0] for c in cur.description]
+
+    return Response({"ok": True, "row": dict(zip(cols, updated_row))})
+
+
+@api_view(["POST"])
+@permission_classes([require("upload.use")])
+def ads_master_bs_delete(request):
+    row_id = str((request.data or {}).get("row_id") or "").strip()
+    if not row_id:
+        return Response({"detail": "row_id is required."}, status=400)
+    with transaction.atomic(), connection.cursor() as cur:
+        cur.execute(
+            """
+            DELETE FROM ads_master_bs
+            WHERE ctid = %s::tid
+            RETURNING month, campaign_id, sku_id
+            """,
+            [row_id],
+        )
+        deleted = cur.fetchone()
+        if not deleted:
+            return Response({"detail": "Row was not found. Please search again."}, status=404)
+
+    return Response({
+        "ok": True,
+        "deleted": {
+            "month": deleted[0],
+            "campaign_id": deleted[1],
+            "sku_id": deleted[2],
         },
     })
 
