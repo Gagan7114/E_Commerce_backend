@@ -2606,6 +2606,102 @@ def amazon_ads_dashboard(request, slug: str):
     })
 
 
+@api_view(["GET"])
+@permission_classes([require("platform.stats.view")])
+def swiggy_ads_dashboard(request, slug: str):
+    _ensure_scope(request.user, slug)
+    if slug != "swiggy":
+        raise ValidationError("Swiggy Ads Dashboard is available only for Swiggy.")
+
+    year_param = (request.query_params.get("year") or "").strip()
+    month_param = (request.query_params.get("month") or "").strip().upper()
+
+    where_clauses: list[str] = []
+    params: list = []
+    if year_param:
+        try:
+            where_clauses.append("year = %s")
+            params.append(int(year_param))
+        except ValueError:
+            raise ValidationError(f"Invalid year value: {year_param!r}")
+    if month_param:
+        where_clauses.append("month = %s")
+        params.append(month_param)
+    where_sql = ("WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
+
+    summary_rows = _dict_rows(
+        f"""
+        SELECT
+            COALESCE(SUM(ad_spent),         0) AS ad_spent,
+            COALESCE(SUM(direct_qty_sold),  0) AS direct_qty_sold,
+            COALESCE(SUM(ads_ltr_sold),     0) AS ads_ltr_sold,
+            MAX(date)                          AS max_date
+        FROM swiggy_ads_master
+        {where_sql}
+        """,
+        params,
+    )
+
+    item_rows = _dict_rows(
+        f"""
+        SELECT
+            COALESCE(NULLIF(TRIM(item), ''), '(Unmapped)') AS item,
+            COALESCE(SUM(ad_spent),        0) AS ad_spent,
+            COALESCE(SUM(direct_qty_sold), 0) AS direct_qty_sold,
+            COALESCE(SUM(ads_ltr_sold),    0) AS ads_ltr_sold
+        FROM swiggy_ads_master
+        {where_sql}
+        GROUP BY COALESCE(NULLIF(TRIM(item), ''), '(Unmapped)')
+        ORDER BY ad_spent DESC NULLS LAST
+        """,
+        params,
+    )
+
+    years = [
+        int(r["year"])
+        for r in _dict_rows(
+            "SELECT DISTINCT year FROM swiggy_ads_master WHERE year IS NOT NULL ORDER BY year DESC",
+            [],
+        )
+    ]
+    months = [
+        r["month"]
+        for r in _dict_rows(
+            """
+            SELECT DISTINCT month, MIN(date) AS sort_date
+            FROM swiggy_ads_master
+            WHERE month IS NOT NULL AND month <> ''
+            GROUP BY month
+            ORDER BY sort_date
+            """,
+            [],
+        )
+    ]
+
+    summary = summary_rows[0] if summary_rows else {
+        "ad_spent": 0, "direct_qty_sold": 0, "ads_ltr_sold": 0, "max_date": None,
+    }
+    max_date = summary.pop("max_date", None)
+    if hasattr(max_date, "isoformat"):
+        max_date = max_date.isoformat()
+
+    return Response({
+        "source": "swiggy_ads_master",
+        "dashboard_title": "Swiggy ADS Dashboard",
+        "summary": summary,
+        "max_date": max_date,
+        "item_rows": item_rows,
+        "filter_options": {
+            "years": years,
+            "months": months,
+        },
+        "filters": {
+            "year": year_param or None,
+            "month": month_param or None,
+        },
+    })
+
+
 # ─── Monthly Landing Rate ───
 # Single shared table `monthly_landing_rate` with columns:
 #   sku_code, sku_name, landing_rate, basic_rate, format, month
