@@ -39,6 +39,7 @@ INSTALLED_APPS = [
     "sap",
     "dashboard",
     "uploads",
+    "shipment",
 ]
 
 MIDDLEWARE = [
