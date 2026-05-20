@@ -63,8 +63,20 @@ def _compute_priority(drr_unit, soh_unit, doh, days_to_expiry, po_status):
     return bucket, round(score, 2), reason
 
 
-def _auto_plan_truck(items, truck_size):
-    capacity = TRUCK_CAPACITIES.get(truck_size, 15000.0)
+def _resolve_capacity(truck_size, capacity_override=None):
+    """Resolve truck capacity in liters. Falls back to known sizes; honors custom override."""
+    if capacity_override is not None:
+        try:
+            v = float(capacity_override)
+            if v > 0:
+                return v
+        except (TypeError, ValueError):
+            pass
+    return TRUCK_CAPACITIES.get(truck_size, 15000.0)
+
+
+def _auto_plan_truck(items, truck_size, capacity_override=None):
+    capacity = _resolve_capacity(truck_size, capacity_override)
     remaining = capacity
     loaded, not_loaded = [], []
 
@@ -136,17 +148,19 @@ class AppointmentDatesView(APIView):
         with connection.cursor() as cur:
             cur.execute("""
                 SELECT DATE(appointment_time) AS appt_date,
-                       COUNT(DISTINCT appointment_id) AS appt_count
+                       COUNT(DISTINCT CASE WHEN status = 'Confirmed' THEN appointment_id END) AS confirmed_count,
+                       COUNT(DISTINCT CASE WHEN status = 'Cancelled' THEN appointment_id END) AS cancelled_count
                 FROM reporting."appointment"
-                WHERE status = 'Confirmed'
+                WHERE status IN ('Confirmed','Cancelled')
                   AND appointment_time IS NOT NULL
                 GROUP BY DATE(appointment_time)
                 ORDER BY appt_date
             """)
             rows = cur.fetchall()
-        dates = [row[0].isoformat() for row in rows if row[0]]
-        counts = {row[0].isoformat(): row[1] for row in rows if row[0]}
-        return Response({'dates': dates, 'counts': counts})
+        dates = [r[0].isoformat() for r in rows if r[0] and r[1] > 0]
+        counts = {r[0].isoformat(): r[1] for r in rows if r[0]}
+        cancelled = {r[0].isoformat(): r[2] for r in rows if r[0] and r[2] > 0}
+        return Response({'dates': dates, 'counts': counts, 'cancelled': cancelled})
 
 
 class AppointmentListView(APIView):
@@ -189,6 +203,7 @@ class AppointmentItemsView(APIView):
 
     def get(self, request, appointment_id):
         truck_size = request.query_params.get('truck_size', '15_ton')
+        capacity_override = request.query_params.get('truck_capacity_liters')
 
         with connection.cursor() as cur:
             cur.execute("""
@@ -284,7 +299,7 @@ class AppointmentItemsView(APIView):
                 'not_loaded_items': [],
                 'load_summary': {
                     'truck_size': truck_size,
-                    'capacity': TRUCK_CAPACITIES.get(truck_size, 15000),
+                    'capacity': _resolve_capacity(truck_size, capacity_override),
                     'planned_liters': 0,
                     'load_percentage': 0,
                 },
@@ -308,7 +323,7 @@ class AppointmentItemsView(APIView):
             -(x.get('accepted_qty') or 0),
         ))
 
-        loaded, not_loaded, capacity, planned_liters, load_pct = _auto_plan_truck(items, truck_size)
+        loaded, not_loaded, capacity, planned_liters, load_pct = _auto_plan_truck(items, truck_size, capacity_override)
 
         return Response({
             'appointment': appt,
@@ -853,6 +868,7 @@ class ManualPlanView(APIView):
     def post(self, request):
         selected_items = request.data.get('items', [])
         truck_size = request.data.get('truck_size', '15_ton')
+        capacity_override = request.data.get('truck_capacity_liters')
 
         if not selected_items:
             return Response({'error': 'No items selected'}, status=400)
@@ -874,7 +890,7 @@ class ManualPlanView(APIView):
         ))
 
         loaded, not_loaded, capacity, planned_liters, load_pct = _auto_plan_truck(
-            selected_items, truck_size
+            selected_items, truck_size, capacity_override
         )
 
         with transaction.atomic():
@@ -924,20 +940,137 @@ class ManualPlanView(APIView):
         return Response(ShipmentSerializer(shipment).data, status=201)
 
 
+def _doh_bucket(doh, drr):
+    """4-bucket priority based purely on live DOH (matches SOH/DOH page color thresholds)."""
+    drr = float(drr or 0)
+    if drr <= 0:
+        return 'NO DEMAND', 'No demand (DRR = 0)'
+    d = float(doh if doh is not None else 0)
+    if d < 7:
+        return 'CRITICAL', f'DOH {d:.1f} — restock urgently'
+    if d < 14:
+        return 'HIGH',     f'DOH {d:.1f} — low cover'
+    if d < 30:
+        return 'MEDIUM',   f'DOH {d:.1f} — comfortable'
+    return 'LOW', f'DOH {d:.1f} — well stocked'
+
+
 class DOHAutoFillView(APIView):
     """
-    Auto-fill a truck with the most urgent items by DOH priority.
-    Scans ALL pending confirmed POs (optionally filtered by FC),
-    scores each by the priority engine, sorts CRITICAL→HOLD with
-    FEFO tiebreaker, then fills the truck greedily.
+    Auto-fill a truck using LIVE DOH from amazon_master_inventory + amazon_sec_range_master_view
+    (same source as the SOH/DOH dashboard so numbers match exactly).
+
+    FC filter scopes both PO availability AND inventory (if amazon_master_inventory has an fc column);
+    otherwise DOH is platform-wide and only POs are FC-filtered.
+
+    Response also includes 'urgent_no_po' — ASINs where DOH < 14 but no eligible PO exists.
     """
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
         truck_size = request.query_params.get('truck_size', '15_ton')
+        capacity_override = request.query_params.get('truck_capacity_liters')
         fc = request.query_params.get('fc', '').strip()
 
-        where = [
+        # 1) Resolve the effective inventory snapshot date (latest available)
+        with connection.cursor() as cur:
+            cur.execute("""
+                SELECT MAX(inventory_date) FROM amazon_master_inventory
+            """)
+            effective_date = cur.fetchone()[0]
+
+        if not effective_date:
+            return Response({
+                'loaded_items': [],
+                'not_loaded_items': [],
+                'urgent_no_po': [],
+                'load_summary': {'truck_size': truck_size, 'capacity': _resolve_capacity(truck_size, capacity_override), 'planned_liters': 0, 'load_percentage': 0},
+                'priority_breakdown': {},
+                'stats': {'total_candidates': 0, 'loaded_count': 0, 'not_loaded_count': 0, 'urgent_no_po_count': 0},
+                'source': {'sales': 'amazon_sec_range_master_view', 'inventory': 'amazon_master_inventory'},
+                'message': 'No inventory snapshots found in amazon_master_inventory.',
+            })
+
+        elapsed_day = max(1, effective_date.day)
+        month_name = effective_date.strftime('%B').upper()
+        year = effective_date.year
+        month_day = f"{effective_date.day:02d}-{effective_date.strftime('%b').upper()}"
+
+        # 2) Compute live DOH per ASIN (mirrors SOH/DOH dashboard logic)
+        with connection.cursor() as cur:
+            cur.execute("""
+                WITH sales AS (
+                    SELECT
+                        UPPER(TRIM(COALESCE(asin::text, ''))) AS asin_key,
+                        COALESCE(SUM(shipped_units), 0)::numeric  AS units_sold,
+                        COALESCE(SUM(shipped_litres), 0)::numeric AS ltr_sold
+                    FROM amazon_sec_range_master_view
+                    WHERE "year" = %s
+                      AND UPPER(TRIM("month"::text)) = %s
+                      AND UPPER(TRIM(month_day::text)) = %s
+                    GROUP BY UPPER(TRIM(COALESCE(asin::text, '')))
+                ),
+                inventory AS (
+                    SELECT
+                        UPPER(TRIM(COALESCE(asin::text, ''))) AS asin_key,
+                        MIN(NULLIF(TRIM(item_head::text), ''))    AS item_head,
+                        MIN(NULLIF(TRIM(category::text), ''))     AS category,
+                        MIN(NULLIF(TRIM(sub_category::text), '')) AS sub_category,
+                        MIN(NULLIF(TRIM(brand_2::text), ''))      AS brand,
+                        MIN(NULLIF(TRIM(per_unit::text), ''))     AS per_unit,
+                        MIN(NULLIF(TRIM(asin::text), ''))         AS asin,
+                        COALESCE(SUM(sellable_on_hand_units), 0)::numeric AS soh_unit,
+                        COALESCE(SUM(soh_ltr), 0)::numeric                AS soh_ltr
+                    FROM amazon_master_inventory
+                    WHERE "year" = %s
+                      AND UPPER(TRIM("month"::text)) = %s
+                      AND inventory_date = %s
+                      AND NULLIF(TRIM(COALESCE(asin::text, '')), '') IS NOT NULL
+                    GROUP BY UPPER(TRIM(COALESCE(asin::text, '')))
+                )
+                SELECT
+                    i.asin_key,
+                    i.asin, i.item_head, i.category, i.sub_category, i.brand, i.per_unit,
+                    i.soh_unit, i.soh_ltr,
+                    COALESCE(s.units_sold, 0) AS units_sold,
+                    COALESCE(s.ltr_sold,  0) AS ltr_sold
+                FROM inventory i
+                LEFT JOIN sales s ON s.asin_key = i.asin_key
+            """, [year, month_name, month_day, year, month_name, effective_date])
+            doh_rows = _row_to_dict(cur, cur.fetchall())
+
+        # Compute DOH per ASIN: (soh_unit / drr_unit) - 2, drr = units_sold / elapsed_day
+        doh_by_asin = {}
+        for r in doh_rows:
+            row = _serialize_row(r)
+            units_sold = float(row.get('units_sold') or 0)
+            ltr_sold = float(row.get('ltr_sold') or 0)
+            soh_unit = float(row.get('soh_unit') or 0)
+            soh_ltr = float(row.get('soh_ltr') or 0)
+            drr_unit = units_sold / elapsed_day if elapsed_day > 0 else 0.0
+            drr_ltr = ltr_sold / elapsed_day if elapsed_day > 0 else 0.0
+            doh = ((soh_unit / drr_unit) - 2) if drr_unit > 0 else 0.0
+            asin_up = str(row.get('asin_key') or '').upper()
+            if not asin_up:
+                continue
+            doh_by_asin[asin_up] = {
+                'asin': row.get('asin'),
+                'item_head_live': row.get('item_head'),
+                'category_live': row.get('category'),
+                'sub_category_live': row.get('sub_category'),
+                'brand_live': row.get('brand'),
+                'per_unit_live': row.get('per_unit'),
+                'units_sold': units_sold,
+                'ltr_sold': ltr_sold,
+                'soh_unit': soh_unit,
+                'soh_ltr': soh_ltr,
+                'drr_unit': drr_unit,
+                'drr_ltr': drr_ltr,
+                'doh': doh,
+            }
+
+        # 3) Fetch available POs (FC-scoped if fc provided)
+        po_where = [
             "p.status = 'Confirmed'",
             "p.availability_status = 'AC - Accepted: In stock'",
             "p.accepted_qty > 0",
@@ -945,12 +1078,11 @@ class DOHAutoFillView(APIView):
             "p.per_liter IS NOT NULL",
             "p.per_liter > 0",
         ]
-        params = []
+        po_params = []
         if fc:
-            where.append("LOWER(p.fulfillment_center) LIKE LOWER(%s)")
-            params.append(f'%{fc}%')
-
-        where_sql = ' AND '.join(where)
+            po_where.append("LOWER(p.fulfillment_center) LIKE LOWER(%s)")
+            po_params.append(f'%{fc}%')
+        po_where_sql = ' AND '.join(po_where)
 
         with connection.cursor() as cur:
             cur.execute(f"""
@@ -960,84 +1092,92 @@ class DOHAutoFillView(APIView):
                     JOIN sp_shipments s ON s.id = si.shipment_id
                     WHERE s.status IN ('approved','dispatched','in_transit','delivered')
                       AND si.not_loaded = FALSE
-                ),
-                doh_data AS (
-                    SELECT asin, soh_unit, soh_ltr, drr_unit, drr_ltr, doh
-                    FROM sp_asin_doh_daily
-                    WHERE date = (SELECT MAX(date) FROM sp_asin_doh_daily)
                 )
                 SELECT
-                    p.po_number,
-                    p.asin,
-                    p.merchant_sku           AS internal_sku,
-                    p.sku_name               AS product_name,
-                    p.accepted_qty,
-                    p.case_pack,
-                    p.per_liter,
-                    p.total_accepted_liters,
-                    p.days_to_expiry,
-                    p.expiry_date,
-                    p.fulfillment_center     AS destination_fc,
-                    p.category,
-                    p.sub_category,
-                    p.brand,
-                    p.item_head,
-                    p.item,
-                    p.availability_status,
-                    p.po_status,
-                    p.status,
-                    COALESCE(d.soh_unit, 0)  AS soh_unit,
-                    COALESCE(d.soh_ltr,  0)  AS soh_ltr,
-                    COALESCE(d.drr_unit, 0)  AS drr_unit,
-                    COALESCE(d.drr_ltr,  0)  AS drr_ltr,
-                    COALESCE(d.doh,      0)  AS doh
+                    p.po_number, p.asin,
+                    p.merchant_sku       AS internal_sku,
+                    p.sku_name           AS product_name,
+                    p.accepted_qty, p.case_pack, p.per_liter, p.total_accepted_liters,
+                    p.days_to_expiry, p.expiry_date,
+                    p.fulfillment_center AS destination_fc,
+                    p.category, p.sub_category, p.brand,
+                    p.item_head, p.item,
+                    p.availability_status, p.po_status, p.status
                 FROM reporting."Amazon PO" p
-                LEFT JOIN doh_data d ON d.asin = p.asin
                 LEFT JOIN locked_pairs lp
-                    ON lp.asin = p.asin
-                    AND lp.po_number = UPPER(TRIM(p.po_number))
-                WHERE {where_sql}
-                  AND lp.asin IS NULL
-            """, params)
-            raw = _row_to_dict(cur, cur.fetchall())
+                    ON lp.asin = p.asin AND lp.po_number = UPPER(TRIM(p.po_number))
+                WHERE {po_where_sql} AND lp.asin IS NULL
+            """, po_params)
+            po_raw = _row_to_dict(cur, cur.fetchall())
 
-        capacity = TRUCK_CAPACITIES.get(truck_size, 15000)
-        if not raw:
-            return Response({
-                'loaded_items': [],
-                'not_loaded_items': [],
-                'load_summary': {'truck_size': truck_size, 'capacity': capacity, 'planned_liters': 0, 'load_percentage': 0},
-                'priority_breakdown': {},
-                'stats': {'total_candidates': 0, 'loaded_count': 0, 'not_loaded_count': 0},
-                'message': 'No eligible PO items found. All confirmed POs may already be dispatched or locked.',
+        # 4) Merge live DOH into each PO item, compute bucket
+        items = []
+        asins_with_po = set()
+        for r in po_raw:
+            row = _serialize_row(r)
+            asin_up = str(row.get('asin') or '').upper()
+            asins_with_po.add(asin_up)
+            live = doh_by_asin.get(asin_up, {})
+            row.update({
+                'soh_unit': live.get('soh_unit', 0),
+                'soh_ltr':  live.get('soh_ltr',  0),
+                'drr_unit': live.get('drr_unit', 0),
+                'drr_ltr':  live.get('drr_ltr',  0),
+                'doh':      live.get('doh',      0),
+                'units_sold': live.get('units_sold', 0),
+                'ltr_sold':   live.get('ltr_sold',   0),
             })
+            bucket, reason = _doh_bucket(row['doh'], row['drr_unit'])
+            row['priority_bucket'] = bucket
+            row['priority_reason'] = reason
+            items.append(row)
 
-        items = [_serialize_row(r) for r in raw]
-        for item in items:
-            bucket, score, reason = _compute_priority(
-                item['drr_unit'], item['soh_unit'], item['doh'],
-                item['days_to_expiry'], item['po_status'],
-            )
-            item['priority_bucket'] = bucket
-            item['priority_score'] = score
-            item['priority_reason'] = reason
-
-        items.sort(key=lambda x: (
-            -x['priority_score'],
+        # 5) Sort: NO-DEMAND items skipped; rest by DOH ASC (most urgent first), FEFO tiebreaker
+        actionable = [it for it in items if it['priority_bucket'] != 'NO DEMAND']
+        no_demand = [it for it in items if it['priority_bucket'] == 'NO DEMAND']
+        actionable.sort(key=lambda x: (
+            float(x.get('doh') if x.get('doh') is not None else 9999),
             x.get('days_to_expiry') or 999,
             -(float(x.get('accepted_qty') or 0)),
         ))
 
-        loaded, not_loaded, capacity, planned_liters, load_pct = _auto_plan_truck(items, truck_size)
+        # 6) Greedy pack the truck
+        loaded, not_loaded, capacity, planned_liters, load_pct = _auto_plan_truck(actionable, truck_size, capacity_override)
+        not_loaded = not_loaded + no_demand
+
+        # 7) Build urgent-no-PO list (CRITICAL or HIGH DOH but no eligible PO)
+        urgent_no_po = []
+        for asin_up, live in doh_by_asin.items():
+            if asin_up in asins_with_po:
+                continue
+            bucket, reason = _doh_bucket(live.get('doh'), live.get('drr_unit'))
+            if bucket in ('CRITICAL', 'HIGH'):
+                urgent_no_po.append({
+                    'asin': live.get('asin'),
+                    'item_head': live.get('item_head_live'),
+                    'category': live.get('category_live'),
+                    'sub_category': live.get('sub_category_live'),
+                    'brand': live.get('brand_live'),
+                    'per_unit': live.get('per_unit_live'),
+                    'soh_unit': live.get('soh_unit'),
+                    'soh_ltr': live.get('soh_ltr'),
+                    'drr_unit': live.get('drr_unit'),
+                    'drr_ltr': live.get('drr_ltr'),
+                    'doh': live.get('doh'),
+                    'priority_bucket': bucket,
+                    'priority_reason': reason,
+                })
+        urgent_no_po.sort(key=lambda x: float(x.get('doh') if x.get('doh') is not None else 9999))
 
         breakdown = {}
         for item in loaded:
-            b = item.get('priority_bucket', 'HOLD')
+            b = item.get('priority_bucket', 'LOW')
             breakdown[b] = breakdown.get(b, 0) + 1
 
         return Response({
             'loaded_items': loaded,
             'not_loaded_items': not_loaded,
+            'urgent_no_po': urgent_no_po,
             'load_summary': {
                 'truck_size': truck_size,
                 'capacity': capacity,
@@ -1046,10 +1186,20 @@ class DOHAutoFillView(APIView):
             },
             'priority_breakdown': breakdown,
             'stats': {
-                'total_candidates': len(items),
+                'total_candidates': len(actionable),
                 'loaded_count': len(loaded),
                 'not_loaded_count': len(not_loaded),
+                'urgent_no_po_count': len(urgent_no_po),
             },
+            'source': {
+                'sales': 'amazon_sec_range_master_view',
+                'inventory': 'amazon_master_inventory',
+            },
+            'effective_date': effective_date.isoformat() if effective_date else None,
+            'month': month_name,
+            'year': year,
+            'month_day': month_day,
+            'elapsed_day': elapsed_day,
         })
 
 
