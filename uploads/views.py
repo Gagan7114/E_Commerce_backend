@@ -50,6 +50,9 @@ UPLOAD_ALLOWED_TABLES = {
     "blinkit_ads",
     "amazon_ads",
     "swiggy_ads",
+    "zepto_ads",
+    "bigbasket_ads",
+    "flipkart_ads",
 }
 
 BATCH_SIZE = 50

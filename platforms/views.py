@@ -2583,70 +2583,183 @@ def amazon_price_dashboard(request, slug: str):
     })
 
 
-@api_view(["GET"])
-@permission_classes([require("platform.stats.view")])
-def amazon_ads_dashboard(request, slug: str):
-    _ensure_scope(request.user, slug)
-    if slug != "amazon":
-        raise ValidationError("Amazon Ads Dashboard is available only for Amazon.")
+# ─── Ads dashboard (unified payload for all 5 platforms) ─────────────────────
+#
+# Each platform's endpoint is a thin wrapper that calls _ads_dashboard_payload()
+# with platform-specific config. Output shape is identical across platforms so a
+# single frontend component renders all of them:
+#
+#   {
+#     "source": <view name>,
+#     "dashboard_title": <string>,
+#     "dimension_label": "Portfolios" | "Items",
+#     "summary": {<metric_key>: <number>, ...},
+#     "available_metrics": [{key, label, format, agg}, ...],
+#     "default_metric_keys": [...],
+#     "trend_axes": {"spend": {label, format}, "revenue": {label, format}},
+#     "trend_rows": [{date, spend, revenue}, ...],
+#     "breakdown_columns": [{key, label, format, agg, default_visible}, ...],
+#     "breakdown_rows": [{dimension, <metric_key>: <number>, ...}, ...],
+#     "max_date": <iso date>,
+#     "filter_options": {years, months, dates},
+#     "filters": {year, month, date},
+#   }
+#
+# metric_specs is a list of dicts with:
+#   {key, label, format, agg, expr}
+# where `expr` is a SQL aggregate expression (e.g. "COALESCE(SUM(total_cost), 0)"
+# or "CASE WHEN SUM(total_cost) > 0 THEN SUM(sales)/SUM(total_cost) ELSE 0 END").
+# Derived ratios are weighted (SUM-of-numerator / SUM-of-denominator), labelled
+# AVERAGE in the UI.
 
+def _ads_build_where(request, *, allow_date: bool = True):
+    """Parse year / month / date query params and build TWO where clauses:
+      * `where_sql` / `params`         — full filter (year + month + date)
+      * `trend_where_sql` / `trend_params` — same filter without `date`
+
+    The trend chart uses the no-date version so picking a single date doesn't
+    collapse the trend to a single point.
+
+    Returns (where_sql, params, trend_where_sql, trend_params, filters_dict).
+    """
     year_param = (request.query_params.get("year") or "").strip()
     month_param = (request.query_params.get("month") or "").strip().upper()
+    date_param = (request.query_params.get("date") or "").strip()
 
-    where_clauses: list[str] = []
-    params: list = []
+    base_clauses: list[str] = []
+    base_params: list = []
     if year_param:
         try:
-            where_clauses.append("year = %s")
-            params.append(int(year_param))
+            base_clauses.append("year = %s")
+            base_params.append(int(year_param))
         except ValueError:
             raise ValidationError(f"Invalid year value: {year_param!r}")
     if month_param:
-        where_clauses.append("month = %s")
-        params.append(month_param)
-    where_sql = ("WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
+        base_clauses.append("month = %s")
+        base_params.append(month_param)
 
+    # Trend version stops here — no date narrowing.
+    trend_clauses = list(base_clauses)
+    trend_params = list(base_params)
+    trend_where_sql = ("WHERE " + " AND ".join(trend_clauses)) if trend_clauses else ""
+
+    # Full version adds the date narrowing if present.
+    full_clauses = list(base_clauses)
+    full_params = list(base_params)
+    if allow_date and date_param:
+        if not re.match(r"^\d{4}-\d{2}-\d{2}$", date_param):
+            raise ValidationError(f"Invalid date value: {date_param!r} (expected YYYY-MM-DD)")
+        full_clauses.append("date = %s::date")
+        full_params.append(date_param)
+    where_sql = ("WHERE " + " AND ".join(full_clauses)) if full_clauses else ""
+
+    return where_sql, full_params, trend_where_sql, trend_params, {
+        "year": year_param or None,
+        "month": month_param or None,
+        "date": date_param or None,
+    }
+
+
+def _ads_dashboard_payload(
+    *,
+    source: str,
+    title: str,
+    dimension_key: str,            # e.g. "portfolio_name" or "item"
+    dimension_label: str,          # e.g. "Portfolios" or "Items"
+    dimension_unmapped: str,       # e.g. "(Unassigned)" or "(Unmapped)"
+    metric_specs: list[dict],
+    default_metric_keys: list[str],
+    default_visible_columns: list[str],
+    spend_metric: str,             # which metric drives the trend chart's spend axis
+    revenue_metric: str,           # which metric drives the trend chart's revenue axis
+    where_sql: str,
+    params: list,
+    trend_where_sql: str,
+    trend_params: list,
+    filters: dict,
+    allow_date_filter: bool = True,
+) -> dict:
+    # Comma-separated "expr AS \"key\"" for the SELECT list.
+    metric_select_sql = ", ".join(
+        f'{spec["expr"]} AS "{spec["key"]}"' for spec in metric_specs
+    )
+
+    # Inline the unmapped-placeholder literal so we don't have to manage
+    # param ordering with the GROUP BY.
+    unmapped_lit = "'" + dimension_unmapped.replace("'", "''") + "'"
+    dim_expr = f"COALESCE(NULLIF(TRIM({dimension_key}::text), ''), {unmapped_lit})"
+
+    # 1) Summary (single row of aggregates)
     summary_rows = _dict_rows(
         f"""
-        SELECT
-            COALESCE(SUM(total_cost), 0)  AS total_cost,
-            COALESCE(SUM(units_sold), 0)  AS units_sold,
-            COALESCE(SUM(sales), 0)       AS sales,
-            MAX(date)                     AS max_date
-        FROM amazon_ads_master
+        SELECT {metric_select_sql}, MAX(date) AS max_date
+        FROM {source}
         {where_sql}
         """,
         params,
     )
+    summary = dict(summary_rows[0]) if summary_rows else {s["key"]: 0 for s in metric_specs}
+    max_date = summary.pop("max_date", None)
+    if hasattr(max_date, "isoformat"):
+        max_date = max_date.isoformat()
 
-    portfolio_rows = _dict_rows(
+    # 2) Breakdown by dimension
+    spend_alias = f'"{spend_metric}"'
+    breakdown_rows = _dict_rows(
         f"""
-        SELECT
-            COALESCE(NULLIF(TRIM(portfolio_name), ''), '(Unassigned)') AS portfolio_name,
-            COALESCE(SUM(total_cost), 0)  AS total_cost,
-            COALESCE(SUM(units_sold), 0)  AS units_sold,
-            COALESCE(SUM(sales), 0)       AS sales
-        FROM amazon_ads_master
+        SELECT {dim_expr} AS dimension, {metric_select_sql}
+        FROM {source}
         {where_sql}
-        GROUP BY COALESCE(NULLIF(TRIM(portfolio_name), ''), '(Unassigned)')
-        ORDER BY sales DESC NULLS LAST
+        GROUP BY {dim_expr}
+        ORDER BY {spend_alias} DESC NULLS LAST
         """,
         params,
     )
 
+    # 3) Trend by date. Includes a value-per-metric column so the frontend can
+    # render BOTH the dual-axis spend-vs-revenue chart AND a tiny sparkline
+    # inside each KPI card without a second round-trip.
+    #
+    # IMPORTANT: trend deliberately ignores the `date` filter so picking a
+    # single date in the UI doesn't collapse the trend to a single point.
+    # Year / month filters still apply.
+    spend_spec = next(s for s in metric_specs if s["key"] == spend_metric)
+    revenue_spec = next(s for s in metric_specs if s["key"] == revenue_metric)
+    trend_metric_select_sql = ", ".join(
+        f'{spec["expr"]} AS "{spec["key"]}"' for spec in metric_specs
+    )
+    trend_rows = _dict_rows(
+        f"""
+        SELECT date,
+               {spend_spec["expr"]}   AS spend,
+               {revenue_spec["expr"]} AS revenue,
+               {trend_metric_select_sql}
+        FROM {source}
+        {trend_where_sql}
+        GROUP BY date
+        ORDER BY date
+        """,
+        trend_params,
+    )
+    for r in trend_rows:
+        if hasattr(r.get("date"), "isoformat"):
+            r["date"] = r["date"].isoformat()
+
+    # 4) Filter options — always global (ignore current filters so dropdowns
+    #    always show every available choice).
     years = [
         int(r["year"])
         for r in _dict_rows(
-            "SELECT DISTINCT year FROM amazon_ads_master WHERE year IS NOT NULL ORDER BY year DESC",
+            f"SELECT DISTINCT year FROM {source} WHERE year IS NOT NULL ORDER BY year DESC",
             [],
         )
     ]
     months = [
         r["month"]
         for r in _dict_rows(
-            """
+            f"""
             SELECT DISTINCT month, MIN(date) AS sort_date
-            FROM amazon_ads_master
+            FROM {source}
             WHERE month IS NOT NULL AND month <> ''
             GROUP BY month
             ORDER BY sort_date
@@ -2654,29 +2767,172 @@ def amazon_ads_dashboard(request, slug: str):
             [],
         )
     ]
+    dates = [
+        r["date"].isoformat() if hasattr(r["date"], "isoformat") else r["date"]
+        for r in _dict_rows(
+            f"SELECT DISTINCT date FROM {source} WHERE date IS NOT NULL ORDER BY date DESC",
+            [],
+        )
+    ]
 
-    summary = summary_rows[0] if summary_rows else {
-        "total_cost": 0, "units_sold": 0, "sales": 0, "max_date": None,
-    }
-    max_date = summary.pop("max_date", None)
-    if hasattr(max_date, "isoformat"):
-        max_date = max_date.isoformat()
-
-    return Response({
-        "source": "amazon_ads_master",
-        "dashboard_title": "AMS ADS Dashboard",
+    return {
+        "source": source,
+        "dashboard_title": title,
+        "dimension_label": dimension_label,
+        "dimension_key": dimension_key,
         "summary": summary,
+        "available_metrics": [
+            {"key": s["key"], "label": s["label"], "format": s["format"], "agg": s["agg"]}
+            for s in metric_specs
+        ],
+        "default_metric_keys": default_metric_keys,
+        "trend_axes": {
+            "spend":   {"label": spend_spec["label"],   "format": spend_spec["format"]},
+            "revenue": {"label": revenue_spec["label"], "format": revenue_spec["format"]},
+        },
+        "trend_rows": trend_rows,
+        "breakdown_columns": [
+            {
+                "key": s["key"],
+                "label": s["label"],
+                "format": s["format"],
+                "agg": s["agg"],
+                "default_visible": s["key"] in default_visible_columns,
+            }
+            for s in metric_specs
+        ],
+        "breakdown_rows": breakdown_rows,
         "max_date": max_date,
-        "portfolio_rows": portfolio_rows,
-        "filter_options": {
-            "years": years,
-            "months": months,
-        },
-        "filters": {
-            "year": year_param or None,
-            "month": month_param or None,
-        },
-    })
+        "filter_options": {"years": years, "months": months, "dates": dates},
+        "filters": filters,
+    }
+
+
+# ─── Amazon ──────────────────────────────────────────────────────────────────
+# Source: amazon_ads_master (rich column set — total_cost, sales, impressions,
+# clicks, purchases, units_sold, NTB variants, …). Dimension: portfolio_name.
+
+_AMAZON_METRIC_SPECS = [
+    {"key": "total_cost",     "label": "Total cost",   "format": "inr",     "agg": "sum",
+     "expr": "COALESCE(SUM(total_cost), 0)"},
+    {"key": "sales",          "label": "Sales",        "format": "inr",     "agg": "sum",
+     "expr": "COALESCE(SUM(sales), 0)"},
+    {"key": "roas",           "label": "ROAS",         "format": "ratio",   "agg": "avg",
+     "expr": "CASE WHEN COALESCE(SUM(total_cost), 0) > 0 "
+             "THEN COALESCE(SUM(sales), 0)::numeric / SUM(total_cost) "
+             "ELSE 0 END"},
+    {"key": "acos",           "label": "ACOS",         "format": "percent", "agg": "avg",
+     "expr": "CASE WHEN COALESCE(SUM(sales), 0) > 0 "
+             "THEN COALESCE(SUM(total_cost), 0)::numeric / SUM(sales) * 100 "
+             "ELSE 0 END"},
+    {"key": "impressions",    "label": "Impressions",  "format": "count",   "agg": "sum",
+     "expr": "COALESCE(SUM(impressions), 0)"},
+    {"key": "clicks",         "label": "Clicks",       "format": "count",   "agg": "sum",
+     "expr": "COALESCE(SUM(clicks), 0)"},
+    {"key": "ctr",            "label": "CTR",          "format": "percent", "agg": "avg",
+     "expr": "CASE WHEN COALESCE(SUM(impressions), 0) > 0 "
+             "THEN COALESCE(SUM(clicks), 0)::numeric / SUM(impressions) * 100 "
+             "ELSE 0 END"},
+    {"key": "cpc",            "label": "CPC",          "format": "inr",     "agg": "avg",
+     "expr": "CASE WHEN COALESCE(SUM(clicks), 0) > 0 "
+             "THEN COALESCE(SUM(total_cost), 0)::numeric / SUM(clicks) "
+             "ELSE 0 END"},
+    {"key": "purchases",      "label": "Purchases",    "format": "count",   "agg": "sum",
+     "expr": "COALESCE(SUM(purchases), 0)"},
+    {"key": "units_sold",     "label": "Units sold",   "format": "count",   "agg": "sum",
+     "expr": "COALESCE(SUM(units_sold), 0)"},
+    {"key": "ntb_orders",     "label": "NTB orders",   "format": "count",   "agg": "sum",
+     "expr": "COALESCE(SUM(purchases_ntb), 0)"},
+    {"key": "ntb_sales",      "label": "NTB sales",    "format": "inr",     "agg": "sum",
+     "expr": "COALESCE(SUM(sales_ntb), 0)"},
+    {"key": "ntb_orders_pct", "label": "% orders NTB", "format": "percent", "agg": "avg",
+     "expr": "CASE WHEN COALESCE(SUM(purchases), 0) > 0 "
+             "THEN COALESCE(SUM(purchases_ntb), 0)::numeric / SUM(purchases) * 100 "
+             "ELSE 0 END"},
+    {"key": "ntb_sales_pct",  "label": "% sales NTB",  "format": "percent", "agg": "avg",
+     "expr": "CASE WHEN COALESCE(SUM(sales), 0) > 0 "
+             "THEN COALESCE(SUM(sales_ntb), 0)::numeric / SUM(sales) * 100 "
+             "ELSE 0 END"},
+    {"key": "detail_page_views", "label": "Detail page views", "format": "count", "agg": "sum",
+     "expr": "COALESCE(SUM(detail_page_views), 0)"},
+]
+
+
+@api_view(["GET"])
+@permission_classes([require("platform.stats.view")])
+def amazon_ads_dashboard(request, slug: str):
+    _ensure_scope(request.user, slug)
+    if slug != "amazon":
+        raise ValidationError("Amazon Ads Dashboard is available only for Amazon.")
+
+    where_sql, params, trend_where_sql, trend_params, filters = _ads_build_where(request, allow_date=True)
+    return Response(_ads_dashboard_payload(
+        source="amazon_ads_master",
+        title="AMS ADS Dashboard",
+        dimension_key="portfolio_name",
+        dimension_label="Portfolios",
+        dimension_unmapped="(Unassigned)",
+        metric_specs=_AMAZON_METRIC_SPECS,
+        default_metric_keys=["total_cost", "sales", "roas", "acos"],
+        default_visible_columns=[
+            "impressions", "clicks", "ctr", "total_cost", "cpc",
+            "purchases", "sales", "acos", "roas",
+        ],
+        spend_metric="total_cost",
+        revenue_metric="sales",
+        where_sql=where_sql,
+        params=params,
+        trend_where_sql=trend_where_sql,
+        trend_params=trend_params,
+        filters=filters,
+    ))
+
+
+# ─── Swiggy / Zepto / BigBasket / Blinkit ────────────────────────────────────
+# Source views: swiggy_ads_master / zepto_ads_master / bigbasket_ads_master /
+# blinkit_ads_master. Dimension: item (from master_sheet via the views).
+#
+# Swiggy / Zepto / BigBasket share a single GMV column. Blinkit keeps direct
+# and indirect GMV separate. All share ad_spent, direct_qty_sold, ads_ltr_sold,
+# impressions.
+
+def _quick_commerce_metrics(*, gmv_field: str, include_indirect_qty: bool, include_indirect_gmv: bool):
+    """Build metric_specs for Swiggy/Zepto/BigBasket/Blinkit. Single source of
+    truth so the schema stays in lockstep across the four platforms."""
+    gmv_label = "GMV" if gmv_field == "gmv" else "Direct GMV"
+    specs = [
+        {"key": "ad_spent",        "label": "Ad spent",        "format": "inr",     "agg": "sum",
+         "expr": "COALESCE(SUM(ad_spent), 0)"},
+        {"key": "gmv",             "label": gmv_label,         "format": "inr",     "agg": "sum",
+         "expr": f"COALESCE(SUM({gmv_field}), 0)"},
+        {"key": "roas",            "label": "ROAS",            "format": "ratio",   "agg": "avg",
+         "expr": f"CASE WHEN COALESCE(SUM(ad_spent), 0) > 0 "
+                 f"THEN COALESCE(SUM({gmv_field}), 0)::numeric / SUM(ad_spent) "
+                 f"ELSE 0 END"},
+        {"key": "acos",            "label": "ACOS",            "format": "percent", "agg": "avg",
+         "expr": f"CASE WHEN COALESCE(SUM({gmv_field}), 0) > 0 "
+                 f"THEN COALESCE(SUM(ad_spent), 0)::numeric / SUM({gmv_field}) * 100 "
+                 f"ELSE 0 END"},
+        {"key": "impressions",     "label": "Impressions",     "format": "count",   "agg": "sum",
+         "expr": "COALESCE(SUM(impressions), 0)"},
+        {"key": "direct_qty_sold", "label": "Direct qty sold", "format": "count",   "agg": "sum",
+         "expr": "COALESCE(SUM(direct_qty_sold), 0)"},
+    ]
+    if include_indirect_qty:
+        specs.append({"key": "indirect_qty_sold", "label": "Indirect qty sold", "format": "count", "agg": "sum",
+                      "expr": "COALESCE(SUM(indirect_qty_sold), 0)"})
+    if include_indirect_gmv:
+        specs.append({"key": "indirect_gmv", "label": "Indirect GMV", "format": "inr", "agg": "sum",
+                      "expr": "COALESCE(SUM(indirect_gmv), 0)"})
+    specs.append({"key": "ads_ltr_sold", "label": "Ads litres sold", "format": "litres", "agg": "sum",
+                  "expr": "COALESCE(SUM(ads_ltr_sold), 0)"})
+    return specs
+
+
+_QC_DEFAULT_METRIC_KEYS = ["ad_spent", "gmv", "roas", "acos"]
+_QC_DEFAULT_VISIBLE_COLUMNS = [
+    "impressions", "ad_spent", "direct_qty_sold", "gmv", "ads_ltr_sold", "roas", "acos",
+]
 
 
 @api_view(["GET"])
@@ -2685,94 +2941,173 @@ def swiggy_ads_dashboard(request, slug: str):
     _ensure_scope(request.user, slug)
     if slug != "swiggy":
         raise ValidationError("Swiggy Ads Dashboard is available only for Swiggy.")
+    where_sql, params, trend_where_sql, trend_params, filters = _ads_build_where(request, allow_date=True)
+    return Response(_ads_dashboard_payload(
+        source="swiggy_ads_master",
+        title="Swiggy ADS Dashboard",
+        dimension_key="item",
+        dimension_label="Items",
+        dimension_unmapped="(Unmapped)",
+        # swiggy_ads_master uses `direct_gmv` (not `gmv`) — alias it via the gmv_field arg.
+        metric_specs=_quick_commerce_metrics(gmv_field="direct_gmv", include_indirect_qty=False, include_indirect_gmv=False),
+        default_metric_keys=_QC_DEFAULT_METRIC_KEYS,
+        default_visible_columns=_QC_DEFAULT_VISIBLE_COLUMNS,
+        spend_metric="ad_spent",
+        revenue_metric="gmv",
+        where_sql=where_sql,
+        params=params,
+        trend_where_sql=trend_where_sql,
+        trend_params=trend_params,
+        filters=filters,
+    ))
 
-    year_param = (request.query_params.get("year") or "").strip()
-    month_param = (request.query_params.get("month") or "").strip().upper()
 
-    where_clauses: list[str] = []
-    params: list = []
-    if year_param:
-        try:
-            where_clauses.append("year = %s")
-            params.append(int(year_param))
-        except ValueError:
-            raise ValidationError(f"Invalid year value: {year_param!r}")
-    if month_param:
-        where_clauses.append("month = %s")
-        params.append(month_param)
-    where_sql = ("WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
+@api_view(["GET"])
+@permission_classes([require("platform.stats.view")])
+def zepto_ads_dashboard(request, slug: str):
+    _ensure_scope(request.user, slug)
+    if slug != "zepto":
+        raise ValidationError("Zepto Ads Dashboard is available only for Zepto.")
+    where_sql, params, trend_where_sql, trend_params, filters = _ads_build_where(request, allow_date=True)
+    return Response(_ads_dashboard_payload(
+        source="zepto_ads_master",
+        title="Zepto ADS Dashboard",
+        dimension_key="item",
+        dimension_label="Items",
+        dimension_unmapped="(Unmapped)",
+        metric_specs=_quick_commerce_metrics(gmv_field="gmv", include_indirect_qty=True, include_indirect_gmv=False),
+        default_metric_keys=_QC_DEFAULT_METRIC_KEYS,
+        default_visible_columns=_QC_DEFAULT_VISIBLE_COLUMNS,
+        spend_metric="ad_spent",
+        revenue_metric="gmv",
+        where_sql=where_sql,
+        params=params,
+        trend_where_sql=trend_where_sql,
+        trend_params=trend_params,
+        filters=filters,
+    ))
 
-    summary_rows = _dict_rows(
-        f"""
-        SELECT
-            COALESCE(SUM(ad_spent),         0) AS ad_spent,
-            COALESCE(SUM(direct_qty_sold),  0) AS direct_qty_sold,
-            COALESCE(SUM(ads_ltr_sold),     0) AS ads_ltr_sold,
-            MAX(date)                          AS max_date
-        FROM swiggy_ads_master
-        {where_sql}
-        """,
-        params,
-    )
 
-    item_rows = _dict_rows(
-        f"""
-        SELECT
-            COALESCE(NULLIF(TRIM(item), ''), '(Unmapped)') AS item,
-            COALESCE(SUM(ad_spent),        0) AS ad_spent,
-            COALESCE(SUM(direct_qty_sold), 0) AS direct_qty_sold,
-            COALESCE(SUM(ads_ltr_sold),    0) AS ads_ltr_sold
-        FROM swiggy_ads_master
-        {where_sql}
-        GROUP BY COALESCE(NULLIF(TRIM(item), ''), '(Unmapped)')
-        ORDER BY ad_spent DESC NULLS LAST
-        """,
-        params,
-    )
+@api_view(["GET"])
+@permission_classes([require("platform.stats.view")])
+def bigbasket_ads_dashboard(request, slug: str):
+    _ensure_scope(request.user, slug)
+    if slug != "bigbasket":
+        raise ValidationError("BigBasket Ads Dashboard is available only for BigBasket.")
+    where_sql, params, trend_where_sql, trend_params, filters = _ads_build_where(request, allow_date=True)
+    return Response(_ads_dashboard_payload(
+        source="bigbasket_ads_master",
+        title="BigBasket ADS Dashboard",
+        dimension_key="item",
+        dimension_label="Items",
+        dimension_unmapped="(Unmapped)",
+        metric_specs=_quick_commerce_metrics(gmv_field="gmv", include_indirect_qty=True, include_indirect_gmv=False),
+        default_metric_keys=_QC_DEFAULT_METRIC_KEYS,
+        default_visible_columns=_QC_DEFAULT_VISIBLE_COLUMNS,
+        spend_metric="ad_spent",
+        revenue_metric="gmv",
+        where_sql=where_sql,
+        params=params,
+        trend_where_sql=trend_where_sql,
+        trend_params=trend_params,
+        filters=filters,
+    ))
 
-    years = [
-        int(r["year"])
-        for r in _dict_rows(
-            "SELECT DISTINCT year FROM swiggy_ads_master WHERE year IS NOT NULL ORDER BY year DESC",
-            [],
-        )
-    ]
-    months = [
-        r["month"]
-        for r in _dict_rows(
-            """
-            SELECT DISTINCT month, MIN(date) AS sort_date
-            FROM swiggy_ads_master
-            WHERE month IS NOT NULL AND month <> ''
-            GROUP BY month
-            ORDER BY sort_date
-            """,
-            [],
-        )
-    ]
 
-    summary = summary_rows[0] if summary_rows else {
-        "ad_spent": 0, "direct_qty_sold": 0, "ads_ltr_sold": 0, "max_date": None,
-    }
-    max_date = summary.pop("max_date", None)
-    if hasattr(max_date, "isoformat"):
-        max_date = max_date.isoformat()
+@api_view(["GET"])
+@permission_classes([require("platform.stats.view")])
+def blinkit_ads_dashboard(request, slug: str):
+    _ensure_scope(request.user, slug)
+    if slug != "blinkit":
+        raise ValidationError("Blinkit Ads Dashboard is available only for Blinkit.")
+    where_sql, params, trend_where_sql, trend_params, filters = _ads_build_where(request, allow_date=True)
+    return Response(_ads_dashboard_payload(
+        source="blinkit_ads_master",
+        title="Blinkit ADS Dashboard",
+        dimension_key="item",
+        dimension_label="Items",
+        dimension_unmapped="(Unmapped)",
+        # blinkit_ads_master has both `direct_gmv` and `indirect_gmv` — keep them separate.
+        metric_specs=_quick_commerce_metrics(gmv_field="direct_gmv", include_indirect_qty=True, include_indirect_gmv=True),
+        default_metric_keys=_QC_DEFAULT_METRIC_KEYS,
+        default_visible_columns=[*_QC_DEFAULT_VISIBLE_COLUMNS, "indirect_gmv", "indirect_qty_sold"],
+        spend_metric="ad_spent",
+        revenue_metric="gmv",
+        where_sql=where_sql,
+        params=params,
+        trend_where_sql=trend_where_sql,
+        trend_params=trend_params,
+        filters=filters,
+    ))
 
-    return Response({
-        "source": "swiggy_ads_master",
-        "dashboard_title": "Swiggy ADS Dashboard",
-        "summary": summary,
-        "max_date": max_date,
-        "item_rows": item_rows,
-        "filter_options": {
-            "years": years,
-            "months": months,
-        },
-        "filters": {
-            "year": year_param or None,
-            "month": month_param or None,
-        },
-    })
+
+# ─── Flipkart ────────────────────────────────────────────────────────────────
+# Source: flipkart_ads_master (= flipkart_ads + derived year/month). Dimension:
+# campaign_name — Flipkart ads are campaign-level, no SKU dimension.
+
+_FLIPKART_METRIC_SPECS = [
+    {"key": "ad_spend",        "label": "Ad spend",       "format": "inr",     "agg": "sum",
+     "expr": "COALESCE(SUM(ad_spend), 0)"},
+    {"key": "revenue",         "label": "Revenue",        "format": "inr",     "agg": "sum",
+     "expr": "COALESCE(SUM(total_revenue), 0)"},
+    {"key": "roi",             "label": "ROI",            "format": "ratio",   "agg": "avg",
+     "expr": "CASE WHEN COALESCE(SUM(ad_spend), 0) > 0 "
+             "THEN COALESCE(SUM(total_revenue), 0)::numeric / SUM(ad_spend) "
+             "ELSE 0 END"},
+    {"key": "acos",            "label": "ACOS",           "format": "percent", "agg": "avg",
+     "expr": "CASE WHEN COALESCE(SUM(total_revenue), 0) > 0 "
+             "THEN COALESCE(SUM(ad_spend), 0)::numeric / SUM(total_revenue) * 100 "
+             "ELSE 0 END"},
+    {"key": "views",           "label": "Views",          "format": "count",   "agg": "sum",
+     "expr": "COALESCE(SUM(views), 0)"},
+    {"key": "clicks",          "label": "Clicks",         "format": "count",   "agg": "sum",
+     "expr": "COALESCE(SUM(clicks), 0)"},
+    {"key": "ctr",             "label": "CTR",            "format": "percent", "agg": "avg",
+     "expr": "CASE WHEN COALESCE(SUM(views), 0) > 0 "
+             "THEN COALESCE(SUM(clicks), 0)::numeric / SUM(views) * 100 "
+             "ELSE 0 END"},
+    {"key": "cpc",             "label": "CPC",            "format": "inr",     "agg": "avg",
+     "expr": "CASE WHEN COALESCE(SUM(clicks), 0) > 0 "
+             "THEN COALESCE(SUM(ad_spend), 0)::numeric / SUM(clicks) "
+             "ELSE 0 END"},
+    {"key": "units_sold",      "label": "Units sold",     "format": "count",   "agg": "sum",
+     "expr": "COALESCE(SUM(total_converted_units), 0)"},
+    {"key": "cvr",             "label": "CVR",            "format": "percent", "agg": "avg",
+     "expr": "CASE WHEN COALESCE(SUM(clicks), 0) > 0 "
+             "THEN COALESCE(SUM(total_converted_units), 0)::numeric / SUM(clicks) * 100 "
+             "ELSE 0 END"},
+    {"key": "campaign_budget", "label": "Campaign budget","format": "inr",     "agg": "sum",
+     "expr": "COALESCE(SUM(campaign_budget), 0)"},
+]
+
+
+@api_view(["GET"])
+@permission_classes([require("platform.stats.view")])
+def flipkart_ads_dashboard(request, slug: str):
+    _ensure_scope(request.user, slug)
+    if slug != "flipkart":
+        raise ValidationError("Flipkart Ads Dashboard is available only for Flipkart.")
+    where_sql, params, trend_where_sql, trend_params, filters = _ads_build_where(request, allow_date=True)
+    return Response(_ads_dashboard_payload(
+        source="flipkart_ads_master",
+        title="Flipkart ADS Dashboard",
+        dimension_key="campaign_name",
+        dimension_label="Campaigns",
+        dimension_unmapped="(Unnamed)",
+        metric_specs=_FLIPKART_METRIC_SPECS,
+        default_metric_keys=["ad_spend", "revenue", "roi", "acos"],
+        default_visible_columns=[
+            "ad_spend", "views", "clicks", "ctr", "cpc",
+            "units_sold", "cvr", "revenue", "roi",
+        ],
+        spend_metric="ad_spend",
+        revenue_metric="revenue",
+        where_sql=where_sql,
+        params=params,
+        trend_where_sql=trend_where_sql,
+        trend_params=trend_params,
+        filters=filters,
+    ))
 
 
 # ─── Monthly Landing Rate ───
