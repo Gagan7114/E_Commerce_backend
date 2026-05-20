@@ -423,6 +423,10 @@ _PRIMARY_METRIC_SQL = """
     COALESCE(SUM(COALESCE(metric_delivered_value, 0)), 0) AS done_value,
     COALESCE(SUM(COALESCE(metric_delivered_liters, 0)), 0) AS done_ltrs,
     COALESCE(SUM(COALESCE(metric_delivered_qty, 0)), 0) AS done_qty,
+    COALESCE(SUM(COALESCE(missed_ltrs, GREATEST(
+        COALESCE(metric_order_liters, 0) - COALESCE(metric_delivered_liters, 0),
+        0
+    ))), 0) AS missed_ltrs,
     COALESCE(SUM(CASE WHEN open_close_key = 'OPEN'
         THEN GREATEST(
             COALESCE(metric_order_value, 0) - COALESCE(metric_delivered_value, 0),
@@ -1306,6 +1310,66 @@ def primary_dashboard(request, slug: str):
         metrics = _primary_metrics(summary_by_head.get(item_head))
         summary.append({"item_head": item_head, **metrics})
 
+    fill_rate_date_col = "po_dt" if mode == "PO MONTH" else "delivery_dt"
+    fill_rate_month_key = "po_month_key" if mode == "PO MONTH" else "delivery_month_key"
+    fill_rate_year_key = "po_year" if mode == "PO MONTH" else "delivery_year"
+    fill_rate_max_date = _scalar(
+        f"""
+        {primary_cte}
+        SELECT MAX({fill_rate_date_col})
+        FROM normalized
+        WHERE {fill_rate_month_key} = %s
+          AND {fill_rate_year_key} = %s
+        """,
+        [month_name, year],
+    )
+    fill_rate_cutoff = None
+    if hasattr(fill_rate_max_date, "isoformat"):
+        fill_rate_cutoff = fill_rate_max_date - timedelta(days=7)
+    fill_rate_start = (
+        date(year - 1, 12, 1)
+        if month == 1
+        else date(year, month - 1, 1)
+    )
+    fill_rate_raw = []
+    if fill_rate_cutoff and fill_rate_cutoff >= fill_rate_start:
+        fill_rate_raw = _dict_rows(
+            f"""
+            {primary_cte}
+            SELECT
+                item_head_key AS item_head,
+                {_PRIMARY_METRIC_SQL}
+            FROM normalized
+            WHERE {fill_rate_date_col} BETWEEN %s AND %s
+              AND item_head_key IN ('PREMIUM', 'COMMODITY', 'OTHER')
+            GROUP BY item_head_key
+            """,
+            [fill_rate_start, fill_rate_cutoff],
+        )
+    fill_rate_by_head = {_norm_sec_key(row.get("item_head")): row for row in fill_rate_raw}
+    fill_rate_summary = []
+    for item_head in _ZEPTO_PRIMARY_ITEM_HEADS:
+        metrics = _primary_metrics(fill_rate_by_head.get(item_head))
+        fill_rate_summary.append({"item_head": item_head, **metrics})
+    fill_rate_total = _primary_total(fill_rate_summary)
+    lead_time_days = 0.0
+    if fill_rate_cutoff and fill_rate_cutoff >= fill_rate_start:
+        lead_time_days = _num(_scalar(
+            f"""
+            {primary_cte}
+            SELECT AVG(
+                CASE
+                    WHEN NULLIF(TRIM(lead_time::text), '') ~ '^-?[0-9]+(\\.[0-9]+)?$'
+                    THEN lead_time::numeric
+                    ELSE NULL
+                END
+            )
+            FROM normalized
+            WHERE {fill_rate_date_col} BETWEEN %s AND %s
+            """,
+            [fill_rate_start, fill_rate_cutoff],
+        ))
+
     detail_raw = _dict_rows(
         f"""
         {primary_cte}
@@ -1406,6 +1470,7 @@ def primary_dashboard(request, slug: str):
                 COALESCE(metric_delivered_liters, 0) AS delivered_ltrs_row,
                 COALESCE(metric_order_qty, 0) AS order_qty_row,
                 COALESCE(metric_delivered_qty, 0) AS delivered_qty_row,
+                lead_time AS lead_time_row,
                 COALESCE(NULLIF(UPPER(TRIM(open_close::text)), ''), 'CLOSED') AS open_close_key
             FROM normalized
         ),
@@ -1426,7 +1491,10 @@ def primary_dashboard(request, slug: str):
                 COALESCE(SUM(CASE WHEN in_metric_period THEN delivered_qty_row ELSE 0 END), 0) AS delivered_qty,
                 COALESCE(SUM(CASE WHEN open_close_key = 'OPEN' AND in_pending_period
                     THEN GREATEST(order_qty_row - delivered_qty_row, 0)
-                    ELSE 0 END), 0) AS pending_qty
+                    ELSE 0 END), 0) AS pending_qty,
+                AVG(lead_time_row) FILTER (
+                    WHERE in_metric_period AND lead_time_row IS NOT NULL
+                ) AS lead_time_avg
             FROM vendor_rows
             GROUP BY 1
         )
@@ -1617,6 +1685,11 @@ def primary_dashboard(request, slug: str):
         "max_date": max_date.isoformat() if hasattr(max_date, "isoformat") else max_date,
         "summary": summary,
         "summary_total": summary_total,
+        "fill_rate_summary": fill_rate_summary,
+        "fill_rate_total": fill_rate_total,
+        "lead_time_days": lead_time_days,
+        "fill_rate_date_from": fill_rate_start.isoformat(),
+        "fill_rate_date_to": fill_rate_cutoff.isoformat() if fill_rate_cutoff else None,
         "details": details,
         "detail_total": detail_total,
         "top_items": top_items,
@@ -3645,7 +3718,11 @@ normalized AS (
     SELECT
         *,
         COALESCE(NULLIF(UPPER(TRIM(po_status::text)), ''), 'OTHER') AS status_key,
-        COALESCE(NULLIF(UPPER(TRIM(item_head::text)), ''), 'OTHER') AS item_head_key,
+        CASE
+            WHEN UPPER(TRIM(item_head::text)) = 'PREMIUM' THEN 'PREMIUM'
+            WHEN UPPER(TRIM(item_head::text)) = 'COMMODITY' THEN 'COMMODITY'
+            ELSE 'OTHER'
+        END AS item_head_key,
         COALESCE(NULLIF(UPPER(TRIM(item::text)), ''), NULLIF(UPPER(TRIM(sku_name::text)), ''), 'OTHER') AS item_key,
         COALESCE(NULLIF(UPPER(TRIM(category::text)), ''), 'OTHER') AS category_key,
         COALESCE(NULLIF(UPPER(TRIM(sub_category::text)), ''), 'OTHER') AS sub_category_key,
@@ -3669,7 +3746,8 @@ normalized AS (
             ELSE UPPER(TRIM(TO_CHAR(effective_per_liter, 'FM999999990.###'))) || ' LTR'
         END AS per_ltr_key,
         COALESCE(
-            total_order_liters,
+            NULLIF(order_ltrs_cl, 0),
+            NULLIF(total_order_liters, 0),
             CASE
                 WHEN order_qty IS NOT NULL
                     THEN COALESCE(order_qty, 0) * COALESCE(effective_per_liter, 0)
@@ -3678,7 +3756,8 @@ normalized AS (
             0
         ) AS metric_order_liters,
         COALESCE(
-            total_delivered_liters,
+            NULLIF(filled_ltrs, 0),
+            NULLIF(total_delivered_liters, 0),
             CASE
                 WHEN delivered_qty IS NOT NULL
                     THEN COALESCE(delivered_qty, 0) * COALESCE(effective_per_liter, 0)
@@ -3687,7 +3766,7 @@ normalized AS (
             0
         ) AS metric_delivered_liters,
         COALESCE(
-            total_order_amt_exclusive,
+            NULLIF(total_order_amt_exclusive, 0),
             CASE
                 WHEN order_qty IS NOT NULL AND basic_rate IS NOT NULL
                     THEN COALESCE(order_qty, 0) * COALESCE(basic_rate, 0)
@@ -3696,7 +3775,7 @@ normalized AS (
             0
         ) AS metric_order_value,
         COALESCE(
-            total_delivered_amt_exclusive,
+            NULLIF(total_delivered_amt_exclusive, 0),
             CASE
                 WHEN delivered_qty IS NOT NULL AND basic_rate IS NOT NULL
                     THEN COALESCE(delivered_qty, 0) * COALESCE(basic_rate, 0)
@@ -3798,6 +3877,7 @@ def _primary_zero_metrics() -> dict:
         "done_value": 0.0,
         "done_ltrs": 0.0,
         "done_qty": 0.0,
+        "missed_ltrs": 0.0,
         "pending_value": 0.0,
         "pending_ltrs": 0.0,
         "pending_qty": 0.0,
@@ -3820,6 +3900,7 @@ def _primary_metrics(row: dict | None) -> dict:
             "done_value",
             "done_ltrs",
             "done_qty",
+            "missed_ltrs",
             "pending_value",
             "pending_ltrs",
             "pending_qty",

@@ -22,6 +22,7 @@ REPORT_VIEW_CATALOG = {
     },
     "prim_master_po": {
         "date_column": "po_date",
+        "date_expr": "public._pm_parse_date(\"po_date\")",
         "format_column": "format",
         "max_rows": 50000,
     },
@@ -115,7 +116,7 @@ def report_raw(request):
     date_from = (request.query_params.get("date_from") or "").strip()
     date_to = (request.query_params.get("date_to") or "").strip()
     if catalog["date_column"]:
-        date_expr = f'("{catalog["date_column"]}")::date'
+        date_expr = catalog.get("date_expr") or f'("{catalog["date_column"]}")::date'
         if date_from:
             if not _DATE.match(date_from):
                 raise ValidationError("`date_from` must be YYYY-MM-DD.")

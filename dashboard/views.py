@@ -415,14 +415,19 @@ def table_data(request, table_name: str):
 
     qt = _quoted(table_name)
 
+    # Snapshot of WHERE state before the max-date self-filter is applied.
+    # Used both for the max-date subquery and for the "Latest Date" pill so
+    # they reflect the user's other filters (year/month/date/search/expiry)
+    # instead of the unfiltered global max.
+    filter_where = list(where)
+    filter_params = list(params)
+
     if max_date and date_expr:
-        base_where = list(where)
-        base_params = list(params)
-        base_where_sql = f" WHERE {' AND '.join(base_where)}" if base_where else ""
+        base_where_sql = f" WHERE {' AND '.join(filter_where)}" if filter_where else ""
         where.append(
             f"{date_expr} = (SELECT MAX({_date_expr(dc)}) FROM {qt}{base_where_sql})"
         )
-        params.extend(base_params)
+        params.extend(filter_params)
 
     where_sql = f" WHERE {' AND '.join(where)}" if where else ""
     order_sql = ""
@@ -443,7 +448,13 @@ def table_data(request, table_name: str):
         with connection.cursor() as cur:
             latest_date = None
             if date_expr:
-                cur.execute(f"SELECT MAX({date_expr}) FROM {qt}")
+                pill_where_sql = (
+                    f" WHERE {' AND '.join(filter_where)}" if filter_where else ""
+                )
+                cur.execute(
+                    f"SELECT MAX({date_expr}) FROM {qt}{pill_where_sql}",
+                    filter_params,
+                )
                 latest_date = cur.fetchone()[0]
             cur.execute(f"SELECT COUNT(*) FROM {qt}{where_sql}", params)
             total = int(cur.fetchone()[0] or 0)
