@@ -3093,6 +3093,144 @@ def flipkart_ads_dashboard(request, slug: str):
     ))
 
 
+# ─── Brand Fund Dashboards (Blinkit / Swiggy / Zepto) ────────────────────────
+# Source views: blinkit_brandfund_master / swiggy_brandfund_master /
+# zepto_brandfund_master. All three share the same column shape:
+#   date, sku_id, sku_name, format, brand_fund_spent,
+#   category, sub_category, item, item_head, month, year, month_day
+#
+# Payload shape (one shell renders all three):
+#   {
+#     "source": <view name>,
+#     "dashboard_title": <string>,
+#     "summary": {"total_brand_fund": <number>},
+#     "item_rows":        [{dimension, total}, ...],   # grouped by `item`
+#     "subcategory_rows": [{dimension, total}, ...],   # grouped by `sub_category`
+#     "max_date": <iso date>,
+#     "filter_options": {years, months, dates},
+#     "filters": {year, month, date},
+#   }
+
+def _brandfund_dashboard_payload(*, source: str, title: str, request) -> dict:
+    where_sql, params, _trend_where, _trend_params, filters = _ads_build_where(
+        request, allow_date=True,
+    )
+
+    # 1) Summary — single number, plus max_date for the header chip.
+    summary_rows = _dict_rows(
+        f"""
+        SELECT COALESCE(SUM(brand_fund_spent), 0) AS total_brand_fund,
+               MAX(date) AS max_date
+        FROM {source}
+        {where_sql}
+        """,
+        params,
+    )
+    summary = dict(summary_rows[0]) if summary_rows else {"total_brand_fund": 0, "max_date": None}
+    max_date = summary.pop("max_date", None)
+    if hasattr(max_date, "isoformat"):
+        max_date = max_date.isoformat()
+
+    # 2) Breakdown rows for each grouping. Unmapped/null dimensions collapse
+    #    into a single "(Unmapped)" bucket so the row count stays meaningful.
+    def _grouped(dim_col: str):
+        dim_expr = f"COALESCE(NULLIF(TRIM({dim_col}::text), ''), '(Unmapped)')"
+        return _dict_rows(
+            f"""
+            SELECT {dim_expr} AS dimension,
+                   COALESCE(SUM(brand_fund_spent), 0) AS total
+            FROM {source}
+            {where_sql}
+            GROUP BY {dim_expr}
+            ORDER BY total DESC NULLS LAST
+            """,
+            params,
+        )
+
+    item_rows = _grouped("item")
+    subcategory_rows = _grouped("sub_category")
+
+    # 3) Filter options — global (ignore current filters so dropdowns always
+    #    show every available choice).
+    years = [
+        int(r["year"])
+        for r in _dict_rows(
+            f"SELECT DISTINCT year FROM {source} WHERE year IS NOT NULL ORDER BY year DESC",
+            [],
+        )
+    ]
+    months = [
+        r["month"]
+        for r in _dict_rows(
+            f"""
+            SELECT DISTINCT month, MIN(date) AS sort_date
+            FROM {source}
+            WHERE month IS NOT NULL AND month <> ''
+            GROUP BY month
+            ORDER BY sort_date
+            """,
+            [],
+        )
+    ]
+    dates = [
+        r["date"].isoformat() if hasattr(r["date"], "isoformat") else r["date"]
+        for r in _dict_rows(
+            f"SELECT DISTINCT date FROM {source} WHERE date IS NOT NULL ORDER BY date DESC",
+            [],
+        )
+    ]
+
+    return {
+        "source": source,
+        "dashboard_title": title,
+        "summary": summary,
+        "item_rows": item_rows,
+        "subcategory_rows": subcategory_rows,
+        "max_date": max_date,
+        "filter_options": {"years": years, "months": months, "dates": dates},
+        "filters": filters,
+    }
+
+
+@api_view(["GET"])
+@permission_classes([require("platform.stats.view")])
+def blinkit_brandfund_dashboard(request, slug: str):
+    _ensure_scope(request.user, slug)
+    if slug != "blinkit":
+        raise ValidationError("Blinkit Brand Fund Dashboard is available only for Blinkit.")
+    return Response(_brandfund_dashboard_payload(
+        source="blinkit_brandfund_master",
+        title="Blinkit Brand Fund Dashboard",
+        request=request,
+    ))
+
+
+@api_view(["GET"])
+@permission_classes([require("platform.stats.view")])
+def swiggy_brandfund_dashboard(request, slug: str):
+    _ensure_scope(request.user, slug)
+    if slug != "swiggy":
+        raise ValidationError("Swiggy Brand Fund Dashboard is available only for Swiggy.")
+    return Response(_brandfund_dashboard_payload(
+        source="swiggy_brandfund_master",
+        title="Swiggy Brand Fund Dashboard",
+        request=request,
+    ))
+
+
+@api_view(["GET"])
+@permission_classes([require("platform.stats.view")])
+def zepto_brandfund_dashboard(request, slug: str):
+    _ensure_scope(request.user, slug)
+    if slug != "zepto":
+        raise ValidationError("Zepto Brand Fund Dashboard is available only for Zepto.")
+    return Response(_brandfund_dashboard_payload(
+        source="zepto_brandfund_master",
+        title="Zepto Brand Fund Dashboard",
+        request=request,
+    ))
+
+
 # ─── Monthly Landing Rate ───
 # Single shared table `monthly_landing_rate` with columns:
 #   sku_code, sku_name, landing_rate, basic_rate, format, month

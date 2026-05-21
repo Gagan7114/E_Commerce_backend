@@ -57,6 +57,8 @@ UPLOAD_ALLOWED_TABLES = {
     "zepto_brandfund",
     "swiggy_brandfund",
     "blinkit_brandfund",
+    # Coupons (Amazon)
+    "amazon_coupon",
 }
 
 BATCH_SIZE = 50
@@ -627,23 +629,26 @@ def master_sheet_delete(request):
 
 # ─── ads_master_bs ───
 # Manual mapping table: (month, campaign_id, sku_id, item, format).
-# Unique key = (month, campaign_id, sku_id).
+# Unique key = (month, campaign_id, sku_id). The frontend exposes this as
+# "ADS Master" (without the historical "_bs" suffix), but the DB table
+# itself keeps the original name to avoid breaking the swiggy_ads_master
+# and blinkit_ads_master views that JOIN to it.
 
-ADS_MASTER_BS_COLUMNS = ["month", "campaign_id", "sku_id", "item", "format"]
-ADS_MASTER_BS_KEY_COLUMNS = ["month", "campaign_id", "sku_id"]
-ADS_MASTER_BS_SEARCH_COLUMNS = ["month", "campaign_id", "sku_id", "item", "format"]
+ADS_MASTER_COLUMNS = ["month", "campaign_id", "sku_id", "item", "format"]
+ADS_MASTER_KEY_COLUMNS = ["month", "campaign_id", "sku_id"]
+ADS_MASTER_SEARCH_COLUMNS = ["month", "campaign_id", "sku_id", "item", "format"]
 
 
-def _ads_master_bs_select_columns() -> str:
-    quoted = ", ".join(_quote_ident(col) for col in ADS_MASTER_BS_COLUMNS)
+def _ads_master_select_columns() -> str:
+    quoted = ", ".join(_quote_ident(col) for col in ADS_MASTER_COLUMNS)
     return f'ctid::text AS "row_id", {quoted}'
 
 
-def _ads_master_bs_payload(data) -> dict:
+def _ads_master_payload(data) -> dict:
     if not isinstance(data, dict):
         raise ValueError("Row data is required.")
     row = {}
-    for column in ADS_MASTER_BS_COLUMNS:
+    for column in ADS_MASTER_COLUMNS:
         if column not in data:
             continue
         value = data.get(column)
@@ -657,7 +662,7 @@ def _ads_master_bs_payload(data) -> dict:
 
 @api_view(["GET"])
 @permission_classes([require("upload.use")])
-def ads_master_bs_list(request):
+def ads_master_list(request):
     query = str(request.query_params.get("search") or "").strip()
     fmt = str(
         request.query_params.get("format_name")
@@ -678,11 +683,11 @@ def ads_master_bs_list(request):
             "("
             + " OR ".join(
                 f"CAST({_quote_ident(col)} AS text) ILIKE %s"
-                for col in ADS_MASTER_BS_SEARCH_COLUMNS
+                for col in ADS_MASTER_SEARCH_COLUMNS
             )
             + ")"
         )
-        params.extend([like] * len(ADS_MASTER_BS_SEARCH_COLUMNS))
+        params.extend([like] * len(ADS_MASTER_SEARCH_COLUMNS))
     if fmt:
         where.append("UPPER(TRIM(format::text)) = UPPER(TRIM(%s))")
         params.append(fmt)
@@ -696,7 +701,7 @@ def ads_master_bs_list(request):
 
         cur.execute(
             f"""
-            SELECT {_ads_master_bs_select_columns()}
+            SELECT {_ads_master_select_columns()}
             FROM ads_master_bs
             {where_sql}
             ORDER BY COALESCE(month, ''), COALESCE(campaign_id, ''), COALESCE(sku_id, '')
@@ -708,7 +713,7 @@ def ads_master_bs_list(request):
         rows = [dict(zip(cols, row)) for row in cur.fetchall()]
 
     return Response({
-        "columns": ADS_MASTER_BS_COLUMNS,
+        "columns": ADS_MASTER_COLUMNS,
         "rows": rows,
         "total": total,
         "page": page,
@@ -718,13 +723,13 @@ def ads_master_bs_list(request):
 
 @api_view(["POST"])
 @permission_classes([require("upload.use")])
-def ads_master_bs_create(request):
+def ads_master_create(request):
     try:
-        row = _ads_master_bs_payload(request.data or {})
+        row = _ads_master_payload(request.data or {})
     except ValueError as exc:
         return Response({"detail": str(exc)}, status=400)
 
-    missing = [col for col in ADS_MASTER_BS_KEY_COLUMNS if not row.get(col)]
+    missing = [col for col in ADS_MASTER_KEY_COLUMNS if not row.get(col)]
     if missing:
         return Response(
             {"detail": f"Required fields missing: {', '.join(missing)}."},
@@ -734,10 +739,10 @@ def ads_master_bs_create(request):
     # Normalize key columns to NOT NULL TEXT (Postgres treats NULL as distinct
     # in unique indexes, so blanks must be empty strings, not NULL).
     insert_row = dict(row)
-    for col in ADS_MASTER_BS_KEY_COLUMNS:
+    for col in ADS_MASTER_KEY_COLUMNS:
         insert_row[col] = insert_row.get(col) or ""
 
-    columns = [col for col in ADS_MASTER_BS_COLUMNS if col in insert_row]
+    columns = [col for col in ADS_MASTER_COLUMNS if col in insert_row]
     placeholders = ", ".join(["%s"] * len(columns))
     values = [insert_row[col] for col in columns]
 
@@ -747,7 +752,7 @@ def ads_master_bs_create(request):
                 f"""
                 INSERT INTO ads_master_bs ({", ".join(_quote_ident(col) for col in columns)})
                 VALUES ({placeholders})
-                RETURNING {_ads_master_bs_select_columns()}
+                RETURNING {_ads_master_select_columns()}
                 """,
                 values,
             )
@@ -767,19 +772,19 @@ def ads_master_bs_create(request):
 
 @api_view(["POST"])
 @permission_classes([require("upload.use")])
-def ads_master_bs_update(request):
+def ads_master_update(request):
     row_id = str((request.data or {}).get("row_id") or "").strip()
     if not row_id:
         return Response({"detail": "row_id is required."}, status=400)
     try:
-        row = _ads_master_bs_payload((request.data or {}).get("row") or {})
+        row = _ads_master_payload((request.data or {}).get("row") or {})
     except ValueError as exc:
         return Response({"detail": str(exc)}, status=400)
     if not row:
         return Response({"detail": "No fields to update."}, status=400)
 
     # Empty key columns must remain '' (NOT NULL) to keep the unique index sane.
-    for col in ADS_MASTER_BS_KEY_COLUMNS:
+    for col in ADS_MASTER_KEY_COLUMNS:
         if col in row and row[col] is None:
             row[col] = ""
 
@@ -793,7 +798,7 @@ def ads_master_bs_update(request):
                 UPDATE ads_master_bs
                 SET {assignments}, updated_at = NOW()
                 WHERE ctid = %s::tid
-                RETURNING {_ads_master_bs_select_columns()}
+                RETURNING {_ads_master_select_columns()}
                 """,
                 [*values, row_id],
             )
@@ -815,7 +820,7 @@ def ads_master_bs_update(request):
 
 @api_view(["POST"])
 @permission_classes([require("upload.use")])
-def ads_master_bs_delete(request):
+def ads_master_delete(request):
     row_id = str((request.data or {}).get("row_id") or "").strip()
     if not row_id:
         return Response({"detail": "row_id is required."}, status=400)
@@ -839,6 +844,263 @@ def ads_master_bs_delete(request):
             "campaign_id": deleted[1],
             "sku_id": deleted[2],
         },
+    })
+
+
+# ─── ads_master_bs bulk upload (paste/CSV) ───
+# Mirrors master_sheet bulk upload: dedupe key is (month, campaign_id, sku_id);
+# matching keys update in place, new keys insert.
+
+ADS_MASTER_HEADER_ALIASES = {
+    "month_name": "month",
+    "campaign": "campaign_id",
+    "campaignid": "campaign_id",
+    "campaign_code": "campaign_id",
+    "sku": "sku_id",
+    "skuid": "sku_id",
+    "sku_code": "sku_id",
+    "format_name": "format",
+    "platform": "format",
+}
+
+
+def _ads_master_key(month, campaign_id, sku_id) -> str:
+    return "|".join([
+        str(month or "").strip().upper(),
+        str(campaign_id or "").strip().upper(),
+        str(sku_id or "").strip().upper(),
+    ])
+
+
+def _ads_master_existing_by_key(keys: list[str]) -> dict[str, dict]:
+    seen = sorted({k for k in keys if k and k != "||"})
+    if not seen:
+        return {}
+    with connection.cursor() as cur:
+        cur.execute(
+            f"""
+            SELECT {_ads_master_select_columns()},
+                   UPPER(TRIM(month::text)) || '|'
+                || UPPER(TRIM(campaign_id::text)) || '|'
+                || UPPER(TRIM(sku_id::text)) AS norm_key
+            FROM ads_master_bs
+            WHERE (UPPER(TRIM(month::text)) || '|'
+                || UPPER(TRIM(campaign_id::text)) || '|'
+                || UPPER(TRIM(sku_id::text))) = ANY(%s)
+            """,
+            [seen],
+        )
+        cols = [c[0] for c in cur.description]
+        out = {}
+        for values in cur.fetchall():
+            row = dict(zip(cols, values))
+            key = row.pop("norm_key", "")
+            out[key] = row
+    return out
+
+
+def _ads_master_bulk_rows(data) -> list[dict]:
+    rows = (data or {}).get("rows") if isinstance(data, dict) else None
+    if not isinstance(rows, list):
+        raise ValueError("rows must be a list.")
+
+    parsed = []
+    for index, raw in enumerate(rows, start=1):
+        if not isinstance(raw, dict):
+            parsed.append({
+                "index": index,
+                "key": "",
+                "row": {},
+                "valid": False,
+                "reason": "Row must be an object.",
+            })
+            continue
+
+        try:
+            payload = _ads_master_payload(raw)
+        except ValueError as exc:
+            parsed.append({
+                "index": index,
+                "key": "",
+                "row": raw,
+                "valid": False,
+                "reason": str(exc),
+            })
+            continue
+
+        missing = [col for col in ADS_MASTER_KEY_COLUMNS if not (payload.get(col) or "").strip()]
+        if missing:
+            parsed.append({
+                "index": index,
+                "key": "",
+                "row": payload,
+                "valid": False,
+                "reason": f"Required fields missing: {', '.join(missing)}.",
+            })
+            continue
+
+        # Normalize key columns to empty string (NOT NULL); unique index would
+        # otherwise treat NULL as distinct.
+        for col in ADS_MASTER_KEY_COLUMNS:
+            payload[col] = (payload.get(col) or "").strip()
+
+        parsed.append({
+            "index": index,
+            "key": _ads_master_key(payload["month"], payload["campaign_id"], payload["sku_id"]),
+            "row": payload,
+            "valid": True,
+            "reason": "",
+        })
+    return parsed
+
+
+def _ads_master_bulk_preview_payload(parsed_rows: list[dict]) -> dict:
+    existing = _ads_master_existing_by_key([r["key"] for r in parsed_rows if r.get("valid")])
+    seen_new: set[str] = set()
+    preview_rows = []
+    summary = {"insert": 0, "update": 0, "invalid": 0, "total": len(parsed_rows)}
+
+    for row in parsed_rows:
+        if not row.get("valid"):
+            summary["invalid"] += 1
+            preview_rows.append({
+                "index": row["index"],
+                "action": "invalid",
+                "key": row.get("key", ""),
+                "reason": row.get("reason", "Invalid row."),
+                "row": row.get("row", {}),
+            })
+            continue
+
+        key = row["key"]
+        action = "update" if key in existing or key in seen_new else "insert"
+        if action == "insert":
+            seen_new.add(key)
+        summary[action] += 1
+        preview_rows.append({
+            "index": row["index"],
+            "action": action,
+            "key": key,
+            "reason": "",
+            "row": row["row"],
+            "existing": existing.get(key),
+        })
+
+    return {
+        "columns": ADS_MASTER_COLUMNS,
+        "summary": summary,
+        "rows": preview_rows,
+    }
+
+
+@api_view(["POST"])
+@permission_classes([require("upload.use")])
+def ads_master_bulk_preview(request):
+    try:
+        parsed_rows = _ads_master_bulk_rows(request.data or {})
+    except ValueError as exc:
+        return Response({"detail": str(exc)}, status=400)
+    try:
+        return Response(_ads_master_bulk_preview_payload(parsed_rows))
+    except Exception as exc:  # noqa: BLE001
+        return Response({"detail": f"Preview failed: {exc}"}, status=400)
+
+
+@api_view(["POST"])
+@permission_classes([require("upload.use")])
+def ads_master_bulk_upsert(request):
+    try:
+        parsed_rows = _ads_master_bulk_rows(request.data or {})
+    except ValueError as exc:
+        return Response({"detail": str(exc)}, status=400)
+
+    try:
+        existing = _ads_master_existing_by_key([r["key"] for r in parsed_rows if r.get("valid")])
+    except Exception as exc:  # noqa: BLE001
+        return Response({"detail": f"Could not read ads_master_bs: {exc}"}, status=400)
+
+    result_rows = []
+    summary = {"inserted": 0, "updated": 0, "invalid": 0, "total": len(parsed_rows)}
+
+    with transaction.atomic(), connection.cursor() as cur:
+        for parsed in parsed_rows:
+            if not parsed.get("valid"):
+                summary["invalid"] += 1
+                result_rows.append({
+                    "index": parsed["index"],
+                    "action": "invalid",
+                    "key": parsed.get("key", ""),
+                    "reason": parsed.get("reason", "Invalid row."),
+                    "row": parsed.get("row", {}),
+                })
+                continue
+
+            key = parsed["key"]
+            row = parsed["row"]
+            existing_row = existing.get(key)
+
+            if existing_row:
+                # Update non-key columns only (changing a key column would be
+                # an insert under a new key, not an update).
+                update_columns = [
+                    col for col in ADS_MASTER_COLUMNS
+                    if col not in ADS_MASTER_KEY_COLUMNS and col in row
+                ]
+                if update_columns:
+                    assignments = ", ".join(f"{_quote_ident(col)} = %s" for col in update_columns)
+                    values = [row[col] for col in update_columns]
+                    cur.execute(
+                        f"""
+                        UPDATE ads_master_bs
+                        SET {assignments}, updated_at = NOW()
+                        WHERE ctid = %s::tid
+                        RETURNING {_ads_master_select_columns()}
+                        """,
+                        [*values, existing_row["row_id"]],
+                    )
+                    cols = [c[0] for c in cur.description]
+                    saved_row = dict(zip(cols, cur.fetchone()))
+                else:
+                    saved_row = existing_row
+
+                existing[key] = saved_row
+                summary["updated"] += 1
+                result_rows.append({
+                    "index": parsed["index"],
+                    "action": "update",
+                    "key": key,
+                    "reason": "",
+                    "row": saved_row,
+                })
+                continue
+
+            insert_columns = [col for col in ADS_MASTER_COLUMNS if col in row]
+            placeholders = ", ".join(["%s"] * len(insert_columns))
+            cur.execute(
+                f"""
+                INSERT INTO ads_master_bs ({", ".join(_quote_ident(col) for col in insert_columns)})
+                VALUES ({placeholders})
+                RETURNING {_ads_master_select_columns()}
+                """,
+                [row[col] for col in insert_columns],
+            )
+            cols = [c[0] for c in cur.description]
+            saved_row = dict(zip(cols, cur.fetchone()))
+            existing[key] = saved_row
+            summary["inserted"] += 1
+            result_rows.append({
+                "index": parsed["index"],
+                "action": "insert",
+                "key": key,
+                "reason": "",
+                "row": saved_row,
+            })
+
+    return Response({
+        "ok": True,
+        "columns": ADS_MASTER_COLUMNS,
+        "summary": summary,
+        "rows": result_rows,
     })
 
 
