@@ -2883,6 +2883,17 @@ def _quick_commerce_metrics(*, gmv_field: str, include_indirect_qty: bool, inclu
     """Build metric_specs for Swiggy/Zepto/BigBasket/Blinkit. Single source of
     truth so the schema stays in lockstep across the four platforms."""
     gmv_label = "GMV" if gmv_field == "gmv" else "Direct GMV"
+    # When indirect GMV is tracked separately (Blinkit only), the ROAS
+    # numerator sums direct + indirect — both are attributed revenue and
+    # excluding the halo understates ad efficiency. ACOS still uses
+    # `gmv_field` alone (= direct), so ACOS is no longer the exact inverse
+    # of ROAS for Blinkit — this is intentional. The other QC platforms
+    # don't expose an indirect column, so their ROAS is unchanged.
+    roas_numerator = (
+        f"(COALESCE(SUM({gmv_field}), 0) + COALESCE(SUM(indirect_gmv), 0))"
+        if include_indirect_gmv
+        else f"COALESCE(SUM({gmv_field}), 0)"
+    )
     specs = [
         {"key": "ad_spent",        "label": "Ad spent",        "format": "inr",     "agg": "sum",
          "expr": "COALESCE(SUM(ad_spent), 0)"},
@@ -2890,7 +2901,7 @@ def _quick_commerce_metrics(*, gmv_field: str, include_indirect_qty: bool, inclu
          "expr": f"COALESCE(SUM({gmv_field}), 0)"},
         {"key": "roas",            "label": "ROAS",            "format": "ratio",   "agg": "avg",
          "expr": f"CASE WHEN COALESCE(SUM(ad_spent), 0) > 0 "
-                 f"THEN COALESCE(SUM({gmv_field}), 0)::numeric / SUM(ad_spent) "
+                 f"THEN {roas_numerator}::numeric / SUM(ad_spent) "
                  f"ELSE 0 END"},
         {"key": "acos",            "label": "ACOS",            "format": "percent", "agg": "avg",
          "expr": f"CASE WHEN COALESCE(SUM({gmv_field}), 0) > 0 "

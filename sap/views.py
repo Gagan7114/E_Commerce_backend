@@ -349,6 +349,102 @@ def items(request):
     return Response({"data": data, "count": total, "page": page, "page_size": page_size})
 
 
+# ─── /warehouses ───
+def _warehouse_columns() -> str:
+    return """
+            T0."WhsCode", T0."WhsName", T0."Inactive",
+            T0."Location", T0."DropShip", T0."BinActivat", T0."Locked",
+            T0."Street", T0."Block", T0."StreetNo",
+            T0."City", T0."County", T0."State", T0."Country", T0."ZipCode",
+            T0."Address2", T0."Address3",
+            T0."GlblLocNum", T0."BPLid",
+            T0."U_PriceList", T0."U_Owner",
+            T0."createDate" AS "CreateDate",
+            T0."updateDate" AS "UpdateDate"
+    """
+
+
+def _warehouse_inactive_filter(raw: str) -> str:
+    value = raw.strip().lower()
+    if value in {"y", "yes", "true", "1"}:
+        return "Y"
+    if value in {"n", "no", "false", "0"}:
+        return "N"
+    return ""
+
+
+@api_view(["GET"])
+@permission_classes([require("sap.view")])
+def warehouses(request):
+    search = request.query_params.get("search", "").strip()
+    inactive = _warehouse_inactive_filter(request.query_params.get("inactive", ""))
+    page, page_size = _page(request)
+    offset = page * page_size
+
+    where = "WHERE 1=1"
+    params: list = []
+    if inactive:
+        where += ' AND T0."Inactive" = ?'
+        params.append(inactive)
+    if search:
+        where += (
+            ' AND (T0."WhsCode" LIKE ? OR T0."WhsName" LIKE ?'
+            ' OR T0."City" LIKE ? OR T0."State" LIKE ? OR T0."Country" LIKE ?)'
+        )
+        s = f"%{search}%"
+        params.extend([s, s, s, s, s])
+
+    sql = f"""
+        SELECT
+            {_warehouse_columns()}
+        FROM OWHS T0
+        {where}
+        ORDER BY T0."WhsCode"
+        LIMIT {page_size} OFFSET {offset}
+    """
+    data = _run(sql, params or None)
+    total = _count_of(f'SELECT COUNT(*) AS "total" FROM OWHS T0 {where}', params or None)
+    return Response({"data": data, "count": total, "page": page, "page_size": page_size})
+
+
+# ─── /warehouses/{whs_code} ───
+@api_view(["GET"])
+@permission_classes([require("sap.view")])
+def warehouse_detail(request, whs_code: str):
+    warehouse_sql = f"""
+        SELECT
+            {_warehouse_columns()}
+        FROM OWHS T0
+        WHERE T0."WhsCode" = ?
+    """
+    warehouse = _run(warehouse_sql, (whs_code,))
+    if not warehouse:
+        raise NotFound("Warehouse not found")
+
+    stock_summary_sql = """
+        SELECT
+            COUNT(*) AS "itemWarehouseRows",
+            COUNT(DISTINCT CASE
+                WHEN T0."OnHand" > 0 THEN T0."ItemCode"
+            END) AS "itemsWithOnHand",
+            COUNT(DISTINCT CASE
+                WHEN T0."OnHand" <> 0 OR T0."IsCommited" <> 0 OR T0."OnOrder" <> 0
+                THEN T0."ItemCode"
+            END) AS "activeStockItems",
+            SUM(T0."OnHand") AS "OnHand",
+            SUM(T0."IsCommited") AS "Committed",
+            SUM(T0."OnOrder") AS "OnOrder",
+            SUM(T0."OnHand" - T0."IsCommited") AS "Available"
+        FROM OITW T0
+        WHERE T0."WhsCode" = ?
+    """
+    stock_summary = _run(stock_summary_sql, (whs_code,))
+    return Response({
+        "warehouse": warehouse[0],
+        "stock_summary": stock_summary[0] if stock_summary else None,
+    })
+
+
 # ─── /stock-by-warehouse ───
 @api_view(["GET"])
 @permission_classes([require("sap.view")])
@@ -372,6 +468,188 @@ def stock_by_warehouse(request):
     """
     data = _run(sql, params or None)
     return Response({"data": data})
+
+
+# ─── /inventory-overview ───
+# Item × Warehouse drill-down grid + KPI summary + filter option lists.
+# Joins OITM ↔ OITW ↔ OWHS ↔ OITB (for item group name). Filters: warehouse,
+# item group, validFor status, stock state (in/out/low), free-text search.
+
+def _split_csv(raw: str) -> list[str]:
+    return [piece.strip() for piece in (raw or "").split(",") if piece.strip()]
+
+
+@api_view(["GET"])
+@permission_classes([require("sap.view")])
+def inventory_overview(request):
+    page, page_size = _page(request)
+    offset = page * page_size
+
+    search = (request.query_params.get("search") or "").strip()
+    status = (request.query_params.get("status") or "").strip().upper()
+    stock_state = (request.query_params.get("stock_state") or "").strip().lower()
+    warehouse_codes = _split_csv(request.query_params.get("warehouse", ""))
+    group_codes_raw = _split_csv(request.query_params.get("group", ""))
+    # Item group codes are integers in OITM; drop anything non-numeric to keep
+    # the IN-clause safe and to avoid a HANA cast error.
+    group_codes: list[int] = []
+    for piece in group_codes_raw:
+        try:
+            group_codes.append(int(piece))
+        except ValueError:
+            pass
+
+    where_clauses: list[str] = ["1=1"]
+    params: list = []
+
+    if search:
+        where_clauses.append(
+            '(T0."ItemCode" LIKE ? OR T0."ItemName" LIKE ? OR T0."CodeBars" LIKE ?)'
+        )
+        s = f"%{search}%"
+        params.extend([s, s, s])
+
+    if status in ("Y", "N"):
+        where_clauses.append('T0."validFor" = ?')
+        params.append(status)
+
+    if warehouse_codes:
+        placeholders = ", ".join(["?"] * len(warehouse_codes))
+        where_clauses.append(f'T1."WhsCode" IN ({placeholders})')
+        params.extend(warehouse_codes)
+
+    if group_codes:
+        placeholders = ", ".join(["?"] * len(group_codes))
+        where_clauses.append(f'T0."ItmsGrpCod" IN ({placeholders})')
+        params.extend(group_codes)
+
+    if stock_state == "in":
+        where_clauses.append('T1."OnHand" > 0')
+    elif stock_state == "out":
+        where_clauses.append('T1."OnHand" = 0')
+    elif stock_state == "low":
+        # Low-stock requires a populated MinStock; rows without one are excluded.
+        where_clauses.append('T1."OnHand" > 0')
+        where_clauses.append('T1."MinStock" > 0')
+        where_clauses.append('T1."OnHand" < T1."MinStock"')
+
+    where_sql = "WHERE " + " AND ".join(where_clauses)
+
+    # 1) Paginated item × warehouse rows
+    rows_sql = f"""
+        SELECT
+            T0."ItemCode",
+            T0."ItemName",
+            T0."ItmsGrpCod" AS "GroupCode",
+            T3."ItmsGrpNam" AS "GroupName",
+            T0."SalUnitMsr" AS "UOM",
+            T0."validFor"   AS "Active",
+            T0."LastPurPrc" AS "LastPurchasePrice",
+            T0."LastPurCur" AS "Currency",
+            T1."WhsCode",
+            T2."WhsName",
+            T2."Location",
+            T2."City",
+            T1."OnHand",
+            T1."IsCommited" AS "Committed",
+            T1."OnHand" - T1."IsCommited" AS "Available",
+            T1."OnOrder",
+            T1."MinStock",
+            T1."MaxStock",
+            T1."OnHand" * T0."LastPurPrc" AS "StockValue"
+        FROM OITM T0
+        INNER JOIN OITW T1 ON T1."ItemCode" = T0."ItemCode"
+        LEFT  JOIN OWHS T2 ON T2."WhsCode"  = T1."WhsCode"
+        LEFT  JOIN OITB T3 ON T3."ItmsGrpCod" = T0."ItmsGrpCod"
+        {where_sql}
+        ORDER BY T0."ItemName", T1."WhsCode"
+        LIMIT {page_size} OFFSET {offset}
+    """
+    data = _run(rows_sql, params or None)
+
+    # 2) Total row count for pagination footer
+    count_sql = f"""
+        SELECT COUNT(*) AS "total"
+        FROM OITM T0
+        INNER JOIN OITW T1 ON T1."ItemCode" = T0."ItemCode"
+        LEFT  JOIN OWHS T2 ON T2."WhsCode"  = T1."WhsCode"
+        {where_sql}
+    """
+    total = _count_of(count_sql, params or None)
+
+    # 3) KPI aggregates over the FULL filtered set (not just the current page)
+    summary_sql = f"""
+        SELECT
+            COUNT(DISTINCT T0."ItemCode") AS "total_skus",
+            COALESCE(SUM(T1."OnHand"), 0) AS "total_units_on_hand",
+            COALESCE(SUM(T1."OnHand" * T0."LastPurPrc"), 0) AS "total_stock_value"
+        FROM OITM T0
+        INNER JOIN OITW T1 ON T1."ItemCode" = T0."ItemCode"
+        LEFT  JOIN OWHS T2 ON T2."WhsCode"  = T1."WhsCode"
+        {where_sql}
+    """
+    summary_rows = _run(summary_sql, params or None)
+    summary = dict(summary_rows[0]) if summary_rows else {
+        "total_skus": 0, "total_units_on_hand": 0, "total_stock_value": 0,
+    }
+
+    # Items where the total OnHand across all (filtered) warehouses is 0.
+    items_zero_sql = f"""
+        SELECT COUNT(*) AS "n" FROM (
+            SELECT T0."ItemCode"
+            FROM OITM T0
+            INNER JOIN OITW T1 ON T1."ItemCode" = T0."ItemCode"
+            LEFT  JOIN OWHS T2 ON T2."WhsCode"  = T1."WhsCode"
+            {where_sql}
+            GROUP BY T0."ItemCode"
+            HAVING COALESCE(SUM(T1."OnHand"), 0) = 0
+        )
+    """
+    summary["items_zero_stock"] = _count_of(items_zero_sql, params or None)
+
+    # Items where total OnHand < total MinStock (only counts items whose
+    # MinStock is actually populated — otherwise this would always be 0 vs 0).
+    items_below_min_sql = f"""
+        SELECT COUNT(*) AS "n" FROM (
+            SELECT T0."ItemCode"
+            FROM OITM T0
+            INNER JOIN OITW T1 ON T1."ItemCode" = T0."ItemCode"
+            LEFT  JOIN OWHS T2 ON T2."WhsCode"  = T1."WhsCode"
+            {where_sql}
+            GROUP BY T0."ItemCode"
+            HAVING COALESCE(SUM(T1."MinStock"), 0) > 0
+               AND COALESCE(SUM(T1."OnHand"), 0) < COALESCE(SUM(T1."MinStock"), 0)
+        )
+    """
+    summary["items_below_min"] = _count_of(items_below_min_sql, params or None)
+
+    # Global flag: does ANY OITW row have a non-zero MinStock? Frontend hides
+    # the "Items Below Min" KPI when this is false, since the count would be
+    # meaningless (always 0).
+    has_min_stock = _count_of('SELECT COUNT(*) FROM OITW WHERE "MinStock" > 0')
+    summary["min_stock_tracked"] = has_min_stock > 0
+
+    # 4) Filter option lists — always global so the dropdowns don't shrink as
+    # filters narrow the rows. Warehouses include inactive ones too (with a
+    # flag) so the caller can choose to render them muted.
+    warehouses_opts = _run(
+        'SELECT "WhsCode", "WhsName", "Inactive" FROM OWHS ORDER BY "WhsName"'
+    )
+    groups_opts = _run(
+        'SELECT "ItmsGrpCod", "ItmsGrpNam" FROM OITB ORDER BY "ItmsGrpNam"'
+    )
+
+    return Response({
+        "data": data,
+        "count": total,
+        "page": page,
+        "page_size": page_size,
+        "summary": summary,
+        "filters": {
+            "warehouses": warehouses_opts,
+            "groups": groups_opts,
+        },
+    })
 
 
 # ─── /sales-invoices ───
