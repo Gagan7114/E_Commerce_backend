@@ -3,6 +3,7 @@ from calendar import monthrange
 from datetime import date, timedelta
 from decimal import Decimal, InvalidOperation
 
+from django.core.cache import cache
 from django.db import connection, transaction
 from django.shortcuts import get_object_or_404
 from rest_framework.decorators import api_view, permission_classes
@@ -42,6 +43,42 @@ def _dict_rows(sql: str, params: list) -> list[dict]:
             return []
         cols = [c[0] for c in cur.description]
         return [dict(zip(cols, row)) for row in cur.fetchall()]
+
+
+# The primary-dashboard endpoints run 6+ SELECTs that each rebuild the same
+# heavy CTE chain (regex pack parsing, text-date parsing, COALESCE
+# normalization). _materialize_primary_normalized() runs that chain ONCE per
+# request and stores the `normalized` rows in a PostgreSQL session-private
+# TEMP TABLE — also named `normalized` so the downstream queries can keep
+# their existing `FROM normalized` references unchanged (the temp table
+# shadows the CTE name in subsequent queries).
+# Pair every call with _drop_primary_normalized() in a try/finally so the
+# table cannot survive into the next request on a persistent (CONN_MAX_AGE)
+# connection.
+_PRIMARY_NORMALIZED_TEMP = "normalized"
+
+
+def _materialize_primary_normalized(cte_sql: str) -> None:
+    with connection.cursor() as cur:
+        cur.execute(f"DROP TABLE IF EXISTS pg_temp.{_PRIMARY_NORMALIZED_TEMP}")
+        cur.execute(
+            f"CREATE TEMP TABLE {_PRIMARY_NORMALIZED_TEMP} AS "
+            f"{cte_sql} SELECT * FROM normalized"
+        )
+        cur.execute(f"ANALYZE {_PRIMARY_NORMALIZED_TEMP}")
+
+
+def _drop_primary_normalized() -> None:
+    with connection.cursor() as cur:
+        cur.execute(f"DROP TABLE IF EXISTS pg_temp.{_PRIMARY_NORMALIZED_TEMP}")
+
+
+# Empty WITH-clause stub. Substituted into queries that previously prefixed
+# the full CTE so the existing f-string SQL (which often extends with
+# `, item_agg AS (...)`) keeps its comma-prefixed grammar valid.
+_PRIMARY_CTE_STUB = "WITH _stub AS (SELECT 1)"
+
+_PRIMARY_DASHBOARD_CACHE_TTL = 60  # seconds
 
 
 def _get_platform(slug: str) -> PlatformConfig:
@@ -629,7 +666,6 @@ def _amazon_primary_dashboard_response(request):
     if channel not in {"ALL", "CORE", "FRESH", "NOW"}:
         raise ValidationError("`channel` must be All, Core, Fresh, or Now.")
     month_name = _month_name(month)
-    amazon_cte = _amazon_primary_po_cte()
     period_filter = "po_month_key = %s AND po_year = %s"
     period_params = [month_name, year]
     channel_filter = "" if channel == "ALL" else " AND channel_key = %s"
@@ -643,9 +679,66 @@ def _amazon_primary_dashboard_response(request):
     trend_head_filter = " AND item_head_key = %s" if item_head_raw else ""
     trend_head_params = [item_head_raw] if item_head_raw else []
 
+    cache_key = (
+        f"prim_dash:amazon:{mode}:{channel}:{month}:{year}:"
+        f"{item_head_raw or ''}:{int(defaulted_to_latest)}"
+    )
+    cached = cache.get(cache_key)
+    if cached is not None:
+        return Response(cached)
+
+    # Materialize the heavy CTE once for this request. All downstream queries
+    # below substitute `amazon_cte = _PRIMARY_CTE_STUB` and read from the
+    # `normalized` TEMP TABLE rather than re-running the regex/normalization
+    # pipeline 6+ times.
+    _materialize_primary_normalized(_amazon_primary_po_cte())
+    amazon_cte = _PRIMARY_CTE_STUB
+
     def with_channel(params: list) -> list:
         return [*params, *channel_params]
 
+    try:
+        return _amazon_primary_dashboard_payload(
+            request,
+            mode=mode,
+            month=month,
+            month_name=month_name,
+            year=year,
+            channel=channel,
+            channel_filter=channel_filter,
+            channel_params=channel_params,
+            period_filter=period_filter,
+            period_params=period_params,
+            trend_head_filter=trend_head_filter,
+            trend_head_params=trend_head_params,
+            with_channel=with_channel,
+            amazon_cte=amazon_cte,
+            defaulted_to_latest=defaulted_to_latest,
+            cache_key=cache_key,
+        )
+    finally:
+        _drop_primary_normalized()
+
+
+def _amazon_primary_dashboard_payload(
+    request,
+    *,
+    mode,
+    month,
+    month_name,
+    year,
+    channel,
+    channel_filter,
+    channel_params,
+    period_filter,
+    period_params,
+    trend_head_filter,
+    trend_head_params,
+    with_channel,
+    amazon_cte,
+    defaulted_to_latest,
+    cache_key,
+):
     max_date = _scalar(
         f"""
         {amazon_cte}
@@ -905,106 +998,16 @@ def _amazon_primary_dashboard_response(request):
         """,
         [period_start, period_end] + with_channel(period_params) + trend_head_params,
     ))
-    monthly_trend = _primary_trend_rows(_dict_rows(
-        f"""
-        {amazon_cte},
-        bounds AS (
-            SELECT
-                make_date(%s::integer, 1, 1) AS start_month,
-                COALESCE(
-                    DATE_TRUNC('month', MAX(period_dt))::date,
-                    make_date(%s::integer, 12, 1)
-                ) AS end_month
-            FROM normalized
-            WHERE period_dt IS NOT NULL
-              AND EXTRACT(YEAR FROM period_dt)::integer = %s{channel_filter}
-              AND item_head_key IN ('PREMIUM', 'COMMODITY', 'OTHER')
-              {trend_head_filter}
-        ),
-        trend_months AS (
-            SELECT generate_series(start_month, end_month, interval '1 month')::date AS period
-            FROM bounds
-            WHERE start_month IS NOT NULL
-        ),
-        agg AS (
-            SELECT
-                DATE_TRUNC('month', period_dt)::date AS period,
-                {_AMAZON_PRIMARY_METRIC_SQL}
-            FROM normalized
-            WHERE period_dt IS NOT NULL
-              AND EXTRACT(YEAR FROM period_dt)::integer = %s{channel_filter}
-              AND item_head_key IN ('PREMIUM', 'COMMODITY', 'OTHER')
-              {trend_head_filter}
-            GROUP BY DATE_TRUNC('month', period_dt)::date
-        )
-        SELECT
-            m.period,
-            TO_CHAR(m.period, 'Mon YYYY') AS label,
-            COALESCE(a.done_value, 0) AS done_value,
-            COALESCE(a.done_ltrs, 0) AS done_ltrs,
-            COALESCE(a.done_qty, 0) AS done_qty,
-            COALESCE(a.pending_value, 0) AS pending_value,
-            COALESCE(a.pending_ltrs, 0) AS pending_ltrs,
-            COALESCE(a.pending_qty, 0) AS pending_qty,
-            COALESCE(a.order_value, 0) AS order_value,
-            COALESCE(a.order_ltrs, 0) AS order_ltrs,
-            COALESCE(a.order_qty, 0) AS order_qty
-        FROM trend_months m
-        LEFT JOIN agg a ON a.period = m.period
-        ORDER BY m.period
-        """,
-        [year, year, year] + channel_params + trend_head_params + [year] + channel_params + trend_head_params,
-    ))
-    yearly_trend = _primary_trend_rows(_dict_rows(
-        f"""
-        {amazon_cte},
-        bounds AS (
-            SELECT
-                MIN(EXTRACT(YEAR FROM period_dt)::integer) AS start_year,
-                MAX(EXTRACT(YEAR FROM period_dt)::integer) AS end_year
-            FROM normalized
-            WHERE period_dt IS NOT NULL{channel_filter}
-              AND item_head_key IN ('PREMIUM', 'COMMODITY', 'OTHER')
-              {trend_head_filter}
-        ),
-        trend_years AS (
-            SELECT generate_series(start_year, end_year)::integer AS period
-            FROM bounds
-            WHERE start_year IS NOT NULL
-        ),
-        agg AS (
-            SELECT
-                EXTRACT(YEAR FROM period_dt)::integer AS period,
-                {_AMAZON_PRIMARY_METRIC_SQL}
-            FROM normalized
-            WHERE period_dt IS NOT NULL{channel_filter}
-              AND item_head_key IN ('PREMIUM', 'COMMODITY', 'OTHER')
-              {trend_head_filter}
-            GROUP BY EXTRACT(YEAR FROM period_dt)::integer
-        )
-        SELECT
-            y.period,
-            y.period::text AS label,
-            COALESCE(a.done_value, 0) AS done_value,
-            COALESCE(a.done_ltrs, 0) AS done_ltrs,
-            COALESCE(a.done_qty, 0) AS done_qty,
-            COALESCE(a.pending_value, 0) AS pending_value,
-            COALESCE(a.pending_ltrs, 0) AS pending_ltrs,
-            COALESCE(a.pending_qty, 0) AS pending_qty,
-            COALESCE(a.order_value, 0) AS order_value,
-            COALESCE(a.order_ltrs, 0) AS order_ltrs,
-            COALESCE(a.order_qty, 0) AS order_qty
-        FROM trend_years y
-        LEFT JOIN agg a ON a.period = y.period
-        ORDER BY y.period
-        """,
-        channel_params + trend_head_params + channel_params + trend_head_params,
-    ))
+    # monthly_trend / yearly_trend were removed: the frontend only consumes
+    # `trends.day` (PlatformDashboard sparklines). Keys are preserved so any
+    # in-flight clients still parse the response shape.
+    monthly_trend = []
+    yearly_trend = []
 
     detail_total = _primary_total(details)
     summary_total = _primary_total(summary)
 
-    return Response({
+    payload = {
         "source": 'reporting."Amazon PO"',
         "format": "AMAZON",
         "dashboard_title": "AMAZON Primary Dashboard",
@@ -1033,7 +1036,9 @@ def _amazon_primary_dashboard_response(request):
         },
         "detail_rows_fixed": False,
         "extra_detail_rows_included": True,
-    })
+    }
+    cache.set(cache_key, payload, _PRIMARY_DASHBOARD_CACHE_TTL)
+    return Response(payload)
 
 
 _PENDENCY_DASHBOARD_FORMATS = {
@@ -1257,7 +1262,6 @@ def primary_dashboard(request, slug: str):
             "Primary Dashboard is available only for primary sales platforms."
         )
 
-    primary_cte = _primary_master_po_cte(platform_format)
     mode, month, year, defaulted_to_latest = _parse_primary_dashboard_params(
         request.query_params,
         platform_format,
@@ -1278,6 +1282,63 @@ def primary_dashboard(request, slug: str):
     trend_head_filter = " AND item_head_key = %s" if item_head_raw else ""
     trend_head_params = [item_head_raw] if item_head_raw else []
 
+    cache_key = (
+        f"prim_dash:{slug}:{platform_format}:{mode}:{month}:{year}:"
+        f"{item_head_raw or ''}:{int(defaulted_to_latest)}"
+    )
+    cached = cache.get(cache_key)
+    if cached is not None:
+        return Response(cached)
+
+    # Materialize the heavy CTE once for this request — all downstream queries
+    # below substitute `primary_cte = _PRIMARY_CTE_STUB` and read from the
+    # `normalized` TEMP TABLE rather than re-running the regex pack parsing,
+    # text-date parsing and COALESCE normalization 6+ times.
+    _materialize_primary_normalized(_primary_master_po_cte(platform_format))
+    primary_cte = _PRIMARY_CTE_STUB
+
+    try:
+        return _primary_dashboard_payload(
+            slug=slug,
+            platform_format=platform_format,
+            primary_cte=primary_cte,
+            mode=mode,
+            month=month,
+            month_name=month_name,
+            year=year,
+            period_filter=period_filter,
+            period_params=period_params,
+            vendor_metric_filter=vendor_metric_filter,
+            vendor_pending_filter=vendor_pending_filter,
+            vendor_period_params=vendor_period_params,
+            trend_head_filter=trend_head_filter,
+            trend_head_params=trend_head_params,
+            defaulted_to_latest=defaulted_to_latest,
+            cache_key=cache_key,
+        )
+    finally:
+        _drop_primary_normalized()
+
+
+def _primary_dashboard_payload(
+    *,
+    slug,
+    platform_format,
+    primary_cte,
+    mode,
+    month,
+    month_name,
+    year,
+    period_filter,
+    period_params,
+    vendor_metric_filter,
+    vendor_pending_filter,
+    vendor_period_params,
+    trend_head_filter,
+    trend_head_params,
+    defaulted_to_latest,
+    cache_key,
+):
     # This mirrors PRIMARY DASHBOARD!D2 in the workbook:
     # MAXIFS(PRIMARY!BM:BM, PRIMARY!AG:AG, month, PRIMARY!AI:AI, year)
     max_date = _scalar(
@@ -1587,93 +1648,13 @@ def primary_dashboard(request, slug: str):
         """,
         [period_start, period_end] + period_params + trend_head_params,
     ))
-    monthly_trend = _primary_trend_rows(_dict_rows(
-        f"""
-        {primary_cte},
-        bounds AS (
-            SELECT
-                make_date(%s::integer, 1, 1) AS start_month,
-                COALESCE(
-                    DATE_TRUNC('month', MAX({trend_date_col}))::date,
-                    make_date(%s::integer, 12, 1)
-                ) AS end_month
-            FROM normalized
-            WHERE {trend_date_col} IS NOT NULL
-              AND EXTRACT(YEAR FROM {trend_date_col})::integer = %s
-              {trend_head_filter}
-        ),
-        trend_months AS (
-            SELECT generate_series(start_month, end_month, interval '1 month')::date AS period
-            FROM bounds
-            WHERE start_month IS NOT NULL
-        ),
-        agg AS (
-            SELECT
-                DATE_TRUNC('month', {trend_date_col})::date AS period,
-                {_PRIMARY_TREND_METRIC_SQL}
-            FROM normalized
-            WHERE {trend_date_col} IS NOT NULL
-              AND EXTRACT(YEAR FROM {trend_date_col})::integer = %s
-              {trend_head_filter}
-            GROUP BY DATE_TRUNC('month', {trend_date_col})::date
-        )
-        SELECT
-            m.period,
-            TO_CHAR(m.period, 'Mon YYYY') AS label,
-            COALESCE(a.done_value, 0) AS done_value,
-            COALESCE(a.done_ltrs, 0) AS done_ltrs,
-            COALESCE(a.done_qty, 0) AS done_qty,
-            COALESCE(a.pending_value, 0) AS pending_value,
-            COALESCE(a.pending_ltrs, 0) AS pending_ltrs,
-            COALESCE(a.pending_qty, 0) AS pending_qty
-        FROM trend_months m
-        LEFT JOIN agg a ON a.period = m.period
-        ORDER BY m.period
-        """,
-        [year, year, year] + trend_head_params + [year] + trend_head_params,
-    ))
-    yearly_trend = _primary_trend_rows(_dict_rows(
-        f"""
-        {primary_cte},
-        bounds AS (
-            SELECT
-                MIN(EXTRACT(YEAR FROM {trend_date_col})::integer) AS start_year,
-                MAX(EXTRACT(YEAR FROM {trend_date_col})::integer) AS end_year
-            FROM normalized
-            WHERE {trend_date_col} IS NOT NULL
-              {trend_head_filter}
-        ),
-        trend_years AS (
-            SELECT generate_series(start_year, end_year)::integer AS period
-            FROM bounds
-            WHERE start_year IS NOT NULL
-        ),
-        agg AS (
-            SELECT
-                EXTRACT(YEAR FROM {trend_date_col})::integer AS period,
-                {_PRIMARY_TREND_METRIC_SQL}
-            FROM normalized
-            WHERE {trend_date_col} IS NOT NULL
-              {trend_head_filter}
-            GROUP BY EXTRACT(YEAR FROM {trend_date_col})::integer
-        )
-        SELECT
-            y.period,
-            y.period::text AS label,
-            COALESCE(a.done_value, 0) AS done_value,
-            COALESCE(a.done_ltrs, 0) AS done_ltrs,
-            COALESCE(a.done_qty, 0) AS done_qty,
-            COALESCE(a.pending_value, 0) AS pending_value,
-            COALESCE(a.pending_ltrs, 0) AS pending_ltrs,
-            COALESCE(a.pending_qty, 0) AS pending_qty
-        FROM trend_years y
-        LEFT JOIN agg a ON a.period = y.period
-        ORDER BY y.period
-        """,
-        trend_head_params + trend_head_params,
-    ))
+    # monthly_trend / yearly_trend were removed: the frontend only consumes
+    # `trends.day` (PlatformDashboard sparklines). Keys are preserved so any
+    # in-flight clients still parse the response shape.
+    monthly_trend = []
+    yearly_trend = []
 
-    return Response({
+    payload = {
         "source": "prim_master_po",
         "format": platform_format,
         "dashboard_title": f"{platform_format} Primary Dashboard",
@@ -1705,7 +1686,9 @@ def primary_dashboard(request, slug: str):
         },
         "detail_rows_fixed": slug == "zepto",
         "extra_detail_rows_included": True,
-    })
+    }
+    cache.set(cache_key, payload, _PRIMARY_DASHBOARD_CACHE_TTL)
+    return Response(payload)
 
 
 def _parse_price_upload_date(value: str) -> date | None:
@@ -4080,46 +4063,14 @@ normalized AS (
                 THEN UPPER(TRIM(TO_CHAR(effective_per_liter * 1000, 'FM999999990.###'))) || ' MLS'
             ELSE UPPER(TRIM(TO_CHAR(effective_per_liter, 'FM999999990.###'))) || ' LTR'
         END AS per_ltr_key,
-        COALESCE(
-            NULLIF(order_ltrs_cl, 0),
-            NULLIF(total_order_liters, 0),
-            CASE
-                WHEN order_qty IS NOT NULL
-                    THEN COALESCE(order_qty, 0) * COALESCE(effective_per_liter, 0)
-                ELSE NULL
-            END,
-            0
-        ) AS metric_order_liters,
-        COALESCE(
-            NULLIF(filled_ltrs, 0),
-            NULLIF(total_delivered_liters, 0),
-            CASE
-                WHEN delivered_qty IS NOT NULL
-                    THEN COALESCE(delivered_qty, 0) * COALESCE(effective_per_liter, 0)
-                ELSE NULL
-            END,
-            0
-        ) AS metric_delivered_liters,
-        COALESCE(
-            NULLIF(total_order_amt_exclusive, 0),
-            CASE
-                WHEN order_qty IS NOT NULL AND basic_rate IS NOT NULL
-                    THEN COALESCE(order_qty, 0) * COALESCE(basic_rate, 0)
-                ELSE NULL
-            END,
-            0
-        ) AS metric_order_value,
-        COALESCE(
-            NULLIF(total_delivered_amt_exclusive, 0),
-            CASE
-                WHEN delivered_qty IS NOT NULL AND basic_rate IS NOT NULL
-                    THEN COALESCE(delivered_qty, 0) * COALESCE(basic_rate, 0)
-                ELSE NULL
-            END,
-            0
-        ) AS metric_delivered_value,
-        COALESCE(order_qty_cl, order_qty, 0) AS metric_order_qty,
-        COALESCE(filled_qty, delivered_qty, 0) AS metric_delivered_qty
+        -- Direct mapping per user spec: each KPI card reads exactly one
+        -- canonical column from prim_master_po — no qty x rate fallbacks.
+        COALESCE(total_order_liters, 0) AS metric_order_liters,
+        COALESCE(total_delivered_liters, 0) AS metric_delivered_liters,
+        COALESCE(total_order_amt_exclusive, 0) AS metric_order_value,
+        COALESCE(total_delivered_amt_exclusive, 0) AS metric_delivered_value,
+        COALESCE(order_qty, 0) AS metric_order_qty,
+        COALESCE(delivered_qty, 0) AS metric_delivered_qty
     FROM metric_base
 )
 """
@@ -6279,6 +6230,15 @@ def _blinkit_sec_dashboard_response(request):
     date_filter, date_params = _sec_date_filter(selected_date)
     month_name = _month_name(month)
 
+    cache_key = (
+        f"sec_dash:blinkit:{month}:{year}:"
+        f"{selected_date.isoformat() if selected_date else ''}:"
+        f"{int(defaulted_to_latest)}"
+    )
+    cached = cache.get(cache_key)
+    if cached is not None:
+        return Response(cached)
+
     max_date = _scalar(
         f"""
         SELECT MAX("date")
@@ -6382,92 +6342,16 @@ def _blinkit_sec_dashboard_response(request):
         date_filter,
         date_params,
     )
-    days_in_month = monthrange(year, month)[1]
-    daily_raw = _dict_rows(
-        f"""
-        SELECT
-            "date"::date AS period,
-            COALESCE(SUM("sales_amt_exc"), 0) AS shipped_value,
-            COALESCE(SUM("ltr_sold"), 0) AS shipped_ltr,
-            COALESCE(SUM("quantity"), 0) AS shipped_units
-        FROM "SecMaster"
-        WHERE REGEXP_REPLACE(LOWER(TRIM("format"::text)), '[^a-z0-9]+', '', 'g') = 'blinkit'
-          AND UPPER(TRIM("month"::text)) = %s
-          AND "year"::numeric = %s
-          AND "date" IS NOT NULL
-          {date_filter}
-        GROUP BY "date"::date
-        ORDER BY "date"::date
-        """,
-        [month_name, year, *date_params],
-    )
-    daily_by_period = {row.get("period"): row for row in daily_raw}
+    # daily/monthly/yearly trend queries removed: no frontend file consumes
+    # `data.trends.*` for the Blinkit sec dashboard. The yearly query scanned
+    # every Blinkit row across all years (no date scope) and was the dominant
+    # cost of this endpoint. Keys are preserved in the response so any
+    # in-flight client still parses the shape.
     daily_trend = []
-    for day in range(1, days_in_month + 1):
-        period = date(year, month, day)
-        row = daily_by_period.get(period, {})
-        daily_trend.append({
-            "period": period.isoformat(),
-            "label": f"{day:02d}",
-            "shipped_value": _num(row.get("shipped_value")),
-            "shipped_ltr": _num(row.get("shipped_ltr")),
-            "shipped_units": _num(row.get("shipped_units")),
-        })
+    monthly_trend = []
+    yearly_trend = []
 
-    monthly_raw = _dict_rows(
-        """
-        SELECT
-            DATE_TRUNC('month', "date")::date AS period,
-            COALESCE(SUM("sales_amt_exc"), 0) AS shipped_value,
-            COALESCE(SUM("ltr_sold"), 0) AS shipped_ltr,
-            COALESCE(SUM("quantity"), 0) AS shipped_units
-        FROM "SecMaster"
-        WHERE REGEXP_REPLACE(LOWER(TRIM("format"::text)), '[^a-z0-9]+', '', 'g') = 'blinkit'
-          AND "date" IS NOT NULL
-          AND EXTRACT(YEAR FROM "date")::integer = %s
-        GROUP BY DATE_TRUNC('month', "date")::date
-        ORDER BY DATE_TRUNC('month', "date")::date
-        """,
-        [year],
-    )
-    monthly_trend = [
-        {
-            "period": row["period"].isoformat() if hasattr(row.get("period"), "isoformat") else row.get("period"),
-            "label": row["period"].strftime("%b").upper() if hasattr(row.get("period"), "strftime") else str(row.get("period") or ""),
-            "shipped_value": _num(row.get("shipped_value")),
-            "shipped_ltr": _num(row.get("shipped_ltr")),
-            "shipped_units": _num(row.get("shipped_units")),
-        }
-        for row in monthly_raw
-    ]
-
-    yearly_raw = _dict_rows(
-        """
-        SELECT
-            EXTRACT(YEAR FROM "date")::integer AS period_year,
-            COALESCE(SUM("sales_amt_exc"), 0) AS shipped_value,
-            COALESCE(SUM("ltr_sold"), 0) AS shipped_ltr,
-            COALESCE(SUM("quantity"), 0) AS shipped_units
-        FROM "SecMaster"
-        WHERE REGEXP_REPLACE(LOWER(TRIM("format"::text)), '[^a-z0-9]+', '', 'g') = 'blinkit'
-          AND "date" IS NOT NULL
-        GROUP BY EXTRACT(YEAR FROM "date")::integer
-        ORDER BY EXTRACT(YEAR FROM "date")::integer
-        """,
-        [],
-    )
-    yearly_trend = [
-        {
-            "period": str(row.get("period_year") or ""),
-            "label": str(row.get("period_year") or ""),
-            "shipped_value": _num(row.get("shipped_value")),
-            "shipped_ltr": _num(row.get("shipped_ltr")),
-            "shipped_units": _num(row.get("shipped_units")),
-        }
-        for row in yearly_raw
-    ]
-
-    return Response({
+    payload = {
         "source": "SecMaster",
         "format": "BLINKIT",
         "detail_rows_fixed": True,
@@ -6490,7 +6374,9 @@ def _blinkit_sec_dashboard_response(request):
             "month": monthly_trend,
             "year": yearly_trend,
         },
-    })
+    }
+    cache.set(cache_key, payload, _PRIMARY_DASHBOARD_CACHE_TTL)
+    return Response(payload)
 
 
 def _swiggy_sec_dashboard_response(request):

@@ -46,8 +46,16 @@ SECMASTER_SLUGS = {"blinkit", "swiggy", "zepto", "bigbasket", "flipkart"}
 MASTER_PO_SLUGS = {"zomato", "citymall"}
 FLIPKART_GROCERY_SLUGS = {"flipkart_grocery"}
 
+# Platforms whose Monthly Targets row is populated by user input only — no
+# automatic source query is run because the platform's sales/PO data lives
+# outside the secmaster / prim_master_po / flipkart_grocery_master sources
+# this module supports. Setting a target row still goes through the normal
+# POST UI; done_ltrs / done_value start at 0 and the user updates them via
+# the edit flow.
+MANUAL_SLUGS = {"amazon"}
+
 # Slugs explicitly out of scope — spec §8.1.
-SKIPPED_SLUGS = {"amazon", "jiomart"}
+SKIPPED_SLUGS = {"jiomart"}
 
 # All in-scope slugs, in the order the combined dashboard renders.
 IN_SCOPE_SLUGS = (
@@ -60,6 +68,13 @@ IN_SCOPE_SLUGS = (
     "flipkart",
     "flipkart_grocery",
 )
+
+# Display-only slug order for the Monthly Targets dashboard endpoint. Amazon
+# is shown at the top here even though it remains in SKIPPED_SLUGS for the
+# write paths (create/update/refresh). If `month_targets` has no Amazon row
+# for the requested month, the existing placeholder branch returns a
+# "No target" row — same behaviour every other platform already has.
+DASHBOARD_DISPLAY_SLUGS = ("amazon",) + IN_SCOPE_SLUGS
 
 DASHBOARD_ITEM_HEADS = ("PREMIUM", "COMMODITY")
 DEFAULT_ITEM_HEADS = ("PREMIUM", "COMMODITY")
@@ -79,10 +94,12 @@ def _source_for(slug: str) -> str:
         return "prim_master_po"
     if slug in FLIPKART_GROCERY_SLUGS:
         return "flipkart_grocery"
+    if slug in MANUAL_SLUGS:
+        return "manual"
     raise ValidationError(
         f"Platform '{slug}' is not supported for Monthly Targets. "
         f"In-scope platforms: "
-        f"{', '.join(sorted(SECMASTER_SLUGS | MASTER_PO_SLUGS | FLIPKART_GROCERY_SLUGS))}."
+        f"{', '.join(sorted(SECMASTER_SLUGS | MASTER_PO_SLUGS | FLIPKART_GROCERY_SLUGS | MANUAL_SLUGS))}."
     )
 
 
@@ -314,6 +331,14 @@ def _read_source(slug: str, fmt: str, item_head: str, month: int, year: int) -> 
         return _read_secmaster(fmt, item_head, month, year)
     if source == "flipkart_grocery":
         return _read_flipkart_grocery(fmt, item_head, month, year)
+    if source == "manual":
+        # Manual platforms (Amazon): no auto-aggregation. The user sets the
+        # target; done values start at 0 and are updated via the edit flow.
+        return {
+            "done_ltrs": Decimal(0),
+            "done_value": Decimal(0),
+            "latest_date": None,
+        }
     return _read_master_po(fmt, item_head, month, year)
 
 
@@ -973,15 +998,17 @@ def month_targets_dashboard(request):
     """
     month, year = _parse_month_year(request.query_params)
 
-    # Scope to platforms the user can see, intersected with in-scope slugs.
-    allowed_slugs = set(user_platform_slugs(request.user)) & set(IN_SCOPE_SLUGS)
+    # Scope to platforms the user can see, intersected with the dashboard
+    # display order. DASHBOARD_DISPLAY_SLUGS adds Amazon to the front of
+    # IN_SCOPE_SLUGS for display only — write paths still use IN_SCOPE_SLUGS.
+    allowed_slugs = set(user_platform_slugs(request.user)) & set(DASHBOARD_DISPLAY_SLUGS)
     if not allowed_slugs:
         return Response({"premium": {"rows": [], "total": _empty_total()},
                          "commodity": {"rows": [], "total": _empty_total()},
                          "month": month, "year": year})
 
     # Preserve the sheet's display order.
-    ordered = [s for s in IN_SCOPE_SLUGS if s in allowed_slugs]
+    ordered = [s for s in DASHBOARD_DISPLAY_SLUGS if s in allowed_slugs]
     platforms = {p.slug: p for p in PlatformConfig.objects.filter(slug__in=ordered)}
 
     # One query per SKU-group. Using LOWER/TRIM on format so the row joins

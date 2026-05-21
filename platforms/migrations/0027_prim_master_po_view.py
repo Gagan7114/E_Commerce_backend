@@ -91,6 +91,10 @@ $$ LANGUAGE plpgsql IMMUTABLE;
 
 CREATE OR REPLACE VIEW public.prim_master_po AS
 WITH master_lookup AS (
+    -- master_item is the SHORT item name (e.g. "JIVO POMACE 1L"). The full
+    -- product_name (e.g. "Jivo Pomace Olive Oil 1.0 LITER") is kept on
+    -- master_full_name so pack-regex parsing still has the long text to
+    -- search; the dashboard's `item` column ends up as the short label.
     SELECT DISTINCT ON (UPPER(TRIM(format_sku_code::text)))
         format_sku_code,
         item_head,
@@ -99,7 +103,8 @@ WITH master_lookup AS (
         per_unit_value,
         per_unit,
         brand,
-        product_name AS master_item,
+        item AS master_item,
+        product_name AS master_full_name,
         sku_sap_name,
         format AS master_format
     FROM public.master_sheet
@@ -108,10 +113,15 @@ WITH master_lookup AS (
         UPPER(TRIM(format_sku_code::text)),
         COALESCE(item_head, ''),
         COALESCE(category, ''),
+        COALESCE(item, ''),
         COALESCE(product_name, '')
 ),
 unified AS (
     -- BLINKIT ---------------------------------------------------------
+    -- blinkit_prim.delivered_qty is unreliable (often null/0 even when goods
+    -- arrived). The accurate signal is `remaining_quantity` — units that
+    -- weren't received. Derive delivered_qty = units_ordered - remaining_quantity,
+    -- falling back to the stored delivered_qty if remaining_quantity is null.
     SELECT
         'BLINKIT'::text                                AS format,
         b.po_number::text                              AS po_number,
@@ -125,17 +135,27 @@ unified AS (
         public._pm_dmy_text(b.expiry_date)             AS po_expiry_date,
         public._pm_dmy_text(b.appointment_date)        AS delivery_date,
         b.units_ordered::numeric                       AS order_qty,
-        b.delivered_qty::numeric                       AS delivered_qty,
+        COALESCE(
+            CASE
+                WHEN b.remaining_quantity IS NOT NULL
+                    THEN GREATEST(COALESCE(b.units_ordered, 0) - b.remaining_quantity, 0)
+            END,
+            b.delivered_qty,
+            0
+        )::numeric                                     AS delivered_qty,
         b.cost_price::numeric                          AS basic_rate,
         b.landing_rate::numeric                        AS landing_rate,
         NULL::text                                     AS remarks
     FROM public.blinkit_prim b
     UNION ALL
     -- ZEPTO -----------------------------------------------------------
+    -- Zepto's PO export keeps the product UUID in the `sku` column and
+    -- always ships an empty `sku_code`. Surface `sku` as the canonical
+    -- sku_code so the master_sheet join in `master_lookup` can match.
     SELECT
         'ZEPTO'::text,
         z.po_no::text,
-        z.sku_code::text,
+        COALESCE(NULLIF(TRIM(z.sku_code::text), ''), z.sku::text) AS sku_code,
         z.sku_desc::text,
         z.vendor_name::text,
         NULL::text,
@@ -266,9 +286,12 @@ joined AS (
         COALESCE(ml.master_item, u.sku_name) AS item,
         ml.sku_sap_name            AS sap_sku_name,
         -- Pack-text used to regex-parse litres from SKU/product names when
-        -- master_sheet has no matching entry (Zepto UUIDs, etc.).
+        -- master_sheet has no matching entry (Zepto UUIDs, etc.). Include the
+        -- long master_full_name so size patterns like "1.0 LITER" stay matchable
+        -- even after we switched `item` to the short label.
         UPPER(CONCAT_WS(' ',
-            COALESCE(ml.master_item, u.sku_name)::text,
+            COALESCE(ml.master_full_name, ml.master_item, u.sku_name)::text,
+            ml.master_item::text,
             ml.sku_sap_name::text,
             u.sku_name::text,
             ml.per_unit::text

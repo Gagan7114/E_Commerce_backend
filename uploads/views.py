@@ -105,6 +105,18 @@ UPLOAD_FORCED_UNIQUE_KEYS = {
     ),
 }
 
+PRIMARY_UPLOAD_REPLACE_KEYS = {
+    # Primary PO rows are identified by platform PO + platform SKU. Status,
+    # dates, vendor, rates, and quantities are mutable row data.
+    "blinkit_prim": (("po_number",), ("item_id",)),
+    "zepto_prim": (("po_no",), ("sku_code", "sku")),
+    "swiggy_prim": (("po_number",), ("sku_code",)),
+    "bigbasket_prim": (("po_number",), ("sku_code",)),
+    "flipkart_grocery_prim": (("po_number",), ("sku_code",)),
+    "zomato_prim": (("po_number",), ("sku_code",)),
+    "citymall_prim": (("po_number",), ("sku_code",)),
+}
+
 INVENTORY_DOH_UPLOAD_PLATFORMS = {
     "blinkit_inventory": "blinkit",
     "zepto_inventory": "zepto",
@@ -846,6 +858,55 @@ def _row_value(row: dict, source):
     return row.get(source)
 
 
+def _normalize_upload_key(value) -> str:
+    return str(value or "").strip().lower()
+
+
+def _primary_upload_key_parts(table: str, row: dict) -> tuple[str, ...] | None:
+    key_specs = PRIMARY_UPLOAD_REPLACE_KEYS.get(table)
+    if not key_specs:
+        return None
+
+    parts = tuple(_normalize_upload_key(_row_value(row, spec)) for spec in key_specs)
+    if any(not part for part in parts):
+        return None
+    return parts
+
+
+def _primary_upload_key_sql(spec: tuple[str, ...]) -> str:
+    expressions = [f"t.{_quote_ident(column)}::text" for column in spec]
+    if len(expressions) == 1:
+        value_sql = expressions[0]
+    else:
+        value_sql = "COALESCE(" + ", ".join(
+            f"NULLIF(TRIM({expr}), '')" for expr in expressions
+        ) + ")"
+    return f"LOWER(TRIM(COALESCE({value_sql}, '')))"
+
+
+def _delete_existing_primary_upload_row(cur, table: str, row: dict) -> int:
+    """Remove existing platform-primary rows with the same PO + SKU.
+
+    The source tables do not all have a database unique constraint on this
+    business key, so using DELETE + INSERT is the most reliable way to make a
+    status refresh replace the old row instead of creating a duplicate.
+    """
+    key_parts = _primary_upload_key_parts(table, row)
+    key_specs = PRIMARY_UPLOAD_REPLACE_KEYS.get(table)
+    if not key_parts or not key_specs:
+        return 0
+
+    where = " AND ".join(
+        f"{_primary_upload_key_sql(spec)} = %s"
+        for spec in key_specs
+    )
+    cur.execute(
+        f"DELETE FROM {_quote_ident(table)} AS t WHERE {where}",
+        list(key_parts),
+    )
+    return cur.rowcount or 0
+
+
 # master_po sync helpers were removed once the master_po table was retired.
 # Uploads now go straight to each platform's per-tenant table via the upsert
 # `INSERT ... ON CONFLICT` path in `_batch_upload`.
@@ -870,6 +931,10 @@ def _batch_upload(body, *, forced_table: str | None = None):
 
     if upsert and table in UPLOAD_FORCED_UNIQUE_KEYS:
         unique_key = UPLOAD_FORCED_UNIQUE_KEYS[table]
+
+    replace_by_primary_key = table in PRIMARY_UPLOAD_REPLACE_KEYS
+    if replace_by_primary_key:
+        unique_key = ""
 
     if table == "zepto_prim":
         for row in data:
@@ -933,8 +998,22 @@ def _batch_upload(body, *, forced_table: str | None = None):
             batch = data[i : i + BATCH_SIZE]
             for row in batch:
                 try:
-                    cur.execute(sql, [row.get(c) for c in columns])
-                    if tracks_upsert_counts:
+                    replaced_rows = 0
+                    if replace_by_primary_key:
+                        with transaction.atomic():
+                            replaced_rows = _delete_existing_primary_upload_row(cur, table, row)
+                            cur.execute(sql, [row.get(c) for c in columns])
+                    else:
+                        cur.execute(sql, [row.get(c) for c in columns])
+
+                    if replace_by_primary_key:
+                        if replaced_rows:
+                            updated += 1
+                            platform_updated += 1
+                        else:
+                            created += 1
+                            platform_created += 1
+                    elif tracks_upsert_counts:
                         result = cur.fetchone()
                         if result is None:
                             skipped += 1
