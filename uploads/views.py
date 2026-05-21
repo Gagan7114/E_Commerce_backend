@@ -53,6 +53,10 @@ UPLOAD_ALLOWED_TABLES = {
     "zepto_ads",
     "bigbasket_ads",
     "flipkart_ads",
+    # Brand Fund
+    "zepto_brandfund",
+    "swiggy_brandfund",
+    "blinkit_brandfund",
 }
 
 BATCH_SIZE = 50
