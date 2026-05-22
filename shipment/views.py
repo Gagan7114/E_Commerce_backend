@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from datetime import date as _date, timedelta
 from decimal import Decimal
 
 from django.db import connection, transaction
@@ -131,15 +132,24 @@ def _pack_into_capacity(items, capacity_lt):
     return loaded, not_loaded, used
 
 
-def _auto_plan_truck(items, truck_size, capacity_override=None, priority=None):
+def _auto_plan_truck(items, truck_size, capacity_override=None, priority=None, strict=False):
     """
     Plan a truck load.
 
     `priority` (optional): {'PREMIUM': pct, 'COMMODITY': pct, 'OTHER': pct} — each
-    percentage 0..100, summing to 100. When provided, the loader allocates
-    `pct/100 * capacity` to each bucket and packs ONLY items from that bucket
-    into its slice (no cross-bucket spillover — strict adherence). Items that
-    don't fit go to not_loaded.
+    percentage 0..100, summing to 100. When provided, the loader carves the truck
+    into three bucket slices and packs each bucket's items into its slice.
+
+    `strict` controls what happens with capacity left over after each bucket is
+    packed:
+      - strict=True  -> hard adherence to the slider split. Leftover bucket slices
+        stay empty, items from other buckets are NOT borrowed. Truck may ship
+        under-loaded if a bucket's pool is too small.
+      - strict=False (default) -> "best-effort". After bucket-greedy packing, any
+        un-used capacity (from any slice) is pooled and a second pass fills it
+        with the highest-scoring un-loaded items regardless of bucket, until the
+        truck is full or no more items fit. The Priority Adherence panel still
+        reports requested vs actually-used per bucket so users see the trade-off.
 
     When `priority` is None, falls back to a flat greedy pack across all items.
     """
@@ -151,7 +161,7 @@ def _auto_plan_truck(items, truck_size, capacity_override=None, priority=None):
         load_pct = round((planned / capacity * 100) if capacity > 0 else 0, 2)
         return loaded, not_loaded, capacity, planned, load_pct, None
 
-    # Strict priority allocation
+    # Bucket the candidates
     buckets = {'PREMIUM': [], 'COMMODITY': [], 'OTHER': []}
     for it in items:
         buckets[_item_head_bucket(it)].append(it)
@@ -163,29 +173,60 @@ def _auto_plan_truck(items, truck_size, capacity_override=None, priority=None):
 
     loaded_all, not_loaded_all = [], []
     priority_actual = {}
+    bucket_used = {}
     for k, bucket_items in buckets.items():
         cap_k = bucket_caps.get(k, 0)
         if cap_k <= 0:
-            # Bucket not requested — push everything to not_loaded
+            # Bucket not requested — push everything to not_loaded (kept for
+            # best-effort second pass if strict=False)
             for it in bucket_items:
                 it['planned_qty'] = 0
                 it['planned_liters'] = 0
                 not_loaded_all.append(it)
             priority_actual[k] = {'requested_liters': 0, 'used_liters': 0}
+            bucket_used[k] = 0.0
             continue
         l, nl, used = _pack_into_capacity(bucket_items, cap_k)
         loaded_all.extend(l)
         not_loaded_all.extend(nl)
         priority_actual[k] = {'requested_liters': cap_k, 'used_liters': round(used, 4)}
+        bucket_used[k] = float(used)
+
+    # Best-effort second pass — fill leftover capacity from any bucket's not-loaded
+    # items, highest-scoring first. Caller has already sorted `items` by score so
+    # `not_loaded_all` is roughly score-ordered per bucket; re-sort for safety.
+    if not strict:
+        first_pass_used = sum(bucket_used.values())
+        leftover_capacity = max(0.0, capacity - first_pass_used)
+        if leftover_capacity > 0 and not_loaded_all:
+            # Sort the remaining pool by priority score (high first), then expiry,
+            # then accepted qty — same key the candidate pool uses upstream.
+            spill_pool = sorted(
+                not_loaded_all,
+                key=lambda x: (
+                    -float(x.get('priority_score') or 0),
+                    int(x.get('days_to_expiry') or 999),
+                    -float(x.get('accepted_qty') or 0),
+                ),
+            )
+            spill_loaded, spill_not_loaded, spill_used = _pack_into_capacity(
+                spill_pool, leftover_capacity
+            )
+            # Credit the spill to whichever bucket each spilled item belongs to,
+            # so adherence reporting reflects the real bucket split that shipped.
+            for it in spill_loaded:
+                bkt = _item_head_bucket(it)
+                if bkt in priority_actual:
+                    priority_actual[bkt]['used_liters'] = round(
+                        priority_actual[bkt]['used_liters'] + float(it.get('planned_liters') or 0),
+                        4,
+                    )
+            loaded_all.extend(spill_loaded)
+            not_loaded_all = spill_not_loaded
 
     planned = round(sum(p['used_liters'] for p in priority_actual.values()), 4)
     load_pct = round((planned / capacity * 100) if capacity > 0 else 0, 2)
 
-    # Attach priority adherence info to one item-like dict at the end of the list?
-    # Better — return as an extra dict via a side channel. We'll stash it on
-    # loaded_all[0]._priority_meta if any items loaded; callers can read it.
-    # Cleaner approach: return as tuple via separate variable; callers updated
-    # to handle 6-tuple when priority is present.
     return loaded_all, not_loaded_all, capacity, planned, load_pct, priority_actual
 
 
@@ -206,13 +247,64 @@ def _serialize_row(row):
     return out
 
 
+DRR_WINDOW_DAYS = 30  # rolling-window length for daily run-rate computation
+
+
+def _doh_snapshot_meta(effective_date):
+    """Snapshot metadata so the UI can warn when DOH data is stale."""
+    if not effective_date:
+        return {
+            'effective_date': None,
+            'window_days': DRR_WINDOW_DAYS,
+            'snapshot_age_days': None,
+            'is_stale': True,
+            'message': 'No inventory snapshot found yet.',
+        }
+    today = _date.today()
+    age = (today - effective_date).days
+    return {
+        'effective_date': effective_date.isoformat(),
+        'window_days': DRR_WINDOW_DAYS,
+        'snapshot_age_days': age,
+        'is_stale': age > 1,
+        'message': (
+            'Live snapshot.' if age <= 0
+            else f'Snapshot is {age} day{"s" if age != 1 else ""} old.'
+        ),
+    }
+
+
+def _rolling_window_date_keys(effective_date, days=DRR_WINDOW_DAYS):
+    """
+    Produce the list of (year, month_upper, month_day_upper) tuples for the
+    last `days` calendar days ending at `effective_date`. Used to query the
+    daily-grain `amazon_sec_range_master_view` over a rolling window.
+    """
+    keys = []
+    for i in range(days):
+        d = effective_date - timedelta(days=i)
+        keys.append((
+            d.year,
+            d.strftime('%B').upper(),
+            f"{d.day:02d}-{d.strftime('%b').upper()}",
+        ))
+    return keys
+
+
 def _live_doh_by_asin():
     """
-    Returns {asin_upper: {soh_unit, soh_ltr, drr_unit, drr_ltr, doh, units_sold, ltr_sold}}
-    sourced from amazon_master_inventory + amazon_sec_range_master_view — exact same logic
-    as the SOH/DOH dashboard and DOH Auto-Fill, so numbers match across all 4 surfaces.
+    Returns (by_asin, meta).
 
-    Returns {} if no inventory snapshot is available yet.
+    by_asin: {asin_upper: {soh_unit, soh_ltr, drr_unit, drr_ltr, doh, units_sold, ltr_sold}}
+        sourced from amazon_master_inventory + amazon_sec_range_master_view.
+    meta:    {effective_date, window_days, snapshot_age_days, is_stale, message}
+
+    DRR is computed over a rolling DRR_WINDOW_DAYS window so the first days of a
+    new month no longer collapse DRR to ~0 (month-to-date used to divide by the
+    day-of-month). All four surfaces (SOH/DOH dashboard, Manual PO, Appointment
+    plan, DOH Auto-Fill) call this helper so the numbers stay in sync.
+
+    Returns ({}, meta) if no inventory snapshot is available yet.
     """
     with connection.cursor() as cur:
         cur.execute(
@@ -220,25 +312,27 @@ def _live_doh_by_asin():
         )
         eff_row = cur.fetchone()
         effective_date = eff_row[0] if eff_row else None
+        meta = _doh_snapshot_meta(effective_date)
         if not effective_date:
-            return {}
+            return {}, meta
 
-        elapsed_day = max(1, effective_date.day)
         month_name = effective_date.strftime('%B').upper()
         year = effective_date.year
-        month_day = f"{effective_date.day:02d}-{effective_date.strftime('%b').upper()}"
+
+        date_keys = _rolling_window_date_keys(effective_date, DRR_WINDOW_DAYS)
+        # Build a (year, month, month_day) IN-list for the trailing window
+        placeholders = ', '.join(['(%s, %s, %s)'] * len(date_keys))
+        flat_params = [v for triple in date_keys for v in triple]
 
         cur.execute(
-            """
+            f"""
             WITH sales AS (
                 SELECT
                     UPPER(TRIM(COALESCE(asin::text, ''))) AS asin_key,
                     COALESCE(SUM(shipped_units), 0)::numeric  AS units_sold,
                     COALESCE(SUM(shipped_litres), 0)::numeric AS ltr_sold
                 FROM amazon_sec_range_master_view
-                WHERE "year" = %s
-                  AND UPPER(TRIM("month"::text)) = %s
-                  AND UPPER(TRIM(month_day::text)) = %s
+                WHERE ("year", UPPER(TRIM("month"::text)), UPPER(TRIM(month_day::text))) IN ({placeholders})
                 GROUP BY UPPER(TRIM(COALESCE(asin::text, '')))
             ),
             inventory AS (
@@ -260,11 +354,12 @@ def _live_doh_by_asin():
             FROM inventory i
             LEFT JOIN sales s ON s.asin_key = i.asin_key
             """,
-            [year, month_name, month_day, year, month_name, effective_date],
+            flat_params + [year, month_name, effective_date],
         )
         rows = cur.fetchall()
 
     by_asin = {}
+    window = float(DRR_WINDOW_DAYS)
     for asin_key, soh_unit, soh_ltr, units_sold, ltr_sold in rows:
         if not asin_key:
             continue
@@ -272,8 +367,8 @@ def _live_doh_by_asin():
         soh_ltr_f  = float(soh_ltr or 0)
         units_sold_f = float(units_sold or 0)
         ltr_sold_f   = float(ltr_sold or 0)
-        drr_unit = units_sold_f / elapsed_day if elapsed_day > 0 else 0.0
-        drr_ltr  = ltr_sold_f / elapsed_day if elapsed_day > 0 else 0.0
+        drr_unit = units_sold_f / window
+        drr_ltr  = ltr_sold_f / window
         doh = ((soh_unit_f / drr_unit) - 2) if drr_unit > 0 else 0.0
         by_asin[asin_key] = {
             'soh_unit': soh_unit_f,
@@ -284,7 +379,7 @@ def _live_doh_by_asin():
             'units_sold': units_sold_f,
             'ltr_sold':   ltr_sold_f,
         }
-    return by_asin
+    return by_asin, meta
 
 
 # ---------------------------------------------------------------------------
@@ -313,6 +408,40 @@ class AppointmentDatesView(APIView):
         return Response({'dates': dates, 'counts': counts, 'cancelled': cancelled})
 
 
+def _explain_ineligibility(c):
+    """
+    Build a short, human-friendly reason string explaining why an appointment
+    has zero eligible POs. The frontend shows this on the appointment card so
+    planners can see WHY a slot is unusable before they invest time configuring
+    the truck.
+    """
+    total = int(c.get('po_count') or 0)
+    if total == 0:
+        return 'No POs linked to this appointment'
+
+    not_pending = int(c.get('not_pending_count') or 0)
+    not_in_stock = int(c.get('not_in_stock_count') or 0)
+    no_qty = int(c.get('no_qty_count') or 0)
+    locked = int(c.get('locked_count') or 0)
+
+    # Dominant-cause cases — read more clearly than a list of fragments
+    if locked == total:
+        return f'All {total} POs are locked in other shipments'
+    if not_in_stock == total:
+        return f'All {total} POs are out of stock'
+    if not_pending == total:
+        return f'All {total} POs are already closed or dispatched'
+    if no_qty == total:
+        return f'All {total} POs have zero accepted qty'
+
+    parts = []
+    if locked:       parts.append(f'{locked} locked in other shipments')
+    if not_in_stock: parts.append(f'{not_in_stock} out of stock')
+    if not_pending:  parts.append(f'{not_pending} closed/dispatched')
+    if no_qty:       parts.append(f'{no_qty} with no accepted qty')
+    return f'Of {total} POs: ' + (', '.join(parts) if parts else 'all unavailable')
+
+
 class AppointmentListView(APIView):
     permission_classes = [IsAuthenticated]
 
@@ -321,31 +450,103 @@ class AppointmentListView(APIView):
         if not date_str:
             return Response({'error': 'date parameter required'}, status=400)
 
+        # Single round-trip: dedup appointments for the date, explode the
+        # comma-separated POs, evaluate eligibility per (appointment, PO),
+        # then aggregate counts back per appointment.
         with connection.cursor() as cur:
             cur.execute("""
-                SELECT * FROM (
+                WITH appt_dedup AS (
                     SELECT DISTINCT ON (a.appointment_id)
-                        a.appointment_id,
-                        a.status,
-                        a.appointment_time,
-                        a.destination_fc,
-                        a.pro,
-                        (
-                            SELECT COUNT(DISTINCT NULLIF(TRIM(pv), ''))
-                            FROM unnest(
-                                regexp_split_to_array(COALESCE(a.pos, ''), '\s*[,;]\s*')
-                            ) AS pv
-                            WHERE NULLIF(TRIM(pv), '') IS NOT NULL
-                        ) AS po_count
+                        a.appointment_id, a.status, a.appointment_time,
+                        a.destination_fc, a.pro, a.pos
                     FROM reporting."appointment" a
                     WHERE DATE(a.appointment_time) = %s
                     ORDER BY a.appointment_id, a.appointment_time DESC NULLS LAST
-                ) deduped
-                ORDER BY appointment_time, appointment_id
+                ),
+                appt_po_pairs AS (
+                    SELECT
+                        ad.appointment_id,
+                        ad.destination_fc,
+                        UPPER(TRIM(pv)) AS po_upper
+                    FROM appt_dedup ad,
+                    LATERAL unnest(
+                        regexp_split_to_array(COALESCE(ad.pos, ''), '\s*[,;]\s*')
+                    ) AS pv
+                    WHERE NULLIF(TRIM(pv), '') IS NOT NULL
+                ),
+                po_status AS (
+                    SELECT
+                        app.appointment_id,
+                        app.po_upper,
+                        BOOL_OR(p.status = 'Confirmed' AND p.po_status = 'PENDING') AS is_pending,
+                        BOOL_OR(p.availability_status = 'AC - Accepted: In stock') AS is_in_stock,
+                        BOOL_OR(COALESCE(p.accepted_qty, 0) > 0) AS has_qty,
+                        BOOL_OR(
+                            p.status = 'Confirmed'
+                            AND p.po_status = 'PENDING'
+                            AND p.availability_status = 'AC - Accepted: In stock'
+                            AND COALESCE(p.accepted_qty, 0) > 0
+                            AND NOT EXISTS (
+                                SELECT 1
+                                FROM sp_items si
+                                JOIN sp_shipments s ON s.id = si.shipment_id
+                                WHERE UPPER(TRIM(si.po_number)) = app.po_upper
+                                  AND UPPER(TRIM(si.asin))      = UPPER(TRIM(p.asin))
+                                  AND si.not_loaded = FALSE
+                                  AND s.status != 'rejected'
+                            )
+                        ) AS is_eligible
+                    FROM appt_po_pairs app
+                    LEFT JOIN reporting."Amazon PO" p
+                        ON UPPER(TRIM(p.po_number)) = app.po_upper
+                       AND p.fulfillment_center = app.destination_fc
+                    GROUP BY app.appointment_id, app.po_upper
+                ),
+                appt_counts AS (
+                    SELECT
+                        appointment_id,
+                        COUNT(*) AS total_po,
+                        COUNT(*) FILTER (WHERE is_eligible) AS eligible_po,
+                        COUNT(*) FILTER (WHERE NOT COALESCE(is_pending, FALSE))   AS not_pending_po,
+                        COUNT(*) FILTER (WHERE NOT COALESCE(is_in_stock, FALSE))  AS not_in_stock_po,
+                        COUNT(*) FILTER (WHERE NOT COALESCE(has_qty, FALSE))      AS no_qty_po,
+                        COUNT(*) FILTER (
+                            WHERE COALESCE(is_pending, FALSE)
+                              AND COALESCE(is_in_stock, FALSE)
+                              AND COALESCE(has_qty, FALSE)
+                              AND NOT COALESCE(is_eligible, FALSE)
+                        ) AS locked_po
+                    FROM po_status
+                    GROUP BY appointment_id
+                )
+                SELECT
+                    ad.appointment_id,
+                    ad.status,
+                    ad.appointment_time,
+                    ad.destination_fc,
+                    ad.pro,
+                    COALESCE(ac.total_po,        0) AS po_count,
+                    COALESCE(ac.eligible_po,     0) AS eligible_po_count,
+                    COALESCE(ac.not_pending_po,  0) AS not_pending_count,
+                    COALESCE(ac.not_in_stock_po, 0) AS not_in_stock_count,
+                    COALESCE(ac.no_qty_po,       0) AS no_qty_count,
+                    COALESCE(ac.locked_po,       0) AS locked_count
+                FROM appt_dedup ad
+                LEFT JOIN appt_counts ac USING (appointment_id)
+                ORDER BY ad.appointment_time, ad.appointment_id
             """, [date_str])
             rows = _row_to_dict(cur, cur.fetchall())
 
-        return Response([_serialize_row(r) for r in rows])
+        # Attach an `ineligible_reason` string when eligible_po_count == 0 so
+        # the frontend can display it directly on the appointment card.
+        out = []
+        for r in rows:
+            data = _serialize_row(r)
+            elig = int(data.get('eligible_po_count') or 0)
+            data['has_eligible'] = elig > 0
+            data['ineligible_reason'] = '' if elig > 0 else _explain_ineligibility(data)
+            out.append(data)
+        return Response(out)
 
 
 class AppointmentItemsView(APIView):
@@ -371,6 +572,11 @@ class AppointmentItemsView(APIView):
                     }
         except (TypeError, ValueError):
             priority = None
+
+        # Strict-adherence toggle (default best-effort: leftover capacity fills
+        # from other buckets after the per-bucket pack).
+        strict_param = str(request.query_params.get('priority_strict') or '').lower()
+        priority_strict = strict_param in ('1', 'true', 'yes', 'on')
 
         with connection.cursor() as cur:
             cur.execute("""
@@ -457,7 +663,7 @@ class AppointmentItemsView(APIView):
             raw = _row_to_dict(cur, cur.fetchall())
 
         # Attach LIVE DOH/DRR/SOH (matches SOH/DOH dashboard exactly)
-        doh_by_asin = _live_doh_by_asin()
+        doh_by_asin, doh_meta = _live_doh_by_asin()
         for r in raw:
             asin_up = str(r.get('asin') or '').upper().strip()
             live = doh_by_asin.get(asin_up, {})
@@ -499,11 +705,13 @@ class AppointmentItemsView(APIView):
         ))
 
         loaded, not_loaded, capacity, planned_liters, load_pct, priority_actual = _auto_plan_truck(
-            items, truck_size, capacity_override, priority=priority,
+            items, truck_size, capacity_override, priority=priority, strict=priority_strict,
         )
 
         return Response({
             'appointment': appt,
+            'doh_snapshot': doh_meta,
+            'priority_strict': priority_strict,
             'loaded_items': loaded,
             'not_loaded_items': not_loaded,
             'priority_requested': priority,
@@ -556,6 +764,52 @@ class ShipmentListCreateView(APIView):
                 Shipment.PlanningMode.APPOINTMENT if appointment_id
                 else Shipment.PlanningMode.MANUAL
             )
+
+        # Lock re-check at draft time. Between the moment the plan was generated
+        # and this Save call, another planner may have claimed some of the same
+        # ASIN+PO rows. Fail fast with details so the UI can guide the user
+        # rather than surfacing the conflict later at Submit time.
+        if loaded_items:
+            pair_keys = {
+                (
+                    str(it.get('asin') or '').strip().upper(),
+                    str(it.get('po_number') or '').strip().upper(),
+                )
+                for it in loaded_items
+                if it.get('asin') and it.get('po_number')
+            }
+            if pair_keys:
+                from django.db.models import Q
+                conflict_q = Q()
+                for asin_up, po_up in pair_keys:
+                    conflict_q |= Q(asin__iexact=asin_up, po_number__iexact=po_up)
+                claimed = (
+                    ShipmentItem.objects
+                    .filter(not_loaded=False)
+                    .filter(conflict_q)
+                    .exclude(shipment__status=Shipment.Status.REJECTED)
+                    .select_related('shipment')
+                    .values(
+                        'asin', 'po_number',
+                        'shipment_id', 'shipment__status',
+                        'shipment__appointment_id', 'shipment__destination_fc',
+                    )
+                )
+                conflicts = list(claimed)
+                if conflicts:
+                    # De-dup per (asin, po) so the message is concise
+                    return Response(
+                        {
+                            'error': 'Some items are already in another active shipment',
+                            'conflicts': conflicts,
+                            'detail': (
+                                f'{len(conflicts)} row(s) were claimed by another '
+                                'shipment since this plan was generated. Refresh '
+                                'the plan and try again.'
+                            ),
+                        },
+                        status=409,
+                    )
 
         with transaction.atomic():
             shipment = Shipment.objects.create(
@@ -934,7 +1188,7 @@ class AsinCatalogView(APIView):
 
         # DOH/DRR/SOH — LIVE from amazon_master_inventory + amazon_sec_range_master_view
         # so the Manual PO planner matches the SOH/DOH dashboard exactly.
-        doh_by_asin = _live_doh_by_asin()
+        doh_by_asin, _doh_meta = _live_doh_by_asin()
 
         catalog = {}
         for r in po_rows:
@@ -1201,6 +1455,11 @@ class DOHAutoFillView(APIView):
         except (TypeError, ValueError):
             priority = None
 
+        # Strict-adherence toggle (default best-effort: leftover capacity fills
+        # from other buckets after the per-bucket pack).
+        strict_param = str(request.query_params.get('priority_strict') or '').lower()
+        priority_strict = strict_param in ('1', 'true', 'yes', 'on')
+
         # 1) Resolve the effective inventory snapshot date (latest available)
         with connection.cursor() as cur:
             cur.execute("""
@@ -1208,6 +1467,7 @@ class DOHAutoFillView(APIView):
             """)
             effective_date = cur.fetchone()[0]
 
+        doh_meta = _doh_snapshot_meta(effective_date)
         if not effective_date:
             return Response({
                 'loaded_items': [],
@@ -1215,28 +1475,33 @@ class DOHAutoFillView(APIView):
                 'urgent_no_po': [],
                 'load_summary': {'truck_size': truck_size, 'capacity': _resolve_capacity(truck_size, capacity_override), 'planned_liters': 0, 'load_percentage': 0},
                 'priority_breakdown': {},
+                'priority_strict': priority_strict,
+                'doh_snapshot': doh_meta,
+                'fc_used': None,
+                'fc_options': [],
                 'stats': {'total_candidates': 0, 'loaded_count': 0, 'not_loaded_count': 0, 'urgent_no_po_count': 0},
                 'source': {'sales': 'amazon_sec_range_master_view', 'inventory': 'amazon_master_inventory'},
                 'message': 'No inventory snapshots found in amazon_master_inventory.',
             })
 
-        elapsed_day = max(1, effective_date.day)
         month_name = effective_date.strftime('%B').upper()
         year = effective_date.year
-        month_day = f"{effective_date.day:02d}-{effective_date.strftime('%b').upper()}"
 
-        # 2) Compute live DOH per ASIN (mirrors SOH/DOH dashboard logic)
+        date_keys = _rolling_window_date_keys(effective_date, DRR_WINDOW_DAYS)
+        placeholders = ', '.join(['(%s, %s, %s)'] * len(date_keys))
+        flat_date_params = [v for triple in date_keys for v in triple]
+
+        # 2) Compute live DOH per ASIN over a rolling DRR_WINDOW_DAYS window
+        #    (mirrors SOH/DOH dashboard logic via the shared helper).
         with connection.cursor() as cur:
-            cur.execute("""
+            cur.execute(f"""
                 WITH sales AS (
                     SELECT
                         UPPER(TRIM(COALESCE(asin::text, ''))) AS asin_key,
                         COALESCE(SUM(shipped_units), 0)::numeric  AS units_sold,
                         COALESCE(SUM(shipped_litres), 0)::numeric AS ltr_sold
                     FROM amazon_sec_range_master_view
-                    WHERE "year" = %s
-                      AND UPPER(TRIM("month"::text)) = %s
-                      AND UPPER(TRIM(month_day::text)) = %s
+                    WHERE ("year", UPPER(TRIM("month"::text)), UPPER(TRIM(month_day::text))) IN ({placeholders})
                     GROUP BY UPPER(TRIM(COALESCE(asin::text, '')))
                 ),
                 inventory AS (
@@ -1265,10 +1530,11 @@ class DOHAutoFillView(APIView):
                     COALESCE(s.ltr_sold,  0) AS ltr_sold
                 FROM inventory i
                 LEFT JOIN sales s ON s.asin_key = i.asin_key
-            """, [year, month_name, month_day, year, month_name, effective_date])
+            """, flat_date_params + [year, month_name, effective_date])
             doh_rows = _row_to_dict(cur, cur.fetchall())
 
-        # Compute DOH per ASIN: (soh_unit / drr_unit) - 2, drr = units_sold / elapsed_day
+        # Compute DOH per ASIN: (soh_unit / drr_unit) - 2, drr = units_sold / DRR_WINDOW_DAYS
+        window = float(DRR_WINDOW_DAYS)
         doh_by_asin = {}
         for r in doh_rows:
             row = _serialize_row(r)
@@ -1276,8 +1542,8 @@ class DOHAutoFillView(APIView):
             ltr_sold = float(row.get('ltr_sold') or 0)
             soh_unit = float(row.get('soh_unit') or 0)
             soh_ltr = float(row.get('soh_ltr') or 0)
-            drr_unit = units_sold / elapsed_day if elapsed_day > 0 else 0.0
-            drr_ltr = ltr_sold / elapsed_day if elapsed_day > 0 else 0.0
+            drr_unit = units_sold / window
+            drr_ltr = ltr_sold / window
             doh = ((soh_unit / drr_unit) - 2) if drr_unit > 0 else 0.0
             asin_up = str(row.get('asin_key') or '').upper()
             if not asin_up:
@@ -1373,12 +1639,51 @@ class DOHAutoFillView(APIView):
             -(float(x.get('accepted_qty') or 0)),
         ))
 
+        # Compute per-FC urgency summary so the frontend can show a dropdown of
+        # selectable FCs with how many critical items each contains. Treat lower
+        # DOH as more urgent: weight count by inverse-DOH.
+        fc_summary = {}
+        for it in actionable:
+            fc_key = (it.get('destination_fc') or '').strip()
+            if not fc_key:
+                continue
+            entry = fc_summary.setdefault(fc_key, {
+                'fc': fc_key,
+                'item_count': 0,
+                'liters': 0.0,
+                'critical_count': 0,
+                'min_doh': None,
+            })
+            entry['item_count'] += 1
+            entry['liters'] += float(it.get('total_accepted_liters') or 0)
+            if it.get('priority_bucket') in ('CRITICAL', 'VERY HIGH', 'HIGH'):
+                entry['critical_count'] += 1
+            doh_val = it.get('doh')
+            if doh_val is not None:
+                cur_min = entry['min_doh']
+                entry['min_doh'] = doh_val if cur_min is None else min(cur_min, doh_val)
+        # Rank FCs by "most urgent first": critical_count desc, min_doh asc, liters desc.
+        fc_options = sorted(
+            fc_summary.values(),
+            key=lambda x: (
+                -x['critical_count'],
+                float(x['min_doh']) if x['min_doh'] is not None else 9999.0,
+                -x['liters'],
+            ),
+        )
+
         # 6) Single-FC constraint: a truck must contain items from one FC only.
-        #    Pick the FC of the most urgent (lowest-DOH) item; items from other FCs
-        #    are moved to not_loaded with a reason.
-        primary_fc = ''
-        if actionable:
+        #    If the user explicitly passed `fc`, the candidate pool was already
+        #    filtered to it. Otherwise pick the FC whose items are most urgent
+        #    (top of fc_options).
+        if fc and actionable:
             primary_fc = (actionable[0].get('destination_fc') or '').strip().upper()
+        elif fc_options:
+            primary_fc = fc_options[0]['fc'].strip().upper()
+        elif actionable:
+            primary_fc = (actionable[0].get('destination_fc') or '').strip().upper()
+        else:
+            primary_fc = ''
 
         if primary_fc:
             same_fc = []
@@ -1388,15 +1693,15 @@ class DOHAutoFillView(APIView):
                     same_fc.append(it)
                 else:
                     it_copy = dict(it)
-                    it_copy['skipped_reason'] = f'Different FC ({it.get("destination_fc")}); truck is locked to {actionable[0].get("destination_fc")}'
+                    it_copy['skipped_reason'] = f'Different FC ({it.get("destination_fc")}); truck is locked to {primary_fc}'
                     other_fc.append(it_copy)
             loaded, not_loaded, capacity, planned_liters, load_pct, priority_actual = _auto_plan_truck(
-                same_fc, truck_size, capacity_override, priority=priority,
+                same_fc, truck_size, capacity_override, priority=priority, strict=priority_strict,
             )
             not_loaded = not_loaded + other_fc + no_demand
         else:
             loaded, not_loaded, capacity, planned_liters, load_pct, priority_actual = _auto_plan_truck(
-                actionable, truck_size, capacity_override, priority=priority,
+                actionable, truck_size, capacity_override, priority=priority, strict=priority_strict,
             )
             not_loaded = not_loaded + no_demand
 
@@ -1429,12 +1734,25 @@ class DOHAutoFillView(APIView):
             b = item.get('priority_bucket', 'LOW')
             breakdown[b] = breakdown.get(b, 0) + 1
 
+        # The FC label actually loaded on the truck (matches one entry in fc_options
+        # if the candidate pool had items). Use the first loaded item if available
+        # so even after best-effort spillover the label reflects reality.
+        fc_used = None
+        if loaded:
+            fc_used = loaded[0].get('destination_fc')
+        elif primary_fc and fc_options:
+            for opt in fc_options:
+                if opt['fc'].strip().upper() == primary_fc:
+                    fc_used = opt['fc']
+                    break
+
         return Response({
             'loaded_items': loaded,
             'not_loaded_items': not_loaded,
             'urgent_no_po': urgent_no_po,
             'priority_requested': priority,
             'priority_actual': priority_actual,
+            'priority_strict': priority_strict,
             'load_summary': {
                 'truck_size': truck_size,
                 'capacity': capacity,
@@ -1452,12 +1770,13 @@ class DOHAutoFillView(APIView):
                 'sales': 'amazon_sec_range_master_view',
                 'inventory': 'amazon_master_inventory',
             },
+            'doh_snapshot': doh_meta,
             'effective_date': effective_date.isoformat() if effective_date else None,
             'month': month_name,
             'year': year,
-            'month_day': month_day,
-            'elapsed_day': elapsed_day,
-            'primary_fc': actionable[0].get('destination_fc') if actionable else None,
+            'fc_used': fc_used,
+            'fc_options': fc_options,
+            'primary_fc': fc_used,
         })
 
 
