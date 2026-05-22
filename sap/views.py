@@ -1,5 +1,6 @@
 """SAP B1 (HANA) read endpoints. Mirrors FastAPI routes/sap.py."""
 
+import logging
 import re
 from datetime import date
 from decimal import InvalidOperation
@@ -11,6 +12,8 @@ from rest_framework.response import Response
 from accounts.permissions import require
 
 from .service import report_sales_analysis, select
+
+logger = logging.getLogger(__name__)
 
 
 # Platform slug → SAP U_Chain values + CardName patterns
@@ -70,7 +73,11 @@ _SALES_ANALYSIS_FILTERS = {
     "item_head": "U_TYPE",
     "sub_group": "U_Sub_Group",
     "sales_person": "U_SALES_PERSON",
+    "cardname": "CardName",
 }
+# Filters that accept multiple values (sent as repeated `?key=A&key=B…`).
+# The view reads these via getlist; _row_matches treats them as set-membership.
+_SALES_ANALYSIS_MULTI_FILTERS = {"cardname"}
 _SALES_ANALYSIS_SEARCH_COLS = (
     "CardCode",
     "CardName",
@@ -106,10 +113,18 @@ def _num(value) -> float:
         return 0.0
 
 
-def _row_matches(row: dict, query: str, filters: dict[str, str]) -> bool:
+def _row_matches(row: dict, query: str, filters: dict) -> bool:
+    """`filters` values are pre-lowercased: a `str` for single-value filters
+    or a `set[str]` for multi-value filters. Empty/None means 'no filter'."""
     for param, column in _SALES_ANALYSIS_FILTERS.items():
         selected = filters.get(param)
-        if selected and str(row.get(column) or "").strip().lower() != selected.lower():
+        if not selected:
+            continue
+        row_val = str(row.get(column) or "").strip().lower()
+        if isinstance(selected, set):
+            if row_val not in selected:
+                return False
+        elif row_val != selected:
             return False
 
     if not query:
@@ -118,15 +133,37 @@ def _row_matches(row: dict, query: str, filters: dict[str, str]) -> bool:
     return query.lower() in haystack.lower()
 
 
-def _filter_options(rows: list[dict]) -> dict:
+def _filter_options(rows: list[dict], filters: dict, query: str) -> dict:
+    """Filter option lists.
+
+    Single-value filters (Main Group, Chain, State, Type, Item Head, Sub
+    Group, Brand, Location, Sales Person) always show every distinct value
+    in the date range, so the user can pivot freely between selections.
+
+    Multi-value filters (Card Name) cascade: their options are computed from
+    rows that pass **all other** active filters and the search query. That
+    way picking Main Group + Chain narrows Card Name to only the customers
+    that exist in those rows.
+
+    Each option list is sorted and capped at 300 to keep dropdowns light."""
     result = {}
     for param, column in _SALES_ANALYSIS_FILTERS.items():
-        values = sorted({
-            str(row.get(column)).strip()
-            for row in rows
-            if row.get(column) is not None and str(row.get(column)).strip()
-        })
-        result[param] = values[:300]
+        if param in _SALES_ANALYSIS_MULTI_FILTERS:
+            sub_filters = {k: v for k, v in filters.items() if k != param}
+            source_rows = (
+                r for r in rows if _row_matches(r, query, sub_filters)
+            )
+        else:
+            source_rows = rows
+        values: set[str] = set()
+        for row in source_rows:
+            raw = row.get(column)
+            if raw is None:
+                continue
+            s = str(raw).strip()
+            if s:
+                values.add(s)
+        result[param] = sorted(values)[:300]
     return result
 
 
@@ -156,10 +193,20 @@ def sales_analysis(request):
 
     page, page_size = _page(request)
     query = str(request.query_params.get("search") or "").strip()
-    filters = {
-        param: str(request.query_params.get(param) or "").strip()
-        for param in _SALES_ANALYSIS_FILTERS
-    }
+    # Pre-normalize filters once so per-row matching is just a hash lookup or
+    # string compare — no repeated lower()/strip() inside the inner loop.
+    filters: dict = {}
+    for param in _SALES_ANALYSIS_FILTERS:
+        if param in _SALES_ANALYSIS_MULTI_FILTERS:
+            values = [
+                v.strip()
+                for v in request.query_params.getlist(param)
+                if v and v.strip()
+            ]
+            filters[param] = {v.lower() for v in values} if values else None
+        else:
+            raw = str(request.query_params.get(param) or "").strip()
+            filters[param] = raw.lower() if raw else None
 
     try:
         rows = report_sales_analysis(from_date, to_date)
@@ -169,15 +216,27 @@ def sales_analysis(request):
     columns = list(rows[0].keys()) if rows else []
     filtered = [row for row in rows if _row_matches(row, query, filters)]
     offset = page * page_size
+    active = {k: v for k, v in filters.items() if v}
+    logger.warning(
+        "[SAP] sales_analysis %s..%s | procedure=%d | filtered=%d | page=%d/%d | active=%s | search=%r",
+        from_date,
+        to_date,
+        len(rows),
+        len(filtered),
+        page,
+        page_size,
+        active,
+        query,
+    )
     return Response({
         "data": filtered[offset:offset + page_size],
         "count": len(filtered),
         "page": page,
         "page_size": page_size,
         "columns": columns,
-        "filters": _filter_options(rows),
+        "filters": _filter_options(rows, filters, query),
         "summary": _sales_analysis_summary(filtered),
-        "procedure": "JIVO_OIL_HANADB.REPORT_SALES_ANALYSIS",
+        "procedure": "JIVO_MART_HANADB.REPORT_SALES_ANALYSIS",
         "from_date": from_date,
         "to_date": to_date,
     })

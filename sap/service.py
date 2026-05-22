@@ -12,11 +12,14 @@ with `sqlalchemy` or add `hdbcli`'s own connection pool separately.
 
 from __future__ import annotations
 
+import logging
 import re
 from contextlib import contextmanager
 from typing import Any, Iterator
 
 from django.conf import settings
+
+logger = logging.getLogger(__name__)
 
 try:
     from hdbcli import dbapi
@@ -69,17 +72,31 @@ def select(sql: str, params: list | tuple | None = None) -> list[dict]:
 
 
 def report_sales_analysis(from_date: str, to_date: str) -> list[dict]:
-    """Run the allow-listed SAP HANA sales analysis procedure."""
+    """Run the allow-listed SAP HANA sales analysis procedure.
+
+    Logs the raw row count returned by HANA so we can verify whether the
+    procedure itself caps results or our pipeline drops some downstream.
+    """
     with hana_connection() as conn:
         cur = conn.cursor()
         cur.execute(
-            'CALL "JIVO_OIL_HANADB"."REPORT_SALES_ANALYSIS"(?, ?)',
+            'CALL "JIVO_MART_HANADB"."REPORT_SALES_ANALYSIS"(?, ?)',
             [from_date, to_date],
         )
         cols = [d[0] for d in cur.description] if cur.description else []
-        rows = cur.fetchall() if cur.description else []
+        raw_rows = cur.fetchall() if cur.description else []
+        rowcount_attr = getattr(cur, "rowcount", "n/a")
         cur.close()
-    return [dict(zip(cols, r)) for r in rows]
+    result = [dict(zip(cols, r)) for r in raw_rows]
+    logger.warning(
+        "[SAP] report_sales_analysis(%s, %s) -> fetchall=%d rows, cur.rowcount=%s, cols=%d",
+        from_date,
+        to_date,
+        len(raw_rows),
+        rowcount_attr,
+        len(cols),
+    )
+    return result
 
 
 def scalar(sql: str, params: list | tuple | None = None):
