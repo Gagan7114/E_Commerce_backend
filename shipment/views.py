@@ -75,15 +75,28 @@ def _resolve_capacity(truck_size, capacity_override=None):
     return TRUCK_CAPACITIES.get(truck_size, 15000.0)
 
 
-def _auto_plan_truck(items, truck_size, capacity_override=None):
-    capacity = _resolve_capacity(truck_size, capacity_override)
-    remaining = capacity
-    loaded, not_loaded = [], []
+def _item_head_bucket(item):
+    """Map an item's item_head to one of PREMIUM / COMMODITY / OTHER."""
+    raw = str(item.get('item_head') or '').strip().upper()
+    if 'PREMIUM' in raw:
+        return 'PREMIUM'
+    if 'COMMODITY' in raw:
+        return 'COMMODITY'
+    return 'OTHER'
 
+
+def _pack_into_capacity(items, capacity_lt):
+    """
+    Greedy pack a list of pre-sorted items into the given liter capacity.
+    Returns (loaded_subset, not_loaded_subset, used_liters).
+    Mutates each item with planned_qty / planned_liters.
+    """
+    remaining = float(capacity_lt)
+    loaded, not_loaded = [], []
     for item in items:
         total_liters = float(item.get('total_accepted_liters') or 0)
-        per_liter = float(item.get('per_liter') or 0)
-        case_pack = float(item.get('case_pack') or 1)
+        per_liter    = float(item.get('per_liter') or 0)
+        case_pack    = float(item.get('case_pack') or 1)
         accepted_qty = float(item.get('accepted_qty') or 0)
 
         if accepted_qty == 0 or total_liters == 0:
@@ -114,10 +127,66 @@ def _auto_plan_truck(items, truck_size, capacity_override=None):
                 item['planned_qty'] = 0
                 item['planned_liters'] = 0
                 not_loaded.append(item)
+    used = float(capacity_lt) - remaining
+    return loaded, not_loaded, used
 
-    planned = round(capacity - remaining, 4)
+
+def _auto_plan_truck(items, truck_size, capacity_override=None, priority=None):
+    """
+    Plan a truck load.
+
+    `priority` (optional): {'PREMIUM': pct, 'COMMODITY': pct, 'OTHER': pct} — each
+    percentage 0..100, summing to 100. When provided, the loader allocates
+    `pct/100 * capacity` to each bucket and packs ONLY items from that bucket
+    into its slice (no cross-bucket spillover — strict adherence). Items that
+    don't fit go to not_loaded.
+
+    When `priority` is None, falls back to a flat greedy pack across all items.
+    """
+    capacity = _resolve_capacity(truck_size, capacity_override)
+
+    if not priority:
+        loaded, not_loaded, used = _pack_into_capacity(items, capacity)
+        planned = round(used, 4)
+        load_pct = round((planned / capacity * 100) if capacity > 0 else 0, 2)
+        return loaded, not_loaded, capacity, planned, load_pct, None
+
+    # Strict priority allocation
+    buckets = {'PREMIUM': [], 'COMMODITY': [], 'OTHER': []}
+    for it in items:
+        buckets[_item_head_bucket(it)].append(it)
+
+    bucket_caps = {
+        k: round(capacity * (float(priority.get(k, 0) or 0) / 100.0), 4)
+        for k in buckets
+    }
+
+    loaded_all, not_loaded_all = [], []
+    priority_actual = {}
+    for k, bucket_items in buckets.items():
+        cap_k = bucket_caps.get(k, 0)
+        if cap_k <= 0:
+            # Bucket not requested — push everything to not_loaded
+            for it in bucket_items:
+                it['planned_qty'] = 0
+                it['planned_liters'] = 0
+                not_loaded_all.append(it)
+            priority_actual[k] = {'requested_liters': 0, 'used_liters': 0}
+            continue
+        l, nl, used = _pack_into_capacity(bucket_items, cap_k)
+        loaded_all.extend(l)
+        not_loaded_all.extend(nl)
+        priority_actual[k] = {'requested_liters': cap_k, 'used_liters': round(used, 4)}
+
+    planned = round(sum(p['used_liters'] for p in priority_actual.values()), 4)
     load_pct = round((planned / capacity * 100) if capacity > 0 else 0, 2)
-    return loaded, not_loaded, capacity, planned, load_pct
+
+    # Attach priority adherence info to one item-like dict at the end of the list?
+    # Better — return as an extra dict via a side channel. We'll stash it on
+    # loaded_all[0]._priority_meta if any items loaded; callers can read it.
+    # Cleaner approach: return as tuple via separate variable; callers updated
+    # to handle 6-tuple when priority is present.
+    return loaded_all, not_loaded_all, capacity, planned, load_pct, priority_actual
 
 
 def _row_to_dict(cur, rows):
@@ -135,6 +204,87 @@ def _serialize_row(row):
         else:
             out[k] = v
     return out
+
+
+def _live_doh_by_asin():
+    """
+    Returns {asin_upper: {soh_unit, soh_ltr, drr_unit, drr_ltr, doh, units_sold, ltr_sold}}
+    sourced from amazon_master_inventory + amazon_sec_range_master_view — exact same logic
+    as the SOH/DOH dashboard and DOH Auto-Fill, so numbers match across all 4 surfaces.
+
+    Returns {} if no inventory snapshot is available yet.
+    """
+    with connection.cursor() as cur:
+        cur.execute(
+            "SELECT MAX(inventory_date) FROM amazon_master_inventory"
+        )
+        eff_row = cur.fetchone()
+        effective_date = eff_row[0] if eff_row else None
+        if not effective_date:
+            return {}
+
+        elapsed_day = max(1, effective_date.day)
+        month_name = effective_date.strftime('%B').upper()
+        year = effective_date.year
+        month_day = f"{effective_date.day:02d}-{effective_date.strftime('%b').upper()}"
+
+        cur.execute(
+            """
+            WITH sales AS (
+                SELECT
+                    UPPER(TRIM(COALESCE(asin::text, ''))) AS asin_key,
+                    COALESCE(SUM(shipped_units), 0)::numeric  AS units_sold,
+                    COALESCE(SUM(shipped_litres), 0)::numeric AS ltr_sold
+                FROM amazon_sec_range_master_view
+                WHERE "year" = %s
+                  AND UPPER(TRIM("month"::text)) = %s
+                  AND UPPER(TRIM(month_day::text)) = %s
+                GROUP BY UPPER(TRIM(COALESCE(asin::text, '')))
+            ),
+            inventory AS (
+                SELECT
+                    UPPER(TRIM(COALESCE(asin::text, ''))) AS asin_key,
+                    COALESCE(SUM(sellable_on_hand_units), 0)::numeric AS soh_unit,
+                    COALESCE(SUM(soh_ltr), 0)::numeric                AS soh_ltr
+                FROM amazon_master_inventory
+                WHERE "year" = %s
+                  AND UPPER(TRIM("month"::text)) = %s
+                  AND inventory_date = %s
+                  AND NULLIF(TRIM(COALESCE(asin::text, '')), '') IS NOT NULL
+                GROUP BY UPPER(TRIM(COALESCE(asin::text, '')))
+            )
+            SELECT i.asin_key,
+                   i.soh_unit, i.soh_ltr,
+                   COALESCE(s.units_sold, 0) AS units_sold,
+                   COALESCE(s.ltr_sold,  0) AS ltr_sold
+            FROM inventory i
+            LEFT JOIN sales s ON s.asin_key = i.asin_key
+            """,
+            [year, month_name, month_day, year, month_name, effective_date],
+        )
+        rows = cur.fetchall()
+
+    by_asin = {}
+    for asin_key, soh_unit, soh_ltr, units_sold, ltr_sold in rows:
+        if not asin_key:
+            continue
+        soh_unit_f = float(soh_unit or 0)
+        soh_ltr_f  = float(soh_ltr or 0)
+        units_sold_f = float(units_sold or 0)
+        ltr_sold_f   = float(ltr_sold or 0)
+        drr_unit = units_sold_f / elapsed_day if elapsed_day > 0 else 0.0
+        drr_ltr  = ltr_sold_f / elapsed_day if elapsed_day > 0 else 0.0
+        doh = ((soh_unit_f / drr_unit) - 2) if drr_unit > 0 else 0.0
+        by_asin[asin_key] = {
+            'soh_unit': soh_unit_f,
+            'soh_ltr':  soh_ltr_f,
+            'drr_unit': drr_unit,
+            'drr_ltr':  drr_ltr,
+            'doh':      doh,
+            'units_sold': units_sold_f,
+            'ltr_sold':   ltr_sold_f,
+        }
+    return by_asin
 
 
 # ---------------------------------------------------------------------------
@@ -205,6 +355,23 @@ class AppointmentItemsView(APIView):
         truck_size = request.query_params.get('truck_size', '15_ton')
         capacity_override = request.query_params.get('truck_capacity_liters')
 
+        # Optional priority allocation (PREMIUM/COMMODITY/OTHER pct, summing to 100)
+        priority = None
+        try:
+            p_premium = float(request.query_params.get('priority_premium_pct') or -1)
+            p_commodity = float(request.query_params.get('priority_commodity_pct') or -1)
+            p_other = float(request.query_params.get('priority_other_pct') or -1)
+            if p_premium >= 0 and p_commodity >= 0 and p_other >= 0:
+                total_pct = p_premium + p_commodity + p_other
+                if abs(total_pct - 100) <= 0.5:
+                    priority = {
+                        'PREMIUM': p_premium,
+                        'COMMODITY': p_commodity,
+                        'OTHER': p_other,
+                    }
+        except (TypeError, ValueError):
+            priority = None
+
         with connection.cursor() as cur:
             cur.execute("""
                 SELECT appointment_id, status, appointment_time, destination_fc, pro
@@ -240,16 +407,16 @@ class AppointmentItemsView(APIView):
                       AND NULLIF(TRIM(pv), '') IS NOT NULL
                 ),
                 locked_pairs AS (
+                    -- Block items committed to ANY shipment, regardless of status,
+                    -- so users can't re-pick rows already used in a draft/pending plan.
                     SELECT DISTINCT si.asin, UPPER(TRIM(si.po_number)) AS po_number
                     FROM sp_items si
                     JOIN sp_shipments s ON s.id = si.shipment_id
-                    WHERE s.status IN ('approved','dispatched','in_transit','delivered')
-                      AND si.not_loaded = FALSE
+                    WHERE si.not_loaded = FALSE
                 ),
                 doh_data AS (
-                    SELECT asin, soh_unit, soh_ltr, drr_unit, drr_ltr, doh
-                    FROM sp_asin_doh_daily
-                    WHERE date = (SELECT MAX(date) FROM sp_asin_doh_daily)
+                    -- placeholder; DOH joined in Python via _live_doh_by_asin() below
+                    SELECT NULL::text AS asin
                 )
                 SELECT
                     p.po_number,
@@ -270,17 +437,11 @@ class AppointmentItemsView(APIView):
                     p.availability_status,
                     p.po_status,
                     p.status,
-                    p.fulfillment_center,
-                    COALESCE(d.soh_unit, 0)  AS soh_unit,
-                    COALESCE(d.soh_ltr, 0)   AS soh_ltr,
-                    COALESCE(d.drr_unit, 0)  AS drr_unit,
-                    COALESCE(d.drr_ltr, 0)   AS drr_ltr,
-                    COALESCE(d.doh, 0)        AS doh
+                    p.fulfillment_center
                 FROM appt_pos ap
                 JOIN reporting."Amazon PO" p
                     ON UPPER(TRIM(p.po_number)) = ap.po_number
                     AND p.fulfillment_center = %s
-                LEFT JOIN doh_data d ON d.asin = p.asin
                 LEFT JOIN locked_pairs lp
                     ON lp.asin = p.asin
                     AND lp.po_number = UPPER(TRIM(p.po_number))
@@ -291,6 +452,17 @@ class AppointmentItemsView(APIView):
                   AND lp.asin IS NULL
             """, [appointment_id, appt['destination_fc']])
             raw = _row_to_dict(cur, cur.fetchall())
+
+        # Attach LIVE DOH/DRR/SOH (matches SOH/DOH dashboard exactly)
+        doh_by_asin = _live_doh_by_asin()
+        for r in raw:
+            asin_up = str(r.get('asin') or '').upper().strip()
+            live = doh_by_asin.get(asin_up, {})
+            r['soh_unit'] = live.get('soh_unit', 0) or 0
+            r['soh_ltr']  = live.get('soh_ltr', 0) or 0
+            r['drr_unit'] = live.get('drr_unit', 0) or 0
+            r['drr_ltr']  = live.get('drr_ltr', 0) or 0
+            r['doh']      = live.get('doh', 0) or 0
 
         if not raw:
             return Response({
@@ -323,12 +495,16 @@ class AppointmentItemsView(APIView):
             -(x.get('accepted_qty') or 0),
         ))
 
-        loaded, not_loaded, capacity, planned_liters, load_pct = _auto_plan_truck(items, truck_size, capacity_override)
+        loaded, not_loaded, capacity, planned_liters, load_pct, priority_actual = _auto_plan_truck(
+            items, truck_size, capacity_override, priority=priority,
+        )
 
         return Response({
             'appointment': appt,
             'loaded_items': loaded,
             'not_loaded_items': not_loaded,
+            'priority_requested': priority,
+            'priority_actual': priority_actual,
             'load_summary': {
                 'truck_size': truck_size,
                 'capacity': capacity,
@@ -362,17 +538,34 @@ class ShipmentListCreateView(APIView):
         appointment = data.get('appointment', {})
         load_summary = data.get('load_summary', {})
 
+        # Derive destination_fc: explicit > appointment > most common FC across loaded items
+        explicit_fc = (appointment or {}).get('destination_fc') or data.get('destination_fc')
+        if not explicit_fc and loaded_items:
+            from collections import Counter
+            fcs = [i.get('destination_fc') for i in loaded_items if i.get('destination_fc')]
+            explicit_fc = Counter(fcs).most_common(1)[0][0] if fcs else ''
+        destination_fc = explicit_fc or ''
+
+        # Resolve planning_mode: explicit from frontend wins; otherwise infer from payload shape
+        planning_mode = data.get('planning_mode')
+        if planning_mode not in dict(Shipment.PlanningMode.choices):
+            planning_mode = (
+                Shipment.PlanningMode.APPOINTMENT if appointment_id
+                else Shipment.PlanningMode.MANUAL
+            )
+
         with transaction.atomic():
             shipment = Shipment.objects.create(
                 appointment_id=appointment_id or '',
                 appointment_time=appointment.get('appointment_time') if appointment else None,
-                destination_fc=(appointment or {}).get('destination_fc', data.get('destination_fc', '')),
+                destination_fc=destination_fc,
                 pro=(appointment or {}).get('pro', ''),
                 truck_size=truck_size,
                 truck_capacity_liters=load_summary.get('capacity'),
                 planned_liters=load_summary.get('planned_liters'),
                 load_percentage=load_summary.get('load_percentage'),
-                auto_planned=bool(appointment_id),
+                auto_planned=planning_mode != Shipment.PlanningMode.MANUAL,
+                planning_mode=planning_mode,
                 vehicle_type=data.get('vehicle_type', truck_size),
                 vehicle_number=data.get('vehicle_number', ''),
                 driver_name=data.get('driver_name', ''),
@@ -384,21 +577,40 @@ class ShipmentListCreateView(APIView):
             )
 
             def _make_item(item_data, not_loaded=False):
+                dte = item_data.get('days_to_expiry')
+                try:
+                    dte_int = int(dte) if dte is not None else None
+                except (TypeError, ValueError):
+                    dte_int = None
+                # Parse expiry_date — accepts ISO date string or None
+                exp_raw = item_data.get('expiry_date')
+                expiry_date_val = None
+                if exp_raw:
+                    try:
+                        from datetime import date, datetime
+                        if isinstance(exp_raw, (date, datetime)):
+                            expiry_date_val = exp_raw if isinstance(exp_raw, date) and not isinstance(exp_raw, datetime) else exp_raw.date()
+                        else:
+                            # Strip time component if present (e.g. "2026-05-26T00:00:00")
+                            expiry_date_val = datetime.fromisoformat(str(exp_raw).split('T')[0]).date()
+                    except (ValueError, TypeError):
+                        expiry_date_val = None
                 return ShipmentItem(
                     shipment=shipment,
-                    appointment_id=appointment_id,
-                    po_number=item_data.get('po_number', ''),
-                    asin=item_data.get('asin', ''),
-                    internal_sku=item_data.get('internal_sku', ''),
-                    product_name=item_data.get('product_name', ''),
-                    category=item_data.get('category', ''),
-                    sub_category=item_data.get('sub_category', ''),
-                    brand=item_data.get('brand', ''),
-                    item_head=item_data.get('item_head', ''),
-                    item=item_data.get('item', ''),
-                    availability_status=item_data.get('availability_status', ''),
-                    po_status=item_data.get('po_status', ''),
-                    status=item_data.get('status', ''),
+                    appointment_id=appointment_id or '',
+                    po_number=item_data.get('po_number') or '',
+                    asin=item_data.get('asin') or '',
+                    internal_sku=item_data.get('internal_sku') or item_data.get('merchant_sku') or '',
+                    product_name=item_data.get('product_name') or item_data.get('sku_name') or '',
+                    destination_fc=item_data.get('destination_fc') or '',
+                    category=item_data.get('category') or '',
+                    sub_category=item_data.get('sub_category') or '',
+                    brand=item_data.get('brand') or '',
+                    item_head=item_data.get('item_head') or '',
+                    item=item_data.get('item') or '',
+                    availability_status=item_data.get('availability_status') or '',
+                    po_status=item_data.get('po_status') or '',
+                    status=item_data.get('status') or '',
                     accepted_qty=item_data.get('accepted_qty'),
                     available_qty=item_data.get('accepted_qty'),
                     planned_qty=item_data.get('planned_qty', 0) if not not_loaded else 0,
@@ -408,10 +620,11 @@ class ShipmentListCreateView(APIView):
                     doh=item_data.get('doh'),
                     drr_unit=item_data.get('drr_unit'),
                     soh_unit=item_data.get('soh_unit'),
-                    days_to_expiry=item_data.get('days_to_expiry'),
-                    priority_bucket=item_data.get('priority_bucket', ''),
+                    days_to_expiry=dte_int,
+                    expiry_date=expiry_date_val,
+                    priority_bucket=item_data.get('priority_bucket') or '',
                     priority_score=item_data.get('priority_score'),
-                    priority_reason=item_data.get('priority_reason', ''),
+                    priority_reason=item_data.get('priority_reason') or '',
                     is_auto_selected=True,
                     not_loaded=not_loaded,
                 )
@@ -448,12 +661,40 @@ class ShipmentDetailView(APIView):
         if shipment.status not in (Shipment.Status.DRAFT, Shipment.Status.REJECTED):
             return Response({'error': 'Only draft or rejected shipments can be edited'}, status=400)
 
-        allowed = ['driver_name', 'driver_phone', 'vehicle_number', 'vehicle_type']
+        allowed = [
+            'driver_name', 'driver_phone', 'vehicle_number', 'vehicle_type',
+            'appointment_id', 'appointment_time', 'destination_fc', 'pro',
+            'dispatch_date_planned', 'notes',
+        ]
+        update_fields = []
         for field in allowed:
             if field in request.data:
-                setattr(shipment, field, request.data[field])
-        shipment.save(update_fields=allowed)
+                value = request.data[field]
+                # Normalize empty strings for nullable date/time fields
+                if field in ('appointment_time', 'dispatch_date_planned') and value == '':
+                    value = None
+                setattr(shipment, field, value if value is not None else ('' if field not in ('appointment_time', 'dispatch_date_planned') else None))
+                update_fields.append(field)
+        if update_fields:
+            shipment.save(update_fields=update_fields)
         return Response(ShipmentSerializer(shipment).data)
+
+    def delete(self, request, pk):
+        shipment = self._get_shipment(pk)
+        if not shipment:
+            return Response({'error': 'Not found'}, status=404)
+        # Only DRAFT shipments can be deleted; rejected/approved/dispatched are protected.
+        if shipment.status != Shipment.Status.DRAFT:
+            return Response(
+                {'error': f'Only draft shipments can be deleted. This shipment is "{shipment.get_status_display()}".'},
+                status=400,
+            )
+        # Only the creator (or staff) can delete.
+        if shipment.created_by_id and shipment.created_by_id != request.user.id and not request.user.is_staff:
+            return Response({'error': 'Only the creator or staff can delete this draft.'}, status=403)
+        sid = shipment.id
+        shipment.delete()  # cascades to items + audit_logs via FK
+        return Response({'deleted': True, 'shipment_id': sid}, status=200)
 
 
 class ShipmentItemUpdateView(APIView):
@@ -685,21 +926,20 @@ class AsinCatalogView(APIView):
             """)
             po_rows = _row_to_dict(cur, cur.fetchall())
 
-            # DOH from latest daily snapshot
-            cur.execute("""
-                SELECT asin, doh, drr_unit, soh_unit
-                FROM sp_asin_doh_daily
-                WHERE date = (SELECT MAX(date) FROM sp_asin_doh_daily)
-            """)
-            doh_rows = {r['asin']: r for r in _row_to_dict(cur, cur.fetchall())}
+        # DOH/DRR/SOH — LIVE from amazon_master_inventory + amazon_sec_range_master_view
+        # so the Manual PO planner matches the SOH/DOH dashboard exactly.
+        doh_by_asin = _live_doh_by_asin()
 
         catalog = {}
         for r in po_rows:
             entry = _serialize_row(r)
-            doh = doh_rows.get(r['asin'], {})
-            entry['doh'] = float(doh.get('doh') or 0) if doh.get('doh') else None
-            entry['drr_unit'] = float(doh.get('drr_unit') or 0) if doh.get('drr_unit') else None
-            entry['soh_unit'] = float(doh.get('soh_unit') or 0) if doh.get('soh_unit') else None
+            asin_up = str(r.get('asin') or '').upper().strip()
+            live = doh_by_asin.get(asin_up, {})
+            entry['doh']      = live.get('doh')
+            entry['drr_unit'] = live.get('drr_unit')
+            entry['soh_unit'] = live.get('soh_unit')
+            entry['soh_ltr']  = live.get('soh_ltr')
+            entry['drr_ltr']  = live.get('drr_ltr')
             catalog[r['asin']] = entry
 
         return Response(catalog)
@@ -862,7 +1102,7 @@ class AllAppointmentsView(APIView):
 
 
 class ManualPlanView(APIView):
-    """Create a draft shipment from manually selected PO items."""
+    """Preview a plan from manually selected PO items (no DB writes — Save as Draft persists it)."""
     permission_classes = [IsAuthenticated]
 
     def post(self, request):
@@ -889,55 +1129,21 @@ class ManualPlanView(APIView):
             -(float(x.get('accepted_qty') or 0)),
         ))
 
-        loaded, not_loaded, capacity, planned_liters, load_pct = _auto_plan_truck(
+        loaded, not_loaded, capacity, planned_liters, load_pct, priority_actual = _auto_plan_truck(
             selected_items, truck_size, capacity_override
         )
 
-        with transaction.atomic():
-            shipment = Shipment.objects.create(
-                truck_size=truck_size,
-                truck_capacity_liters=capacity,
-                planned_liters=planned_liters,
-                load_percentage=load_pct,
-                auto_planned=False,
-                status=Shipment.Status.DRAFT,
-                created_by=request.user,
-            )
-
-            def _make_item(item_data, not_loaded=False):
-                return ShipmentItem(
-                    shipment=shipment,
-                    po_number=item_data.get('po_number', ''),
-                    asin=item_data.get('asin', ''),
-                    internal_sku=item_data.get('merchant_sku') or item_data.get('internal_sku', ''),
-                    product_name=item_data.get('sku_name') or item_data.get('product_name', ''),
-                    category=item_data.get('category', ''),
-                    sub_category=item_data.get('sub_category', ''),
-                    brand=item_data.get('brand', ''),
-                    item_head=item_data.get('item_head', ''),
-                    item=item_data.get('item', ''),
-                    availability_status=item_data.get('availability_status', ''),
-                    po_status=item_data.get('po_status', ''),
-                    accepted_qty=item_data.get('accepted_qty'),
-                    available_qty=item_data.get('accepted_qty'),
-                    planned_qty=item_data.get('planned_qty', 0) if not not_loaded else 0,
-                    planned_liters=item_data.get('planned_liters', 0) if not not_loaded else 0,
-                    per_liter=item_data.get('per_liter'),
-                    case_pack=item_data.get('case_pack'),
-                    days_to_expiry=item_data.get('days_to_expiry'),
-                    priority_bucket=item_data.get('priority_bucket', ''),
-                    priority_score=item_data.get('priority_score'),
-                    priority_reason=item_data.get('priority_reason', ''),
-                    is_auto_selected=False,
-                    not_loaded=not_loaded,
-                )
-
-            ShipmentItem.objects.bulk_create(
-                [_make_item(i, False) for i in loaded]
-                + [_make_item(i, True) for i in not_loaded]
-            )
-
-        return Response(ShipmentSerializer(shipment).data, status=201)
+        return Response({
+            'loaded_items': loaded,
+            'not_loaded_items': not_loaded,
+            'priority_actual': priority_actual,
+            'load_summary': {
+                'truck_size': truck_size,
+                'capacity': capacity,
+                'planned_liters': planned_liters,
+                'load_percentage': load_pct,
+            },
+        })
 
 
 def _doh_bucket(doh, drr):
@@ -971,6 +1177,23 @@ class DOHAutoFillView(APIView):
         truck_size = request.query_params.get('truck_size', '15_ton')
         capacity_override = request.query_params.get('truck_capacity_liters')
         fc = request.query_params.get('fc', '').strip()
+
+        # Optional priority allocation (PREMIUM/COMMODITY/OTHER pct, summing to 100)
+        priority = None
+        try:
+            p_premium = float(request.query_params.get('priority_premium_pct') or -1)
+            p_commodity = float(request.query_params.get('priority_commodity_pct') or -1)
+            p_other = float(request.query_params.get('priority_other_pct') or -1)
+            if p_premium >= 0 and p_commodity >= 0 and p_other >= 0:
+                total_pct = p_premium + p_commodity + p_other
+                if abs(total_pct - 100) <= 0.5:
+                    priority = {
+                        'PREMIUM': p_premium,
+                        'COMMODITY': p_commodity,
+                        'OTHER': p_other,
+                    }
+        except (TypeError, ValueError):
+            priority = None
 
         # 1) Resolve the effective inventory snapshot date (latest available)
         with connection.cursor() as cur:
@@ -1087,11 +1310,11 @@ class DOHAutoFillView(APIView):
         with connection.cursor() as cur:
             cur.execute(f"""
                 WITH locked_pairs AS (
+                    -- Block items committed to ANY shipment, regardless of status.
                     SELECT DISTINCT si.asin, UPPER(TRIM(si.po_number)) AS po_number
                     FROM sp_items si
                     JOIN sp_shipments s ON s.id = si.shipment_id
-                    WHERE s.status IN ('approved','dispatched','in_transit','delivered')
-                      AND si.not_loaded = FALSE
+                    WHERE si.not_loaded = FALSE
                 )
                 SELECT
                     p.po_number, p.asin,
@@ -1141,9 +1364,32 @@ class DOHAutoFillView(APIView):
             -(float(x.get('accepted_qty') or 0)),
         ))
 
-        # 6) Greedy pack the truck
-        loaded, not_loaded, capacity, planned_liters, load_pct = _auto_plan_truck(actionable, truck_size, capacity_override)
-        not_loaded = not_loaded + no_demand
+        # 6) Single-FC constraint: a truck must contain items from one FC only.
+        #    Pick the FC of the most urgent (lowest-DOH) item; items from other FCs
+        #    are moved to not_loaded with a reason.
+        primary_fc = ''
+        if actionable:
+            primary_fc = (actionable[0].get('destination_fc') or '').strip().upper()
+
+        if primary_fc:
+            same_fc = []
+            other_fc = []
+            for it in actionable:
+                if (it.get('destination_fc') or '').strip().upper() == primary_fc:
+                    same_fc.append(it)
+                else:
+                    it_copy = dict(it)
+                    it_copy['skipped_reason'] = f'Different FC ({it.get("destination_fc")}); truck is locked to {actionable[0].get("destination_fc")}'
+                    other_fc.append(it_copy)
+            loaded, not_loaded, capacity, planned_liters, load_pct, priority_actual = _auto_plan_truck(
+                same_fc, truck_size, capacity_override, priority=priority,
+            )
+            not_loaded = not_loaded + other_fc + no_demand
+        else:
+            loaded, not_loaded, capacity, planned_liters, load_pct, priority_actual = _auto_plan_truck(
+                actionable, truck_size, capacity_override, priority=priority,
+            )
+            not_loaded = not_loaded + no_demand
 
         # 7) Build urgent-no-PO list (CRITICAL or HIGH DOH but no eligible PO)
         urgent_no_po = []
@@ -1178,6 +1424,8 @@ class DOHAutoFillView(APIView):
             'loaded_items': loaded,
             'not_loaded_items': not_loaded,
             'urgent_no_po': urgent_no_po,
+            'priority_requested': priority,
+            'priority_actual': priority_actual,
             'load_summary': {
                 'truck_size': truck_size,
                 'capacity': capacity,
@@ -1200,6 +1448,7 @@ class DOHAutoFillView(APIView):
             'year': year,
             'month_day': month_day,
             'elapsed_day': elapsed_day,
+            'primary_fc': actionable[0].get('destination_fc') if actionable else None,
         })
 
 
@@ -1212,3 +1461,76 @@ class ShipmentPendingApprovalsView(APIView):
             status=Shipment.Status.PENDING_APPROVAL
         )
         return Response(ShipmentSerializer(qs, many=True).data)
+
+
+class PoShipmentLookupView(APIView):
+    """
+    Live map of (asin, po_number) -> list of shipments that contain that line.
+
+    Used by the planning UI to block re-selection of items already committed to
+    another shipment (any status: draft / pending / approved / dispatched / ...).
+    Frontend shows a popup with these details when the user tries to select a
+    blocked row.
+    """
+    permission_classes = [IsAuthenticated]
+
+    STATUS_LABELS = {
+        'draft': 'Draft',
+        'pending_approval': 'Pending Approval',
+        'approved': 'Approved',
+        'rejected': 'Rejected',
+        'dispatched': 'Dispatched',
+        'in_transit': 'In Transit',
+        'delivered': 'Delivered',
+    }
+
+    def get(self, request):
+        items = (
+            ShipmentItem.objects
+            .filter(not_loaded=False)
+            .select_related('shipment', 'shipment__created_by')
+            .only(
+                'asin', 'po_number', 'planned_qty', 'planned_liters', 'accepted_qty',
+                'product_name', 'internal_sku',
+                'shipment__id', 'shipment__status', 'shipment__appointment_id',
+                'shipment__destination_fc', 'shipment__truck_size',
+                'shipment__planned_liters', 'shipment__load_percentage',
+                'shipment__created_at', 'shipment__rejection_reason',
+                'shipment__dispatch_date_planned', 'shipment__created_by__email',
+            )
+        )
+
+        result = {}
+        for it in items:
+            asin = (it.asin or '').strip()
+            po = (it.po_number or '').strip()
+            if not asin or not po:
+                continue
+            key = f"{asin}__{po}"
+            s = it.shipment
+            entry = {
+                'shipment_id': s.id,
+                'status': s.status,
+                'status_label': self.STATUS_LABELS.get(s.status, s.status or '—'),
+                'appointment_id': s.appointment_id or '',
+                'destination_fc': s.destination_fc or '',
+                'truck_size': s.truck_size or '',
+                'planned_liters_shipment': float(s.planned_liters or 0),
+                'load_percentage': float(s.load_percentage or 0),
+                'created_at': s.created_at.isoformat() if s.created_at else None,
+                'created_by': s.created_by.email if s.created_by else None,
+                'dispatch_date_planned': s.dispatch_date_planned.isoformat() if s.dispatch_date_planned else None,
+                'rejection_reason': s.rejection_reason or '',
+                'item_planned_qty': float(it.planned_qty or 0),
+                'item_planned_liters': float(it.planned_liters or 0),
+                'item_accepted_qty': float(it.accepted_qty or 0),
+                'product_name': it.product_name or '',
+                'internal_sku': it.internal_sku or '',
+            }
+            result.setdefault(key, []).append(entry)
+
+        # Sort each list newest-first
+        for k in result:
+            result[k].sort(key=lambda x: x.get('created_at') or '', reverse=True)
+
+        return Response(result)

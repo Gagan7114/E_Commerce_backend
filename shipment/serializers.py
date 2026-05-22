@@ -40,8 +40,8 @@ class ShipmentListSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'appointment_id', 'appointment_time', 'destination_fc',
             'pro', 'truck_size', 'truck_capacity_liters', 'planned_liters',
-            'load_percentage', 'auto_planned', 'status', 'created_by_email',
-            'item_count', 'created_at', 'updated_at',
+            'load_percentage', 'auto_planned', 'planning_mode', 'status',
+            'created_by_email', 'item_count', 'created_at', 'updated_at',
             'vehicle_type', 'vehicle_number', 'driver_name', 'driver_phone',
             'dispatch_date_planned', 'notes',
         ]

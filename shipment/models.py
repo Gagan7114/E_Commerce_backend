@@ -30,6 +30,11 @@ class Shipment(models.Model):
         IN_TRANSIT = 'in_transit', 'In Transit'
         DELIVERED = 'delivered', 'Delivered'
 
+    class PlanningMode(models.TextChoices):
+        MANUAL = 'manual', 'Manual'
+        APPOINTMENT = 'appointment', 'With Appointment'
+        DOH = 'doh', 'With DOH'
+
     appointment_id = models.TextField(blank=True)
     appointment_time = models.DateTimeField(null=True)
     destination_fc = models.TextField(blank=True)
@@ -39,6 +44,9 @@ class Shipment(models.Model):
     planned_liters = models.DecimalField(max_digits=14, decimal_places=4, null=True)
     load_percentage = models.DecimalField(max_digits=6, decimal_places=2, null=True)
     auto_planned = models.BooleanField(default=False)
+    planning_mode = models.CharField(
+        max_length=16, choices=PlanningMode.choices, default=PlanningMode.MANUAL, blank=True
+    )
     vehicle_type = models.TextField(blank=True)
     driver_name = models.TextField(blank=True)
     driver_phone = models.TextField(blank=True)
@@ -75,6 +83,7 @@ class ShipmentItem(models.Model):
     asin = models.TextField(blank=True)
     internal_sku = models.TextField(blank=True)
     product_name = models.TextField(blank=True)
+    destination_fc = models.TextField(blank=True)
     category = models.TextField(blank=True)
     sub_category = models.TextField(blank=True)
     brand = models.TextField(blank=True)
@@ -93,6 +102,7 @@ class ShipmentItem(models.Model):
     drr_unit = models.DecimalField(max_digits=14, decimal_places=4, null=True)
     soh_unit = models.DecimalField(max_digits=14, decimal_places=4, null=True)
     days_to_expiry = models.IntegerField(null=True)
+    expiry_date = models.DateField(null=True, blank=True)
     priority_bucket = models.TextField(blank=True)
     priority_score = models.DecimalField(max_digits=6, decimal_places=2, null=True)
     priority_reason = models.TextField(blank=True)

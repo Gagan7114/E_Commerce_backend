@@ -3848,6 +3848,90 @@ def appointment_summary(request):
         )
         pro_breakdown = _rows_to_dicts(cur)
 
+        # Top SKUs and Item Head breakdowns join appointment.pos → Amazon PO.
+        # They depend on the Amazon PO table having matching po_numbers; if the
+        # join fails (e.g. POs not yet loaded) we return empty arrays rather
+        # than crashing the whole dashboard.
+        sku_breakdown = []
+        item_head_breakdown = []
+        try:
+            # The Amazon PO table column is `sku_name` (not product_name).
+            # GROUP BY (asin, sku_name) so the name comes along for free.
+            # One ASIN may split into multiple rows if names differ across POs;
+            # we collapse them in Python below, keeping the longest non-empty name.
+            cur.execute(
+                r"""
+                SELECT p.asin,
+                       COALESCE(p.sku_name, '') AS sku_name,
+                       COUNT(DISTINCT a.appointment_id) AS appointment_count,
+                       COALESCE(SUM(p.accepted_qty), 0)::bigint AS total_qty
+                FROM reporting."appointment" a
+                CROSS JOIN LATERAL unnest(
+                    regexp_split_to_array(COALESCE(a.pos, ''), '\s*[,;]\s*')
+                ) AS po_val
+                JOIN reporting."Amazon PO" p
+                  ON UPPER(TRIM(p.po_number)) = UPPER(TRIM(po_val))
+                WHERE NULLIF(TRIM(po_val), '') IS NOT NULL
+                  AND p.asin IS NOT NULL
+                  AND TRIM(p.asin) <> ''
+                GROUP BY p.asin, p.sku_name
+                """
+            )
+            raw_rows = cur.fetchall()
+
+            # Collapse by ASIN; keep the longest non-empty product_name.
+            agg = {}
+            for asin, pname, appt_count, total_qty in raw_rows:
+                a = agg.setdefault(asin, {"asin": asin, "product_name": "", "appointment_count": 0, "total_qty": 0})
+                a["appointment_count"] += int(appt_count or 0)
+                a["total_qty"] += int(total_qty or 0)
+                pname = (pname or "").strip()
+                if pname and len(pname) > len(a["product_name"]):
+                    a["product_name"] = pname
+
+            sku_breakdown = sorted(
+                agg.values(),
+                key=lambda x: (-x["appointment_count"], -x["total_qty"]),
+            )[:10]
+        except Exception as exc:
+            logger.exception("appointment_summary: sku_breakdown query failed: %s", exc)
+
+        try:
+            cur.execute(
+                r"""
+                WITH appt_pos AS (
+                    SELECT DISTINCT
+                           a.appointment_id,
+                           UPPER(TRIM(po_val)) AS po_number
+                    FROM reporting."appointment" a
+                    CROSS JOIN LATERAL unnest(
+                        regexp_split_to_array(COALESCE(a.pos, ''), '\s*[,;]\s*')
+                    ) AS po_val
+                    WHERE NULLIF(TRIM(po_val), '') IS NOT NULL
+                )
+                SELECT COALESCE(NULLIF(UPPER(TRIM(p.item_head)), ''), 'OTHER') AS item_head,
+                       COUNT(DISTINCT ap.appointment_id) AS appointment_count,
+                       COUNT(DISTINCT p.asin) AS sku_count,
+                       COALESCE(SUM(p.accepted_qty), 0)::bigint AS total_qty
+                FROM appt_pos ap
+                JOIN reporting."Amazon PO" p
+                  ON UPPER(TRIM(p.po_number)) = ap.po_number
+                GROUP BY COALESCE(NULLIF(UPPER(TRIM(p.item_head)), ''), 'OTHER')
+                ORDER BY appointment_count DESC
+                """
+            )
+            item_head_breakdown = [
+                {
+                    "item_head": r[0],
+                    "appointment_count": int(r[1] or 0),
+                    "sku_count": int(r[2] or 0),
+                    "total_qty": int(r[3] or 0),
+                }
+                for r in cur.fetchall()
+            ]
+        except Exception as exc:
+            logger.warning("appointment_summary: item_head_breakdown query failed: %s", exc)
+
         # Month-over-month trend (current month vs previous month)
         cur.execute(
             """
@@ -3883,6 +3967,8 @@ def appointment_summary(request):
             "fc_breakdown": fc_breakdown,
             "daily_counts": daily_counts,
             "pro_breakdown": pro_breakdown,
+            "sku_breakdown": sku_breakdown,
+            "item_head_breakdown": item_head_breakdown,
             "mom_trend": mom_trend,
         }
     )
