@@ -100,11 +100,34 @@ def _page(request) -> tuple[int, int]:
     return page, page_size
 
 
+# Approximate row counts from pg_class. Postgres maintains `reltuples` via
+# ANALYZE/autovacuum, so this is O(1) vs a full COUNT(*) scan. Good enough
+# for a stat card; exact totals are not required.
+def _approx_count(table: str) -> int:
+    try:
+        val = _scalar(
+            "SELECT reltuples::bigint FROM pg_class WHERE relname = %s",
+            [table],
+        )
+        return int(val) if val and val > 0 else 0
+    except Exception:
+        return 0
+
+
 # ─── /{slug}/stats ───
+_STATS_CACHE_TTL = 60  # seconds
+
+
 @api_view(["GET"])
 @permission_classes([require("platform.stats.view")])
 def platform_stats(request, slug: str):
     _ensure_scope(request.user, slug)
+
+    cache_key = f"platform_stats:{slug}"
+    cached = cache.get(cache_key)
+    if cached is not None:
+        return Response(cached)
+
     p = _get_platform(slug)
     inv = _safe_ident(p.inventory_table) if p.inventory_table else None
     sec = _safe_ident(p.secondary_table) if p.secondary_table else None
@@ -113,20 +136,9 @@ def platform_stats(request, slug: str):
     filter_col = _safe_col(p.po_filter_column or "platform") or "platform"
     filter_val = p.po_filter_value or p.slug
 
-    inventory_count = 0
-    sells_count = 0
-    open_pos = 0
+    inventory_count = _approx_count(inv) if inv else 0
+    sells_count = _approx_count(sec) if sec else 0
 
-    try:
-        if inv:
-            inventory_count = _scalar(f'SELECT COUNT(*) FROM "{inv}"', []) or 0
-    except Exception:
-        inventory_count = 0
-    try:
-        if sec:
-            sells_count = _scalar(f'SELECT COUNT(*) FROM "{sec}"', []) or 0
-    except Exception:
-        sells_count = 0
     try:
         open_pos = _scalar(
             f'SELECT COUNT(*) FROM "{master}" WHERE "{filter_col}" ILIKE %s',
@@ -135,12 +147,14 @@ def platform_stats(request, slug: str):
     except Exception:
         open_pos = 0
 
-    return Response({
+    payload = {
         "inventory": int(inventory_count),
         "sells": int(sells_count),
         "openPOs": int(open_pos),
         "activeTrucks": 0,
-    })
+    }
+    cache.set(cache_key, payload, _STATS_CACHE_TTL)
+    return Response(payload)
 
 
 # ─── /{slug}/pos ───
@@ -8964,4 +8978,325 @@ def landing_rate_update(request, slug: str):
             "month": updated[5],
             "created_at": updated[6].isoformat() if updated[6] else None,
         },
+    })
+
+
+# ─── /{slug}/landing-rate/preview  +  /bulk-upsert  (POST) ─────────────────
+# Bulk paste / CSV upload for monthly landing rates. Mirrors the single-row
+# add/update behaviour (basic_rate auto-compute, audit log on update) but
+# applied across a whole batch in one transaction. SKUs unknown to
+# master_sheet for the platform are rejected — the user must add them via
+# the existing single-SKU "+ Add entry" flow first.
+
+def _parse_landing_rate_bulk_rows(rows):
+    """Validate paste rows; one record per row with classification metadata."""
+    parsed = []
+    for index, raw in enumerate(rows, start=1):
+        record = {
+            "index": index,
+            "row": raw if isinstance(raw, dict) else {},
+            "valid": False,
+            "reason": "",
+            "sku_code": "",
+            "sku_name": "",
+            "sku_key": "",
+        }
+        if not isinstance(raw, dict):
+            record["reason"] = "Row must be an object."
+            parsed.append(record)
+            continue
+
+        sku_code = str(raw.get("sku_code") or "").strip()
+        sku_name = str(raw.get("sku_name") or "").strip()
+        record["sku_code"] = sku_code
+        record["sku_name"] = sku_name
+        record["sku_key"] = _norm_sec_key(sku_code)
+
+        if not sku_code:
+            record["reason"] = "sku_code is required."
+            parsed.append(record)
+            continue
+
+        try:
+            landing_rate = _decimal_input(raw.get("landing_rate"), "landing_rate")
+        except ValidationError as exc:
+            record["reason"] = exc.detail if hasattr(exc, "detail") else str(exc)
+            parsed.append(record)
+            continue
+
+        if landing_rate <= 0:
+            record["reason"] = "landing_rate must be greater than 0."
+            parsed.append(record)
+            continue
+
+        basic_value = raw.get("basic_rate")
+        has_basic = basic_value not in (None, "") and str(basic_value).strip() != ""
+        if has_basic:
+            try:
+                basic_rate = _decimal_input(basic_value, "basic_rate")
+            except ValidationError as exc:
+                record["reason"] = exc.detail if hasattr(exc, "detail") else str(exc)
+                parsed.append(record)
+                continue
+        else:
+            basic_rate = landing_rate / _LANDING_BASIC_DIVISOR
+
+        record["valid"] = True
+        record["landing_rate"] = landing_rate
+        record["basic_rate"] = basic_rate
+        parsed.append(record)
+    return parsed
+
+
+def _existing_landing_rates(format_clause, format_params, month, sku_keys):
+    """For a given format+month, return latest row per SKU keyed by normalized
+    sku_code. Mirrors landing_rate_update's "ORDER BY created_at DESC LIMIT 1"
+    logic so a bulk update touches the same row the modal would."""
+    keys = sorted({k for k in sku_keys if k})
+    if not keys:
+        return {}
+    with connection.cursor() as cur:
+        cur.execute(
+            f"""
+            SELECT DISTINCT ON (UPPER(TRIM("sku_code"::text)))
+                ctid::text                              AS row_ctid,
+                "sku_code",
+                "sku_name",
+                "landing_rate",
+                "basic_rate",
+                "format",
+                "month",
+                "created_at",
+                UPPER(TRIM("sku_code"::text))           AS sku_key
+            FROM "monthly_landing_rate"
+            WHERE {format_clause}
+              AND UPPER(TRIM("sku_code"::text)) = ANY(%s)
+              AND "month"::date >= %s::date
+              AND "month"::date < (%s::date + INTERVAL '1 month')
+            ORDER BY UPPER(TRIM("sku_code"::text)), "created_at" DESC
+            """,
+            format_params + [keys, month, month],
+        )
+        cols = [c[0] for c in cur.description]
+        out = {}
+        for values in cur.fetchall():
+            row = dict(zip(cols, values))
+            out[row["sku_key"]] = row
+    return out
+
+
+def _known_master_skus(format_clause, format_params, sku_keys):
+    """{sku_key: sku_name} for SKUs that exist in master_sheet for this format.
+    Used to reject paste rows whose SKU isn't registered yet."""
+    keys = sorted({k for k in sku_keys if k})
+    if not keys:
+        return {}
+    with connection.cursor() as cur:
+        cur.execute(
+            f"""
+            SELECT UPPER(TRIM("format_sku_code"::text)) AS sku_key,
+                   COALESCE(NULLIF("product_name"::text, ''), "item"::text, '') AS sku_name
+            FROM "master_sheet"
+            WHERE {format_clause}
+              AND UPPER(TRIM("format_sku_code"::text)) = ANY(%s)
+            """,
+            format_params + [keys],
+        )
+        return {row[0]: row[1] for row in cur.fetchall()}
+
+
+def _bulk_classify_row(parsed_row, existing, known):
+    """Decide insert / update / skip / invalid for one parsed row. Returns
+    (action, reason, sku_name_to_use, existing_row_or_None)."""
+    if not parsed_row.get("valid"):
+        return "invalid", parsed_row.get("reason", "Invalid row."), "", None
+    sku_key = parsed_row["sku_key"]
+    if sku_key not in known:
+        return "invalid", "SKU not found in master_sheet for this platform.", "", None
+
+    sku_name = parsed_row["sku_name"] or known.get(sku_key, "") or parsed_row["sku_code"]
+    existing_row = existing.get(sku_key)
+    if not existing_row:
+        return "insert", "", sku_name, None
+
+    same = (
+        Decimal(str(existing_row["landing_rate"])) == parsed_row["landing_rate"]
+        and Decimal(str(existing_row["basic_rate"])) == parsed_row["basic_rate"]
+    )
+    if same:
+        return "skip", "no change", sku_name, existing_row
+    return "update", "", sku_name, existing_row
+
+
+@api_view(["POST"])
+@permission_classes([require("platform.landing_rate.edit")])
+def landing_rate_bulk_preview(request, slug: str):
+    """Dry-run a bulk paste; no DB writes."""
+    _ensure_scope(request.user, slug)
+    if slug not in _LANDING_PLATFORMS:
+        raise ValidationError(f"Monthly landing rate is only available for {_LANDING_PLATFORM_LABELS}.")
+    p = _get_platform(slug)
+    fmt = _format_for(p)
+    format_clause, format_params = _format_match_clause(p)
+
+    body = request.data or {}
+    month = _parse_month(str(body.get("month") or ""))
+    raw_rows = body.get("rows") or []
+
+    if not month:
+        raise ValidationError("month is required (YYYY-MM or YYYY-MM-DD).")
+    if not isinstance(raw_rows, list):
+        raise ValidationError("rows must be a list.")
+
+    parsed = _parse_landing_rate_bulk_rows(raw_rows)
+    keys = [r["sku_key"] for r in parsed if r["valid"]]
+    existing = _existing_landing_rates(format_clause, format_params, month, keys)
+    known = _known_master_skus(format_clause, format_params, keys)
+
+    summary = {"insert": 0, "update": 0, "skip": 0, "invalid": 0, "total": len(parsed)}
+    preview_rows = []
+    for r in parsed:
+        action, reason, sku_name, existing_row = _bulk_classify_row(r, existing, known)
+        summary[action] += 1
+        preview_rows.append({
+            "index": r["index"],
+            "sku_code": r.get("sku_code", ""),
+            "sku_name": sku_name,
+            "action": action,
+            "reason": reason,
+            "landing_rate": str(r.get("landing_rate")) if r.get("valid") else "",
+            "basic_rate": str(r.get("basic_rate")) if r.get("valid") else "",
+            "existing_landing_rate": str(existing_row["landing_rate"]) if existing_row else "",
+            "existing_basic_rate": str(existing_row["basic_rate"]) if existing_row else "",
+        })
+
+    return Response({
+        "format": fmt,
+        "month": month,
+        "summary": summary,
+        "rows": preview_rows,
+    })
+
+
+@api_view(["POST"])
+@permission_classes([require("platform.landing_rate.edit")])
+def landing_rate_bulk_upsert(request, slug: str):
+    """Apply a bulk paste in a single transaction. Updates write an audit
+    row to month_landingrate_logs the same way the single-row update does."""
+    _ensure_scope(request.user, slug)
+    if slug not in _LANDING_PLATFORMS:
+        raise ValidationError(f"Monthly landing rate is only available for {_LANDING_PLATFORM_LABELS}.")
+    p = _get_platform(slug)
+    fmt = _format_for(p)
+    format_clause, format_params = _format_match_clause(p)
+
+    body = request.data or {}
+    month = _parse_month(str(body.get("month") or ""))
+    raw_rows = body.get("rows") or []
+    audit_reason = (str(body.get("reason") or "").strip() or "bulk upload")
+
+    if not month:
+        raise ValidationError("month is required (YYYY-MM or YYYY-MM-DD).")
+    if not isinstance(raw_rows, list):
+        raise ValidationError("rows must be a list.")
+
+    parsed = _parse_landing_rate_bulk_rows(raw_rows)
+    keys = [r["sku_key"] for r in parsed if r["valid"]]
+    existing = _existing_landing_rates(format_clause, format_params, month, keys)
+    known = _known_master_skus(format_clause, format_params, keys)
+
+    user = request.user if getattr(request, "user", None) and request.user.is_authenticated else None
+    updated_by_id = getattr(user, "id", None)
+    updated_by_email = getattr(user, "email", "") or getattr(user, "username", "") if user else ""
+
+    summary = {"inserted": 0, "updated": 0, "skipped": 0, "invalid": 0, "total": len(parsed)}
+    result_rows = []
+
+    try:
+        with transaction.atomic(), connection.cursor() as cur:
+            for r in parsed:
+                action, reason, sku_name, existing_row = _bulk_classify_row(r, existing, known)
+
+                if action == "invalid":
+                    summary["invalid"] += 1
+                    result_rows.append({
+                        "index": r["index"],
+                        "sku_code": r.get("sku_code", ""),
+                        "action": "invalid",
+                        "reason": reason,
+                    })
+                    continue
+                if action == "skip":
+                    summary["skipped"] += 1
+                    result_rows.append({
+                        "index": r["index"],
+                        "sku_code": r["sku_code"],
+                        "action": "skip",
+                        "reason": "no change",
+                    })
+                    continue
+                if action == "update":
+                    cur.execute(
+                        """
+                        INSERT INTO month_landingrate_logs
+                        (sku_code, sku_name, format, month, old_landing_rate, old_basic_rate,
+                         new_landing_rate, new_basic_rate, reason, updated_by_id,
+                         updated_by_email, source_created_at)
+                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                        """,
+                        [
+                            existing_row["sku_code"],
+                            existing_row["sku_name"],
+                            existing_row["format"],
+                            existing_row["month"],
+                            existing_row["landing_rate"],
+                            existing_row["basic_rate"],
+                            r["landing_rate"],
+                            r["basic_rate"],
+                            audit_reason,
+                            updated_by_id,
+                            updated_by_email,
+                            existing_row["created_at"],
+                        ],
+                    )
+                    cur.execute(
+                        """
+                        UPDATE "monthly_landing_rate"
+                        SET "sku_name" = %s, "landing_rate" = %s, "basic_rate" = %s
+                        WHERE ctid = %s::tid
+                        """,
+                        [sku_name, r["landing_rate"], r["basic_rate"], existing_row["row_ctid"]],
+                    )
+                    summary["updated"] += 1
+                    result_rows.append({
+                        "index": r["index"],
+                        "sku_code": r["sku_code"],
+                        "action": "update",
+                        "reason": "",
+                    })
+                    continue
+
+                # insert
+                cur.execute(
+                    'INSERT INTO "monthly_landing_rate" '
+                    '("sku_code","sku_name","landing_rate","basic_rate","format","month") '
+                    'VALUES (%s,%s,%s,%s,%s,%s)',
+                    [r["sku_code"], sku_name, r["landing_rate"], r["basic_rate"], fmt, month],
+                )
+                summary["inserted"] += 1
+                result_rows.append({
+                    "index": r["index"],
+                    "sku_code": r["sku_code"],
+                    "action": "insert",
+                    "reason": "",
+                })
+    except Exception as exc:  # noqa: BLE001
+        return Response({"ok": False, "error": str(exc)}, status=400)
+
+    return Response({
+        "ok": True,
+        "format": fmt,
+        "month": month,
+        "summary": summary,
+        "rows": result_rows,
     })
