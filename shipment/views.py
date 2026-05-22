@@ -407,12 +407,15 @@ class AppointmentItemsView(APIView):
                       AND NULLIF(TRIM(pv), '') IS NOT NULL
                 ),
                 locked_pairs AS (
-                    -- Block items committed to ANY shipment, regardless of status,
-                    -- so users can't re-pick rows already used in a draft/pending plan.
+                    -- Block items committed to any active shipment so users can't
+                    -- re-pick rows already used in a draft/pending/approved plan.
+                    -- Rejected shipments are excluded — their items are released
+                    -- and become re-selectable in new plans.
                     SELECT DISTINCT si.asin, UPPER(TRIM(si.po_number)) AS po_number
                     FROM sp_items si
                     JOIN sp_shipments s ON s.id = si.shipment_id
                     WHERE si.not_loaded = FALSE
+                      AND s.status != 'rejected'
                 ),
                 doh_data AS (
                     -- placeholder; DOH joined in Python via _live_doh_by_asin() below
@@ -683,15 +686,16 @@ class ShipmentDetailView(APIView):
         shipment = self._get_shipment(pk)
         if not shipment:
             return Response({'error': 'Not found'}, status=404)
-        # Only DRAFT shipments can be deleted; rejected/approved/dispatched are protected.
-        if shipment.status != Shipment.Status.DRAFT:
+        # Only DRAFT and REJECTED shipments can be deleted; approved/dispatched/delivered are protected.
+        deletable_statuses = {Shipment.Status.DRAFT, Shipment.Status.REJECTED}
+        if shipment.status not in deletable_statuses:
             return Response(
-                {'error': f'Only draft shipments can be deleted. This shipment is "{shipment.get_status_display()}".'},
+                {'error': f'Only draft or rejected shipments can be deleted. This shipment is "{shipment.get_status_display()}".'},
                 status=400,
             )
         # Only the creator (or staff) can delete.
         if shipment.created_by_id and shipment.created_by_id != request.user.id and not request.user.is_staff:
-            return Response({'error': 'Only the creator or staff can delete this draft.'}, status=403)
+            return Response({'error': 'Only the creator or staff can delete this shipment.'}, status=403)
         sid = shipment.id
         shipment.delete()  # cascades to items + audit_logs via FK
         return Response({'deleted': True, 'shipment_id': sid}, status=200)
@@ -900,13 +904,15 @@ class ShipmentStatsView(APIView):
         stats = Shipment.objects.aggregate(
             total=Count('id'),
             draft=Count('id', filter=Q(status='draft')),
-            pending=Count('id', filter=Q(status='pending_approval')),
+            pending_approval=Count('id', filter=Q(status='pending_approval')),
             approved=Count('id', filter=Q(status='approved')),
             dispatched=Count('id', filter=Q(status='dispatched')),
             in_transit=Count('id', filter=Q(status='in_transit')),
             delivered=Count('id', filter=Q(status='delivered')),
             rejected=Count('id', filter=Q(status='rejected')),
         )
+        # Backwards-compat: keep `pending` alias for any older client.
+        stats['pending'] = stats['pending_approval']
         return Response(stats)
 
 
@@ -1310,11 +1316,14 @@ class DOHAutoFillView(APIView):
         with connection.cursor() as cur:
             cur.execute(f"""
                 WITH locked_pairs AS (
-                    -- Block items committed to ANY shipment, regardless of status.
+                    -- Block items committed to any active shipment. Rejected
+                    -- shipments are excluded — their items are released back
+                    -- into the pool of selectable rows.
                     SELECT DISTINCT si.asin, UPPER(TRIM(si.po_number)) AS po_number
                     FROM sp_items si
                     JOIN sp_shipments s ON s.id = si.shipment_id
                     WHERE si.not_loaded = FALSE
+                      AND s.status != 'rejected'
                 )
                 SELECT
                     p.po_number, p.asin,
@@ -1468,9 +1477,10 @@ class PoShipmentLookupView(APIView):
     Live map of (asin, po_number) -> list of shipments that contain that line.
 
     Used by the planning UI to block re-selection of items already committed to
-    another shipment (any status: draft / pending / approved / dispatched / ...).
-    Frontend shows a popup with these details when the user tries to select a
-    blocked row.
+    another active shipment (draft / pending / approved / dispatched / in_transit /
+    delivered). Rejected shipments are excluded — when a plan is rejected its POs
+    and SKUs become re-selectable in new shipments. Frontend shows a popup with
+    these details when the user tries to select a blocked row.
     """
     permission_classes = [IsAuthenticated]
 
@@ -1488,6 +1498,7 @@ class PoShipmentLookupView(APIView):
         items = (
             ShipmentItem.objects
             .filter(not_loaded=False)
+            .exclude(shipment__status=Shipment.Status.REJECTED)
             .select_related('shipment', 'shipment__created_by')
             .only(
                 'asin', 'po_number', 'planned_qty', 'planned_liters', 'accepted_qty',
