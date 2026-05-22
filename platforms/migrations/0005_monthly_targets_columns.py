@@ -1,21 +1,22 @@
 from django.db import migrations
 
 
-# Adds the 13 sheet columns (format, type, date, targets, done_ltrs,
+# Adds the sheet columns (format, type, item_head, date, targets, done_ltrs,
 # done_value, achieved_pct, est_ltr, est_value, est_ltr_pct, last_month,
-# growth, growth_pct) to monthly_targets.
+# growth, growth_pct) to month_targets.
 #
 # Idempotent: IF NOT EXISTS on every column, so re-running against a DB
 # where some columns already exist is safe. The table itself is created if
 # missing so a fresh environment also works without a manual CREATE TABLE.
 ADD_COLUMNS_SQL = """
-CREATE TABLE IF NOT EXISTS monthly_targets (
+CREATE TABLE IF NOT EXISTS month_targets (
     id BIGSERIAL PRIMARY KEY
 );
 
-ALTER TABLE monthly_targets
+ALTER TABLE month_targets
     ADD COLUMN IF NOT EXISTS format        TEXT,
     ADD COLUMN IF NOT EXISTS type          TEXT,
+    ADD COLUMN IF NOT EXISTS item_head     TEXT,
     ADD COLUMN IF NOT EXISTS date          DATE,
     ADD COLUMN IF NOT EXISTS targets       NUMERIC(14, 2) DEFAULT 0,
     ADD COLUMN IF NOT EXISTS done_ltrs     NUMERIC(14, 2) DEFAULT 0,
@@ -33,9 +34,10 @@ ALTER TABLE monthly_targets
 # Reverse drops only the columns this migration added. The table itself is
 # left in place — if it pre-existed the migration we don't own it.
 REVERSE_SQL = """
-ALTER TABLE monthly_targets
+ALTER TABLE month_targets
     DROP COLUMN IF EXISTS format,
     DROP COLUMN IF EXISTS type,
+    DROP COLUMN IF EXISTS item_head,
     DROP COLUMN IF EXISTS date,
     DROP COLUMN IF EXISTS targets,
     DROP COLUMN IF EXISTS done_ltrs,
