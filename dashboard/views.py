@@ -8,6 +8,12 @@ from rest_framework.decorators import api_view, permission_classes
 from rest_framework.response import Response
 
 from accounts.permissions import require
+from platforms.primary_po_columns import (
+    PRIMARY_MASTER_PO_TABLES,
+    order_primary_master_po_columns,
+    order_primary_master_po_row,
+    primary_master_po_labels,
+)
 
 _IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
@@ -126,7 +132,16 @@ def table_columns(request, table_name: str):
     sample = _sample_row(table_name)
     if not sample:
         return Response({"columns": [], "sample": None})
-    return Response({"columns": list(sample.keys()), "sample": sample})
+    columns = list(sample.keys())
+    if table_name in PRIMARY_MASTER_PO_TABLES:
+        columns = order_primary_master_po_columns(columns)
+        sample = order_primary_master_po_row(sample)
+        return Response({
+            "columns": columns,
+            "column_labels": primary_master_po_labels(columns),
+            "sample": sample,
+        })
+    return Response({"columns": columns, "sample": sample})
 
 
 # ─── /expiry-alerts/{table} ───
@@ -466,6 +481,8 @@ def table_data(request, table_name: str):
                 return Response({"error": "No data returned", "data": [], "count": 0})
             cols = [c[0] for c in cur.description]
             rows = [dict(zip(cols, r)) for r in cur.fetchall()]
+            if table_name in PRIMARY_MASTER_PO_TABLES:
+                rows = [order_primary_master_po_row(row) for row in rows]
     except Exception:
         return Response({"error": "Query failed", "data": [], "count": 0})
 

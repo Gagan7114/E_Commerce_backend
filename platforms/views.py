@@ -13,6 +13,7 @@ from rest_framework.response import Response
 from accounts.permissions import can_access_platform, require
 
 from .models import PlatformConfig
+from .primary_po_columns import order_primary_master_po_row
 
 _IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _LANDING_BASIC_DIVISOR = Decimal("1.05")
@@ -170,6 +171,7 @@ def platform_pos(request, slug: str):
             f'SELECT * FROM "{master}" {where} LIMIT %s OFFSET %s',
             params + [page_size, offset],
         )
+        rows = [order_primary_master_po_row(row) for row in rows]
     except Exception:
         total = 0
         rows = []
