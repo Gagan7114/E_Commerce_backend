@@ -39,7 +39,7 @@ UPLOAD_ALLOWED_TABLES = {
     "fk_grocery", "flipkart_grocery_master",
     "zomatoSec", "citymallSec",
     # Primary
-    "zepto_grn", "zepto_prim",
+    "zepto_grn", "zepto_prim", "zepto_prim_grn_update",
     "blinkit_grn", "blinkit_prim",
     "bigbasket_prim",
     "flipkart_grocery_prim",
@@ -1173,6 +1173,65 @@ def _delete_existing_primary_upload_row(cur, table: str, row: dict) -> int:
     return cur.rowcount or 0
 
 
+def _update_zepto_prim_grn_dates(data: list[dict]) -> Response:
+    """Update Zepto primary rows from the lean GRN upload.
+
+    The GRN file gives a PO id and created date. We use the PO id to update
+    only existing PO lines and never insert rows.
+    """
+    success = 0
+    updated = 0
+    skipped = 0
+    failed = 0
+    last_error: str | None = None
+    seen_po_ids: set[str] = set()
+
+    with connection.cursor() as cur:
+        for row in data:
+            try:
+                po_id = str(row.get("po_id") or "").strip()
+                created_on = str(row.get("created_on") or "").strip()
+
+                if not po_id or not created_on:
+                    skipped += 1
+                    continue
+
+                key = po_id.lower()
+                if key in seen_po_ids:
+                    skipped += 1
+                    continue
+                seen_po_ids.add(key)
+
+                cur.execute(
+                    """
+                    UPDATE zepto_prim
+                       SET grn_date = %s
+                     WHERE LOWER(TRIM(po_no::text)) = LOWER(TRIM(%s))
+                    """,
+                    [created_on, po_id],
+                )
+                line_count = cur.rowcount or 0
+                if line_count:
+                    success += 1
+                    updated += line_count
+                else:
+                    skipped += 1
+            except Exception as exc:
+                failed += 1
+                last_error = str(exc)
+
+    return Response(
+        {
+            "success": success,
+            "created": 0,
+            "updated": updated,
+            "skipped": skipped,
+            "failed": failed,
+            "error": last_error,
+        }
+    )
+
+
 # master_po sync helpers were removed once the master_po table was retired.
 # Uploads now go straight to each platform's per-tenant table via the upsert
 # `INSERT ... ON CONFLICT` path in `_batch_upload`.
@@ -1194,6 +1253,9 @@ def _batch_upload(body, *, forced_table: str | None = None):
         return Response({"detail": "Invalid table name."}, status=400)
     if not isinstance(data, list) or not data:
         return Response({"success": 0, "failed": 0, "error": None})
+
+    if table == "zepto_prim_grn_update":
+        return _update_zepto_prim_grn_dates(data)
 
     if upsert and table in UPLOAD_FORCED_UNIQUE_KEYS:
         unique_key = UPLOAD_FORCED_UNIQUE_KEYS[table]

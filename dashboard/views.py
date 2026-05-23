@@ -1,4 +1,5 @@
 import calendar
+import json
 import re
 from collections import defaultdict
 from datetime import date, datetime, timedelta
@@ -120,7 +121,16 @@ def table_count(request, table_name: str):
 @api_view(["GET"])
 @permission_classes([require("dashboard.view")])
 def table_counts(request):
-    return Response({t: _count(t) for t in ALLOWED_TABLES})
+    requested = request.query_params.get("tables", "")
+    if requested:
+        tables = [
+            table.strip()
+            for table in requested.split(",")
+            if table.strip() in ALLOWED_TABLES
+        ]
+    else:
+        tables = sorted(ALLOWED_TABLES)
+    return Response({t: _count(t) for t in tables})
 
 
 # ─── /table-columns/{table} ───
@@ -142,6 +152,35 @@ def table_columns(request, table_name: str):
             "sample": sample,
         })
     return Response({"columns": columns, "sample": sample})
+
+
+@api_view(["GET"])
+@permission_classes([require("dashboard.table.view")])
+def table_distinct_values(request, table_name: str, column_name: str):
+    if table_name not in ALLOWED_TABLES or not _IDENT.match(column_name):
+        return Response({"error": "Table or column not allowed", "values": []})
+
+    sample = _sample_row(table_name)
+    if not sample or column_name not in sample:
+        return Response({"error": "Column not found", "values": []})
+
+    qt = _quoted(table_name)
+    qc = f'"{column_name}"'
+    try:
+        with connection.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT DISTINCT COALESCE({qc}::text, '') AS value
+                FROM {qt}
+                ORDER BY value ASC
+                LIMIT 5000
+                """
+            )
+            values = [row[0] for row in cur.fetchall()]
+    except Exception:
+        return Response({"error": "Query failed", "values": []})
+
+    return Response({"table": table_name, "column": column_name, "values": values})
 
 
 # ─── /expiry-alerts/{table} ───
@@ -376,6 +415,7 @@ def table_data(request, table_name: str):
     sort_dir = (q.get("sort_dir", "desc") or "desc").lower()
     expiry_column = q.get("expiry_column", "")
     expiry_before = q.get("expiry_before", "")
+    column_filters_raw = q.get("column_filters", "")
 
     where: list[str] = []
     params: list = []
@@ -427,6 +467,26 @@ def table_data(request, table_name: str):
             ors = " OR ".join(f'"{c}"::text ILIKE %s' for c in cols)
             where.append(f"({ors})")
             params.extend([f"%{search}%"] * len(cols))
+
+    if column_filters_raw:
+        try:
+            parsed_filters = json.loads(column_filters_raw)
+        except (TypeError, ValueError):
+            parsed_filters = []
+        sample = _sample_row(table_name) or {}
+        for item in parsed_filters if isinstance(parsed_filters, list) else []:
+            col = item.get("column") if isinstance(item, dict) else ""
+            values = item.get("values") if isinstance(item, dict) else []
+            if not col or not _IDENT.match(col) or col not in sample:
+                continue
+            if not isinstance(values, list):
+                continue
+            cleaned_values = ["" if v is None else str(v) for v in values[:500]]
+            if not cleaned_values:
+                continue
+            placeholders = ", ".join(["%s"] * len(cleaned_values))
+            where.append(f"COALESCE(\"{col}\"::text, '') IN ({placeholders})")
+            params.extend(cleaned_values)
 
     qt = _quoted(table_name)
 
