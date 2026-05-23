@@ -39,6 +39,11 @@ class Shipment(models.Model):
     appointment_time = models.DateTimeField(null=True)
     destination_fc = models.TextField(blank=True)
     pro = models.TextField(blank=True)
+    # Multi-appointment support: when a single truck services multiple
+    # appointments at the same FC, `appointment_id` holds the PRIMARY
+    # (majority by loaded liters) and these two fields carry the rest.
+    additional_appointment_ids = models.TextField(blank=True, default='')
+    appointments_meta = models.JSONField(default=list, blank=True)
     truck_size = models.CharField(max_length=16, blank=True)
     truck_capacity_liters = models.DecimalField(max_digits=14, decimal_places=4, null=True)
     planned_liters = models.DecimalField(max_digits=14, decimal_places=4, null=True)

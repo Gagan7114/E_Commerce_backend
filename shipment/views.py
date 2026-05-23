@@ -405,7 +405,51 @@ class AppointmentDatesView(APIView):
         dates = [r[0].isoformat() for r in rows if r[0] and r[1] > 0]
         counts = {r[0].isoformat(): r[1] for r in rows if r[0]}
         cancelled = {r[0].isoformat(): r[2] for r in rows if r[0] and r[2] > 0}
-        return Response({'dates': dates, 'counts': counts, 'cancelled': cancelled})
+
+        # Per-date count of appointments already in a non-rejected shipment.
+        # Powers the "X planned" mark on the upcoming-dates tiles so planners
+        # can see at a glance which days already have plans.
+        planned = {}
+        if dates:
+            # Pull all date+appointment pairs once, then walk shipments to
+            # count which dates have planned appointments. Cheap aggregation.
+            with connection.cursor() as cur:
+                cur.execute("""
+                    SELECT DATE(a.appointment_time) AS appt_date, a.appointment_id
+                    FROM reporting."appointment" a
+                    WHERE a.appointment_time IS NOT NULL
+                      AND a.status = 'Confirmed'
+                """)
+                appt_date_by_id = {}
+                for d, aid in cur.fetchall():
+                    if d and aid:
+                        appt_date_by_id.setdefault(aid, set()).add(d.isoformat())
+
+                cur.execute("""
+                    SELECT appointment_id, additional_appointment_ids
+                    FROM sp_shipments
+                    WHERE status != 'rejected'
+                """)
+                planned_appt_ids = set()
+                for primary, additional in cur.fetchall():
+                    if primary:
+                        planned_appt_ids.add(str(primary).strip())
+                    if additional:
+                        for a in str(additional).split(','):
+                            a = a.strip()
+                            if a:
+                                planned_appt_ids.add(a)
+
+            for aid in planned_appt_ids:
+                for d_iso in appt_date_by_id.get(aid, set()):
+                    planned[d_iso] = planned.get(d_iso, 0) + 1
+
+        return Response({
+            'dates': dates,
+            'counts': counts,
+            'cancelled': cancelled,
+            'planned': planned,
+        })
 
 
 def _explain_ineligibility(c):
@@ -414,10 +458,34 @@ def _explain_ineligibility(c):
     has zero eligible POs. The frontend shows this on the appointment card so
     planners can see WHY a slot is unusable before they invest time configuring
     the truck.
+
+    Order of detection matters: FC-mismatch (no PO data at the appointment's
+    FC) is the FIRST thing we check, because the underlying SQL counts can't
+    distinguish "PO row says out-of-stock" from "PO row doesn't exist at this
+    FC at all" — both end up looking like is_in_stock = FALSE. We use a
+    dedicated `no_fc_match_count` signal for the latter.
     """
     total = int(c.get('po_count') or 0)
     if total == 0:
         return 'No POs linked to this appointment'
+
+    no_fc_match = int(c.get('no_fc_match_count') or 0)
+    if no_fc_match == total:
+        appt_fc = (c.get('destination_fc') or '').strip()
+        other_fcs = c.get('pos_actual_fcs') or []
+        if other_fcs:
+            fc_str = ', '.join(other_fcs[:3])
+            if len(other_fcs) > 3:
+                fc_str += f', +{len(other_fcs) - 3} more'
+            return (
+                f"PO data not found at FC {appt_fc} — Amazon's PO Report has "
+                f"these POs at: {fc_str}. Re-upload the Amazon PO Report, or "
+                f"fix the appointment's FC."
+            )
+        return (
+            f"PO data not found at FC {appt_fc} in Amazon's PO Report. "
+            f"Re-upload the report or verify the appointment FC."
+        )
 
     not_pending = int(c.get('not_pending_count') or 0)
     not_in_stock = int(c.get('not_in_stock_count') or 0)
@@ -440,6 +508,240 @@ def _explain_ineligibility(c):
     if not_pending:  parts.append(f'{not_pending} closed/dispatched')
     if no_qty:       parts.append(f'{no_qty} with no accepted qty')
     return f'Of {total} POs: ' + (', '.join(parts) if parts else 'all unavailable')
+
+
+def _filler_pass(loaded, leftover_pool, capacity, primary_fc=None, mark_key='_filler', reason=None):
+    """
+    Second-stage pack that fills any unused truck capacity from `leftover_pool`.
+
+    `mark_key` controls how loaded fillers are tagged so the UI can render
+    different badges (filler vs DOH-filler vs anything future). Defaults to
+    `_filler` for back-compat with the first filler pass.
+
+    Items kept: same FC as the rest of the truck (single-FC trucks only).
+    Sort: priority_score desc, days_to_expiry asc, accepted_qty desc.
+
+    Returns (new_loaded, new_not_loaded). Items that didn't fit go back into
+    not-loaded so the UI can still surface them.
+    """
+    planned_lt = sum(float(it.get('planned_liters') or 0) for it in loaded)
+    remaining = float(capacity) - planned_lt
+    if remaining <= 0.001 or not leftover_pool:
+        return list(loaded), list(leftover_pool)
+
+    # Enforce single-FC for fillers too — a truck physically ships to one FC
+    pool = list(leftover_pool)
+    if primary_fc:
+        pf = str(primary_fc).strip().upper()
+        pool = [
+            it for it in pool
+            if str(it.get('destination_fc') or '').strip().upper() == pf
+        ]
+
+    pool.sort(key=lambda x: (
+        -float(x.get('priority_score') or 0),
+        int(x.get('days_to_expiry') or 999),
+        -float(x.get('accepted_qty') or 0),
+    ))
+
+    filler_loaded, filler_unfit, _used = _pack_into_capacity(pool, remaining)
+    default_reason = (
+        'Filler · added to fill leftover truck capacity '
+        '(not part of the priority-driven plan).'
+    )
+    for it in filler_loaded:
+        it[mark_key] = True
+        it['filler_reason'] = reason or default_reason
+
+    # Anything in leftover_pool not at primary_fc stays in not_loaded
+    if primary_fc:
+        wrong_fc = [
+            it for it in leftover_pool
+            if str(it.get('destination_fc') or '').strip().upper() != str(primary_fc).strip().upper()
+        ]
+    else:
+        wrong_fc = []
+    return list(loaded) + filler_loaded, filler_unfit + wrong_fc
+
+
+def _fetch_doh_filler_pool(fc, exclude_po_uppers, doh_by_asin):
+    """
+    Pull all PENDING in-stock POs at the given FC that ARE NOT already in the
+    `exclude_po_uppers` set (typically the current appointment's own POs) and
+    that aren't locked in another active shipment. Enriches each row with
+    DOH/DRR/SOH from the live snapshot and assigns a priority bucket + score.
+
+    Used as a second-stage filler pool when an appointment-anchored plan
+    leaves capacity on the truck — these are 'extra' POs at the same FC that
+    can ride the same truck, ranked by DOH urgency.
+    """
+    if not fc:
+        return []
+    exclude_list = [str(x).strip().upper() for x in (exclude_po_uppers or []) if x]
+
+    with connection.cursor() as cur:
+        cur.execute("""
+            WITH locked_pairs AS (
+                SELECT DISTINCT si.asin, UPPER(TRIM(si.po_number)) AS po_number
+                FROM sp_items si
+                JOIN sp_shipments s ON s.id = si.shipment_id
+                WHERE si.not_loaded = FALSE
+                  AND s.status != 'rejected'
+            )
+            SELECT
+                p.po_number,
+                p.asin,
+                p.merchant_sku        AS internal_sku,
+                p.sku_name            AS product_name,
+                p.accepted_qty,
+                p.case_pack,
+                p.per_liter,
+                p.total_accepted_liters,
+                p.days_to_expiry,
+                p.expiry_date,
+                p.category,
+                p.sub_category,
+                p.brand,
+                p.item_head,
+                p.item,
+                p.availability_status,
+                p.po_status,
+                p.status,
+                p.fulfillment_center AS destination_fc
+            FROM reporting."Amazon PO" p
+            LEFT JOIN locked_pairs lp
+                ON lp.asin = p.asin
+               AND lp.po_number = UPPER(TRIM(p.po_number))
+            WHERE p.status = 'Confirmed'
+              AND p.availability_status = 'AC - Accepted: In stock'
+              AND p.accepted_qty > 0
+              AND p.po_status = 'PENDING'
+              AND p.per_liter IS NOT NULL
+              AND p.per_liter > 0
+              AND p.fulfillment_center = %s
+              AND NOT (UPPER(TRIM(p.po_number)) = ANY(%s::text[]))
+              AND lp.asin IS NULL
+        """, [fc, exclude_list])
+        raw = _row_to_dict(cur, cur.fetchall())
+
+    pool = []
+    for r in raw:
+        row = _serialize_row(r)
+        asin_up = str(row.get('asin') or '').upper().strip()
+        live = doh_by_asin.get(asin_up, {}) if doh_by_asin else {}
+        row['soh_unit'] = live.get('soh_unit', 0) or 0
+        row['soh_ltr']  = live.get('soh_ltr',  0) or 0
+        row['drr_unit'] = live.get('drr_unit', 0) or 0
+        row['drr_ltr']  = live.get('drr_ltr',  0) or 0
+        row['doh']      = live.get('doh',      0) or 0
+        bucket, score, reason = _compute_priority(
+            row['drr_unit'], row['soh_unit'], row['doh'],
+            row.get('days_to_expiry'), row.get('po_status'),
+        )
+        row['priority_bucket'] = bucket
+        row['priority_score']  = score
+        row['priority_reason'] = reason
+        pool.append(row)
+    return pool
+
+
+# Smaller-truck options the planner can suggest when a load comes out very thin.
+# Tuple of (size_key, liters). Kept ascending so the loop below finds the
+# smallest size that would still hold the current load.
+_SMALLER_TRUCK_SUGGESTIONS = (('10_ton', 10000.0),)
+
+
+def _suggest_smaller_truck(planned_liters, current_capacity, current_truck_size):
+    """
+    When a plan ends up loading <70% of the chosen truck, suggest a smaller
+    truck that would pack to ~80%+. Two-step search:
+      1. Try stock sizes (10-ton) first — they're easier for ops to source.
+      2. If no stock size hits the threshold, suggest a CUSTOM size sized to
+         the actual loaded liters + 10% headroom, rounded to nearest 100 L.
+         That guarantees we always offer a path to a full truck, even when
+         the candidate pool is genuinely tiny.
+    Returns a dict suitable for the API response, or None if not meaningful.
+    """
+    if planned_liters <= 0 or current_capacity <= 0:
+        return None
+    current_pct = (planned_liters / current_capacity) * 100
+    # Show the "not enough POs" warning whenever the truck isn't essentially
+    # full. 95% is the cutoff — above that, the gap is normal case-pack
+    # rounding and a warning would just be noise.
+    if current_pct >= 95:
+        return None
+
+    # 1) Stock-size pass
+    for size_key, cap in _SMALLER_TRUCK_SUGGESTIONS:
+        if size_key == current_truck_size:
+            continue
+        if cap >= current_capacity:
+            continue  # not actually smaller
+        if cap < planned_liters:
+            continue  # can't fit current plan either
+        new_pct = (planned_liters / cap) * 100
+        if new_pct >= 75:
+            return {
+                'truck_size': size_key,
+                'capacity_liters': cap,
+                'estimated_fill_pct': round(new_pct, 1),
+                'current_fill_pct': round(current_pct, 1),
+                'is_custom': False,
+                'reason': (
+                    f'Pool is small ({int(planned_liters)} L) — a smaller '
+                    f'{size_key.replace("_", " ")} truck would ship full.'
+                ),
+            }
+
+    # 2) Custom-size fallback — round the actual load UP to the nearest 100 L.
+    # The truck is already packed, so no headroom needed; this gives the
+    # tightest sensible fit (typically 98-100% load on the suggested size).
+    suggested = max(500, int(math.ceil(planned_liters / 100.0)) * 100)
+    if suggested >= current_capacity:
+        # Already pretty close to current — no meaningful smaller option
+        return None
+    new_pct = round((planned_liters / suggested) * 100, 1)
+    return {
+        'truck_size': 'custom',
+        'capacity_liters': suggested,
+        'estimated_fill_pct': new_pct,
+        'current_fill_pct': round(current_pct, 1),
+        'is_custom': True,
+        'reason': (
+            f'Pool exhausted at {int(planned_liters)} L. No standard truck '
+            f'is small enough — a custom {suggested:,} L truck would ship full.'
+        ),
+    }
+
+
+def _row_eligibility_reason(row):
+    """
+    Per-(PO, ASIN) reason string for the eligibility detail drawer.
+    Order matters: list the most-actionable blocker first. FC mismatch is
+    checked BEFORE other blockers because it dominates — if the PO's row is
+    at the wrong FC, the other flags are aggregated over an empty set or
+    over rows from a different warehouse and don't represent the truth.
+    """
+    if row.get('is_eligible'):
+        return 'OK · ready to ship'
+    if row.get('is_fc_mismatch'):
+        actual = (row.get('actual_fc') or '').strip()
+        expected = (row.get('expected_fc') or '').strip()
+        if actual:
+            return f"FC mismatch · PO is at {actual}, appointment is at {expected or '?'}"
+        return f"FC mismatch · no PO row at {expected or '?'}"
+    if row.get('is_locked'):
+        sid = row.get('locked_shipment_id')
+        return f'Locked in shipment #{sid}' if sid else 'Locked in another shipment'
+    if not row.get('is_pending'):
+        po_status = (row.get('po_status') or '').strip() or 'unknown'
+        return f'PO closed/dispatched (po_status={po_status})'
+    if not row.get('is_in_stock'):
+        avail = (row.get('availability_status') or '').strip() or 'unknown'
+        return f'Out of stock (availability={avail})'
+    if not row.get('has_qty'):
+        return 'Zero accepted qty'
+    return 'Unknown reason'
 
 
 class AppointmentListView(APIView):
@@ -478,6 +780,7 @@ class AppointmentListView(APIView):
                     SELECT
                         app.appointment_id,
                         app.po_upper,
+                        BOOL_OR(p.po_number IS NOT NULL) AS has_fc_match,
                         BOOL_OR(p.status = 'Confirmed' AND p.po_status = 'PENDING') AS is_pending,
                         BOOL_OR(p.availability_status = 'AC - Accepted: In stock') AS is_in_stock,
                         BOOL_OR(COALESCE(p.accepted_qty, 0) > 0) AS has_qty,
@@ -507,6 +810,9 @@ class AppointmentListView(APIView):
                         appointment_id,
                         COUNT(*) AS total_po,
                         COUNT(*) FILTER (WHERE is_eligible) AS eligible_po,
+                        -- POs with NO row at the appointment's FC in Amazon's PO Report.
+                        -- Distinguished from "out of stock" so the warning can be accurate.
+                        COUNT(*) FILTER (WHERE NOT COALESCE(has_fc_match, FALSE)) AS no_fc_match_po,
                         COUNT(*) FILTER (WHERE NOT COALESCE(is_pending, FALSE))   AS not_pending_po,
                         COUNT(*) FILTER (WHERE NOT COALESCE(is_in_stock, FALSE))  AS not_in_stock_po,
                         COUNT(*) FILTER (WHERE NOT COALESCE(has_qty, FALSE))      AS no_qty_po,
@@ -527,6 +833,7 @@ class AppointmentListView(APIView):
                     ad.pro,
                     COALESCE(ac.total_po,        0) AS po_count,
                     COALESCE(ac.eligible_po,     0) AS eligible_po_count,
+                    COALESCE(ac.no_fc_match_po,  0) AS no_fc_match_count,
                     COALESCE(ac.not_pending_po,  0) AS not_pending_count,
                     COALESCE(ac.not_in_stock_po, 0) AS not_in_stock_count,
                     COALESCE(ac.no_qty_po,       0) AS no_qty_count,
@@ -537,14 +844,201 @@ class AppointmentListView(APIView):
             """, [date_str])
             rows = _row_to_dict(cur, cur.fetchall())
 
+        # Second pass — fetch per-(appointment, PO, ASIN) details so the
+        # frontend can show a drawer with EXACTLY which SKUs are blocked,
+        # by which shipment, and how much was ordered. Joined with the
+        # latest inventory snapshot so users see "how much less" too.
+        with connection.cursor() as cur:
+            cur.execute("""
+                WITH appt_dedup AS (
+                    SELECT DISTINCT ON (a.appointment_id)
+                        a.appointment_id, a.appointment_time,
+                        a.destination_fc, a.pos
+                    FROM reporting."appointment" a
+                    WHERE DATE(a.appointment_time) = %s
+                    ORDER BY a.appointment_id, a.appointment_time DESC NULLS LAST
+                ),
+                appt_po_pairs AS (
+                    SELECT
+                        ad.appointment_id,
+                        ad.destination_fc,
+                        UPPER(TRIM(pv)) AS po_upper
+                    FROM appt_dedup ad,
+                    LATERAL unnest(
+                        regexp_split_to_array(COALESCE(ad.pos, ''), '\s*[,;]\s*')
+                    ) AS pv
+                    WHERE NULLIF(TRIM(pv), '') IS NOT NULL
+                ),
+                latest_inv AS (
+                    SELECT
+                        UPPER(TRIM(COALESCE(asin::text, ''))) AS asin_key,
+                        COALESCE(SUM(sellable_on_hand_units), 0)::numeric AS soh_unit
+                    FROM amazon_master_inventory
+                    WHERE inventory_date = (SELECT MAX(inventory_date) FROM amazon_master_inventory)
+                      AND NULLIF(TRIM(COALESCE(asin::text, '')), '') IS NOT NULL
+                    GROUP BY UPPER(TRIM(COALESCE(asin::text, '')))
+                ),
+                locked_lookup AS (
+                    SELECT
+                        UPPER(TRIM(si.po_number)) AS po_upper,
+                        UPPER(TRIM(si.asin))      AS asin_upper,
+                        MIN(si.shipment_id)        AS locked_shipment_id
+                    FROM sp_items si
+                    JOIN sp_shipments s ON s.id = si.shipment_id
+                    WHERE si.not_loaded = FALSE
+                      AND s.status != 'rejected'
+                    GROUP BY UPPER(TRIM(si.po_number)), UPPER(TRIM(si.asin))
+                )
+                SELECT
+                    app.appointment_id,
+                    app.destination_fc      AS expected_fc,
+                    p.po_number,
+                    p.asin,
+                    p.sku_name             AS product_name,
+                    p.accepted_qty,
+                    p.case_pack,
+                    p.per_liter,
+                    p.availability_status,
+                    p.po_status,
+                    p.status               AS po_record_status,
+                    p.days_to_expiry,
+                    p.fulfillment_center   AS actual_fc,
+                    COALESCE(li.soh_unit, 0) AS soh_unit,
+                    (p.fulfillment_center = app.destination_fc)                                AS fc_match,
+                    (p.fulfillment_center IS NOT NULL
+                       AND p.fulfillment_center <> app.destination_fc)                         AS is_fc_mismatch,
+                    (p.status = 'Confirmed' AND p.po_status = 'PENDING')                       AS is_pending,
+                    (p.availability_status = 'AC - Accepted: In stock')                        AS is_in_stock,
+                    (COALESCE(p.accepted_qty, 0) > 0)                                          AS has_qty,
+                    (lk.po_upper IS NOT NULL)                                                  AS is_locked,
+                    lk.locked_shipment_id,
+                    (
+                        p.fulfillment_center = app.destination_fc
+                        AND p.status = 'Confirmed'
+                        AND p.po_status = 'PENDING'
+                        AND p.availability_status = 'AC - Accepted: In stock'
+                        AND COALESCE(p.accepted_qty, 0) > 0
+                        AND lk.po_upper IS NULL
+                    ) AS is_eligible
+                FROM appt_po_pairs app
+                LEFT JOIN reporting."Amazon PO" p
+                    ON UPPER(TRIM(p.po_number)) = app.po_upper
+                LEFT JOIN latest_inv li
+                    ON li.asin_key = UPPER(TRIM(COALESCE(p.asin::text, '')))
+                LEFT JOIN locked_lookup lk
+                    ON lk.po_upper   = app.po_upper
+                   AND lk.asin_upper = UPPER(TRIM(COALESCE(p.asin::text, '')))
+                WHERE p.po_number IS NOT NULL
+                ORDER BY app.appointment_id, p.po_number, p.asin
+            """, [date_str])
+            detail_rows = _row_to_dict(cur, cur.fetchall())
+
+        # Group per-row details by appointment, enriching each row with a
+        # human-readable reason and a "shortfall" (accepted_qty − soh_unit).
+        details_by_appt = {}
+        for r in detail_rows:
+            d = _serialize_row(r)
+            appt_id = d.pop('appointment_id', None)
+            if appt_id is None:
+                continue
+            d['reason'] = _row_eligibility_reason(d)
+            accepted = float(d.get('accepted_qty') or 0)
+            soh = float(d.get('soh_unit') or 0)
+            d['shortfall_unit'] = max(0.0, accepted - soh)
+            d['soh_covers_pct'] = (
+                round((soh / accepted) * 100, 1) if accepted > 0 else None
+            )
+            details_by_appt.setdefault(appt_id, []).append(d)
+
+        # Lookup: for each appointment, which FCs do its POs ACTUALLY live at
+        # in the Amazon PO Report? When the appointment's FC has no matching
+        # PO rows, we surface this list in the warning so planners know where
+        # the POs really exist ("appointment says DED5, POs are at DED3").
+        pos_actual_fcs_by_appt = {}
+        with connection.cursor() as cur:
+            cur.execute("""
+                WITH appt_dedup AS (
+                    SELECT DISTINCT ON (a.appointment_id)
+                        a.appointment_id, a.pos
+                    FROM reporting."appointment" a
+                    WHERE DATE(a.appointment_time) = %s
+                    ORDER BY a.appointment_id, a.appointment_time DESC NULLS LAST
+                ),
+                appt_po_pairs AS (
+                    SELECT ad.appointment_id, UPPER(TRIM(pv)) AS po_upper
+                    FROM appt_dedup ad,
+                    LATERAL unnest(
+                        regexp_split_to_array(COALESCE(ad.pos, ''), '\s*[,;]\s*')
+                    ) AS pv
+                    WHERE NULLIF(TRIM(pv), '') IS NOT NULL
+                )
+                SELECT
+                    app.appointment_id,
+                    ARRAY_AGG(DISTINCT p.fulfillment_center)
+                        FILTER (WHERE p.fulfillment_center IS NOT NULL
+                                  AND TRIM(p.fulfillment_center) <> '')
+                        AS actual_fcs
+                FROM appt_po_pairs app
+                LEFT JOIN reporting."Amazon PO" p
+                    ON UPPER(TRIM(p.po_number)) = app.po_upper
+                GROUP BY app.appointment_id
+            """, [date_str])
+            for appt_id, fcs in cur.fetchall():
+                pos_actual_fcs_by_appt[appt_id] = list(fcs or [])
+
+        # Lookup: which appointments already have a shipment? Surfaces a
+        # visual "already planned" indicator on the appointment cards so
+        # planners can tell at a glance whether they're re-planning vs
+        # creating new. Includes primary and combined (additional) appointment
+        # IDs from any non-rejected shipment.
+        appt_ids_today = [r.get('appointment_id') for r in rows if r.get('appointment_id')]
+        existing_by_appt = {}
+        if appt_ids_today:
+            ids_set = {str(x).strip() for x in appt_ids_today}
+            with connection.cursor() as cur:
+                cur.execute("""
+                    SELECT id, status, appointment_id, additional_appointment_ids
+                    FROM sp_shipments
+                    WHERE status != 'rejected'
+                """)
+                for sid, sstatus, primary, additional in cur.fetchall():
+                    candidates = set()
+                    if primary:
+                        candidates.add(str(primary).strip())
+                    if additional:
+                        for a in str(additional).split(','):
+                            a = a.strip()
+                            if a:
+                                candidates.add(a)
+                    for a in candidates & ids_set:
+                        existing_by_appt.setdefault(a, []).append({
+                            'shipment_id': sid,
+                            'status': sstatus,
+                        })
+
         # Attach an `ineligible_reason` string when eligible_po_count == 0 so
-        # the frontend can display it directly on the appointment card.
+        # the frontend can display it directly on the appointment card. Also
+        # attach the per-(PO, ASIN) detail rows so a click on the warning
+        # opens a drawer showing exactly which SKUs are blocked and by how much.
+        # `existing_shipments` lets the UI mark already-planned appointments
+        # distinctly so users don't accidentally re-plan one.
         out = []
         for r in rows:
             data = _serialize_row(r)
             elig = int(data.get('eligible_po_count') or 0)
             data['has_eligible'] = elig > 0
+            # Stash actual-FC list BEFORE _explain_ineligibility so it can
+            # surface the FC-mismatch reason with the real FC names.
+            actual_fcs = pos_actual_fcs_by_appt.get(data.get('appointment_id'), [])
+            # Filter out the appointment's own FC — only "other" FCs are useful
+            appt_fc = (data.get('destination_fc') or '').strip()
+            data['pos_actual_fcs'] = [f for f in actual_fcs if f and f != appt_fc]
             data['ineligible_reason'] = '' if elig > 0 else _explain_ineligibility(data)
+            data['po_details'] = details_by_appt.get(data.get('appointment_id'), [])
+            data['existing_shipments'] = existing_by_appt.get(
+                str(data.get('appointment_id') or '').strip(), []
+            )
+            data['has_existing_plan'] = len(data['existing_shipments']) > 0
             out.append(data)
         return Response(out)
 
@@ -578,38 +1072,93 @@ class AppointmentItemsView(APIView):
         strict_param = str(request.query_params.get('priority_strict') or '').lower()
         priority_strict = strict_param in ('1', 'true', 'yes', 'on')
 
+        # Maximize-fill toggle: after the priority-driven plan, top up any
+        # remaining capacity with NO-DEMAND / leftover items from the same FC.
+        # Default ON so trucks ship full rather than 30% loaded.
+        fill_param = str(request.query_params.get('maximize_fill') or '1').lower()
+        maximize_fill = fill_param in ('1', 'true', 'yes', 'on')
+
+        # Multi-appointment support: the URL still carries one appointment_id
+        # (the primary entry point) but the caller can pass additional IDs via
+        # the `appointment_ids` query param (comma-separated). All appointments
+        # must be at the same FC — single-FC trucks only.
+        extra_ids_raw = request.query_params.get('appointment_ids') or ''
+        extra_ids = [
+            x.strip() for x in extra_ids_raw.split(',')
+            if x.strip() and x.strip() != appointment_id
+        ]
+        all_appt_ids = [appointment_id] + extra_ids
+
         with connection.cursor() as cur:
             cur.execute("""
-                SELECT appointment_id, status, appointment_time, destination_fc, pro
+                SELECT DISTINCT ON (appointment_id)
+                    appointment_id, status, appointment_time, destination_fc, pro
                 FROM reporting."appointment"
-                WHERE appointment_id = %s
-                LIMIT 1
-            """, [appointment_id])
-            row = cur.fetchone()
+                WHERE appointment_id = ANY(%s::text[])
+                ORDER BY appointment_id, appointment_time DESC NULLS LAST
+            """, [all_appt_ids])
+            appt_rows = cur.fetchall()
 
-        if not row:
+        if not appt_rows:
             return Response({'error': 'Appointment not found'}, status=404)
 
-        appt = {
-            'appointment_id': row[0],
-            'status': row[1],
-            'appointment_time': row[2].isoformat() if row[2] else None,
-            'destination_fc': row[3],
-            'pro': row[4],
-        }
+        # Build the appointments list, validate single-FC + all-Confirmed
+        appts_by_id = {}
+        for r in appt_rows:
+            appts_by_id[r[0]] = {
+                'appointment_id': r[0],
+                'status': r[1],
+                'appointment_time': r[2].isoformat() if r[2] else None,
+                'destination_fc': r[3],
+                'pro': r[4],
+            }
 
+        if appointment_id not in appts_by_id:
+            return Response({'error': 'Primary appointment not found'}, status=404)
+
+        appt = appts_by_id[appointment_id]
         if appt['status'] != 'Confirmed':
             return Response({'error': 'Appointment is not Confirmed'}, status=400)
+
+        # FC consistency check across all combined appointments
+        primary_fc_value = appt['destination_fc']
+        for aid in extra_ids:
+            other = appts_by_id.get(aid)
+            if not other:
+                return Response(
+                    {'error': f'Additional appointment {aid} not found'},
+                    status=400,
+                )
+            if other['status'] != 'Confirmed':
+                return Response(
+                    {'error': f'Appointment {aid} is not Confirmed'},
+                    status=400,
+                )
+            if other['destination_fc'] != primary_fc_value:
+                return Response(
+                    {
+                        'error': (
+                            f'Cannot combine appointments at different FCs '
+                            f'({appointment_id} at {primary_fc_value} vs '
+                            f'{aid} at {other["destination_fc"]})'
+                        ),
+                    },
+                    status=400,
+                )
+
+        all_appts = [appts_by_id[a] for a in all_appt_ids if a in appts_by_id]
 
         with connection.cursor() as cur:
             cur.execute("""
                 WITH appt_pos AS (
-                    SELECT DISTINCT UPPER(TRIM(pv)) AS po_number
+                    SELECT DISTINCT
+                        UPPER(TRIM(pv)) AS po_number,
+                        a.appointment_id
                     FROM reporting."appointment" a,
                     LATERAL unnest(
                         regexp_split_to_array(COALESCE(a.pos, ''), '\s*[,;]\s*')
                     ) AS pv
-                    WHERE a.appointment_id = %s
+                    WHERE a.appointment_id = ANY(%s::text[])
                       AND NULLIF(TRIM(pv), '') IS NOT NULL
                 ),
                 locked_pairs AS (
@@ -646,7 +1195,8 @@ class AppointmentItemsView(APIView):
                     p.availability_status,
                     p.po_status,
                     p.status,
-                    p.fulfillment_center
+                    p.fulfillment_center,
+                    ap.appointment_id     AS source_appointment_id
                 FROM appt_pos ap
                 JOIN reporting."Amazon PO" p
                     ON UPPER(TRIM(p.po_number)) = ap.po_number
@@ -659,7 +1209,7 @@ class AppointmentItemsView(APIView):
                   AND p.accepted_qty > 0
                   AND p.po_status = 'PENDING'
                   AND lp.asin IS NULL
-            """, [appointment_id, appt['destination_fc']])
+            """, [all_appt_ids, primary_fc_value])
             raw = _row_to_dict(cur, cur.fetchall())
 
         # Attach LIVE DOH/DRR/SOH (matches SOH/DOH dashboard exactly)
@@ -696,7 +1246,10 @@ class AppointmentItemsView(APIView):
             item['priority_bucket'] = bucket
             item['priority_score'] = score
             item['priority_reason'] = reason
-            item['appointment_id'] = appointment_id
+            # Track the source appointment so the UI can show "from appt X"
+            # tags + we can compute the majority appointment for the saved
+            # shipment's primary appointment_id field.
+            item['appointment_id'] = item.get('source_appointment_id') or appointment_id
 
         items.sort(key=lambda x: (
             -x['priority_score'],
@@ -708,10 +1261,96 @@ class AppointmentItemsView(APIView):
             items, truck_size, capacity_override, priority=priority, strict=priority_strict,
         )
 
+        # Maximize-fill — three-stage waterfall:
+        #   1) NO-DEMAND + leftover items from THIS appointment's own pool.
+        #   2) DOH-driven fillers: other PENDING POs at the same FC that
+        #      aren't part of this appointment. Lets the truck fill close to
+        #      100% when the appointment itself is small. Items still ship
+        #      on the same truck — single-FC enforced.
+        filler_count = 0
+        doh_filler_count = 0
+        primary_fc = appt.get('destination_fc') if appt else None
+        if maximize_fill:
+            # Stage 1 — same-appointment fillers
+            if not_loaded:
+                loaded, not_loaded = _filler_pass(
+                    loaded, not_loaded, capacity,
+                    primary_fc=primary_fc,
+                    mark_key='_filler',
+                )
+                filler_count = sum(1 for it in loaded if it.get('_filler'))
+
+            # Stage 2 — DOH-driven fillers (non-appointment PENDING POs at same FC)
+            cur_planned = sum(float(it.get('planned_liters') or 0) for it in loaded)
+            if cur_planned < float(capacity) and primary_fc:
+                appt_po_uppers = sorted({
+                    str(it.get('po_number') or '').strip().upper()
+                    for it in items
+                    if it.get('po_number')
+                })
+                doh_pool = _fetch_doh_filler_pool(primary_fc, appt_po_uppers, doh_by_asin)
+                if doh_pool:
+                    loaded, _doh_unfit = _filler_pass(
+                        loaded, doh_pool, capacity,
+                        primary_fc=primary_fc,
+                        mark_key='_doh_filler',
+                        reason=(
+                            'DOH filler · pulled from same-FC PENDING POs not '
+                            'tied to this appointment, ranked by DOH urgency.'
+                        ),
+                    )
+                    doh_filler_count = sum(1 for it in loaded if it.get('_doh_filler'))
+
+            # Recompute totals so the load meter reflects all fillers
+            planned_liters = round(sum(float(it.get('planned_liters') or 0) for it in loaded), 4)
+            load_pct = round((planned_liters / capacity * 100) if capacity > 0 else 0, 2)
+
+        # If load is still thin, suggest a smaller truck size
+        truck_suggestion = _suggest_smaller_truck(planned_liters, capacity, truck_size)
+
+        # Multi-appointment: compute the majority by loaded liters so the
+        # saved shipment can store the right primary appointment_id, and
+        # build per-appointment counts so the UI can show "appt A 3500L,
+        # appt B 1200L · DOH filler 2500L" breakdowns.
+        liters_by_appt = {}
+        for it in loaded:
+            if it.get('_doh_filler'):
+                continue  # DOH fillers don't belong to any appointment
+            aid = str(it.get('appointment_id') or '').strip() or appointment_id
+            liters_by_appt[aid] = liters_by_appt.get(aid, 0.0) + float(it.get('planned_liters') or 0)
+
+        # Majority = appointment with the most loaded liters (ties → URL primary)
+        primary_appt_id = appointment_id
+        if liters_by_appt:
+            sorted_appts = sorted(liters_by_appt.items(), key=lambda x: -x[1])
+            if sorted_appts[0][0] and sorted_appts[0][1] > 0:
+                primary_appt_id = sorted_appts[0][0]
+
+        appointments_meta = []
+        for a in all_appts:
+            a_id = a['appointment_id']
+            appointments_meta.append({
+                'appointment_id': a_id,
+                'appointment_time': a.get('appointment_time'),
+                'destination_fc': a.get('destination_fc'),
+                'pro': a.get('pro'),
+                'loaded_liters': round(liters_by_appt.get(a_id, 0.0), 4),
+                'is_primary': a_id == primary_appt_id,
+            })
+        # Sort: primary first, then by loaded liters desc
+        appointments_meta.sort(key=lambda x: (not x['is_primary'], -x['loaded_liters']))
+
+        primary_appt = appts_by_id.get(primary_appt_id, appt)
+
         return Response({
-            'appointment': appt,
+            'appointment': primary_appt,
+            'appointments_meta': appointments_meta,
+            'primary_appointment_id': primary_appt_id,
             'doh_snapshot': doh_meta,
             'priority_strict': priority_strict,
+            'maximize_fill': maximize_fill,
+            'filler_count': filler_count,
+            'doh_filler_count': doh_filler_count,
             'loaded_items': loaded,
             'not_loaded_items': not_loaded,
             'priority_requested': priority,
@@ -722,6 +1361,7 @@ class AppointmentItemsView(APIView):
                 'planned_liters': planned_liters,
                 'load_percentage': load_pct,
             },
+            'truck_suggestion': truck_suggestion,
         })
 
 
@@ -748,6 +1388,13 @@ class ShipmentListCreateView(APIView):
         not_loaded_items = data.get('not_loaded_items', [])
         appointment = data.get('appointment', {})
         load_summary = data.get('load_summary', {})
+        # Multi-appointment payload: full meta array + extra IDs (excluding
+        # the primary). Frontend sends both; backend uses them to populate
+        # the new `additional_appointment_ids` + `appointments_meta` fields.
+        appointments_meta = data.get('appointments_meta') or []
+        additional_ids = data.get('additional_appointment_ids') or ''
+        if isinstance(additional_ids, list):
+            additional_ids = ','.join(str(x) for x in additional_ids if x)
 
         # Derive destination_fc: explicit > appointment > most common FC across loaded items
         explicit_fc = (appointment or {}).get('destination_fc') or data.get('destination_fc')
@@ -817,6 +1464,8 @@ class ShipmentListCreateView(APIView):
                 appointment_time=appointment.get('appointment_time') if appointment else None,
                 destination_fc=destination_fc,
                 pro=(appointment or {}).get('pro', ''),
+                additional_appointment_ids=additional_ids,
+                appointments_meta=appointments_meta,
                 truck_size=truck_size,
                 truck_capacity_liters=load_summary.get('capacity'),
                 planned_liters=load_summary.get('planned_liters'),
@@ -1460,6 +2109,11 @@ class DOHAutoFillView(APIView):
         strict_param = str(request.query_params.get('priority_strict') or '').lower()
         priority_strict = strict_param in ('1', 'true', 'yes', 'on')
 
+        # Maximize-fill toggle: top up the truck with NO-DEMAND / leftover
+        # items at the chosen FC after the priority-driven pack. Default ON.
+        fill_param = str(request.query_params.get('maximize_fill') or '1').lower()
+        maximize_fill = fill_param in ('1', 'true', 'yes', 'on')
+
         # 1) Resolve the effective inventory snapshot date (latest available)
         with connection.cursor() as cur:
             cur.execute("""
@@ -1705,6 +2359,16 @@ class DOHAutoFillView(APIView):
             )
             not_loaded = not_loaded + no_demand
 
+        # Maximize-fill: top up remaining truck capacity with NO-DEMAND items
+        # + leftover not_loaded items at the chosen FC. Single-FC constraint
+        # still enforced — _filler_pass filters by primary_fc internally.
+        filler_count = 0
+        if maximize_fill and not_loaded:
+            loaded, not_loaded = _filler_pass(loaded, not_loaded, capacity, primary_fc=primary_fc)
+            filler_count = sum(1 for it in loaded if it.get('_filler'))
+            planned_liters = round(sum(float(it.get('planned_liters') or 0) for it in loaded), 4)
+            load_pct = round((planned_liters / capacity * 100) if capacity > 0 else 0, 2)
+
         # 7) Build urgent-no-PO list (CRITICAL or HIGH DOH but no eligible PO)
         urgent_no_po = []
         for asin_up, live in doh_by_asin.items():
@@ -1746,6 +2410,8 @@ class DOHAutoFillView(APIView):
                     fc_used = opt['fc']
                     break
 
+        truck_suggestion = _suggest_smaller_truck(planned_liters, capacity, truck_size)
+
         return Response({
             'loaded_items': loaded,
             'not_loaded_items': not_loaded,
@@ -1753,6 +2419,8 @@ class DOHAutoFillView(APIView):
             'priority_requested': priority,
             'priority_actual': priority_actual,
             'priority_strict': priority_strict,
+            'maximize_fill': maximize_fill,
+            'filler_count': filler_count,
             'load_summary': {
                 'truck_size': truck_size,
                 'capacity': capacity,
@@ -1777,6 +2445,7 @@ class DOHAutoFillView(APIView):
             'fc_used': fc_used,
             'fc_options': fc_options,
             'primary_fc': fc_used,
+            'truck_suggestion': truck_suggestion,
         })
 
 
