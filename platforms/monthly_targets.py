@@ -230,10 +230,11 @@ def _read_secmaster(fmt: str, item_head: str, month: int, year: int) -> dict:
 def _read_master_po(fmt: str, item_head: str, month: int, year: int) -> dict:
     """Read (done_ltrs, done_value, latest_date) from master_po for
     Zomato / CityMall. Filters: status = 'COMPLETED', delivery_month = month,
-    year = year, format = fmt, item_head = item_head.
+    delivered_year = year, format = fmt, item_head = item_head.
 
     Note: `delivery_month` is TEXT in the live DB holding uppercase month
-    names ('APRIL', …) — same convention as SecMaster. `year` is INTEGER.
+    names ('APRIL', …) — same convention as SecMaster. `delivered_year` is
+    INTEGER.
     """
     month_name = _MONTH_NAMES[month]
     sql = """
