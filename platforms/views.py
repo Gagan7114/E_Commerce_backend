@@ -7751,6 +7751,11 @@ def _blinkit_drr_dashboard_response(request):
 
     items = []
     for row in item_rows:
+        row_item_head = (row.get("item_head") or "OTHER").upper()
+        # Mirror the daily filter — KPI totals + the per-SKU table must
+        # only reflect rows matching the selected item-head bucket.
+        if sales_of != "ALL" and row_item_head != sales_of:
+            continue
         qty = _num(row.get("qty"))
         ltr = _num(row.get("ltr"))
         value = _num(row.get("value"))
@@ -7761,7 +7766,7 @@ def _blinkit_drr_dashboard_response(request):
         drr_value = _safe_div(value, elapsed_days)
         product = row.get("product") or row.get("inventory_item") or ""
         items.append({
-            "item_head": row.get("item_head") or "OTHER",
+            "item_head": row_item_head,
             "product": product,
             "item": product,
             "inventory_item": row.get("inventory_item") or "",
@@ -8003,6 +8008,11 @@ def _inventory_drr_dashboard_response(request, slug: str):
 
     items = []
     for row in item_rows:
+        row_item_head = (row.get("item_head") or "OTHER").upper()
+        # Mirror the daily filter — KPI totals + the per-SKU table must
+        # only reflect rows matching the selected item-head bucket.
+        if sales_of != "ALL" and row_item_head != sales_of:
+            continue
         qty = _num(row.get("qty"))
         ltr = _num(row.get("ltr"))
         value = _num(row.get("value"))
@@ -8013,7 +8023,7 @@ def _inventory_drr_dashboard_response(request, slug: str):
         drr_value = _safe_div(value, elapsed_days)
         product = row.get("product") or row.get("inventory_item") or ""
         items.append({
-            "item_head": row.get("item_head") or "OTHER",
+            "item_head": row_item_head,
             "product": product,
             "item": product,
             "inventory_item": row.get("inventory_item") or "",
@@ -8277,6 +8287,11 @@ def _flipkart_mp_drr_dashboard_response(request):
 
     items = []
     for row in item_raw:
+        row_item_head = (row.get("item_head") or "OTHER").upper()
+        # Mirror the daily filter so KPI totals + the per-SKU table reflect
+        # only the selected item-head bucket.
+        if sales_of != "ALL" and row_item_head != sales_of:
+            continue
         qty = _num(row.get("qty"))
         liters = _num(row.get("liters"))
         landing_amt = _num(row.get("landing_amt"))
@@ -8285,7 +8300,7 @@ def _flipkart_mp_drr_dashboard_response(request):
         drr_value = _safe_div(landing_amt, elapsed_days)
         items.append({
             "item": row.get("item"),
-            "item_head": row.get("item_head"),
+            "item_head": row_item_head,
             "qty": qty,
             "liters": liters,
             "landing_amt": landing_amt,

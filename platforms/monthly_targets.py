@@ -52,7 +52,9 @@ FLIPKART_GROCERY_SLUGS = {"flipkart_grocery"}
 # this module supports. Setting a target row still goes through the normal
 # POST UI; done_ltrs / done_value start at 0 and the user updates them via
 # the edit flow.
-MANUAL_SLUGS = {"amazon"}
+AMAZON_SLUGS = {"amazon"}
+# Kept for backwards compatibility / future manual platforms (none today).
+MANUAL_SLUGS: set[str] = set()
 
 # Slugs explicitly out of scope — spec §8.1.
 SKIPPED_SLUGS = {"jiomart"}
@@ -94,12 +96,14 @@ def _source_for(slug: str) -> str:
         return "master_po"
     if slug in FLIPKART_GROCERY_SLUGS:
         return "flipkart_grocery"
+    if slug in AMAZON_SLUGS:
+        return "amazon"
     if slug in MANUAL_SLUGS:
         return "manual"
     raise ValidationError(
         f"Platform '{slug}' is not supported for Monthly Targets. "
         f"In-scope platforms: "
-        f"{', '.join(sorted(SECMASTER_SLUGS | MASTER_PO_SLUGS | FLIPKART_GROCERY_SLUGS | MANUAL_SLUGS))}."
+        f"{', '.join(sorted(SECMASTER_SLUGS | MASTER_PO_SLUGS | FLIPKART_GROCERY_SLUGS | AMAZON_SLUGS | MANUAL_SLUGS))}."
     )
 
 
@@ -326,14 +330,51 @@ def _read_flipkart_grocery(fmt: str, item_head: str, month: int, year: int) -> d
     }
 
 
+def _read_amazon(item_head: str, month: int, year: int) -> dict:
+    """Read (done_ltrs, done_value, latest_date) for Amazon from
+    `amazon_sec_daily_master_view` — the SecMaster-equivalent view that
+    joins amazon_sec_daily with master_sheet on ASIN. `item_head` is the
+    master_sheet classification (PREMIUM / COMMODITY).
+
+    done_ltrs = SUM(shipped_litres)   (shipped_units × master_sheet.per_unit_value)
+    done_value = SUM(shipped_revenue) (Amazon's own shipped_revenue, falls back
+        to shipped_revenue_2 which is ordered_revenue/ordered_units × shipped_units
+        for ASINs missing direct shipped_revenue figures)
+    """
+    sql = """
+        SELECT
+            COALESCE(SUM("shipped_litres"), 0)                              AS done_ltrs,
+            COALESCE(
+                NULLIF(SUM("shipped_revenue"), 0),
+                SUM("shipped_revenue_2"),
+                0
+            )                                                                AS done_value,
+            MAX("from_date")                                                AS latest_date
+        FROM "amazon_sec_daily_master_view"
+        WHERE UPPER(TRIM("item_head"::text)) = UPPER(TRIM(%s))
+          AND EXTRACT(MONTH FROM "from_date") = %s
+          AND EXTRACT(YEAR FROM "from_date")  = %s
+    """
+    with connection.cursor() as cur:
+        cur.execute(sql, [item_head, month, year])
+        row = cur.fetchone()
+    return {
+        "done_ltrs": Decimal(row[0] or 0),
+        "done_value": Decimal(row[1] or 0),
+        "latest_date": row[2],
+    }
+
+
 def _read_source(slug: str, fmt: str, item_head: str, month: int, year: int) -> dict:
     source = _source_for(slug)
     if source == "secmaster":
         return _read_secmaster(fmt, item_head, month, year)
     if source == "flipkart_grocery":
         return _read_flipkart_grocery(fmt, item_head, month, year)
+    if source == "amazon":
+        return _read_amazon(item_head, month, year)
     if source == "manual":
-        # Manual platforms (Amazon): no auto-aggregation. The user sets the
+        # Manual platforms: no auto-aggregation. The user sets the
         # target; done values start at 0 and are updated via the edit flow.
         return {
             "done_ltrs": Decimal(0),
