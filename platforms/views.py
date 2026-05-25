@@ -1387,9 +1387,9 @@ def _primary_dashboard_payload(
         metrics = _primary_metrics(summary_by_head.get(item_head))
         summary.append({"item_head": item_head, **metrics})
 
-    fill_rate_date_col = "po_dt" if mode == "PO MONTH" else "delivery_dt"
-    fill_rate_month_key = "po_month_key" if mode == "PO MONTH" else "delivery_month_key"
-    fill_rate_year_key = "po_year" if mode == "PO MONTH" else "delivery_year"
+    fill_rate_date_col = "po_dt" if mode == "PO MONTH" else "COALESCE(delivery_dt, po_dt)"
+    fill_rate_month_key = "po_month_key" if mode == "PO MONTH" else "COALESCE(delivery_month_key, po_month_key)"
+    fill_rate_year_key = "po_year" if mode == "PO MONTH" else "COALESCE(delivery_year, po_year)"
     fill_rate_max_date = _scalar(
         f"""
         {primary_cte}
@@ -1637,7 +1637,7 @@ def _primary_dashboard_payload(
 
     detail_total = _primary_total(details)
     summary_total = _primary_total(summary)
-    trend_date_col = "delivery_dt" if mode == "DEL MONTH" else "po_dt"
+    trend_date_col = "COALESCE(delivery_dt, po_dt)" if mode == "DEL MONTH" else "po_dt"
     period_start = date(year, month, 1)
     period_end = date(year, month, monthrange(year, month)[1])
 
@@ -4266,14 +4266,14 @@ def _parse_primary_dashboard_params(params, platform_format: str = "ZEPTO") -> t
         raw_month = iso_month.group(2)
 
     if not raw_month or not raw_year:
-        order_date = "delivery_dt" if mode == "DEL MONTH" else "po_dt"
+        order_date = "COALESCE(delivery_dt, po_dt)" if mode == "DEL MONTH" else "po_dt"
         primary_cte = _primary_master_po_cte(platform_format)
         latest = _dict_rows(
             f"""
             {primary_cte}
             SELECT
                 {order_date} AS period_date,
-                COALESCE(expiry_year, EXTRACT(YEAR FROM delivery_dt)::integer, po_year) AS del_year,
+                COALESCE(delivery_year, po_year) AS del_year,
                 po_year
             FROM normalized
             WHERE {order_date} IS NOT NULL
@@ -4315,19 +4315,19 @@ def _parse_primary_dashboard_params(params, platform_format: str = "ZEPTO") -> t
 def _primary_period_filter(mode: str) -> str:
     if mode == "PO MONTH":
         return "po_month_key = %s AND po_year = %s"
-    return "delivery_month_key = %s AND delivery_year = %s"
+    return "COALESCE(delivery_month_key, po_month_key) = %s AND COALESCE(delivery_year, po_year) = %s"
 
 
 def _primary_vendor_metric_filter(mode: str) -> str:
     if mode == "PO MONTH":
         return "po_month_key = %s AND po_year = %s"
-    return "delivery_month_key = %s AND delivery_year = %s"
+    return "COALESCE(delivery_month_key, po_month_key) = %s AND COALESCE(delivery_year, po_year) = %s"
 
 
 def _primary_vendor_pending_filter(mode: str) -> str:
     if mode == "PO MONTH":
         return "po_month_key = %s AND po_year = %s"
-    return "delivery_month_key = %s AND delivery_year = %s"
+    return "COALESCE(delivery_month_key, po_month_key) = %s AND COALESCE(delivery_year, po_year) = %s"
 
 
 def _primary_zero_metrics() -> dict:
