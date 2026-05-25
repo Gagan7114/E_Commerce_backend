@@ -39,7 +39,7 @@ UPLOAD_ALLOWED_TABLES = {
     "fk_grocery", "flipkart_grocery_master",
     "zomatoSec", "citymallSec",
     # Primary
-    "total_po", "total_po_grn_update",
+    "total_po", "total_po_zbs", "total_po_grn_update", "total_po_zbs_grn_update",
     "swiggy_grn", "swiggy_prim",
     # Ads
     "blinkit_ads",
@@ -56,7 +56,7 @@ UPLOAD_ALLOWED_TABLES = {
     "amazon_coupon",
 }
 
-BATCH_SIZE = 50
+BATCH_SIZE = 1000
 
 MASTER_SHEET_COLUMNS = [
     "format_sku_code",
@@ -110,6 +110,7 @@ PRIMARY_UPLOAD_REPLACE_KEYS = {
     # Primary PO rows are identified by platform PO + platform SKU. Status,
     # dates, vendor, rates, and quantities are mutable row data.
     "total_po": (("po_number",), ("sku_code",)),
+    "total_po_zbs": (("po_number",), ("sku_code",)),
     "swiggy_prim": (("po_number",), ("sku_code",)),
 }
 
@@ -148,6 +149,57 @@ def _upload_table_columns(table: str) -> set[str]:
             [table],
         )
         return {row[0] for row in cur.fetchall()}
+
+
+def _upload_table_column_types(table: str) -> dict[str, str]:
+    with connection.cursor() as cur:
+        cur.execute(
+            """
+            SELECT column_name, data_type
+            FROM information_schema.columns
+            WHERE table_schema = 'public'
+              AND table_name = %s
+            """,
+            [table],
+        )
+        return {row[0]: row[1] for row in cur.fetchall()}
+
+
+_BLANK_AS_NULL_TYPES = {
+    "bigint",
+    "boolean",
+    "date",
+    "double precision",
+    "integer",
+    "numeric",
+    "real",
+    "smallint",
+    "timestamp with time zone",
+    "timestamp without time zone",
+}
+
+
+def _normalize_upload_value(value, data_type: str | None):
+    if isinstance(value, str) and value.strip() == "" and data_type in _BLANK_AS_NULL_TYPES:
+        return None
+    if isinstance(value, str) and data_type in {"date", "timestamp with time zone", "timestamp without time zone"}:
+        text = value.strip()
+        date_match = re.match(r"^(\d{1,2})[-/.](\d{1,2})[-/.](\d{4})(?:\s+.*)?$", text)
+        if date_match:
+            day, month, year = date_match.groups()
+            return f"{year}-{month.zfill(2)}-{day.zfill(2)}"
+        iso_match = re.match(r"^(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})(?:\s+.*)?$", text)
+        if iso_match:
+            year, month, day = iso_match.groups()
+            return f"{year}-{month.zfill(2)}-{day.zfill(2)}"
+    return value
+
+
+def _upload_row_values(row: dict, columns: list[str], column_types: dict[str, str]) -> list:
+    return [
+        _normalize_upload_value(row.get(column), column_types.get(column))
+        for column in columns
+    ]
 
 
 def _sync_table_id_sequence(table: str, table_columns: set[str], upload_columns: list[str]) -> None:
@@ -1163,8 +1215,29 @@ def _delete_existing_primary_upload_row(cur, table: str, row: dict) -> int:
     return cur.rowcount or 0
 
 
-def _update_total_po_grn_dates(data: list[dict]) -> Response:
-    """Update existing PO rows in total_po from a lean GRN upload.
+def _execute_batch_insert_rows(
+    cur,
+    sql: str,
+    rows: list[dict],
+    columns: list[str],
+    column_types: dict[str, str],
+    *,
+    tracks_upsert_counts: bool,
+):
+    results = []
+    for row in rows:
+        cur.execute(sql, _upload_row_values(row, columns, column_types))
+        if tracks_upsert_counts:
+            result = cur.fetchone()
+            if result is not None:
+                results.append(result)
+    if tracks_upsert_counts:
+        return results
+    return None
+
+
+def _update_total_po_grn_dates(data: list[dict], target_table: str = "total_po") -> Response:
+    """Update existing PO rows in a primary PO table from a lean GRN upload.
 
     The GRN sheet supplies po_number and grn_date. It may also supply sku_code
     and delivered_qty; delivered_qty is updated only when sku_code is present so
@@ -1172,87 +1245,113 @@ def _update_total_po_grn_dates(data: list[dict]) -> Response:
     When format is supplied, the update is limited to that platform. No new rows
     are inserted from GRN files.
     """
+    if target_table not in {"total_po", "total_po_zbs"}:
+        return Response(
+            {"detail": f"Table '{target_table}' is not allowed for GRN update"},
+            status=400,
+        )
+
+    quoted_target_table = _quote_ident(target_table)
+    prepared: dict[tuple[str, str], tuple[str, str, str, object]] = {}
+    skipped = 0
+
+    for row in data:
+        po_number = str(row.get("po_number") or "").strip()
+        sku_code = str(row.get("sku_code") or "").strip()
+        grn_date = str(row.get("grn_date") or "").strip()
+        format_value = str(row.get("format") or "").strip().upper()
+        delivered_qty_raw = row.get("delivered_qty")
+        has_delivered_qty = (
+            delivered_qty_raw is not None
+            and str(delivered_qty_raw).strip() != ""
+        )
+        if not po_number or not grn_date:
+            skipped += 1
+            continue
+
+        key = (po_number.lower(), sku_code.lower())
+        if key in prepared:
+            skipped += 1
+            continue
+        prepared[key] = (
+            po_number,
+            sku_code,
+            grn_date,
+            format_value,
+            delivered_qty_raw if has_delivered_qty else None,
+        )
+
     success = 0
     updated = 0
-    skipped = 0
     failed = 0
     last_error: str | None = None
-    seen_po_ids: set[str] = set()
 
-    with connection.cursor() as cur:
-        for row in data:
-            try:
-                po_number = str(row.get("po_number") or "").strip()
-                sku_code = str(row.get("sku_code") or "").strip()
-                grn_date = str(row.get("grn_date") or "").strip()
-                format_value = str(row.get("format") or "").strip().upper()
-                delivered_qty_raw = row.get("delivered_qty")
-                has_delivered_qty = (
-                    delivered_qty_raw is not None
-                    and str(delivered_qty_raw).strip() != ""
+    if prepared:
+        try:
+            with transaction.atomic(), connection.cursor() as cur:
+                cur.execute(
+                    """
+                    CREATE TEMP TABLE tmp_total_po_grn_update (
+                        po_number text,
+                        sku_code text,
+                        grn_date date,
+                        format text,
+                        delivered_qty numeric
+                    ) ON COMMIT DROP
+                    """
                 )
+                cur.executemany(
+                    """
+                    INSERT INTO tmp_total_po_grn_update
+                        (po_number, sku_code, grn_date, format, delivered_qty)
+                    VALUES (%s, %s, %s, %s, %s)
+                    """,
+                    list(prepared.values()),
+                )
+                cur.execute(
+                    f"""
+                    WITH changed AS (
+                        UPDATE {quoted_target_table} AS t
+                           SET grn_date = u.grn_date,
+                               delivered_qty = u.delivered_qty
+                          FROM tmp_total_po_grn_update AS u
+                         WHERE NULLIF(TRIM(u.sku_code), '') IS NOT NULL
+                           AND u.delivered_qty IS NOT NULL
+                           AND LOWER(TRIM(t.po_number::text)) = LOWER(TRIM(u.po_number))
+                           AND LOWER(TRIM(t.sku_code::text)) = LOWER(TRIM(u.sku_code))
+                           AND (NULLIF(TRIM(u.format), '') IS NULL OR UPPER(TRIM(t.format::text)) = UPPER(TRIM(u.format)))
+                     RETURNING LOWER(TRIM(u.po_number)) AS po_key, LOWER(TRIM(u.sku_code)) AS sku_key
+                    )
+                    SELECT COUNT(*) AS updated_rows,
+                           COUNT(DISTINCT po_key || '::' || sku_key) AS matched_rows
+                      FROM changed
+                    """
+                )
+                sku_updated, sku_matched = cur.fetchone() or (0, 0)
+                cur.execute(
+                    f"""
+                    WITH changed AS (
+                        UPDATE {quoted_target_table} AS t
+                           SET grn_date = u.grn_date
+                          FROM tmp_total_po_grn_update AS u
+                         WHERE (NULLIF(TRIM(u.sku_code), '') IS NULL OR u.delivered_qty IS NULL)
+                           AND LOWER(TRIM(t.po_number::text)) = LOWER(TRIM(u.po_number))
+                           AND (NULLIF(TRIM(u.format), '') IS NULL OR UPPER(TRIM(t.format::text)) = UPPER(TRIM(u.format)))
+                     RETURNING LOWER(TRIM(u.po_number)) AS po_key, LOWER(TRIM(COALESCE(u.sku_code, ''))) AS sku_key
+                    )
+                    SELECT COUNT(*) AS updated_rows,
+                           COUNT(DISTINCT po_key || '::' || sku_key) AS matched_rows
+                      FROM changed
+                    """
+                )
+                po_updated, po_matched = cur.fetchone() or (0, 0)
+                updated = int(sku_updated or 0) + int(po_updated or 0)
+                success = int(sku_matched or 0) + int(po_matched or 0)
+        except Exception as exc:
+            failed = len(prepared)
+            last_error = str(exc)
 
-                if not po_number or not grn_date:
-                    skipped += 1
-                    continue
-
-                key = f"{po_number.lower()}::{sku_code.lower()}"
-                if key in seen_po_ids:
-                    skipped += 1
-                    continue
-                seen_po_ids.add(key)
-
-                if sku_code and has_delivered_qty and format_value:
-                    cur.execute(
-                        """
-                        UPDATE total_po
-                           SET grn_date = %s,
-                               delivered_qty = %s
-                         WHERE LOWER(TRIM(po_number::text)) = LOWER(TRIM(%s))
-                           AND LOWER(TRIM(sku_code::text)) = LOWER(TRIM(%s))
-                           AND UPPER(TRIM(format::text)) = %s
-                        """,
-                        [grn_date, delivered_qty_raw, po_number, sku_code, format_value],
-                    )
-                elif sku_code and has_delivered_qty:
-                    cur.execute(
-                        """
-                        UPDATE total_po
-                           SET grn_date = %s,
-                               delivered_qty = %s
-                         WHERE LOWER(TRIM(po_number::text)) = LOWER(TRIM(%s))
-                           AND LOWER(TRIM(sku_code::text)) = LOWER(TRIM(%s))
-                        """,
-                        [grn_date, delivered_qty_raw, po_number, sku_code],
-                    )
-                elif format_value:
-                    cur.execute(
-                        """
-                        UPDATE total_po
-                           SET grn_date = %s
-                         WHERE LOWER(TRIM(po_number::text)) = LOWER(TRIM(%s))
-                           AND UPPER(TRIM(format::text)) = %s
-                        """,
-                        [grn_date, po_number, format_value],
-                    )
-                else:
-                    cur.execute(
-                        """
-                        UPDATE total_po
-                           SET grn_date = %s
-                         WHERE LOWER(TRIM(po_number::text)) = LOWER(TRIM(%s))
-                        """,
-                        [grn_date, po_number],
-                    )
-                line_count = cur.rowcount or 0
-                if line_count:
-                    success += 1
-                    updated += line_count
-                else:
-                    skipped += 1
-            except Exception as exc:
-                failed += 1
-                last_error = str(exc)
+    skipped += max(0, len(prepared) - success)
 
     return Response(
         {
@@ -1290,6 +1389,8 @@ def _batch_upload(body, *, forced_table: str | None = None):
 
     if table == "total_po_grn_update":
         return _update_total_po_grn_dates(data)
+    if table == "total_po_zbs_grn_update":
+        return _update_total_po_grn_dates(data, target_table="total_po_zbs")
 
     if upsert and table in UPLOAD_FORCED_UNIQUE_KEYS:
         unique_key = UPLOAD_FORCED_UNIQUE_KEYS[table]
@@ -1300,7 +1401,8 @@ def _batch_upload(body, *, forced_table: str | None = None):
 
     missing_rates = _collect_zepto_missing_rates(data) if table == "zeptoSec" else []
 
-    table_columns = _upload_table_columns(table)
+    column_types = _upload_table_column_types(table)
+    table_columns = set(column_types)
     columns = list(data[0].keys())
     invalid = [c for c in columns if c not in table_columns]
     if invalid:
@@ -1337,9 +1439,11 @@ def _batch_upload(body, *, forced_table: str | None = None):
             upsert_clause = f" ON CONFLICT ({conflict_cols}) DO NOTHING"
 
     sql = f'INSERT INTO {_quote_ident(table)} ({col_list}) VALUES ({placeholders}){upsert_clause}'
+    batch_sql = f'INSERT INTO {_quote_ident(table)} ({col_list}) VALUES %s{upsert_clause}'
     tracks_upsert_counts = bool(upsert and unique_key)
     if tracks_upsert_counts:
         sql += " RETURNING (xmax::text = '0') AS inserted"
+        batch_sql += " RETURNING (xmax::text = '0') AS inserted"
 
     success = 0
     created = 0
@@ -1354,15 +1458,50 @@ def _batch_upload(body, *, forced_table: str | None = None):
     with connection.cursor() as cur:
         for i in range(0, len(data), BATCH_SIZE):
             batch = data[i : i + BATCH_SIZE]
+            if batch and not replace_by_primary_key:
+                try:
+                    batch_results = _execute_batch_insert_rows(
+                        cur,
+                        batch_sql,
+                        batch,
+                        columns,
+                        column_types,
+                        tracks_upsert_counts=tracks_upsert_counts,
+                    )
+                    if tracks_upsert_counts:
+                        for result in batch_results or []:
+                            if result[0]:
+                                created += 1
+                                platform_created += 1
+                            else:
+                                updated += 1
+                                platform_updated += 1
+                        success += len(batch_results or [])
+                        skipped_in_batch = len(batch) - len(batch_results or [])
+                        if skipped_in_batch > 0:
+                            skipped += skipped_in_batch
+                            platform_skipped += skipped_in_batch
+                    else:
+                        created += len(batch)
+                        platform_created += len(batch)
+                        success += len(batch)
+                    continue
+                except Exception as batch_exc:
+                    last_error = str(batch_exc)
+                    try:
+                        connection.rollback()
+                    except Exception:
+                        pass
+
             for row in batch:
                 try:
                     replaced_rows = 0
                     if replace_by_primary_key:
                         with transaction.atomic():
                             replaced_rows = _delete_existing_primary_upload_row(cur, table, row)
-                            cur.execute(sql, [row.get(c) for c in columns])
+                            cur.execute(sql, _upload_row_values(row, columns, column_types))
                     else:
-                        cur.execute(sql, [row.get(c) for c in columns])
+                        cur.execute(sql, _upload_row_values(row, columns, column_types))
 
                     if replace_by_primary_key:
                         if replaced_rows:

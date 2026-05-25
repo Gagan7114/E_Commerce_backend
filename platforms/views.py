@@ -1453,17 +1453,21 @@ def _primary_dashboard_payload(
         SELECT
             sub_category_key,
             per_ltr_key,
-            MIN(item_head_key) AS item_head_key,
-            MIN(category_key) AS category_key,
+            item_head_key,
+            category_key,
             {_PRIMARY_METRIC_SQL}
         FROM normalized
         WHERE {period_filter}
-        GROUP BY sub_category_key, per_ltr_key
+        GROUP BY item_head_key, category_key, sub_category_key, per_ltr_key
         """,
         period_params,
     )
     detail_by_key = {
-        (_norm_sec_key(row.get("sub_category_key")), _norm_sec_key(row.get("per_ltr_key"))): row
+        (
+            _norm_sec_key(row.get("item_head_key")),
+            _norm_sec_key(row.get("sub_category_key")),
+            _norm_sec_key(row.get("per_ltr_key")),
+        ): row
         for row in detail_raw
     }
 
@@ -1471,7 +1475,11 @@ def _primary_dashboard_payload(
     fixed_detail_keys = set()
     if slug == "zepto":
         for fmt, item_head, category, sub_category, per_ltr in _ZEPTO_PRIMARY_DETAIL_ROWS:
-            detail_key = (_norm_sec_key(sub_category), _norm_sec_key(per_ltr))
+            detail_key = (
+                _norm_sec_key(item_head),
+                _norm_sec_key(sub_category),
+                _norm_sec_key(per_ltr),
+            )
             fixed_detail_keys.add(detail_key)
             metrics = _primary_metrics(
                 detail_by_key.get(detail_key)
