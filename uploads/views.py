@@ -1215,6 +1215,50 @@ def _delete_existing_primary_upload_row(cur, table: str, row: dict) -> int:
     return cur.rowcount or 0
 
 
+def _delete_existing_primary_upload_rows(cur, table: str, rows: list[dict]) -> int:
+    """Bulk-remove existing primary rows for the batch's business keys."""
+    key_specs = PRIMARY_UPLOAD_REPLACE_KEYS.get(table)
+    if not key_specs:
+        return 0
+
+    keys = []
+    seen = set()
+    for row in rows:
+        key_parts = _primary_upload_key_parts(table, row)
+        if not key_parts or key_parts in seen:
+            continue
+        seen.add(key_parts)
+        keys.append(key_parts)
+
+    if not keys:
+        return 0
+
+    key_columns = [f"k{index}" for index in range(len(key_specs))]
+    values_sql = ", ".join(
+        "(" + ", ".join(["%s"] * len(key_specs)) + ")"
+        for _ in keys
+    )
+    where = " AND ".join(
+        f"{_primary_upload_key_sql(spec)} = k.{column}"
+        for spec, column in zip(key_specs, key_columns)
+    )
+    params = [part for key in keys for part in key]
+
+    cur.execute(
+        f"""
+        WITH upload_keys({", ".join(key_columns)}) AS (
+            VALUES {values_sql}
+        )
+        DELETE FROM {_quote_ident(table)} AS t
+        USING upload_keys AS k
+        WHERE {where}
+        RETURNING {", ".join(_primary_upload_key_sql(spec) for spec in key_specs)}
+        """,
+        params,
+    )
+    return len({tuple(row) for row in cur.fetchall()})
+
+
 def _execute_batch_insert_rows(
     cur,
     sql: str,
@@ -1458,6 +1502,31 @@ def _batch_upload(body, *, forced_table: str | None = None):
     with connection.cursor() as cur:
         for i in range(0, len(data), BATCH_SIZE):
             batch = data[i : i + BATCH_SIZE]
+            if batch and replace_by_primary_key:
+                try:
+                    with transaction.atomic():
+                        replaced_keys = _delete_existing_primary_upload_rows(cur, table, batch)
+                        cur.executemany(
+                            sql,
+                            [
+                                _upload_row_values(row, columns, column_types)
+                                for row in batch
+                            ],
+                        )
+                    updated += replaced_keys
+                    platform_updated += replaced_keys
+                    inserted_count = max(0, len(batch) - replaced_keys)
+                    created += inserted_count
+                    platform_created += inserted_count
+                    success += len(batch)
+                    continue
+                except Exception as batch_exc:
+                    last_error = str(batch_exc)
+                    try:
+                        connection.rollback()
+                    except Exception:
+                        pass
+
             if batch and not replace_by_primary_key:
                 try:
                     batch_results = _execute_batch_insert_rows(
