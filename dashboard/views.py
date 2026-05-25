@@ -30,9 +30,17 @@ ALLOWED_TABLES = {
     "amazon_sec_range_margins", "amazon_sec_range_master_view",
     "bigbasketSec", "blinkitSec", "flipkart_grocery_master", "fk_grocery", "flipkartSec", "flipkart_secondary_all",
     "jiomartSec", "swiggySec", "zeptoSec",
+    "zomatoSec", "citymallSec",
     "amazon_inventory", "bigbasket_inventory",
     "blinkit_inventory", "jiomart_inventory", "swiggy_inventory", "zepto_inventory",
+    "zomato_inventory", "citymall_inventory",
     "all_platform_inventory",
+    # Ads — destination tables for the unified Upload Hub Ads flow.
+    "blinkit_ads", "amazon_ads", "swiggy_ads", "zepto_ads", "bigbasket_ads", "flipkart_ads",
+    # Brand Fund
+    "zepto_brandfund", "swiggy_brandfund", "blinkit_brandfund",
+    # Coupons (Amazon)
+    "amazon_coupon",
 }
 
 # Mirrors FastAPI INVENTORY_CONFIG for /inventory-charts aggregation.
