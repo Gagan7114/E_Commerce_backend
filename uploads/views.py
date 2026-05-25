@@ -39,13 +39,8 @@ UPLOAD_ALLOWED_TABLES = {
     "fk_grocery", "flipkart_grocery_master",
     "zomatoSec", "citymallSec",
     # Primary
-    "zepto_grn", "zepto_prim", "zepto_prim_grn_update",
-    "blinkit_grn", "blinkit_prim",
-    "bigbasket_prim",
-    "flipkart_grocery_prim",
+    "total_po", "total_po_grn_update",
     "swiggy_grn", "swiggy_prim",
-    "zomato_prim",
-    "citymall_prim",
     # Ads
     "blinkit_ads",
     "amazon_ads",
@@ -114,13 +109,8 @@ UPLOAD_FORCED_UNIQUE_KEYS = {
 PRIMARY_UPLOAD_REPLACE_KEYS = {
     # Primary PO rows are identified by platform PO + platform SKU. Status,
     # dates, vendor, rates, and quantities are mutable row data.
-    "blinkit_prim": (("po_number",), ("item_id",)),
-    "zepto_prim": (("po_no",), ("sku_code", "sku")),
+    "total_po": (("po_number",), ("sku_code",)),
     "swiggy_prim": (("po_number",), ("sku_code",)),
-    "bigbasket_prim": (("po_number",), ("sku_code",)),
-    "flipkart_grocery_prim": (("po_number",), ("sku_code",)),
-    "zomato_prim": (("po_number",), ("sku_code",)),
-    "citymall_prim": (("po_number",), ("sku_code",)),
 }
 
 INVENTORY_DOH_UPLOAD_PLATFORMS = {
@@ -1173,11 +1163,14 @@ def _delete_existing_primary_upload_row(cur, table: str, row: dict) -> int:
     return cur.rowcount or 0
 
 
-def _update_zepto_prim_grn_dates(data: list[dict]) -> Response:
-    """Update Zepto primary rows from the lean GRN upload.
+def _update_total_po_grn_dates(data: list[dict]) -> Response:
+    """Update existing PO rows in total_po from a lean GRN upload.
 
-    The GRN file gives a PO id and created date. We use the PO id to update
-    only existing PO lines and never insert rows.
+    The GRN sheet supplies po_number and grn_date. It may also supply sku_code
+    and delivered_qty; delivered_qty is updated only when sku_code is present so
+    a PO-level GRN date update does not overwrite every SKU line with one qty.
+    When format is supplied, the update is limited to that platform. No new rows
+    are inserted from GRN files.
     """
     success = 0
     updated = 0
@@ -1189,27 +1182,68 @@ def _update_zepto_prim_grn_dates(data: list[dict]) -> Response:
     with connection.cursor() as cur:
         for row in data:
             try:
-                po_id = str(row.get("po_id") or "").strip()
-                created_on = str(row.get("created_on") or "").strip()
+                po_number = str(row.get("po_number") or "").strip()
+                sku_code = str(row.get("sku_code") or "").strip()
+                grn_date = str(row.get("grn_date") or "").strip()
+                format_value = str(row.get("format") or "").strip().upper()
+                delivered_qty_raw = row.get("delivered_qty")
+                has_delivered_qty = (
+                    delivered_qty_raw is not None
+                    and str(delivered_qty_raw).strip() != ""
+                )
 
-                if not po_id or not created_on:
+                if not po_number or not grn_date:
                     skipped += 1
                     continue
 
-                key = po_id.lower()
+                key = f"{po_number.lower()}::{sku_code.lower()}"
                 if key in seen_po_ids:
                     skipped += 1
                     continue
                 seen_po_ids.add(key)
 
-                cur.execute(
-                    """
-                    UPDATE zepto_prim
-                       SET grn_date = %s
-                     WHERE LOWER(TRIM(po_no::text)) = LOWER(TRIM(%s))
-                    """,
-                    [created_on, po_id],
-                )
+                if sku_code and has_delivered_qty and format_value:
+                    cur.execute(
+                        """
+                        UPDATE total_po
+                           SET grn_date = %s,
+                               delivered_qty = %s
+                         WHERE LOWER(TRIM(po_number::text)) = LOWER(TRIM(%s))
+                           AND LOWER(TRIM(sku_code::text)) = LOWER(TRIM(%s))
+                           AND UPPER(TRIM(format::text)) = %s
+                        """,
+                        [grn_date, delivered_qty_raw, po_number, sku_code, format_value],
+                    )
+                elif sku_code and has_delivered_qty:
+                    cur.execute(
+                        """
+                        UPDATE total_po
+                           SET grn_date = %s,
+                               delivered_qty = %s
+                         WHERE LOWER(TRIM(po_number::text)) = LOWER(TRIM(%s))
+                           AND LOWER(TRIM(sku_code::text)) = LOWER(TRIM(%s))
+                        """,
+                        [grn_date, delivered_qty_raw, po_number, sku_code],
+                    )
+                elif format_value:
+                    cur.execute(
+                        """
+                        UPDATE total_po
+                           SET grn_date = %s
+                         WHERE LOWER(TRIM(po_number::text)) = LOWER(TRIM(%s))
+                           AND UPPER(TRIM(format::text)) = %s
+                        """,
+                        [grn_date, po_number, format_value],
+                    )
+                else:
+                    cur.execute(
+                        """
+                        UPDATE total_po
+                           SET grn_date = %s
+                         WHERE LOWER(TRIM(po_number::text)) = LOWER(TRIM(%s))
+                        """,
+                        [grn_date, po_number],
+                    )
                 line_count = cur.rowcount or 0
                 if line_count:
                     success += 1
@@ -1254,8 +1288,8 @@ def _batch_upload(body, *, forced_table: str | None = None):
     if not isinstance(data, list) or not data:
         return Response({"success": 0, "failed": 0, "error": None})
 
-    if table == "zepto_prim_grn_update":
-        return _update_zepto_prim_grn_dates(data)
+    if table == "total_po_grn_update":
+        return _update_total_po_grn_dates(data)
 
     if upsert and table in UPLOAD_FORCED_UNIQUE_KEYS:
         unique_key = UPLOAD_FORCED_UNIQUE_KEYS[table]
@@ -1264,10 +1298,6 @@ def _batch_upload(body, *, forced_table: str | None = None):
     if replace_by_primary_key:
         unique_key = ""
 
-    if table == "zepto_prim":
-        for row in data:
-            if row.get("created_at") in ("", None):
-                row.pop("created_at", None)
     missing_rates = _collect_zepto_missing_rates(data) if table == "zeptoSec" else []
 
     table_columns = _upload_table_columns(table)

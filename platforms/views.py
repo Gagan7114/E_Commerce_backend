@@ -17,7 +17,7 @@ from .primary_po_columns import order_primary_master_po_row
 
 _IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _LANDING_BASIC_DIVISOR = Decimal("1.05")
-PRIMARY_PO_VIEW = "prim_master_po"
+PRIMARY_PO_VIEW = "master_po"
 
 
 def _safe_ident(name: str) -> str:
@@ -257,7 +257,7 @@ def _bigbasket_primary_total(rows: list[dict], *, include_cancelled: bool = True
 
 _PRIMARY_DASHBOARD_FORMATS = {
     "zepto": "ZEPTO",
-    "bigbasket": "BIG BASKET",
+    "bigbasket": "BIGBASKET",
     "blinkit": "BLINKIT",
     "citymall": "CITY MALL",
     "flipkart": "FLIPKART GROCERY",
@@ -319,7 +319,7 @@ def bigbasket_primary_dashboard(request, slug: str):
             SELECT
                 *,
                 ({selected_period}) AS in_selected_period
-            FROM "prim_master_po"
+            FROM "master_po"
             WHERE {period_where}
         )
     """
@@ -334,7 +334,7 @@ def bigbasket_primary_dashboard(request, slug: str):
     max_date = _scalar(
         f"""
         SELECT MAX({date_expr})
-        FROM "prim_master_po"
+        FROM "master_po"
         WHERE UPPER(TRIM("format"::text)) = %s
           AND ({date_expr}) >= %s
           AND ({date_expr}) < %s
@@ -428,7 +428,7 @@ def bigbasket_primary_dashboard(request, slug: str):
     ]
 
     return Response({
-        "source": "prim_master_po",
+        "source": "master_po",
         "format": f"{slug.upper()}_PRIMARY",
         "source_format": platform_format,
         "defaulted_to_latest": defaulted_to_latest,
@@ -1061,7 +1061,7 @@ _PENDENCY_DASHBOARD_FORMATS = {
     "zepto": "ZEPTO",
     "swiggy": "SWIGGY",
     "blinkit": "BLINKIT",
-    "bigbasket": "BIG BASKET",
+    "bigbasket": "BIGBASKET",
     "flipkart_grocery": "FLIPKART GROCERY",
     "citymall": "CITY MALL",
     "zomato": "ZOMATO",
@@ -1092,20 +1092,20 @@ def pendency_dashboard(request, slug: str):
             '''
             SELECT
                 UPPER(TRIM("po_month"::text)) AS po_month,
-                "year" AS year,
+                "po_year" AS year,
                 MAX(
                     CASE
-                        WHEN "po_date" ~ '^[0-9]{2}-[0-9]{2}-[0-9]{4}$'
-                            THEN TO_DATE("po_date", 'DD-MM-YYYY')
-                        WHEN "po_date" ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'
-                            THEN TO_DATE("po_date", 'YYYY-MM-DD')
+                        WHEN TRIM("po_date"::text) ~ '^[0-9]{2}-[0-9]{2}-[0-9]{4}$'
+                            THEN TO_DATE(TRIM("po_date"::text), 'DD-MM-YYYY')
+                        WHEN TRIM("po_date"::text) ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'
+                            THEN TRIM("po_date"::text)::date
                     END
                 ) AS max_date
-            FROM "prim_master_po"
+            FROM "master_po"
             WHERE UPPER(TRIM("format"::text)) = %s
               AND UPPER(TRIM("open_close"::text)) = 'OPEN'
               AND "po_month" IS NOT NULL
-              AND "year" IS NOT NULL
+              AND "po_year" IS NOT NULL
             GROUP BY 1, 2
             ORDER BY max_date DESC NULLS LAST
             LIMIT 1
@@ -1126,7 +1126,7 @@ def pendency_dashboard(request, slug: str):
         where_parts.append('UPPER(TRIM("po_month"::text)) = %s')
         params.append(resolved_month)
     if resolved_year is not None:
-        where_parts.append('"year" = %s')
+        where_parts.append('"po_year" = %s')
         params.append(resolved_year)
 
     base_where = "WHERE " + " AND ".join(where_parts)
@@ -1157,15 +1157,15 @@ def pendency_dashboard(request, slug: str):
             TO_CHAR(
                 MAX(
                     CASE
-                        WHEN "po_date" ~ '^[0-9]{{2}}-[0-9]{{2}}-[0-9]{{4}}$'
-                            THEN TO_DATE("po_date", 'DD-MM-YYYY')
-                        WHEN "po_date" ~ '^[0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}$'
-                            THEN TO_DATE("po_date", 'YYYY-MM-DD')
+                        WHEN TRIM("po_date"::text) ~ '^[0-9]{{2}}-[0-9]{{2}}-[0-9]{{4}}$'
+                            THEN TO_DATE(TRIM("po_date"::text), 'DD-MM-YYYY')
+                        WHEN TRIM("po_date"::text) ~ '^[0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}$'
+                            THEN TRIM("po_date"::text)::date
                     END
                 ),
                 'DD-MM-YYYY'
             ) AS max_po_date
-        FROM "prim_master_po"
+        FROM "master_po"
         {full_where}
         ''',
         params,
@@ -1194,7 +1194,7 @@ def pendency_dashboard(request, slug: str):
         SELECT
             COALESCE(NULLIF(TRIM("city"::text), ''), 'UNMAPPED') AS city,
             {metric_cols}
-        FROM "prim_master_po"
+        FROM "master_po"
         {full_where}
         GROUP BY 1
         {order_clause}
@@ -1209,7 +1209,7 @@ def pendency_dashboard(request, slug: str):
             COALESCE(NULLIF(TRIM("sku_name"::text), ''), '-') AS sku_name,
             COALESCE(NULLIF(TRIM("item"::text), ''), '-') AS item,
             {metric_cols}
-        FROM "prim_master_po"
+        FROM "master_po"
         {full_where}
         GROUP BY 1, 2, 3
         {order_clause}
@@ -1222,7 +1222,7 @@ def pendency_dashboard(request, slug: str):
         SELECT
             COALESCE(NULLIF(TRIM("location"::text), ''), 'UNMAPPED') AS warehouse,
             {metric_cols}
-        FROM "prim_master_po"
+        FROM "master_po"
         {full_where}
         GROUP BY 1
         {order_clause}
@@ -1235,7 +1235,7 @@ def pendency_dashboard(request, slug: str):
         SELECT
             COALESCE(NULLIF(TRIM("vendor_new"::text), ''), 'UNMAPPED') AS distributor,
             {metric_cols}
-        FROM "prim_master_po"
+        FROM "master_po"
         {full_where}
         GROUP BY 1
         {order_clause}
@@ -1671,7 +1671,7 @@ def _primary_dashboard_payload(
     yearly_trend = []
 
     payload = {
-        "source": "prim_master_po",
+        "source": "master_po",
         "format": platform_format,
         "dashboard_title": f"{platform_format} Primary Dashboard",
         "mode": mode,
@@ -4097,7 +4097,7 @@ def _parse_bigbasket_primary_period(params, platform_format: str) -> tuple[str, 
     latest = _dict_rows(
         f"""
         SELECT ({date_expr}) AS latest_date
-        FROM "prim_master_po"
+        FROM "master_po"
         WHERE UPPER(TRIM("format"::text)) = %s
           AND ({date_expr}) IS NOT NULL
         ORDER BY ({date_expr}) DESC
@@ -4135,7 +4135,7 @@ WITH base AS (
         {_PRIM_PO_DATE_EXPR} AS po_dt,
         {_PRIM_PO_EXPIRY_DATE_EXPR} AS expiry_dt,
         {_PRIM_DELIVERY_DATE_EXPR} AS delivery_dt
-    FROM public.prim_master_po p
+    FROM public.master_po p
     WHERE REGEXP_REPLACE(LOWER(TRIM(p.format::text)), '[^a-z0-9]+', '', 'g') = '{format_key}'
 ),
 with_pack_text AS (
@@ -4219,7 +4219,6 @@ normalized AS (
             UPPER(TRIM(TO_CHAR(delivery_dt, 'FMMONTH')))
         ) AS delivery_month_key,
         UPPER(TRIM(TO_CHAR(expiry_dt, 'FMMONTH'))) AS expiry_month_key,
-        COALESCE("year", EXTRACT(YEAR FROM po_dt)::integer) AS po_year,
         EXTRACT(YEAR FROM delivery_dt)::integer AS delivery_year,
         EXTRACT(YEAR FROM expiry_dt)::integer AS expiry_year,
         CASE
@@ -4229,7 +4228,7 @@ normalized AS (
             ELSE UPPER(TRIM(TO_CHAR(effective_per_liter, 'FM999999990.###'))) || ' LTR'
         END AS per_ltr_key,
         -- Direct mapping per user spec: each KPI card reads exactly one
-        -- canonical column from prim_master_po — no qty x rate fallbacks.
+        -- canonical column from master_po — no qty x rate fallbacks.
         COALESCE(total_order_liters, 0) AS metric_order_liters,
         COALESCE(total_delivered_liters, 0) AS metric_delivered_liters,
         COALESCE(total_order_amt_exclusive, 0) AS metric_order_value,

@@ -132,7 +132,7 @@ PRIMARY_MASTER_PO_LABELS = {
     "ltrs_miss_rate_pct": "LTRS MISS RATE %",
 }
 
-PRIMARY_MASTER_PO_TABLES = {"prim_master_po", "test_master_po"}
+PRIMARY_MASTER_PO_TABLES = {"master_po", "prim_master_po", "test_master_po"}
 
 
 def order_primary_master_po_columns(columns):

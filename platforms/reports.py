@@ -20,6 +20,11 @@ REPORT_VIEW_CATALOG = {
         "format_column": "format",
         "max_rows": 50000,
     },
+    "master_po": {
+        "date_column": "po_date",
+        "format_column": "format",
+        "max_rows": 50000,
+    },
     "prim_master_po": {
         "date_column": "po_date",
         "date_expr": "public._pm_parse_date(\"po_date\")",

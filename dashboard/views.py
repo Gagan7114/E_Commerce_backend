@@ -20,7 +20,8 @@ _IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 # Tables the dashboard can query. Mirrors FastAPI ALLOWED_TABLES.
 ALLOWED_TABLES = {
-    "prim_master_po", "test_master_po",
+    "master_po", "prim_master_po", "test_master_po",
+    "total_po", "total_po_zbs",
     "bigbasket_prim", "blinkit_prim", "citymall_prim",
     "flipkart_grocery_prim", "swiggy_prim", "zepto_prim", "zomato_prim",
     "blinkit_grn", "swiggy_grn", "zepto_grn",
