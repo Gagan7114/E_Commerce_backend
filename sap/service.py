@@ -71,27 +71,53 @@ def select(sql: str, params: list | tuple | None = None) -> list[dict]:
     return [dict(zip(cols, r)) for r in rows]
 
 
-def report_sales_analysis(from_date: str, to_date: str) -> list[dict]:
-    """Run the allow-listed SAP HANA sales analysis procedure.
+# Allow-listed HANA procedures the sales-analysis endpoint may call.
+# Adding a new source = add an entry here AND surface it on the frontend.
+SALES_ANALYSIS_PROCEDURES: dict[str, str] = {
+    "mart": '"JIVO_MART_HANADB"."REPORT_SALES_ANALYSIS"',
+    "oil":  '"JIVO_OIL_HANADB"."REPORT_SALES_ANALYSIS"',
+}
+SALES_ANALYSIS_DEFAULT_SOURCE = "mart"
+
+
+def _resolve_sales_analysis_procedure(source: str | None) -> tuple[str, str]:
+    """Returns (source_key, fully_quoted_procedure_name). Raises ValueError
+    for unknown sources so the view can surface a clean 400."""
+    key = (source or SALES_ANALYSIS_DEFAULT_SOURCE).strip().lower()
+    proc = SALES_ANALYSIS_PROCEDURES.get(key)
+    if not proc:
+        allowed = ", ".join(sorted(SALES_ANALYSIS_PROCEDURES))
+        raise ValueError(f"Unknown sales-analysis source '{source}'. Allowed: {allowed}.")
+    return key, proc
+
+
+def report_sales_analysis(
+    from_date: str,
+    to_date: str,
+    source: str = SALES_ANALYSIS_DEFAULT_SOURCE,
+) -> list[dict]:
+    """Run an allow-listed SAP HANA sales analysis procedure.
+
+    `source` picks which schema's REPORT_SALES_ANALYSIS to call — one of
+    the keys in SALES_ANALYSIS_PROCEDURES (mart / oil). Defaults to mart.
 
     Logs the raw row count returned by HANA so we can verify whether the
     procedure itself caps results or our pipeline drops some downstream.
     """
+    source_key, procedure = _resolve_sales_analysis_procedure(source)
     with hana_connection() as conn:
         cur = conn.cursor()
-        cur.execute(
-            'CALL "JIVO_MART_HANADB"."REPORT_SALES_ANALYSIS"(?, ?)',
-            [from_date, to_date],
-        )
+        cur.execute(f'CALL {procedure}(?, ?)', [from_date, to_date])
         cols = [d[0] for d in cur.description] if cur.description else []
         raw_rows = cur.fetchall() if cur.description else []
         rowcount_attr = getattr(cur, "rowcount", "n/a")
         cur.close()
     result = [dict(zip(cols, r)) for r in raw_rows]
     logger.warning(
-        "[SAP] report_sales_analysis(%s, %s) -> fetchall=%d rows, cur.rowcount=%s, cols=%d",
+        "[SAP] report_sales_analysis(%s, %s, source=%s) -> fetchall=%d rows, cur.rowcount=%s, cols=%d",
         from_date,
         to_date,
+        source_key,
         len(raw_rows),
         rowcount_attr,
         len(cols),

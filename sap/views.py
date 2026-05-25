@@ -11,7 +11,12 @@ from rest_framework.response import Response
 
 from accounts.permissions import require
 
-from .service import report_sales_analysis, select
+from .service import (
+    SALES_ANALYSIS_DEFAULT_SOURCE,
+    SALES_ANALYSIS_PROCEDURES,
+    report_sales_analysis,
+    select,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -208,8 +213,20 @@ def sales_analysis(request):
             raw = str(request.query_params.get(param) or "").strip()
             filters[param] = raw.lower() if raw else None
 
+    raw_source = str(request.query_params.get("source") or "").strip().lower()
+    source = raw_source or SALES_ANALYSIS_DEFAULT_SOURCE
+    if source not in SALES_ANALYSIS_PROCEDURES:
+        raise ValidationError(
+            f"`source` must be one of {sorted(SALES_ANALYSIS_PROCEDURES)}."
+        )
+    # Surface the resolved HANA procedure in the response so the UI can show
+    # exactly which one served the data.
+    procedure_label = (
+        SALES_ANALYSIS_PROCEDURES[source].replace('"', '')
+    )
+
     try:
-        rows = report_sales_analysis(from_date, to_date)
+        rows = report_sales_analysis(from_date, to_date, source=source)
     except Exception as e:
         raise SAPError(f"SAP HANA procedure error: {e}")
 
@@ -218,7 +235,8 @@ def sales_analysis(request):
     offset = page * page_size
     active = {k: v for k, v in filters.items() if v}
     logger.warning(
-        "[SAP] sales_analysis %s..%s | procedure=%d | filtered=%d | page=%d/%d | active=%s | search=%r",
+        "[SAP] sales_analysis source=%s %s..%s | procedure=%d | filtered=%d | page=%d/%d | active=%s | search=%r",
+        source,
         from_date,
         to_date,
         len(rows),
@@ -236,7 +254,9 @@ def sales_analysis(request):
         "columns": columns,
         "filters": _filter_options(rows, filters, query),
         "summary": _sales_analysis_summary(filtered),
-        "procedure": "JIVO_MART_HANADB.REPORT_SALES_ANALYSIS",
+        "procedure": procedure_label,
+        "source": source,
+        "sources": sorted(SALES_ANALYSIS_PROCEDURES),
         "from_date": from_date,
         "to_date": to_date,
     })
