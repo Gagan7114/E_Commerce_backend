@@ -40,9 +40,13 @@ class SAPError(APIException):
 
 
 def _page(request) -> tuple[int, int]:
+    # Page size cap raised from 200 -> 100_000 so the JM Primary Dashboard
+    # (PlatformSapDashboard.jsx) can pull a full month's rows in a single
+    # request and compute correct per-vendor totals and latest-sale dates.
+    # Tables still default to small page sizes; this cap is a safety ceiling.
     try:
         page = max(0, int(request.query_params.get("page", 0)))
-        page_size = min(200, max(1, int(request.query_params.get("page_size", 50))))
+        page_size = min(100_000, max(1, int(request.query_params.get("page_size", 50))))
     except ValueError:
         page, page_size = 0, 50
     return page, page_size
@@ -228,6 +232,17 @@ def sales_analysis(request):
     try:
         rows = report_sales_analysis(from_date, to_date, source=source)
     except Exception as e:
+        # Surface infrastructure failures with a human-readable hint instead
+        # of dumping the raw hdbcli stack trace. rc=10060 / RTE:[89006] are
+        # TCP connect timeouts — almost always a VPN/firewall/host-down issue,
+        # not a backend bug, so the message points the user at the right fix.
+        text = str(e)
+        if "rc=10060" in text or "RTE:[89006]" in text or "Connection failed" in text:
+            raise SAPError(
+                "Cannot reach SAP HANA database — connection timed out. "
+                "Check VPN / network access to the HANA host and that the "
+                "SAP HANA server is running."
+            )
         raise SAPError(f"SAP HANA procedure error: {e}")
 
     columns = list(rows[0].keys()) if rows else []

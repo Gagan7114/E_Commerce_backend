@@ -59,8 +59,13 @@ MANUAL_SLUGS: set[str] = set()
 # Slugs explicitly out of scope — spec §8.1.
 SKIPPED_SLUGS = {"jiomart"}
 
-# All in-scope slugs, in the order the combined dashboard renders.
+# All in-scope slugs, in the order the combined dashboard renders. Amazon
+# is now a write-path platform too — targets can be created / updated /
+# refreshed, with `done_ltrs` / `done_value` pulled from
+# `amazon_sec_range_master_view` (same source the Amazon Secondary Monthly
+# Dashboard uses) via `_read_amazon`.
 IN_SCOPE_SLUGS = (
+    "amazon",
     "blinkit",
     "swiggy",
     "zepto",
@@ -71,12 +76,11 @@ IN_SCOPE_SLUGS = (
     "flipkart_grocery",
 )
 
-# Display-only slug order for the Monthly Targets dashboard endpoint. Amazon
-# is shown at the top here even though it remains in SKIPPED_SLUGS for the
-# write paths (create/update/refresh). If `month_targets` has no Amazon row
-# for the requested month, the existing placeholder branch returns a
-# "No target" row — same behaviour every other platform already has.
-DASHBOARD_DISPLAY_SLUGS = ("amazon",) + IN_SCOPE_SLUGS
+# Display-only slug order for the Monthly Targets dashboard endpoint —
+# preserves the original "Amazon at top" rendering even now that Amazon is in
+# IN_SCOPE_SLUGS. De-duplication via tuple(dict.fromkeys(...)) keeps the
+# expression idempotent if the order ever changes.
+DASHBOARD_DISPLAY_SLUGS = tuple(dict.fromkeys(("amazon",) + IN_SCOPE_SLUGS))
 
 DASHBOARD_ITEM_HEADS = ("PREMIUM", "COMMODITY")
 DEFAULT_ITEM_HEADS = ("PREMIUM", "COMMODITY")
@@ -332,36 +336,66 @@ def _read_flipkart_grocery(fmt: str, item_head: str, month: int, year: int) -> d
 
 def _read_amazon(item_head: str, month: int, year: int) -> dict:
     """Read (done_ltrs, done_value, latest_date) for Amazon from
-    `amazon_sec_daily_master_view` — the SecMaster-equivalent view that
-    joins amazon_sec_daily with master_sheet on ASIN. `item_head` is the
-    master_sheet classification (PREMIUM / COMMODITY).
+    `amazon_sec_range_master_view`.
 
-    done_ltrs = SUM(shipped_litres)   (shipped_units × master_sheet.per_unit_value)
-    done_value = SUM(shipped_revenue) (Amazon's own shipped_revenue, falls back
-        to shipped_revenue_2 which is ordered_revenue/ordered_units × shipped_units
-        for ASINs missing direct shipped_revenue figures)
+        done_ltrs   = SUM(shipped_litres)              ┐ at the latest single
+        done_value  = SUM(calculated_shipped_revenue)  ┘ month_day in the period
+        latest_date = date(year, month, day-part of that month_day)
+
+    Filter columns: `item_head`, `month_day`, `year`.
+
+    Amazon range uploads are cumulative — each upload covers
+    `from_date = 1st of month .. to_date = report date`. Summing across
+    every month_day in the month therefore double-counts. We pick the
+    LATEST month_day available (max day-of-month for that month_day's
+    suffix) and sum only that snapshot — exactly one row per ASIN, no
+    overlap.
     """
+    month_name = _MONTH_NAMES[month].upper()  # 'MAY'
+    month_day_suffix = f"%-{month_name}"      # '%-MAY'
+
     sql = """
+        WITH latest AS (
+            SELECT MAX(
+                NULLIF(split_part("month_day"::text, '-', 1), '')::int
+            ) AS max_day
+            FROM "amazon_sec_range_master_view"
+            WHERE UPPER(TRIM("item_head"::text)) = UPPER(TRIM(%s))
+              AND UPPER(TRIM("month_day"::text)) LIKE %s
+              AND "year" = %s
+        )
         SELECT
-            COALESCE(SUM("shipped_litres"), 0)                              AS done_ltrs,
-            COALESCE(
-                NULLIF(SUM("shipped_revenue"), 0),
-                SUM("shipped_revenue_2"),
-                0
-            )                                                                AS done_value,
-            MAX("from_date")                                                AS latest_date
-        FROM "amazon_sec_daily_master_view"
-        WHERE UPPER(TRIM("item_head"::text)) = UPPER(TRIM(%s))
-          AND EXTRACT(MONTH FROM "from_date") = %s
-          AND EXTRACT(YEAR FROM "from_date")  = %s
+            COALESCE(SUM(v."shipped_litres"), 0)              AS done_ltrs,
+            COALESCE(SUM(v."calculated_shipped_revenue"), 0)  AS done_value,
+            l.max_day                                          AS max_day
+        FROM "amazon_sec_range_master_view" v
+        CROSS JOIN latest l
+        WHERE UPPER(TRIM(v."item_head"::text)) = UPPER(TRIM(%s))
+          AND UPPER(TRIM(v."month_day"::text)) LIKE %s
+          AND v."year" = %s
+          AND NULLIF(split_part(v."month_day"::text, '-', 1), '')::int = l.max_day
+        GROUP BY l.max_day
     """
+    params = [
+        item_head, month_day_suffix, year,  # for the `latest` CTE
+        item_head, month_day_suffix, year,  # for the outer SELECT
+    ]
     with connection.cursor() as cur:
-        cur.execute(sql, [item_head, month, year])
+        cur.execute(sql, params)
         row = cur.fetchone()
+
+    if not row:
+        return {"done_ltrs": Decimal(0), "done_value": Decimal(0), "latest_date": None}
+
+    max_day = row[2]
+    try:
+        latest_date = date(year, month, int(max_day)) if max_day else None
+    except (TypeError, ValueError):
+        latest_date = None
     return {
         "done_ltrs": Decimal(row[0] or 0),
         "done_value": Decimal(row[1] or 0),
-        "latest_date": row[2],
+        "latest_date": latest_date,
     }
 
 
