@@ -80,6 +80,7 @@ def _drop_primary_normalized() -> None:
 _PRIMARY_CTE_STUB = "WITH _stub AS (SELECT 1)"
 
 _PRIMARY_DASHBOARD_CACHE_TTL = 60  # seconds
+_PRIMARY_DASHBOARD_CACHE_VERSION = 3
 
 
 def _get_platform(slug: str) -> PlatformConfig:
@@ -201,10 +202,15 @@ def platform_pos(request, slug: str):
 # ─── /{slug}/inventory-match?sku= ───
 def _bigbasket_primary_zero_row(item_head: str | None = None, item: str | None = None) -> dict:
     row = {
+        "order_value": 0.0,
+        "order_ltrs": 0.0,
+        "order_qty": 0.0,
         "done_value": 0.0,
         "done_ltrs": 0.0,
+        "done_qty": 0.0,
         "pending_value": 0.0,
         "pending_ltrs": 0.0,
+        "pending_qty": 0.0,
         "dp_value": 0.0,
         "dp_ltrs": 0.0,
         "expired_value": 0.0,
@@ -222,10 +228,15 @@ def _bigbasket_primary_zero_row(item_head: str | None = None, item: str | None =
 def _bigbasket_primary_normalize_row(row: dict, *, include_cancelled: bool = True) -> dict:
     result = {
         "item_head": row.get("item_head"),
+        "order_value": _num(row.get("order_value")),
+        "order_ltrs": _num(row.get("order_ltrs")),
+        "order_qty": _num(row.get("order_qty")),
         "done_value": _num(row.get("done_value")),
         "done_ltrs": _num(row.get("done_ltrs")),
+        "done_qty": _num(row.get("done_qty")),
         "pending_value": _num(row.get("pending_value")),
         "pending_ltrs": _num(row.get("pending_ltrs")),
+        "pending_qty": _num(row.get("pending_qty")),
         "expired_value": _num(row.get("expired_value")),
         "expired_ltrs": _num(row.get("expired_ltrs")),
     }
@@ -241,10 +252,15 @@ def _bigbasket_primary_normalize_row(row: dict, *, include_cancelled: bool = Tru
 
 def _bigbasket_primary_total(rows: list[dict], *, include_cancelled: bool = True) -> dict:
     fields = [
+        "order_value",
+        "order_ltrs",
+        "order_qty",
         "done_value",
         "done_ltrs",
+        "done_qty",
         "pending_value",
         "pending_ltrs",
+        "pending_qty",
         "dp_value",
         "dp_ltrs",
         "expired_value",
@@ -257,7 +273,7 @@ def _bigbasket_primary_total(rows: list[dict], *, include_cancelled: bool = True
 
 _PRIMARY_DASHBOARD_FORMATS = {
     "zepto": "ZEPTO",
-    "bigbasket": "BIGBASKET",
+    "bigbasket": "BIG BASKET",
     "blinkit": "BLINKIT",
     "citymall": "CITY MALL",
     "flipkart": "FLIPKART GROCERY",
@@ -292,6 +308,10 @@ def _bigbasket_primary_period_bounds(month_name: str, year: int) -> tuple[date, 
 @api_view(["GET"])
 @permission_classes([require("platform.po.view")])
 def bigbasket_primary_dashboard(request, slug: str):
+    return _bigbasket_primary_dashboard_response(request, slug)
+
+
+def _bigbasket_primary_dashboard_response(request, slug: str):
     _ensure_scope(request.user, slug)
     platform_format = _PRIMARY_DASHBOARD_FORMATS.get(slug)
     if not platform_format:
@@ -310,23 +330,25 @@ def bigbasket_primary_dashboard(request, slug: str):
     period_start, period_end = _bigbasket_primary_period_bounds(month_name, year)
     selected_period = f"({date_expr}) >= %s AND ({date_expr}) < %s"
     pending_status = "UPPER(TRIM(\"po_status\"::text)) IN ('APPOINTMENT DONE', 'PENDING')"
+    platform_format_key = re.sub(r"[^a-z0-9]+", "", platform_format.lower())
+    platform_format_where = (
+        "REGEXP_REPLACE(LOWER(TRIM(\"format\"::text)), '[^a-z0-9]+', '', 'g') = %s"
+    )
     period_where = (
-        f"UPPER(TRIM(\"format\"::text)) = %s "
-        f"AND (({selected_period}) OR {pending_status})"
+        f"{platform_format_where} "
+        f"AND ({selected_period})"
     )
     filtered_cte = f"""
         WITH filtered AS (
             SELECT
                 *,
-                ({selected_period}) AS in_selected_period
+                TRUE AS in_selected_period
             FROM "master_po"
             WHERE {period_where}
         )
     """
     filtered_params = [
-        period_start,
-        period_end,
-        platform_format,
+        platform_format_key,
         period_start,
         period_end,
     ]
@@ -335,11 +357,11 @@ def bigbasket_primary_dashboard(request, slug: str):
         f"""
         SELECT MAX({date_expr})
         FROM "master_po"
-        WHERE UPPER(TRIM("format"::text)) = %s
+        WHERE {platform_format_where}
           AND ({date_expr}) >= %s
           AND ({date_expr}) < %s
         """,
-        [platform_format, period_start, period_end],
+        [platform_format_key, period_start, period_end],
     )
 
     summary_raw = _dict_rows(
@@ -347,16 +369,27 @@ def bigbasket_primary_dashboard(request, slug: str):
         {filtered_cte}
         SELECT
             COALESCE(NULLIF(UPPER(TRIM("item_head"::text)), ''), 'OTHER') AS item_head,
+            COALESCE(SUM("total_order_amt_exclusive"), 0) AS order_value,
+            COALESCE(SUM("total_order_liters"), 0) AS order_ltrs,
+            COALESCE(SUM("order_qty"), 0) AS order_qty,
             COALESCE(SUM(CASE WHEN in_selected_period
                 AND UPPER(TRIM("po_status"::text)) = 'COMPLETED'
                 THEN "{done_value_col}" ELSE 0 END), 0) AS done_value,
             COALESCE(SUM(CASE WHEN in_selected_period
                 AND UPPER(TRIM("po_status"::text)) = 'COMPLETED'
                 THEN "total_delivered_liters" ELSE 0 END), 0) AS done_ltrs,
-            COALESCE(SUM(CASE WHEN UPPER(TRIM("po_status"::text)) IN ('APPOINTMENT DONE', 'PENDING')
+            COALESCE(SUM(CASE WHEN in_selected_period
+                AND UPPER(TRIM("po_status"::text)) = 'COMPLETED'
+                THEN "delivered_qty" ELSE 0 END), 0) AS done_qty,
+            COALESCE(SUM(CASE WHEN in_selected_period
+                AND {pending_status}
                 THEN "total_order_amt_exclusive" ELSE 0 END), 0) AS pending_value,
-            COALESCE(SUM(CASE WHEN UPPER(TRIM("po_status"::text)) IN ('APPOINTMENT DONE', 'PENDING')
+            COALESCE(SUM(CASE WHEN in_selected_period
+                AND {pending_status}
                 THEN "total_order_liters" ELSE 0 END), 0) AS pending_ltrs,
+            COALESCE(SUM(CASE WHEN in_selected_period
+                AND {pending_status}
+                THEN "order_qty" ELSE 0 END), 0) AS pending_qty,
             COALESCE(SUM(CASE WHEN in_selected_period
                 AND UPPER(TRIM("po_status"::text)) = 'EXPIRED'
                 THEN "total_order_amt_exclusive" ELSE 0 END), 0) AS expired_value,
@@ -390,16 +423,27 @@ def bigbasket_primary_dashboard(request, slug: str):
             SELECT
                 COALESCE(NULLIF(UPPER(TRIM("item_head"::text)), ''), 'OTHER') AS item_head,
                 COALESCE(NULLIF(UPPER(TRIM("item"::text)), ''), 'UNMAPPED') AS item,
+                COALESCE(SUM("total_order_amt_exclusive"), 0) AS order_value,
+                COALESCE(SUM("total_order_liters"), 0) AS order_ltrs,
+                COALESCE(SUM("order_qty"), 0) AS order_qty,
                 COALESCE(SUM(CASE WHEN in_selected_period
                     AND UPPER(TRIM("po_status"::text)) = 'COMPLETED'
                     THEN "{done_value_col}" ELSE 0 END), 0) AS done_value,
                 COALESCE(SUM(CASE WHEN in_selected_period
                     AND UPPER(TRIM("po_status"::text)) = 'COMPLETED'
                     THEN "total_delivered_liters" ELSE 0 END), 0) AS done_ltrs,
-                COALESCE(SUM(CASE WHEN UPPER(TRIM("po_status"::text)) IN ('APPOINTMENT DONE', 'PENDING')
+                COALESCE(SUM(CASE WHEN in_selected_period
+                    AND UPPER(TRIM("po_status"::text)) = 'COMPLETED'
+                    THEN "delivered_qty" ELSE 0 END), 0) AS done_qty,
+                COALESCE(SUM(CASE WHEN in_selected_period
+                    AND {pending_status}
                     THEN "total_order_amt_exclusive" ELSE 0 END), 0) AS pending_value,
-                COALESCE(SUM(CASE WHEN UPPER(TRIM("po_status"::text)) IN ('APPOINTMENT DONE', 'PENDING')
+                COALESCE(SUM(CASE WHEN in_selected_period
+                    AND {pending_status}
                     THEN "total_order_liters" ELSE 0 END), 0) AS pending_ltrs,
+                COALESCE(SUM(CASE WHEN in_selected_period
+                    AND {pending_status}
+                    THEN "order_qty" ELSE 0 END), 0) AS pending_qty,
                 COALESCE(SUM(CASE WHEN in_selected_period
                     AND UPPER(TRIM("po_status"::text)) = 'EXPIRED'
                     THEN "total_order_amt_exclusive" ELSE 0 END), 0) AS expired_value,
@@ -427,11 +471,13 @@ def bigbasket_primary_dashboard(request, slug: str):
         for row in item_raw
     ]
 
+    item_total = _bigbasket_primary_total(items, include_cancelled=False)
     return Response({
         "source": "master_po",
         "format": f"{slug.upper()}_PRIMARY",
         "source_format": platform_format,
         "defaulted_to_latest": defaulted_to_latest,
+        "mode": month_type,
         "month_type": month_type,
         "month": _MONTH_NAME_TO_NUM.get(month_name),
         "month_name": month_name,
@@ -442,7 +488,10 @@ def bigbasket_primary_dashboard(request, slug: str):
         "summary": summary,
         "summary_total": _bigbasket_primary_total(summary),
         "items": items,
-        "item_total": _bigbasket_primary_total(items, include_cancelled=False),
+        "item_total": item_total,
+        "details": items,
+        "detail_total": item_total,
+        "top_items": items,
         "notes": [
             "DONE metrics use COMPLETED for every item head.",
             f"Done value uses {done_value_col}.",
@@ -1271,6 +1320,8 @@ def primary_dashboard(request, slug: str):
     _ensure_scope(request.user, slug)
     if slug == "amazon":
         return _amazon_primary_dashboard_response(request)
+    if slug == "bigbasket":
+        return _bigbasket_primary_dashboard_response(request, slug)
 
     platform_format = _PRIMARY_DASHBOARD_FORMATS.get(slug)
     if not platform_format:
@@ -1299,7 +1350,8 @@ def primary_dashboard(request, slug: str):
     trend_head_params = [item_head_raw] if item_head_raw else []
 
     cache_key = (
-        f"prim_dash:{slug}:{platform_format}:{mode}:{month}:{year}:"
+        f"prim_dash:v{_PRIMARY_DASHBOARD_CACHE_VERSION}:"
+        f"{slug}:{platform_format}:{mode}:{month}:{year}:"
         f"{item_head_raw or ''}:{int(defaulted_to_latest)}"
     )
     cached = cache.get(cache_key)
@@ -1355,15 +1407,16 @@ def _primary_dashboard_payload(
     defaulted_to_latest,
     cache_key,
 ):
-    # This mirrors PRIMARY DASHBOARD!D2 in the workbook:
-    # MAXIFS(PRIMARY!BM:BM, PRIMARY!AG:AG, month, PRIMARY!AI:AI, year)
+    max_date_col = "po_dt" if mode == "PO MONTH" else "delivery_dt"
+    max_date_month_key = "po_month_key" if mode == "PO MONTH" else "delivery_month_key"
+    max_date_year_key = "po_year" if mode == "PO MONTH" else "delivery_year"
     max_date = _scalar(
         f"""
         {primary_cte}
-        SELECT MAX(po_dt)
+        SELECT MAX({max_date_col})
         FROM normalized
-        WHERE po_month_key = %s
-          AND po_year = %s
+        WHERE {max_date_month_key} = %s
+          AND {max_date_year_key} = %s
         """,
         [month_name, year],
     )
@@ -1387,9 +1440,9 @@ def _primary_dashboard_payload(
         metrics = _primary_metrics(summary_by_head.get(item_head))
         summary.append({"item_head": item_head, **metrics})
 
-    fill_rate_date_col = "po_dt" if mode == "PO MONTH" else "COALESCE(delivery_dt, po_dt)"
-    fill_rate_month_key = "po_month_key" if mode == "PO MONTH" else "COALESCE(delivery_month_key, po_month_key)"
-    fill_rate_year_key = "po_year" if mode == "PO MONTH" else "COALESCE(delivery_year, po_year)"
+    fill_rate_date_col = "po_dt" if mode == "PO MONTH" else "delivery_dt"
+    fill_rate_month_key = "po_month_key" if mode == "PO MONTH" else "delivery_month_key"
+    fill_rate_year_key = "po_year" if mode == "PO MONTH" else "delivery_year"
     fill_rate_max_date = _scalar(
         f"""
         {primary_cte}
@@ -1637,7 +1690,7 @@ def _primary_dashboard_payload(
 
     detail_total = _primary_total(details)
     summary_total = _primary_total(summary)
-    trend_date_col = "COALESCE(delivery_dt, po_dt)" if mode == "DEL MONTH" else "po_dt"
+    trend_date_col = "delivery_dt" if mode == "DEL MONTH" else "po_dt"
     period_start = date(year, month, 1)
     period_end = date(year, month, monthrange(year, month)[1])
 
@@ -4086,7 +4139,7 @@ def _primary_text_date_expr(column_name: str) -> str:
 
 def _parse_bigbasket_primary_period(params, platform_format: str) -> tuple[str, str, str, str, int, bool]:
     month_type, month_col, date_col = _parse_bigbasket_primary_month_type(
-        params.get("month_type")
+        params.get("month_type") or params.get("mode")
     )
     raw_year = str(params.get("year") or "").strip()
     month_name = _parse_month_name_param(params.get("month"))
@@ -4266,14 +4319,14 @@ def _parse_primary_dashboard_params(params, platform_format: str = "ZEPTO") -> t
         raw_month = iso_month.group(2)
 
     if not raw_month or not raw_year:
-        order_date = "COALESCE(delivery_dt, po_dt)" if mode == "DEL MONTH" else "po_dt"
+        order_date = "delivery_dt" if mode == "DEL MONTH" else "po_dt"
         primary_cte = _primary_master_po_cte(platform_format)
         latest = _dict_rows(
             f"""
             {primary_cte}
             SELECT
                 {order_date} AS period_date,
-                COALESCE(delivery_year, po_year) AS del_year,
+                delivery_year AS del_year,
                 po_year
             FROM normalized
             WHERE {order_date} IS NOT NULL
@@ -4315,19 +4368,19 @@ def _parse_primary_dashboard_params(params, platform_format: str = "ZEPTO") -> t
 def _primary_period_filter(mode: str) -> str:
     if mode == "PO MONTH":
         return "po_month_key = %s AND po_year = %s"
-    return "COALESCE(delivery_month_key, po_month_key) = %s AND COALESCE(delivery_year, po_year) = %s"
+    return "delivery_month_key = %s AND delivery_year = %s"
 
 
 def _primary_vendor_metric_filter(mode: str) -> str:
     if mode == "PO MONTH":
         return "po_month_key = %s AND po_year = %s"
-    return "COALESCE(delivery_month_key, po_month_key) = %s AND COALESCE(delivery_year, po_year) = %s"
+    return "delivery_month_key = %s AND delivery_year = %s"
 
 
 def _primary_vendor_pending_filter(mode: str) -> str:
     if mode == "PO MONTH":
         return "po_month_key = %s AND po_year = %s"
-    return "COALESCE(delivery_month_key, po_month_key) = %s AND COALESCE(delivery_year, po_year) = %s"
+    return "delivery_month_key = %s AND delivery_year = %s"
 
 
 def _primary_zero_metrics() -> dict:

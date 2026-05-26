@@ -3,6 +3,7 @@ import json
 import re
 from collections import defaultdict
 from datetime import date, datetime, timedelta
+from decimal import Decimal, InvalidOperation
 
 from django.db import connection
 from rest_framework.decorators import api_view, permission_classes
@@ -554,3 +555,100 @@ def table_data(request, table_name: str):
         "page_size": page_size,
         "max_date": latest_date,
     })
+
+
+PRIMARY_MANUAL_UPDATE_FORMATS = {"CITY MALL", "FLIPKART GROCERY"}
+PRIMARY_MANUAL_UPDATE_COLUMNS = {"grn_date", "status", "delivered_qty", "remark"}
+
+
+def _manual_date_value(value):
+    if value is None or str(value).strip() == "":
+        return None
+    text = str(value).strip()
+    for fmt in ("%Y-%m-%d", "%d-%m-%Y", "%d/%m/%Y"):
+        try:
+            return datetime.strptime(text[:10], fmt).date()
+        except ValueError:
+            continue
+    raise ValueError("GRN Date must be YYYY-MM-DD or DD-MM-YYYY.")
+
+
+def _manual_decimal_value(value):
+    if value is None or str(value).strip() == "":
+        return None
+    try:
+        return Decimal(str(value).replace(",", "").strip())
+    except InvalidOperation as exc:
+        raise ValueError("Delivered Qty must be numeric.") from exc
+
+
+@api_view(["POST"])
+@permission_classes([require("upload.use")])
+def update_primary_manual_fields(request, table_name: str):
+    if table_name != "total_po":
+        return Response({"detail": "Only total_po rows can be edited here."}, status=400)
+
+    body = request.data or {}
+    row_id = body.get("id") or body.get("row_id")
+    try:
+        row_id = int(row_id)
+    except (TypeError, ValueError):
+        return Response({"detail": "Row id is required."}, status=400)
+
+    updates = body.get("updates") or {}
+    if not isinstance(updates, dict):
+        return Response({"detail": "updates must be an object."}, status=400)
+
+    cleaned = {}
+    for raw_col, raw_value in updates.items():
+        col = "remark" if raw_col == "remarks" else str(raw_col or "").strip()
+        if col not in PRIMARY_MANUAL_UPDATE_COLUMNS:
+            continue
+        try:
+            if col == "grn_date":
+                cleaned[col] = _manual_date_value(raw_value)
+            elif col == "delivered_qty":
+                cleaned[col] = _manual_decimal_value(raw_value)
+            elif col in {"status", "remark"}:
+                cleaned[col] = None if raw_value is None else str(raw_value).strip()
+        except ValueError as exc:
+            return Response({"detail": str(exc)}, status=400)
+
+    if not cleaned:
+        return Response({"detail": "No editable fields supplied."}, status=400)
+
+    expected_format = str(body.get("format") or "").strip().upper()
+    if expected_format and expected_format not in PRIMARY_MANUAL_UPDATE_FORMATS:
+        return Response({"detail": "This platform is not editable here."}, status=400)
+
+    assignments = ", ".join(f'"{col}" = %s' for col in cleaned)
+    params = list(cleaned.values())
+    params.append(row_id)
+    if expected_format:
+        params.append(expected_format)
+        format_guard = 'AND UPPER(TRIM("format"::text)) = %s'
+    else:
+        format_guard = (
+            'AND UPPER(TRIM("format"::text)) IN (\'CITY MALL\', \'FLIPKART GROCERY\')'
+        )
+
+    try:
+        with connection.cursor() as cur:
+            cur.execute(
+                f"""
+                UPDATE "total_po"
+                   SET {assignments}
+                 WHERE id = %s
+                   {format_guard}
+             RETURNING *
+                """,
+                params,
+            )
+            row = cur.fetchone()
+            if not row:
+                return Response({"detail": "Matching editable row not found."}, status=404)
+            cols = [c[0] for c in cur.description]
+    except Exception as exc:
+        return Response({"detail": f"Update failed: {exc}"}, status=400)
+
+    return Response({"row": dict(zip(cols, row))})

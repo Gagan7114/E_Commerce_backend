@@ -31,6 +31,12 @@ urlpatterns = [
         {"slug": "zepto"},
         name="platform-zepto-primary-dashboard",
     ),
+    path(
+        "bigbasket/primary-dashboard",
+        views.bigbasket_primary_dashboard,
+        {"slug": "bigbasket"},
+        name="platform-bigbasket-primary-dashboard",
+    ),
     path("<slug:slug>/primary-dashboard", views.primary_dashboard, name="platform-primary-dashboard"),
     path("<slug:slug>/price-dashboard", views.amazon_price_dashboard, name="platform-amazon-price-dashboard"),
     path("<slug:slug>/ads-dashboard", views.amazon_ads_dashboard, name="platform-amazon-ads-dashboard"),
