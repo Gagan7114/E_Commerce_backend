@@ -5,7 +5,7 @@ from collections import defaultdict
 from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 
-from django.db import connection
+from django.db import connection, transaction
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.response import Response
 
@@ -582,6 +582,33 @@ def _manual_decimal_value(value):
         raise ValueError("Delivered Qty must be numeric.") from exc
 
 
+def _clean_primary_manual_updates(updates: dict) -> dict:
+    cleaned = {}
+    for raw_col, raw_value in updates.items():
+        col = "remark" if raw_col == "remarks" else str(raw_col or "").strip()
+        if col not in PRIMARY_MANUAL_UPDATE_COLUMNS:
+            continue
+        if col == "grn_date":
+            cleaned[col] = _manual_date_value(raw_value)
+        elif col == "delivered_qty":
+            cleaned[col] = _manual_decimal_value(raw_value)
+        elif col in {"status", "remark"}:
+            cleaned[col] = None if raw_value is None else str(raw_value).strip()
+    return cleaned
+
+
+def _primary_manual_format_guard(expected_format: str) -> tuple[str, list]:
+    expected_format = str(expected_format or "").strip().upper()
+    if expected_format:
+        if expected_format not in PRIMARY_MANUAL_UPDATE_FORMATS:
+            raise ValueError("This platform is not editable here.")
+        return 'AND UPPER(TRIM("format"::text)) = %s', [expected_format]
+    return (
+        'AND UPPER(TRIM("format"::text)) IN (\'CITY MALL\', \'FLIPKART GROCERY\')',
+        [],
+    )
+
+
 @api_view(["POST"])
 @permission_classes([require("upload.use")])
 def update_primary_manual_fields(request, table_name: str):
@@ -599,38 +626,23 @@ def update_primary_manual_fields(request, table_name: str):
     if not isinstance(updates, dict):
         return Response({"detail": "updates must be an object."}, status=400)
 
-    cleaned = {}
-    for raw_col, raw_value in updates.items():
-        col = "remark" if raw_col == "remarks" else str(raw_col or "").strip()
-        if col not in PRIMARY_MANUAL_UPDATE_COLUMNS:
-            continue
-        try:
-            if col == "grn_date":
-                cleaned[col] = _manual_date_value(raw_value)
-            elif col == "delivered_qty":
-                cleaned[col] = _manual_decimal_value(raw_value)
-            elif col in {"status", "remark"}:
-                cleaned[col] = None if raw_value is None else str(raw_value).strip()
-        except ValueError as exc:
-            return Response({"detail": str(exc)}, status=400)
+    try:
+        cleaned = _clean_primary_manual_updates(updates)
+    except ValueError as exc:
+        return Response({"detail": str(exc)}, status=400)
 
     if not cleaned:
         return Response({"detail": "No editable fields supplied."}, status=400)
 
-    expected_format = str(body.get("format") or "").strip().upper()
-    if expected_format and expected_format not in PRIMARY_MANUAL_UPDATE_FORMATS:
-        return Response({"detail": "This platform is not editable here."}, status=400)
+    try:
+        format_guard, format_params = _primary_manual_format_guard(body.get("format"))
+    except ValueError as exc:
+        return Response({"detail": str(exc)}, status=400)
 
     assignments = ", ".join(f'"{col}" = %s' for col in cleaned)
     params = list(cleaned.values())
     params.append(row_id)
-    if expected_format:
-        params.append(expected_format)
-        format_guard = 'AND UPPER(TRIM("format"::text)) = %s'
-    else:
-        format_guard = (
-            'AND UPPER(TRIM("format"::text)) IN (\'CITY MALL\', \'FLIPKART GROCERY\')'
-        )
+    params.extend(format_params)
 
     try:
         with connection.cursor() as cur:
@@ -652,3 +664,84 @@ def update_primary_manual_fields(request, table_name: str):
         return Response({"detail": f"Update failed: {exc}"}, status=400)
 
     return Response({"row": dict(zip(cols, row))})
+
+
+@api_view(["POST"])
+@permission_classes([require("upload.use")])
+def bulk_update_primary_manual_fields(request, table_name: str):
+    if table_name != "total_po":
+        return Response({"detail": "Only total_po rows can be edited here."}, status=400)
+
+    body = request.data or {}
+    rows = body.get("rows") or []
+    if not isinstance(rows, list) or not rows:
+        return Response({"detail": "No rows supplied."}, status=400)
+
+    try:
+        format_guard, format_params = _primary_manual_format_guard(body.get("format"))
+    except ValueError as exc:
+        return Response({"detail": str(exc)}, status=400)
+
+    updated = 0
+    failed = []
+    saved_rows = []
+
+    try:
+        with transaction.atomic(), connection.cursor() as cur:
+            for index, item in enumerate(rows):
+                row_id = item.get("id") or item.get("row_id")
+                try:
+                    row_id = int(row_id)
+                except (TypeError, ValueError):
+                    failed.append({"index": index, "detail": "Row id is required."})
+                    continue
+
+                updates = item.get("updates") or {}
+                if not isinstance(updates, dict):
+                    failed.append({"id": row_id, "detail": "updates must be an object."})
+                    continue
+
+                try:
+                    cleaned = _clean_primary_manual_updates(updates)
+                except ValueError as exc:
+                    failed.append({"id": row_id, "detail": str(exc)})
+                    continue
+
+                if not cleaned:
+                    continue
+
+                assignments = ", ".join(f'"{col}" = %s' for col in cleaned)
+                params = [*cleaned.values(), row_id, *format_params]
+                cur.execute(
+                    f"""
+                    UPDATE "total_po"
+                       SET {assignments}
+                     WHERE id = %s
+                       {format_guard}
+                 RETURNING *
+                    """,
+                    params,
+                )
+                row = cur.fetchone()
+                if not row:
+                    failed.append({"id": row_id, "detail": "Matching editable row not found."})
+                    continue
+                cols = [c[0] for c in cur.description]
+                saved_rows.append(dict(zip(cols, row)))
+                updated += 1
+            if failed:
+                transaction.set_rollback(True)
+    except Exception as exc:
+        return Response({"detail": f"Bulk update failed: {exc}"}, status=400)
+
+    if failed:
+        return Response(
+            {
+                "detail": "Some rows could not be saved.",
+                "updated": updated,
+                "failed": failed,
+            },
+            status=400,
+        )
+
+    return Response({"updated": updated, "rows": saved_rows})
