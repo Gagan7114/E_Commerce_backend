@@ -420,6 +420,300 @@ def inventory_charts(request):
     })
 
 
+# ─── /primary-po-litres ───
+@api_view(["GET"])
+@permission_classes([require("dashboard.table.view")])
+def primary_po_litres(request):
+    """SUM(total_delivered_liters) for the current month from master_po + reporting.Amazon PO."""
+    today = date.today()
+    month_name = calendar.month_name[today.month].upper()  # e.g. 'MAY'
+    year = today.year
+
+    results = []
+    errors = []
+    with connection.cursor() as cur:
+        try:
+            cur.execute("""
+                SELECT UPPER(TRIM(format::text)) AS format,
+                       COALESCE(SUM(total_delivered_liters), 0) AS delivered_ltrs
+                FROM public.master_po
+                WHERE UPPER(TRIM(delivery_month::text)) = %s
+                  AND delivered_year = %s
+                GROUP BY 1
+                ORDER BY delivered_ltrs DESC
+            """, [month_name, year])
+            for row in cur.fetchall():
+                results.append({"format": row[0], "delivered_ltrs": float(row[1] or 0)})
+        except Exception as e:
+            errors.append({"source": "master_po", "error": str(e)})
+        try:
+            cur.execute("""
+                SELECT COALESCE(SUM(total_delivered_liters), 0)
+                FROM reporting."Amazon PO"
+                WHERE po_month = %s
+                  AND year = %s
+            """, [today.month, year])
+            row = cur.fetchone()
+            if row:
+                results.append({"format": "AMAZON", "delivered_ltrs": float(row[0] or 0)})
+        except Exception as e:
+            errors.append({"source": "amazon_po", "error": str(e)})
+    return Response({"platforms": results, "errors": errors, "month": month_name, "year": year})
+
+
+# ─── /platform-expiry-alerts ───
+@api_view(["GET"])
+@permission_classes([require("dashboard.view")])
+def platform_expiry_alerts(request):
+    """Unique POs with 1 <= days_to_expiry <= 5 in the current month, per platform."""
+    today = date.today()
+    month_name = calendar.month_name[today.month].upper()  # e.g. 'MAY'
+    year = today.year
+
+    FORMAT_TO_SLUG = {
+        'BLINKIT': 'blinkit',
+        'ZEPTO': 'zepto',
+        'SWIGGY': 'swiggy',
+        'BIG BASKET': 'bigbasket',
+        'FLIPKART GROCERY': 'flipkart_grocery',
+        'ZOMATO': 'zomato',
+        'CITY MALL': 'citymall',
+        'AMAZON': 'amazon',
+    }
+    results = []
+    errors = []
+    with connection.cursor() as cur:
+        try:
+            cur.execute("""
+                SELECT
+                    UPPER(TRIM(format::text))                       AS format,
+                    COUNT(DISTINCT po_number)                       AS po_count,
+                    COALESCE(SUM(total_order_liters), 0)            AS total_litrs,
+                    COALESCE(SUM(total_order_amt_exclusive), 0)     AS total_units
+                FROM public.master_po
+                WHERE days_to_expiry IS NOT NULL
+                  AND days_to_expiry >= 1
+                  AND days_to_expiry <= 5
+                  AND UPPER(TRIM(po_status::text)) IN ('PENDING', 'APPOINTMENT DONE')
+                GROUP BY 1
+                ORDER BY total_units DESC
+            """, [])
+            for row in cur.fetchall():
+                fmt = row[0]
+                slug = FORMAT_TO_SLUG.get(fmt, (fmt.lower().replace(' ', '_') if fmt else None))
+                results.append({
+                    "format": fmt,
+                    "slug": slug,
+                    "po_count": int(row[1] or 0),
+                    "total_litrs": float(row[2] or 0),
+                    "total_units": float(row[3] or 0),
+                })
+        except Exception as e:
+            errors.append({"source": "master_po", "error": str(e)})
+        try:
+            cur.execute("""
+                SELECT
+                    COUNT(DISTINCT po_number)                   AS po_count,
+                    COALESCE(SUM(total_order_liters), 0)        AS total_litrs,
+                    COALESCE(SUM(requested_qty), 0)             AS total_units
+                FROM reporting."Amazon PO"
+                WHERE days_to_expiry IS NOT NULL
+                  AND days_to_expiry >= 1
+                  AND days_to_expiry <= 5
+                  AND UPPER(TRIM(po_status::text)) = 'PENDING'
+            """, [])
+            row = cur.fetchone()
+            if row and int(row[0] or 0) > 0:
+                results.append({
+                    "format": "AMAZON",
+                    "slug": "amazon",
+                    "po_count": int(row[0] or 0),
+                    "total_litrs": float(row[1] or 0),
+                    "total_units": float(row[2] or 0),
+                })
+        except Exception as e:
+            errors.append({"source": "amazon_po", "error": str(e)})
+    return Response({
+        "platforms": results,
+        "errors": errors,
+        "month": month_name,
+        "year": year,
+    })
+
+
+# ─── /platform-expiry-alerts/<slug>/pos ───
+@api_view(["GET"])
+@permission_classes([require("dashboard.view")])
+def platform_expiry_alert_pos(request, slug: str):
+    """Distinct POs (1 <= days_to_expiry <= 5) for a platform in the current month."""
+    today = date.today()
+    month_name = calendar.month_name[today.month].upper()
+    year = today.year
+
+    SLUG_TO_FORMAT = {
+        'blinkit': 'BLINKIT',
+        'zepto': 'ZEPTO',
+        'swiggy': 'SWIGGY',
+        'bigbasket': 'BIG BASKET',
+        'flipkart_grocery': 'FLIPKART GROCERY',
+        'zomato': 'ZOMATO',
+        'citymall': 'CITY MALL',
+    }
+
+    rows = []
+    error = None
+    with connection.cursor() as cur:
+        if slug == 'amazon':
+            try:
+                cur.execute("""
+                    SELECT
+                        po_number,
+                        MAX(sku_name)                                           AS sku_name,
+                        MAX(item)                                               AS item,
+                        MAX(days_to_expiry)                                     AS days_to_expiry,
+                        MAX(expiry_date)                                        AS expiry_date,
+                        MAX(po_status)                                          AS po_status,
+                        MAX(fulfillment_center)                                 AS location,
+                        COALESCE(SUM(total_order_liters), 0)                    AS total_litrs,
+                        COALESCE(SUM(requested_qty), 0)                         AS total_units
+                    FROM reporting."Amazon PO"
+                    WHERE days_to_expiry IS NOT NULL
+                      AND days_to_expiry >= 1
+                      AND days_to_expiry <= 5
+                      AND UPPER(TRIM(po_status::text)) = 'PENDING'
+                    GROUP BY po_number
+                    ORDER BY days_to_expiry ASC, po_number
+                """, [])
+                cols = [d[0] for d in cur.description]
+                rows = [dict(zip(cols, r)) for r in cur.fetchall()]
+            except Exception as e:
+                error = str(e)
+        else:
+            fmt = SLUG_TO_FORMAT.get(slug)
+            if not fmt:
+                return Response({"error": f"Unknown platform slug: {slug}"}, status=400)
+            try:
+                cur.execute("""
+                    SELECT
+                        po_number,
+                        MAX(COALESCE(item, sku_name))               AS item,
+                        MAX(sku_name)                               AS sku_name,
+                        MAX(days_to_expiry)                         AS days_to_expiry,
+                        MAX(po_expiry_date)                         AS expiry_date,
+                        MAX(po_status)                              AS po_status,
+                        MAX(location)                               AS location,
+                        COALESCE(SUM(total_order_liters), 0)            AS total_litrs,
+                        COALESCE(SUM(total_order_amt_exclusive), 0)     AS total_units
+                    FROM public.master_po
+                    WHERE UPPER(TRIM(format::text)) = %s
+                      AND days_to_expiry IS NOT NULL
+                      AND days_to_expiry >= 1
+                      AND days_to_expiry <= 5
+                      AND UPPER(TRIM(po_status::text)) IN ('PENDING', 'APPOINTMENT DONE')
+                    GROUP BY po_number
+                    ORDER BY days_to_expiry ASC, po_number
+                """, [fmt])
+                cols = [d[0] for d in cur.description]
+                rows = [dict(zip(cols, r)) for r in cur.fetchall()]
+            except Exception as e:
+                error = str(e)
+
+    # Serialise Decimal / date objects
+    def _clean(v):
+        if hasattr(v, 'isoformat'):
+            return v.isoformat()
+        if hasattr(v, '__float__'):
+            return float(v)
+        return v
+
+    rows = [{k: _clean(v) for k, v in row.items()} for row in rows]
+    return Response({"pos": rows, "error": error, "month": month_name, "year": year})
+
+
+# ─── /platform-expiry-alerts/<slug>/pos/<po_number>/items ───
+@api_view(["GET"])
+@permission_classes([require("dashboard.view")])
+def platform_expiry_alert_po_items(request, slug: str, po_number: str):
+    """Individual line items for a single PO within the 1–5 day expiry window."""
+
+    SLUG_TO_FORMAT = {
+        'blinkit': 'BLINKIT',
+        'zepto': 'ZEPTO',
+        'swiggy': 'SWIGGY',
+        'bigbasket': 'BIG BASKET',
+        'flipkart_grocery': 'FLIPKART GROCERY',
+        'zomato': 'ZOMATO',
+        'citymall': 'CITY MALL',
+    }
+
+    rows = []
+    error = None
+    with connection.cursor() as cur:
+        if slug == 'amazon':
+            try:
+                cur.execute("""
+                    SELECT
+                        sku_name,
+                        item,
+                        merchant_sku                                AS sku_code,
+                        requested_qty                               AS qty,
+                        COALESCE(total_order_liters, 0)             AS litrs,
+                        po_status,
+                        fulfillment_center                          AS location,
+                        expiry_date,
+                        days_to_expiry
+                    FROM reporting."Amazon PO"
+                    WHERE po_number = %s
+                      AND days_to_expiry >= 1
+                      AND days_to_expiry <= 5
+                      AND UPPER(TRIM(po_status::text)) = 'PENDING'
+                    ORDER BY sku_name
+                """, [po_number])
+                cols = [d[0] for d in cur.description]
+                rows = [dict(zip(cols, r)) for r in cur.fetchall()]
+            except Exception as e:
+                error = str(e)
+        else:
+            fmt = SLUG_TO_FORMAT.get(slug)
+            if not fmt:
+                return Response({"error": f"Unknown platform slug: {slug}"}, status=400)
+            try:
+                cur.execute("""
+                    SELECT
+                        COALESCE(item, sku_name)                    AS item,
+                        sku_name,
+                        sku_code,
+                        delivered_qty                               AS qty,
+                        COALESCE(total_order_liters, 0)             AS litrs,
+                        COALESCE(total_order_amt_exclusive, 0)      AS order_value,
+                        po_status,
+                        location,
+                        po_expiry_date                              AS expiry_date,
+                        days_to_expiry
+                    FROM public.master_po
+                    WHERE UPPER(TRIM(format::text)) = %s
+                      AND po_number = %s
+                      AND days_to_expiry >= 1
+                      AND days_to_expiry <= 5
+                      AND UPPER(TRIM(po_status::text)) IN ('PENDING', 'APPOINTMENT DONE')
+                    ORDER BY sku_name
+                """, [fmt, po_number])
+                cols = [d[0] for d in cur.description]
+                rows = [dict(zip(cols, r)) for r in cur.fetchall()]
+            except Exception as e:
+                error = str(e)
+
+    def _clean(v):
+        if hasattr(v, 'isoformat'):
+            return v.isoformat()
+        if hasattr(v, '__float__'):
+            return float(v)
+        return v
+
+    rows = [{k: _clean(v) for k, v in row.items()} for row in rows]
+    return Response({"items": rows, "error": error})
+
+
 # ─── /table-data/{table} ───
 @api_view(["GET"])
 @permission_classes([require("dashboard.table.view")])

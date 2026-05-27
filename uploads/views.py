@@ -2094,3 +2094,104 @@ def fk_grocery_master_upload(request):
         )
     except Exception as e:
         return Response({"detail": str(e)}, status=500)
+
+
+@api_view(["POST"])
+@permission_classes([require("upload.use")])
+def fk_grocery_master_reprocess(request):
+    """Re-enrich existing flipkart_grocery_master rows from master_sheet and monthly_landing_rate.
+
+    Useful when rows were uploaded before their SKUs existed in master_sheet.
+    Accepts optional body: {"month": 5, "year": 2026} to target a specific period.
+    Without filters, re-processes all rows where item_head IS NULL.
+    """
+    body = request.data or {}
+    month_param = body.get("month")
+    year_param = body.get("year")
+
+    try:
+        period_filter = ""
+        period_params: list = []
+        if month_param is not None and year_param is not None:
+            period_filter = 'AND fgm."month" = %s AND fgm."year" = %s'
+            period_params = [int(month_param), int(year_param)]
+
+        with connection.cursor() as cur:
+            # Step 1: bulk update from master_sheet for all NULL item_head rows
+            cur.execute(
+                f"""
+                UPDATE "flipkart_grocery_master" AS fgm
+                SET
+                    item         = ms.item,
+                    category     = ms.category,
+                    sub_category = ms.sub_category,
+                    item_head    = ms.item_head,
+                    per_ltr      = ms.per_unit_value::NUMERIC,
+                    per_ltr_unit = ms.per_unit,
+                    uom          = ms.uom,
+                    brand        = COALESCE(fgm.brand, ms.brand),
+                    ltr_sold     = ms.per_unit_value::NUMERIC * fgm.qty
+                FROM master_sheet ms
+                WHERE ms.format_sku_code = fgm.sku_id
+                  AND fgm.item_head IS NULL
+                  {period_filter}
+                """,
+                period_params,
+            )
+            master_updated = cur.rowcount
+
+            # Step 2: update sale amounts from monthly_landing_rate (prefer month-matched rate)
+            cur.execute(
+                f"""
+                UPDATE "flipkart_grocery_master" AS fgm
+                SET
+                    landing_rate        = mlr.landing_rate,
+                    basic_rate          = mlr.basic_rate,
+                    sale_amt_inclusive  = mlr.landing_rate * fgm.qty,
+                    sale_amt_exclusive  = mlr.basic_rate * fgm.qty
+                FROM (
+                    SELECT DISTINCT ON (sku_code)
+                        sku_code, landing_rate, basic_rate
+                    FROM monthly_landing_rate
+                    WHERE UPPER(TRIM(format)) = 'FLIPKART GROCERY'
+                    ORDER BY sku_code, month DESC, created_at DESC
+                ) mlr
+                WHERE mlr.sku_code = fgm.sku_id
+                  AND (fgm.sale_amt_exclusive IS NULL OR fgm.sale_amt_exclusive = 0)
+                  {period_filter}
+                """,
+                period_params,
+            )
+            price_updated = cur.rowcount
+
+            # Report how many SKUs still have no item_head (not in master_sheet)
+            cur.execute(
+                f"""
+                SELECT DISTINCT sku_id FROM "flipkart_grocery_master" fgm
+                WHERE fgm.item_head IS NULL {period_filter}
+                """,
+                period_params,
+            )
+            missing_master_skus = sorted(r[0] for r in cur.fetchall())
+
+            cur.execute(
+                f"""
+                SELECT DISTINCT sku_id FROM "flipkart_grocery_master" fgm
+                WHERE (fgm.sale_amt_exclusive IS NULL OR fgm.sale_amt_exclusive = 0)
+                  AND fgm.item_head IS NOT NULL
+                  {period_filter}
+                """,
+                period_params,
+            )
+            missing_rate_skus = sorted(r[0] for r in cur.fetchall())
+
+        return Response({
+            "master_updated": master_updated,
+            "price_updated": price_updated,
+            "missing_master": len(missing_master_skus),
+            "missing_master_skus": missing_master_skus,
+            "missing_landing_rate": len(missing_rate_skus),
+            "missing_landing_rate_skus": missing_rate_skus,
+        })
+    except Exception as e:
+        return Response({"detail": str(e)}, status=500)

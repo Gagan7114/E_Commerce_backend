@@ -13,6 +13,11 @@ urlpatterns = [
     path("warehouses/<str:whs_code>", views.warehouse_detail, name="sap-warehouse-detail"),
     path("stock-by-warehouse", views.stock_by_warehouse, name="sap-stock-by-warehouse"),
     path("inventory-overview", views.inventory_overview, name="sap-inventory-overview"),
+    path(
+        "inventory-warehouse-comparison",
+        views.inventory_warehouse_comparison,
+        name="sap-inventory-warehouse-comparison",
+    ),
     path("sales-invoices", views.sales_invoices, name="sap-sales-invoices"),
     path("sales-invoices/<str:card_code>", views.customer_sales_invoices, name="sap-customer-sales-invoices"),
     path("sales-invoice-lines/<int:doc_entry>", views.sales_invoice_lines, name="sap-sales-invoice-lines"),

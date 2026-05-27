@@ -20,5 +20,6 @@ urlpatterns = [
     path("flipkart-grocery/status", views.flipkart_grocery_upload_status, name="flipkart-grocery-upload-status"),
     path("flipkart-grocery/raw", views.flipkart_grocery_raw_upload, name="flipkart-grocery-raw-upload"),
     path("flipkart-grocery/master", views.fk_grocery_master_upload, name="flipkart-grocery-master-upload"),
+    path("flipkart-grocery/reprocess", views.fk_grocery_master_reprocess, name="flipkart-grocery-reprocess"),
     path("fk-grocery-master", views.fk_grocery_master_upload, name="fk-grocery-master-upload"),
 ]

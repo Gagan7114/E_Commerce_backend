@@ -33,7 +33,7 @@ _WRITE_KEYWORDS = re.compile(
 
 
 @contextmanager
-def hana_connection() -> Iterator[Any]:
+def hana_connection(schema: str | None = None) -> Iterator[Any]:
     if dbapi is None:
         raise RuntimeError("hdbcli is not installed. pip install hdbcli.")
     cfg = settings.HANA
@@ -42,7 +42,7 @@ def hana_connection() -> Iterator[Any]:
         port=cfg["port"],
         user=cfg["user"],
         password=cfg["password"],
-        currentSchema=cfg["schema"] or None,
+        currentSchema=(schema or cfg["schema"] or None),
         autocommit=False,
     )
     try:
@@ -59,10 +59,14 @@ def _assert_readonly(sql: str) -> None:
         raise RuntimeError("Only SELECT statements are allowed against SAP HANA.")
 
 
-def select(sql: str, params: list | tuple | None = None) -> list[dict]:
-    """Run a parameterized SELECT and return rows as list[dict]."""
+def select(
+    sql: str, params: list | tuple | None = None, schema: str | None = None
+) -> list[dict]:
+    """Run a parameterized SELECT and return rows as list[dict]. `schema`
+    overrides the connection's default currentSchema for this query, so the
+    same unqualified-table SQL can target either company DB (mart / oil)."""
     _assert_readonly(sql)
-    with hana_connection() as conn:
+    with hana_connection(schema) as conn:
         cur = conn.cursor()
         cur.execute(sql, params or [])
         cols = [d[0] for d in cur.description]
@@ -71,13 +75,32 @@ def select(sql: str, params: list | tuple | None = None) -> list[dict]:
     return [dict(zip(cols, r)) for r in rows]
 
 
-# Allow-listed HANA procedures the sales-analysis endpoint may call.
-# Adding a new source = add an entry here AND surface it on the frontend.
-SALES_ANALYSIS_PROCEDURES: dict[str, str] = {
-    "mart": '"JIVO_MART_HANADB"."REPORT_SALES_ANALYSIS"',
-    "oil":  '"JIVO_OIL_HANADB"."REPORT_SALES_ANALYSIS"',
+# All HANA company schemas we can target, keyed by the `source` the frontend
+# sends (mart / oil). Single place to add a new company DB — both the
+# sales-analysis procedure names and the inventory grid derive from this.
+HANA_SCHEMAS: dict[str, str] = {
+    "mart": "JIVO_MART_HANADB",
+    "oil":  "JIVO_OIL_HANADB",
 }
-SALES_ANALYSIS_DEFAULT_SOURCE = "mart"
+DEFAULT_SOURCE = "mart"
+
+
+def resolve_schema(source: str | None) -> tuple[str, str]:
+    """Map a `source` key to (source_key, schema_name). Unknown/blank sources
+    fall back to the default so a stray value never 500s the grid."""
+    key = (source or DEFAULT_SOURCE).strip().lower()
+    if key not in HANA_SCHEMAS:
+        key = DEFAULT_SOURCE
+    return key, HANA_SCHEMAS[key]
+
+
+# Allow-listed HANA procedures the sales-analysis endpoint may call — one per
+# schema, derived from HANA_SCHEMAS so there's a single source of truth.
+SALES_ANALYSIS_PROCEDURES: dict[str, str] = {
+    key: f'"{schema}"."REPORT_SALES_ANALYSIS"'
+    for key, schema in HANA_SCHEMAS.items()
+}
+SALES_ANALYSIS_DEFAULT_SOURCE = DEFAULT_SOURCE
 
 
 def _resolve_sales_analysis_procedure(source: str | None) -> tuple[str, str]:

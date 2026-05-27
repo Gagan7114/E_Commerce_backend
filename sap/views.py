@@ -12,9 +12,11 @@ from rest_framework.response import Response
 from accounts.permissions import require
 
 from .service import (
+    HANA_SCHEMAS,
     SALES_ANALYSIS_DEFAULT_SOURCE,
     SALES_ANALYSIS_PROCEDURES,
     report_sales_analysis,
+    resolve_schema,
     select,
 )
 
@@ -52,15 +54,19 @@ def _page(request) -> tuple[int, int]:
     return page, page_size
 
 
-def _run(sql: str, params: list | tuple | None = None) -> list[dict]:
+def _run(
+    sql: str, params: list | tuple | None = None, schema: str | None = None
+) -> list[dict]:
     try:
-        return select(sql, params)
+        return select(sql, params, schema)
     except Exception as e:
         raise SAPError(f"SAP HANA error: {e}")
 
 
-def _count_of(sql: str, params: list | tuple | None = None) -> int:
-    rows = _run(sql, params)
+def _count_of(
+    sql: str, params: list | tuple | None = None, schema: str | None = None
+) -> int:
+    rows = _run(sql, params, schema)
     if not rows:
         return 0
     val = next(iter(rows[0].values()))
@@ -579,10 +585,15 @@ def inventory_overview(request):
     page, page_size = _page(request)
     offset = page * page_size
 
+    # Which company DB to read — mart (default) or oil. Every query below runs
+    # against this schema via the `schema=` override on _run/_count_of.
+    source, schema = resolve_schema(request.query_params.get("source"))
+
     search = (request.query_params.get("search") or "").strip()
     status = (request.query_params.get("status") or "").strip().upper()
     stock_state = (request.query_params.get("stock_state") or "").strip().lower()
     warehouse_codes = _split_csv(request.query_params.get("warehouse", ""))
+    warehouse_code_codes = _split_csv(request.query_params.get("warehouse_code", ""))
     group_codes_raw = _split_csv(request.query_params.get("group", ""))
     # Item group codes are integers in OITM; drop anything non-numeric to keep
     # the IN-clause safe and to avoid a HANA cast error.
@@ -593,41 +604,52 @@ def inventory_overview(request):
         except ValueError:
             pass
 
-    where_clauses: list[str] = ["1=1"]
-    params: list = []
+    # Each active filter is a named SQL fragment. The option-list queries below
+    # rebuild the WHERE while EXCLUDING one dimension, which is what makes the
+    # dropdowns cascade — every filter's options reflect the OTHER active
+    # filters. `warehouse` and `warehouse_code` both constrain T1."WhsCode" and
+    # form one "warehouse" dimension for the purpose of narrowing options.
+    frag: dict[str, tuple[str, list]] = {}
 
     if search:
-        where_clauses.append(
-            '(T0."ItemCode" LIKE ? OR T0."ItemName" LIKE ? OR T0."CodeBars" LIKE ?)'
-        )
         s = f"%{search}%"
-        params.extend([s, s, s])
-
+        frag["search"] = (
+            '(T0."ItemCode" LIKE ? OR T0."ItemName" LIKE ? OR T0."CodeBars" LIKE ?)',
+            [s, s, s],
+        )
     if status in ("Y", "N"):
-        where_clauses.append('T0."validFor" = ?')
-        params.append(status)
-
+        frag["status"] = ('T0."validFor" = ?', [status])
     if warehouse_codes:
-        placeholders = ", ".join(["?"] * len(warehouse_codes))
-        where_clauses.append(f'T1."WhsCode" IN ({placeholders})')
-        params.extend(warehouse_codes)
-
+        ph = ", ".join(["?"] * len(warehouse_codes))
+        frag["warehouse"] = (f'T1."WhsCode" IN ({ph})', list(warehouse_codes))
+    if warehouse_code_codes:
+        ph = ", ".join(["?"] * len(warehouse_code_codes))
+        frag["warehouse_code"] = (f'T1."WhsCode" IN ({ph})', list(warehouse_code_codes))
     if group_codes:
-        placeholders = ", ".join(["?"] * len(group_codes))
-        where_clauses.append(f'T0."ItmsGrpCod" IN ({placeholders})')
-        params.extend(group_codes)
-
+        ph = ", ".join(["?"] * len(group_codes))
+        frag["group"] = (f'T0."ItmsGrpCod" IN ({ph})', list(group_codes))
     if stock_state == "in":
-        where_clauses.append('T1."OnHand" > 0')
+        frag["stock_state"] = ('T1."OnHand" > 0', [])
     elif stock_state == "out":
-        where_clauses.append('T1."OnHand" = 0')
+        frag["stock_state"] = ('T1."OnHand" = 0', [])
     elif stock_state == "low":
         # Low-stock requires a populated MinStock; rows without one are excluded.
-        where_clauses.append('T1."OnHand" > 0')
-        where_clauses.append('T1."MinStock" > 0')
-        where_clauses.append('T1."OnHand" < T1."MinStock"')
+        frag["stock_state"] = (
+            'T1."OnHand" > 0 AND T1."MinStock" > 0 AND T1."OnHand" < T1."MinStock"',
+            [],
+        )
 
-    where_sql = "WHERE " + " AND ".join(where_clauses)
+    def compose(exclude: tuple[str, ...] = ()):
+        clauses = ["1=1"]
+        ps: list = []
+        for name, (clause_sql, clause_params) in frag.items():
+            if name in exclude:
+                continue
+            clauses.append(clause_sql)
+            ps.extend(clause_params)
+        return "WHERE " + " AND ".join(clauses), ps
+
+    where_sql, params = compose()
 
     # 1) Paginated item × warehouse rows
     rows_sql = f"""
@@ -659,7 +681,7 @@ def inventory_overview(request):
         ORDER BY T0."ItemName", T1."WhsCode"
         LIMIT {page_size} OFFSET {offset}
     """
-    data = _run(rows_sql, params or None)
+    data = _run(rows_sql, params or None, schema=schema)
 
     # 2) Total row count for pagination footer
     count_sql = f"""
@@ -669,7 +691,7 @@ def inventory_overview(request):
         LEFT  JOIN OWHS T2 ON T2."WhsCode"  = T1."WhsCode"
         {where_sql}
     """
-    total = _count_of(count_sql, params or None)
+    total = _count_of(count_sql, params or None, schema=schema)
 
     # 3) KPI aggregates over the FULL filtered set (not just the current page)
     summary_sql = f"""
@@ -682,7 +704,7 @@ def inventory_overview(request):
         LEFT  JOIN OWHS T2 ON T2."WhsCode"  = T1."WhsCode"
         {where_sql}
     """
-    summary_rows = _run(summary_sql, params or None)
+    summary_rows = _run(summary_sql, params or None, schema=schema)
     summary = dict(summary_rows[0]) if summary_rows else {
         "total_skus": 0, "total_units_on_hand": 0, "total_stock_value": 0,
     }
@@ -699,7 +721,7 @@ def inventory_overview(request):
             HAVING COALESCE(SUM(T1."OnHand"), 0) = 0
         )
     """
-    summary["items_zero_stock"] = _count_of(items_zero_sql, params or None)
+    summary["items_zero_stock"] = _count_of(items_zero_sql, params or None, schema=schema)
 
     # Items where total OnHand < total MinStock (only counts items whose
     # MinStock is actually populated — otherwise this would always be 0 vs 0).
@@ -715,22 +737,47 @@ def inventory_overview(request):
                AND COALESCE(SUM(T1."OnHand"), 0) < COALESCE(SUM(T1."MinStock"), 0)
         )
     """
-    summary["items_below_min"] = _count_of(items_below_min_sql, params or None)
+    summary["items_below_min"] = _count_of(items_below_min_sql, params or None, schema=schema)
 
     # Global flag: does ANY OITW row have a non-zero MinStock? Frontend hides
     # the "Items Below Min" KPI when this is false, since the count would be
     # meaningless (always 0).
-    has_min_stock = _count_of('SELECT COUNT(*) FROM OITW WHERE "MinStock" > 0')
+    has_min_stock = _count_of(
+        'SELECT COUNT(*) FROM OITW WHERE "MinStock" > 0', schema=schema
+    )
     summary["min_stock_tracked"] = has_min_stock > 0
 
-    # 4) Filter option lists — always global so the dropdowns don't shrink as
-    # filters narrow the rows. Warehouses include inactive ones too (with a
-    # flag) so the caller can choose to render them muted.
+    # 4) Cascading filter option lists. Each list is built from the rows that
+    # match every OTHER active filter, so selecting one filter narrows the
+    # choices in the rest (only values that actually have data are shown).
+    # Warehouse + warehouse-code share one dimension, so both are excluded when
+    # building the warehouse list and both narrow the group list.
+    wh_where, wh_params = compose(exclude=("warehouse", "warehouse_code"))
     warehouses_opts = _run(
-        'SELECT "WhsCode", "WhsName", "Inactive" FROM OWHS ORDER BY "WhsName"'
+        f"""
+        SELECT DISTINCT T1."WhsCode", T2."WhsName", T2."Inactive"
+        FROM OITM T0
+        INNER JOIN OITW T1 ON T1."ItemCode" = T0."ItemCode"
+        LEFT  JOIN OWHS T2 ON T2."WhsCode"  = T1."WhsCode"
+        {wh_where}
+        ORDER BY T2."WhsName"
+        """,
+        wh_params or None,
+        schema=schema,
     )
+
+    grp_where, grp_params = compose(exclude=("group",))
     groups_opts = _run(
-        'SELECT "ItmsGrpCod", "ItmsGrpNam" FROM OITB ORDER BY "ItmsGrpNam"'
+        f"""
+        SELECT DISTINCT T0."ItmsGrpCod", T3."ItmsGrpNam"
+        FROM OITM T0
+        INNER JOIN OITW T1 ON T1."ItemCode" = T0."ItemCode"
+        LEFT  JOIN OITB T3 ON T3."ItmsGrpCod" = T0."ItmsGrpCod"
+        {grp_where}
+        ORDER BY T3."ItmsGrpNam"
+        """,
+        grp_params or None,
+        schema=schema,
     )
 
     return Response({
@@ -739,10 +786,47 @@ def inventory_overview(request):
         "page": page,
         "page_size": page_size,
         "summary": summary,
+        "source": source,
+        "sources": sorted(HANA_SCHEMAS),
         "filters": {
             "warehouses": warehouses_opts,
             "groups": groups_opts,
         },
+    })
+
+
+# ─── /inventory-warehouse-comparison ───
+# One aggregate row per warehouse for the JM Inventory Dashboard cards + the
+# "Stock Value by Warehouse" chart. Reads the mart or oil schema via ?source=.
+@api_view(["GET"])
+@permission_classes([require("sap.view")])
+def inventory_warehouse_comparison(request):
+    source, schema = resolve_schema(request.query_params.get("source"))
+
+    rows = _run(
+        """
+        SELECT
+            T1."WhsCode",
+            T2."WhsName",
+            T2."Inactive",
+            COUNT(DISTINCT T0."ItemCode") AS "items",
+            COALESCE(SUM(T1."OnHand"), 0) AS "on_hand",
+            COALESCE(SUM(T1."OnHand" * T0."LastPurPrc"), 0) AS "stock_value",
+            COUNT(DISTINCT CASE WHEN T1."OnHand" = 0 THEN T0."ItemCode" END)
+                AS "zero_stock"
+        FROM OITM T0
+        INNER JOIN OITW T1 ON T1."ItemCode" = T0."ItemCode"
+        LEFT  JOIN OWHS T2 ON T2."WhsCode"  = T1."WhsCode"
+        GROUP BY T1."WhsCode", T2."WhsName", T2."Inactive"
+        ORDER BY T2."WhsName"
+        """,
+        schema=schema,
+    )
+
+    return Response({
+        "warehouses": rows,
+        "source": source,
+        "sources": sorted(HANA_SCHEMAS),
     })
 
 
