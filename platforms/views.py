@@ -80,7 +80,7 @@ def _drop_primary_normalized() -> None:
 _PRIMARY_CTE_STUB = "WITH _stub AS (SELECT 1)"
 
 _PRIMARY_DASHBOARD_CACHE_TTL = 60  # seconds
-_PRIMARY_DASHBOARD_CACHE_VERSION = 9
+_PRIMARY_DASHBOARD_CACHE_VERSION = 10
 
 
 def _get_platform(slug: str) -> PlatformConfig:
@@ -299,9 +299,6 @@ _PRIMARY_DASHBOARD_DONE_VALUE_COLUMNS = {
 }
 _TOTAL_PO_KPI_DASHBOARD_SLUGS = {
     "bigbasket",
-    "citymall",
-    "flipkart",
-    "flipkart_grocery",
     "zomato",
 }
 

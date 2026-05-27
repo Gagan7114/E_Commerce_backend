@@ -590,6 +590,8 @@ def table_data(request, table_name: str):
 
 PRIMARY_REMARK_UPDATE_TABLES = {"total_po", "total_po_zbs"}
 PRIMARY_REMARK_UPDATE_COLUMNS = {"remark"}
+PRIMARY_MANUAL_FULL_UPDATE_FORMATS = {"CITY MALL", "FLIPKART GROCERY"}
+PRIMARY_MANUAL_FULL_UPDATE_COLUMNS = {"grn_date", "status", "delivered_qty"}
 
 
 def _manual_date_value(value):
@@ -613,14 +615,24 @@ def _manual_decimal_value(value):
         raise ValueError("Delivered Qty must be numeric.") from exc
 
 
-def _clean_primary_manual_updates(updates: dict) -> dict:
+def _clean_primary_manual_updates(updates: dict, expected_format: str = "") -> dict:
     cleaned = {}
+    normalized_format = str(expected_format or "").strip().upper()
+    allowed_columns = set(PRIMARY_REMARK_UPDATE_COLUMNS)
+    if normalized_format in PRIMARY_MANUAL_FULL_UPDATE_FORMATS:
+        allowed_columns.update(PRIMARY_MANUAL_FULL_UPDATE_COLUMNS)
     for raw_col, raw_value in updates.items():
         col = "remark" if raw_col == "remarks" else str(raw_col or "").strip()
-        if col not in PRIMARY_REMARK_UPDATE_COLUMNS:
+        if col not in allowed_columns:
             continue
         if col == "remark":
             cleaned[col] = None if raw_value is None else str(raw_value).strip()
+        elif col == "grn_date":
+            cleaned[col] = _manual_date_value(raw_value)
+        elif col == "delivered_qty":
+            cleaned[col] = _manual_decimal_value(raw_value)
+        elif col == "status":
+            cleaned[col] = None if raw_value is None else str(raw_value).strip().upper()
     return cleaned
 
 
@@ -654,17 +666,17 @@ def update_primary_manual_fields(request, table_name: str):
         return Response({"detail": "updates must be an object."}, status=400)
 
     try:
-        cleaned = _clean_primary_manual_updates(updates)
+        format_guard, format_params = _primary_manual_format_guard(body.get("format"))
+    except ValueError as exc:
+        return Response({"detail": str(exc)}, status=400)
+
+    try:
+        cleaned = _clean_primary_manual_updates(updates, body.get("format"))
     except ValueError as exc:
         return Response({"detail": str(exc)}, status=400)
 
     if not cleaned:
         return Response({"detail": "No editable fields supplied."}, status=400)
-
-    try:
-        format_guard, format_params = _primary_manual_format_guard(body.get("format"))
-    except ValueError as exc:
-        return Response({"detail": str(exc)}, status=400)
 
     assignments = ", ".join(f'"{col}" = %s' for col in cleaned)
     params = list(cleaned.values())
@@ -729,7 +741,7 @@ def bulk_update_primary_manual_fields(request, table_name: str):
                     continue
 
                 try:
-                    cleaned = _clean_primary_manual_updates(updates)
+                    cleaned = _clean_primary_manual_updates(updates, body.get("format"))
                 except ValueError as exc:
                     failed.append({"id": row_id, "detail": str(exc)})
                     continue
