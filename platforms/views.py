@@ -80,7 +80,7 @@ def _drop_primary_normalized() -> None:
 _PRIMARY_CTE_STUB = "WITH _stub AS (SELECT 1)"
 
 _PRIMARY_DASHBOARD_CACHE_TTL = 60  # seconds
-_PRIMARY_DASHBOARD_CACHE_VERSION = 3
+_PRIMARY_DASHBOARD_CACHE_VERSION = 9
 
 
 def _get_platform(slug: str) -> PlatformConfig:
@@ -297,6 +297,105 @@ _PRIMARY_DASHBOARD_DONE_VALUE_COLUMNS = {
     ("zomato", "DEL MONTH"): "total_order_amt_exclusive",
     ("zomato", "PO MONTH"): "total_delivered_amt_exclusive",
 }
+_TOTAL_PO_KPI_DASHBOARD_SLUGS = {
+    "bigbasket",
+    "citymall",
+    "flipkart",
+    "flipkart_grocery",
+    "zomato",
+}
+
+
+def _primary_total_po_kpi_total(
+    platform_format: str,
+    mode: str,
+    month: int,
+    year: int,
+    period_end_cap: date,
+) -> dict:
+    """KPI-card totals for current primary upload data stored in total_po."""
+    period_col = "po_date" if mode == "PO MONTH" else "grn_date"
+    period_start = date(year, month, 1)
+    period_end = min(date(year, month, monthrange(year, month)[1]), period_end_cap)
+    if period_end < period_start:
+        return _primary_zero_metrics()
+
+    format_key = re.sub(
+        r"[^a-z0-9]+",
+        "",
+        str(platform_format or "").strip().lower(),
+    )
+    rows = _dict_rows(
+        f"""
+        WITH base AS (
+            SELECT
+                COALESCE(order_qty, 0) AS order_qty,
+                COALESCE(delivered_qty, 0) AS delivered_qty,
+                GREATEST(COALESCE(order_qty, 0) - COALESCE(delivered_qty, 0), 0) AS pending_qty,
+                COALESCE(basic_rate, 0) AS basic_rate,
+                UPPER(COALESCE(sku_name, '')) AS pack_text,
+                regexp_match(
+                    UPPER(COALESCE(sku_name, '')),
+                    '([0-9]+(?:\\.[0-9]+)?)\\s*(?:LTR|LITRE|LITER|L)\\s*\\+\\s*([0-9]+(?:\\.[0-9]+)?)\\s*(?:LTR|LITRE|LITER|L)(?:[^A-Z0-9]|$)'
+                ) AS combo_full_match,
+                regexp_match(
+                    UPPER(COALESCE(sku_name, '')),
+                    '([0-9]+(?:\\.[0-9]+)?)\\s*\\+\\s*([0-9]+(?:\\.[0-9]+)?)\\s*(?:LTR|LITRE|LITER|L)(?:[^A-Z0-9]|$)'
+                ) AS combo_compact_match,
+                regexp_match(
+                    UPPER(COALESCE(sku_name, '')),
+                    '([0-9]+(?:\\.[0-9]+)?)\\s*(?:ML|MLS|M)(?:[^A-Z0-9]|$)'
+                ) AS ml_match,
+                regexp_match(
+                    UPPER(COALESCE(sku_name, '')),
+                    '([0-9]+(?:\\.[0-9]+)?)\\s*(?:LTR|LITRE|LITER)(?:[^A-Z0-9]|$)'
+                ) AS ltr_match,
+                regexp_match(
+                    UPPER(COALESCE(sku_name, '')),
+                    '([0-9]+(?:\\.[0-9]+)?)\\s*L(?:[^A-Z0-9]|$)'
+                ) AS l_match
+            FROM public.total_po
+            WHERE REGEXP_REPLACE(LOWER(TRIM(format::text)), '[^a-z0-9]+', '', 'g') = %s
+              AND {period_col} >= %s
+              AND {period_col} <= %s
+        ),
+        metric_base AS (
+            SELECT
+                *,
+                COALESCE(
+                    CASE
+                        WHEN combo_full_match IS NOT NULL
+                            THEN combo_full_match[1]::numeric + combo_full_match[2]::numeric
+                        WHEN combo_compact_match IS NOT NULL
+                            THEN combo_compact_match[1]::numeric + combo_compact_match[2]::numeric
+                        WHEN ml_match IS NOT NULL
+                            THEN ml_match[1]::numeric / 1000
+                        WHEN ltr_match IS NOT NULL
+                            THEN ltr_match[1]::numeric
+                        WHEN l_match IS NOT NULL
+                            THEN l_match[1]::numeric
+                        ELSE NULL
+                    END,
+                    1
+                ) AS effective_per_liter
+            FROM base
+        )
+        SELECT
+            COALESCE(SUM(order_qty * basic_rate), 0) AS order_value,
+            COALESCE(SUM(order_qty * effective_per_liter), 0) AS order_ltrs,
+            COALESCE(SUM(order_qty), 0) AS order_qty,
+            COALESCE(SUM(delivered_qty * basic_rate), 0) AS done_value,
+            COALESCE(SUM(delivered_qty * effective_per_liter), 0) AS done_ltrs,
+            COALESCE(SUM(delivered_qty), 0) AS done_qty,
+            COALESCE(SUM(pending_qty * basic_rate), 0) AS pending_value,
+            COALESCE(SUM(pending_qty * effective_per_liter), 0) AS pending_ltrs,
+            COALESCE(SUM(pending_qty), 0) AS pending_qty,
+            COALESCE(SUM(pending_qty * effective_per_liter), 0) AS missed_ltrs
+        FROM metric_base
+        """,
+        [format_key, period_start, period_end],
+    )
+    return _primary_metrics(rows[0] if rows else None)
 
 
 def _bigbasket_primary_period_bounds(month_name: str, year: int) -> tuple[date, date]:
@@ -472,10 +571,19 @@ def _bigbasket_primary_dashboard_response(request, slug: str):
     ]
 
     item_total = _bigbasket_primary_total(items, include_cancelled=False)
+    kpi_total = _primary_total_po_kpi_total(
+        platform_format,
+        month_type,
+        _MONTH_NAME_TO_NUM.get(month_name),
+        year,
+        period_end - timedelta(days=1),
+    )
     return Response({
         "source": "master_po",
         "format": f"{slug.upper()}_PRIMARY",
         "source_format": platform_format,
+        "kpi_source": "total_po",
+        "kpi_total": kpi_total,
         "defaulted_to_latest": defaulted_to_latest,
         "mode": month_type,
         "month_type": month_type,
@@ -525,25 +633,10 @@ _PRIMARY_METRIC_SQL = """
     COALESCE(SUM(COALESCE(metric_delivered_value, 0)), 0) AS done_value,
     COALESCE(SUM(COALESCE(metric_delivered_liters, 0)), 0) AS done_ltrs,
     COALESCE(SUM(COALESCE(metric_delivered_qty, 0)), 0) AS done_qty,
-    COALESCE(SUM(COALESCE(missed_ltrs, GREATEST(
-        COALESCE(metric_order_liters, 0) - COALESCE(metric_delivered_liters, 0),
-        0
-    ))), 0) AS missed_ltrs,
-    COALESCE(SUM(CASE WHEN open_close_key = 'OPEN'
-        THEN GREATEST(
-            COALESCE(metric_order_value, 0) - COALESCE(metric_delivered_value, 0),
-            0
-        ) ELSE 0 END), 0) AS pending_value,
-    COALESCE(SUM(CASE WHEN open_close_key = 'OPEN'
-        THEN GREATEST(
-            COALESCE(metric_order_liters, 0) - COALESCE(metric_delivered_liters, 0),
-            0
-        ) ELSE 0 END), 0) AS pending_ltrs,
-    COALESCE(SUM(CASE WHEN open_close_key = 'OPEN'
-        THEN GREATEST(
-            COALESCE(metric_order_qty, 0) - COALESCE(metric_delivered_qty, 0),
-            0
-        ) ELSE 0 END), 0) AS pending_qty,
+    COALESCE(SUM(COALESCE(metric_pending_liters, 0)), 0) AS missed_ltrs,
+    COALESCE(SUM(COALESCE(metric_pending_value, 0)), 0) AS pending_value,
+    COALESCE(SUM(COALESCE(metric_pending_liters, 0)), 0) AS pending_ltrs,
+    COALESCE(SUM(COALESCE(metric_pending_qty, 0)), 0) AS pending_qty,
     COALESCE(SUM(CASE WHEN status_key = 'EXPIRED'
         THEN COALESCE(metric_order_value, 0) ELSE 0 END), 0) AS expired_value,
     COALESCE(SUM(CASE WHEN status_key = 'EXPIRED'
@@ -562,21 +655,9 @@ _PRIMARY_TREND_METRIC_SQL = """
     COALESCE(SUM(COALESCE(metric_delivered_value, 0)), 0) AS done_value,
     COALESCE(SUM(COALESCE(metric_delivered_liters, 0)), 0) AS done_ltrs,
     COALESCE(SUM(COALESCE(metric_delivered_qty, 0)), 0) AS done_qty,
-    COALESCE(SUM(CASE WHEN open_close_key = 'OPEN'
-        THEN GREATEST(
-            COALESCE(metric_order_value, 0) - COALESCE(metric_delivered_value, 0),
-            0
-        ) ELSE 0 END), 0) AS pending_value,
-    COALESCE(SUM(CASE WHEN open_close_key = 'OPEN'
-        THEN GREATEST(
-            COALESCE(metric_order_liters, 0) - COALESCE(metric_delivered_liters, 0),
-            0
-        ) ELSE 0 END), 0) AS pending_ltrs,
-    COALESCE(SUM(CASE WHEN open_close_key = 'OPEN'
-        THEN GREATEST(
-            COALESCE(metric_order_qty, 0) - COALESCE(metric_delivered_qty, 0),
-            0
-        ) ELSE 0 END), 0) AS pending_qty,
+    COALESCE(SUM(COALESCE(metric_pending_value, 0)), 0) AS pending_value,
+    COALESCE(SUM(COALESCE(metric_pending_liters, 0)), 0) AS pending_ltrs,
+    COALESCE(SUM(COALESCE(metric_pending_qty, 0)), 0) AS pending_qty,
     COALESCE(SUM(COALESCE(metric_order_value, 0)), 0) AS order_value,
     COALESCE(SUM(COALESCE(metric_order_liters, 0)), 0) AS order_ltrs,
     COALESCE(SUM(COALESCE(metric_order_qty, 0)), 0) AS order_qty
@@ -1334,11 +1415,23 @@ def primary_dashboard(request, slug: str):
         platform_format,
     )
     month_name = _month_name(month)
-    period_filter = _primary_period_filter(mode)
-    period_params = [month_name, year]
-    vendor_metric_filter = _primary_vendor_metric_filter(mode)
-    vendor_pending_filter = _primary_vendor_pending_filter(mode)
-    vendor_period_params = [month_name, year, month_name, year]
+    period_end_cap = min(
+        date(year, month, monthrange(year, month)[1]),
+        date.today(),
+    )
+    period_date_col = "po_dt" if mode == "PO MONTH" else "delivery_dt"
+    period_filter = f"{_primary_period_filter(mode)} AND {period_date_col} <= %s"
+    period_params = [month_name, year, period_end_cap]
+    vendor_metric_filter = f"{_primary_vendor_metric_filter(mode)} AND {period_date_col} <= %s"
+    vendor_pending_filter = f"{_primary_vendor_pending_filter(mode)} AND {period_date_col} <= %s"
+    vendor_period_params = [
+        month_name,
+        year,
+        period_end_cap,
+        month_name,
+        year,
+        period_end_cap,
+    ]
 
     # Optional `item_head` filter — only applied to the trend queries, since
     # the front-end already filters KPIs / SKUs / sub-categories client-side
@@ -1352,7 +1445,7 @@ def primary_dashboard(request, slug: str):
     cache_key = (
         f"prim_dash:v{_PRIMARY_DASHBOARD_CACHE_VERSION}:"
         f"{slug}:{platform_format}:{mode}:{month}:{year}:"
-        f"{item_head_raw or ''}:{int(defaulted_to_latest)}"
+        f"{period_end_cap.isoformat()}:{item_head_raw or ''}:{int(defaulted_to_latest)}"
     )
     cached = cache.get(cache_key)
     if cached is not None:
@@ -1381,6 +1474,7 @@ def primary_dashboard(request, slug: str):
             vendor_period_params=vendor_period_params,
             trend_head_filter=trend_head_filter,
             trend_head_params=trend_head_params,
+            period_end_cap=period_end_cap,
             defaulted_to_latest=defaulted_to_latest,
             cache_key=cache_key,
         )
@@ -1404,6 +1498,7 @@ def _primary_dashboard_payload(
     vendor_period_params,
     trend_head_filter,
     trend_head_params,
+    period_end_cap,
     defaulted_to_latest,
     cache_key,
 ):
@@ -1417,8 +1512,9 @@ def _primary_dashboard_payload(
         FROM normalized
         WHERE {max_date_month_key} = %s
           AND {max_date_year_key} = %s
+          AND {max_date_col} <= %s
         """,
-        [month_name, year],
+        [month_name, year, period_end_cap],
     )
 
     summary_raw = _dict_rows(
@@ -1450,8 +1546,9 @@ def _primary_dashboard_payload(
         FROM normalized
         WHERE {fill_rate_month_key} = %s
           AND {fill_rate_year_key} = %s
+          AND {fill_rate_date_col} <= %s
         """,
-        [month_name, year],
+        [month_name, year, period_end_cap],
     )
     fill_rate_cutoff = None
     if hasattr(fill_rate_max_date, "isoformat"):
@@ -1608,6 +1705,9 @@ def _primary_dashboard_payload(
                 COALESCE(metric_delivered_liters, 0) AS delivered_ltrs_row,
                 COALESCE(metric_order_qty, 0) AS order_qty_row,
                 COALESCE(metric_delivered_qty, 0) AS delivered_qty_row,
+                COALESCE(metric_pending_value, 0) AS pending_value_row,
+                COALESCE(metric_pending_liters, 0) AS pending_ltrs_row,
+                COALESCE(metric_pending_qty, 0) AS pending_qty_row,
                 lead_time AS lead_time_row,
                 COALESCE(NULLIF(UPPER(TRIM(open_close::text)), ''), 'CLOSED') AS open_close_key
             FROM normalized
@@ -1618,17 +1718,17 @@ def _primary_dashboard_payload(
                 COALESCE(SUM(CASE WHEN in_metric_period THEN order_value_row ELSE 0 END), 0) AS order_value,
                 COALESCE(SUM(CASE WHEN in_metric_period THEN delivered_value_row ELSE 0 END), 0) AS delivered_value,
                 COALESCE(SUM(CASE WHEN open_close_key = 'OPEN' AND in_pending_period
-                    THEN GREATEST(order_value_row - delivered_value_row, 0)
+                    THEN pending_value_row
                     ELSE 0 END), 0) AS pending_value,
                 COALESCE(SUM(CASE WHEN in_metric_period THEN order_ltrs_row ELSE 0 END), 0) AS order_ltrs,
                 COALESCE(SUM(CASE WHEN in_metric_period THEN delivered_ltrs_row ELSE 0 END), 0) AS delivered_ltrs,
                 COALESCE(SUM(CASE WHEN open_close_key = 'OPEN' AND in_pending_period
-                    THEN GREATEST(order_ltrs_row - delivered_ltrs_row, 0)
+                    THEN pending_ltrs_row
                     ELSE 0 END), 0) AS pending_ltrs,
                 COALESCE(SUM(CASE WHEN in_metric_period THEN order_qty_row ELSE 0 END), 0) AS order_qty,
                 COALESCE(SUM(CASE WHEN in_metric_period THEN delivered_qty_row ELSE 0 END), 0) AS delivered_qty,
                 COALESCE(SUM(CASE WHEN open_close_key = 'OPEN' AND in_pending_period
-                    THEN GREATEST(order_qty_row - delivered_qty_row, 0)
+                    THEN pending_qty_row
                     ELSE 0 END), 0) AS pending_qty,
                 AVG(lead_time_row) FILTER (
                     WHERE in_metric_period AND lead_time_row IS NOT NULL
@@ -1692,7 +1792,7 @@ def _primary_dashboard_payload(
     summary_total = _primary_total(summary)
     trend_date_col = "delivery_dt" if mode == "DEL MONTH" else "po_dt"
     period_start = date(year, month, 1)
-    period_end = date(year, month, monthrange(year, month)[1])
+    period_end = min(date(year, month, monthrange(year, month)[1]), period_end_cap)
 
     daily_trend = _primary_trend_rows(_dict_rows(
         f"""
@@ -1743,6 +1843,18 @@ def _primary_dashboard_payload(
         "max_date": max_date.isoformat() if hasattr(max_date, "isoformat") else max_date,
         "summary": summary,
         "summary_total": summary_total,
+        "kpi_source": "total_po" if slug in _TOTAL_PO_KPI_DASHBOARD_SLUGS else "master_po",
+        "kpi_total": (
+            _primary_total_po_kpi_total(
+                platform_format,
+                mode,
+                month,
+                year,
+                period_end_cap,
+            )
+            if slug in _TOTAL_PO_KPI_DASHBOARD_SLUGS
+            else None
+        ),
         "fill_rate_summary": fill_rate_summary,
         "fill_rate_total": fill_rate_total,
         "lead_time_days": lead_time_days,
@@ -4295,7 +4407,17 @@ normalized AS (
         COALESCE(total_order_amt_exclusive, 0) AS metric_order_value,
         COALESCE(total_delivered_amt_exclusive, 0) AS metric_delivered_value,
         COALESCE(order_qty, 0) AS metric_order_qty,
-        COALESCE(delivered_qty, 0) AS metric_delivered_qty
+        COALESCE(delivered_qty, 0) AS metric_delivered_qty,
+        COALESCE(missed_ltrs, 0) AS metric_pending_liters,
+        COALESCE(missed_qty, 0) AS metric_pending_qty,
+        COALESCE(
+            COALESCE(missed_qty, 0) * CASE
+                WHEN NULLIF(TRIM(basic_rate::text), '') ~ '^-?[0-9]+(\\.[0-9]+)?$'
+                    THEN NULLIF(TRIM(basic_rate::text), '')::numeric
+                ELSE 0
+            END,
+            0
+        ) AS metric_pending_value
     FROM metric_base
 )
 """
@@ -4330,10 +4452,11 @@ def _parse_primary_dashboard_params(params, platform_format: str = "ZEPTO") -> t
                 po_year
             FROM normalized
             WHERE {order_date} IS NOT NULL
+              AND {order_date} <= %s
             ORDER BY {order_date} DESC
             LIMIT 1
             """,
-            [],
+            [date.today()],
         )
         if latest:
             period_date = latest[0].get("period_date")

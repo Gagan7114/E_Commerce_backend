@@ -23,9 +23,6 @@ _IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 ALLOWED_TABLES = {
     "master_po", "prim_master_po", "test_master_po",
     "total_po", "total_po_zbs",
-    "bigbasket_prim", "blinkit_prim", "citymall_prim",
-    "flipkart_grocery_prim", "swiggy_prim", "zepto_prim", "zomato_prim",
-    "blinkit_grn", "swiggy_grn", "zepto_grn",
     "amazon_price_data", "amazon_sec_daily", "amazon_sec_daily_master_view", "amazon_sec_range",
     "amazon_sec_range_margins", "amazon_sec_range_master_view",
     "bigbasketSec", "blinkitSec", "flipkart_grocery_master", "fk_grocery", "flipkartSec", "flipkart_secondary_all",
@@ -176,15 +173,40 @@ def table_distinct_values(request, table_name: str, column_name: str):
 
     qt = _quoted(table_name)
     qc = f'"{column_name}"'
+    column_filters_raw = request.query_params.get("column_filters", "")
+    where: list[str] = []
+    params: list = []
+    if column_filters_raw:
+        try:
+            parsed_filters = json.loads(column_filters_raw)
+        except (TypeError, ValueError):
+            parsed_filters = []
+        for item in parsed_filters if isinstance(parsed_filters, list) else []:
+            col = item.get("column") if isinstance(item, dict) else ""
+            values = item.get("values") if isinstance(item, dict) else []
+            if not col or not _IDENT.match(col) or col not in sample:
+                continue
+            if not isinstance(values, list):
+                continue
+            cleaned_values = ["" if v is None else str(v) for v in values[:500]]
+            if not cleaned_values:
+                where.append("1 = 0")
+                continue
+            placeholders = ", ".join(["%s"] * len(cleaned_values))
+            where.append(f"COALESCE(\"{col}\"::text, '') IN ({placeholders})")
+            params.extend(cleaned_values)
+    where_sql = f"WHERE {' AND '.join(where)}" if where else ""
     try:
         with connection.cursor() as cur:
             cur.execute(
                 f"""
                 SELECT DISTINCT COALESCE({qc}::text, '') AS value
                 FROM {qt}
+                {where_sql}
                 ORDER BY value ASC
                 LIMIT 5000
-                """
+                """,
+                params,
             )
             values = [row[0] for row in cur.fetchall()]
     except Exception:
@@ -493,6 +515,7 @@ def table_data(request, table_name: str):
                 continue
             cleaned_values = ["" if v is None else str(v) for v in values[:500]]
             if not cleaned_values:
+                where.append("1 = 0")
                 continue
             placeholders = ", ".join(["%s"] * len(cleaned_values))
             where.append(f"COALESCE(\"{col}\"::text, '') IN ({placeholders})")
@@ -565,8 +588,8 @@ def table_data(request, table_name: str):
     })
 
 
-PRIMARY_MANUAL_UPDATE_FORMATS = {"CITY MALL", "FLIPKART GROCERY"}
-PRIMARY_MANUAL_UPDATE_COLUMNS = {"grn_date", "status", "delivered_qty", "remark"}
+PRIMARY_REMARK_UPDATE_TABLES = {"total_po", "total_po_zbs"}
+PRIMARY_REMARK_UPDATE_COLUMNS = {"remark"}
 
 
 def _manual_date_value(value):
@@ -594,13 +617,9 @@ def _clean_primary_manual_updates(updates: dict) -> dict:
     cleaned = {}
     for raw_col, raw_value in updates.items():
         col = "remark" if raw_col == "remarks" else str(raw_col or "").strip()
-        if col not in PRIMARY_MANUAL_UPDATE_COLUMNS:
+        if col not in PRIMARY_REMARK_UPDATE_COLUMNS:
             continue
-        if col == "grn_date":
-            cleaned[col] = _manual_date_value(raw_value)
-        elif col == "delivered_qty":
-            cleaned[col] = _manual_decimal_value(raw_value)
-        elif col in {"status", "remark"}:
+        if col == "remark":
             cleaned[col] = None if raw_value is None else str(raw_value).strip()
     return cleaned
 
@@ -608,11 +627,11 @@ def _clean_primary_manual_updates(updates: dict) -> dict:
 def _primary_manual_format_guard(expected_format: str) -> tuple[str, list]:
     expected_format = str(expected_format or "").strip().upper()
     if expected_format:
-        if expected_format not in PRIMARY_MANUAL_UPDATE_FORMATS:
-            raise ValueError("This platform is not editable here.")
+        if expected_format == "AMAZON":
+            raise ValueError("Amazon remarks are not editable here.")
         return 'AND UPPER(TRIM("format"::text)) = %s', [expected_format]
     return (
-        'AND UPPER(TRIM("format"::text)) IN (\'CITY MALL\', \'FLIPKART GROCERY\')',
+        'AND UPPER(TRIM("format"::text)) <> \'AMAZON\'',
         [],
     )
 
@@ -620,8 +639,8 @@ def _primary_manual_format_guard(expected_format: str) -> tuple[str, list]:
 @api_view(["POST"])
 @permission_classes([require("upload.use")])
 def update_primary_manual_fields(request, table_name: str):
-    if table_name != "total_po":
-        return Response({"detail": "Only total_po rows can be edited here."}, status=400)
+    if table_name not in PRIMARY_REMARK_UPDATE_TABLES:
+        return Response({"detail": "Only Primary PO remark rows can be edited here."}, status=400)
 
     body = request.data or {}
     row_id = body.get("id") or body.get("row_id")
@@ -656,7 +675,7 @@ def update_primary_manual_fields(request, table_name: str):
         with connection.cursor() as cur:
             cur.execute(
                 f"""
-                UPDATE "total_po"
+                UPDATE "{table_name}"
                    SET {assignments}
                  WHERE id = %s
                    {format_guard}
@@ -677,8 +696,8 @@ def update_primary_manual_fields(request, table_name: str):
 @api_view(["POST"])
 @permission_classes([require("upload.use")])
 def bulk_update_primary_manual_fields(request, table_name: str):
-    if table_name != "total_po":
-        return Response({"detail": "Only total_po rows can be edited here."}, status=400)
+    if table_name not in PRIMARY_REMARK_UPDATE_TABLES:
+        return Response({"detail": "Only Primary PO remark rows can be edited here."}, status=400)
 
     body = request.data or {}
     rows = body.get("rows") or []
@@ -722,7 +741,7 @@ def bulk_update_primary_manual_fields(request, table_name: str):
                 params = [*cleaned.values(), row_id, *format_params]
                 cur.execute(
                     f"""
-                    UPDATE "total_po"
+                    UPDATE "{table_name}"
                        SET {assignments}
                      WHERE id = %s
                        {format_guard}

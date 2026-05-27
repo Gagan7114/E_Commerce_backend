@@ -40,7 +40,6 @@ UPLOAD_ALLOWED_TABLES = {
     "zomatoSec", "citymallSec",
     # Primary
     "total_po", "total_po_zbs", "total_po_grn_update", "total_po_zbs_grn_update",
-    "swiggy_grn", "swiggy_prim",
     # Ads
     "blinkit_ads",
     "amazon_ads",
@@ -98,20 +97,13 @@ MASTER_SHEET_SEARCH_COLUMNS = [
     "sub_category",
 ]
 
-UPLOAD_FORCED_UNIQUE_KEYS = {
-    "swiggy_grn": (
-        "grn_number,purchase_order_number,facility_name,vendor_name,"
-        "invoice_number,invoice_date,created_at_date,dn_quantity,dn_value,"
-        "sku_code,sku_description,received_qty,lot_expiry_date,total_amount"
-    ),
-}
+UPLOAD_FORCED_UNIQUE_KEYS = {}
 
 PRIMARY_UPLOAD_REPLACE_KEYS = {
     # Primary PO rows are identified by platform PO + platform SKU. Status,
     # dates, vendor, rates, and quantities are mutable row data.
     "total_po": (("po_number",), ("sku_code",)),
     "total_po_zbs": (("po_number",), ("sku_code",)),
-    "swiggy_prim": (("po_number",), ("sku_code",)),
 }
 
 INVENTORY_DOH_UPLOAD_PLATFORMS = {
@@ -1429,6 +1421,14 @@ def _batch_upload(body, *, forced_table: str | None = None):
     if not _IDENT.match(table):
         return Response({"detail": "Invalid table name."}, status=400)
     if not isinstance(data, list) or not data:
+        return Response({"success": 0, "failed": 0, "error": None})
+
+    data = [
+        {key: value for key, value in row.items() if not str(key).startswith("__")}
+        for row in data
+        if isinstance(row, dict)
+    ]
+    if not data:
         return Response({"success": 0, "failed": 0, "error": None})
 
     if table == "total_po_grn_update":
