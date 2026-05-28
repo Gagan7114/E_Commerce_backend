@@ -100,10 +100,24 @@ def _pack_into_capacity(items, capacity_lt):
         case_pack    = float(item.get('case_pack') or 1)
         accepted_qty = float(item.get('accepted_qty') or 0)
 
-        if accepted_qty == 0 or total_liters == 0:
+        if accepted_qty == 0:
             item['planned_qty'] = 0
             item['planned_liters'] = 0
             not_loaded.append(item)
+            continue
+
+        if total_liters == 0:
+            # Zero-volume items (e.g. no per-litre value in the master sheet)
+            # normally can't be packed. Exception: OTHER-bucket items still ship
+            # at full qty — they consume no truck capacity, so they always fit.
+            if _item_head_bucket(item) == 'OTHER':
+                item['planned_qty'] = accepted_qty
+                item['planned_liters'] = 0
+                loaded.append(item)
+            else:
+                item['planned_qty'] = 0
+                item['planned_liters'] = 0
+                not_loaded.append(item)
             continue
 
         if total_liters <= remaining + 0.001:
@@ -178,11 +192,20 @@ def _auto_plan_truck(items, truck_size, capacity_override=None, priority=None, s
         cap_k = bucket_caps.get(k, 0)
         if cap_k <= 0:
             # Bucket not requested — push everything to not_loaded (kept for
-            # best-effort second pass if strict=False)
+            # best-effort second pass if strict=False). Exception: zero-volume
+            # OTHER items still ship — they take no capacity, so a 0% slice
+            # doesn't apply to them.
             for it in bucket_items:
-                it['planned_qty'] = 0
-                it['planned_liters'] = 0
-                not_loaded_all.append(it)
+                if (k == 'OTHER'
+                        and float(it.get('total_accepted_liters') or 0) == 0
+                        and float(it.get('accepted_qty') or 0) > 0):
+                    it['planned_qty'] = float(it.get('accepted_qty') or 0)
+                    it['planned_liters'] = 0
+                    loaded_all.append(it)
+                else:
+                    it['planned_qty'] = 0
+                    it['planned_liters'] = 0
+                    not_loaded_all.append(it)
             priority_actual[k] = {'requested_liters': 0, 'used_liters': 0}
             bucket_used[k] = 0.0
             continue
@@ -1161,16 +1184,18 @@ class AppointmentItemsView(APIView):
                     WHERE a.appointment_id = ANY(%s::text[])
                       AND NULLIF(TRIM(pv), '') IS NOT NULL
                 ),
-                locked_pairs AS (
-                    -- Block items committed to any active shipment so users can't
-                    -- re-pick rows already used in a draft/pending/approved plan.
-                    -- Rejected shipments are excluded — their items are released
-                    -- and become re-selectable in new plans.
-                    SELECT DISTINCT si.asin, UPPER(TRIM(si.po_number)) AS po_number
+                committed AS (
+                    -- Quantity already committed to non-rejected shipments per
+                    -- PO+ASIN. The remainder (accepted - committed) is what's
+                    -- still shippable, so a partially-shipped line reappears with
+                    -- its leftover. Rejected shipments release their qty.
+                    SELECT si.asin, UPPER(TRIM(si.po_number)) AS po_number,
+                           SUM(COALESCE(si.planned_qty, 0)) AS committed_qty
                     FROM sp_items si
                     JOIN sp_shipments s ON s.id = si.shipment_id
                     WHERE si.not_loaded = FALSE
                       AND s.status != 'rejected'
+                    GROUP BY si.asin, UPPER(TRIM(si.po_number))
                 ),
                 doh_data AS (
                     -- placeholder; DOH joined in Python via _live_doh_by_asin() below
@@ -1181,10 +1206,14 @@ class AppointmentItemsView(APIView):
                     p.asin,
                     p.merchant_sku        AS internal_sku,
                     p.sku_name            AS product_name,
-                    p.accepted_qty,
+                    -- Orderable amount this plan = leftover after prior commitments.
+                    (p.accepted_qty - COALESCE(c.committed_qty, 0)) AS accepted_qty,
+                    p.accepted_qty        AS original_accepted_qty,
+                    COALESCE(c.committed_qty, 0) AS committed_qty,
                     p.case_pack,
                     p.per_liter,
-                    p.total_accepted_liters,
+                    -- Liters for the leftover so the packer fills against remaining.
+                    round((p.accepted_qty - COALESCE(c.committed_qty, 0)) * COALESCE(p.per_liter, 0), 4) AS total_accepted_liters,
                     p.days_to_expiry,
                     p.expiry_date,
                     p.category,
@@ -1196,19 +1225,20 @@ class AppointmentItemsView(APIView):
                     p.po_status,
                     p.status,
                     p.fulfillment_center,
+                    p.fulfillment_center  AS destination_fc,
                     ap.appointment_id     AS source_appointment_id
                 FROM appt_pos ap
                 JOIN reporting."Amazon PO" p
                     ON UPPER(TRIM(p.po_number)) = ap.po_number
                     AND p.fulfillment_center = %s
-                LEFT JOIN locked_pairs lp
-                    ON lp.asin = p.asin
-                    AND lp.po_number = UPPER(TRIM(p.po_number))
+                LEFT JOIN committed c
+                    ON c.asin = p.asin
+                    AND c.po_number = UPPER(TRIM(p.po_number))
                 WHERE p.status = 'Confirmed'
                   AND p.availability_status = 'AC - Accepted: In stock'
                   AND p.accepted_qty > 0
                   AND p.po_status = 'PENDING'
-                  AND lp.asin IS NULL
+                  AND (p.accepted_qty - COALESCE(c.committed_qty, 0)) > 0
             """, [all_appt_ids, primary_fc_value])
             raw = _row_to_dict(cur, cur.fetchall())
 
@@ -1628,6 +1658,12 @@ class ShipmentItemUpdateView(APIView):
 
         if 'new_qty' in data:
             new_qty = float(data['new_qty'])
+            # Can't ship more than ordered (accepted); the difference is the
+            # short-supply qty shown to planners. Clamp before case-pack rounding.
+            ordered = float(item.accepted_qty or 0)
+            if ordered > 0:
+                new_qty = min(new_qty, ordered)
+            new_qty = max(new_qty, 0)
             case_pack = float(item.case_pack or 1)
             if case_pack > 0:
                 new_qty = math.floor(new_qty / case_pack) * case_pack
@@ -1769,28 +1805,48 @@ def _check_qty_conflicts(shipment):
     loaded_items = shipment.items.filter(not_loaded=False)
     for item in loaded_items:
         with connection.cursor() as cur:
+            # Qty committed to OTHER non-rejected shipments for this PO+ASIN.
+            # Any non-rejected shipment reserves its planned_qty, so the leftover
+            # available to this shipment is (PO original) - (others' committed).
             cur.execute("""
                 SELECT s.id, si.planned_qty
                 FROM sp_items si
                 JOIN sp_shipments s ON s.id = si.shipment_id
                 WHERE si.asin = %s
                   AND UPPER(TRIM(si.po_number)) = UPPER(TRIM(%s))
-                  AND s.status IN ('approved','dispatched','in_transit','delivered')
+                  AND s.status != 'rejected'
                   AND s.id != %s
                   AND si.not_loaded = FALSE
             """, [item.asin, item.po_number, shipment.id])
             locked = cur.fetchall()
+            # The item's stored accepted_qty may itself be a leftover remainder
+            # (it's set to "orderable at creation"), so read the PO's original
+            # ordered qty from the source table for the availability ceiling.
+            cur.execute("""
+                SELECT accepted_qty FROM reporting."Amazon PO"
+                WHERE asin = %s
+                  AND UPPER(TRIM(po_number)) = UPPER(TRIM(%s))
+                  AND fulfillment_center = %s
+                LIMIT 1
+            """, [item.asin, item.po_number, item.destination_fc or ''])
+            po_row = cur.fetchone()
 
         locked_qty = sum(float(r[1] or 0) for r in locked)
-        accepted = float(item.accepted_qty or 0)
-        available = accepted - locked_qty
         planned = float(item.planned_qty or 0)
+        if po_row and po_row[0] is not None:
+            original = float(po_row[0] or 0)
+            available = original - locked_qty
+        else:
+            # Source row not found — fall back to the item's stored orderable qty
+            # (already net of prior commitments) and don't double-subtract locked.
+            original = float(item.accepted_qty or 0)
+            available = original
 
-        if planned > available:
+        if planned > available + 1e-6:
             conflicts.append({
                 'asin': item.asin,
                 'po_number': item.po_number,
-                'accepted_qty': accepted,
+                'accepted_qty': original,
                 'locked_qty': locked_qty,
                 'available_qty': available,
                 'planned_qty': planned,
@@ -1907,7 +1963,7 @@ class POListView(APIView):
                     ap.total_accepted_liters, ap.total_order_liters, ap.days_to_expiry,
                     ap.expiry_date, ap.category, ap.sub_category, ap.brand,
                     ap.item_head, ap.item, ap.order_date,
-                    ap.fill_rate,
+                    ap.fill_rate, ap.total_accepted_cost,
                     COALESCE(NULLIF(ap.city,''), fcm.city)   AS city,
                     COALESCE(NULLIF(ap.state,''), fcm.state) AS state
                 FROM reporting."Amazon PO" ap
@@ -2235,30 +2291,35 @@ class DOHAutoFillView(APIView):
 
         with connection.cursor() as cur:
             cur.execute(f"""
-                WITH locked_pairs AS (
-                    -- Block items committed to any active shipment. Rejected
-                    -- shipments are excluded — their items are released back
-                    -- into the pool of selectable rows.
-                    SELECT DISTINCT si.asin, UPPER(TRIM(si.po_number)) AS po_number
+                WITH committed AS (
+                    -- Quantity already committed to non-rejected shipments per
+                    -- PO+ASIN; the leftover (accepted - committed) stays shippable.
+                    SELECT si.asin, UPPER(TRIM(si.po_number)) AS po_number,
+                           SUM(COALESCE(si.planned_qty, 0)) AS committed_qty
                     FROM sp_items si
                     JOIN sp_shipments s ON s.id = si.shipment_id
                     WHERE si.not_loaded = FALSE
                       AND s.status != 'rejected'
+                    GROUP BY si.asin, UPPER(TRIM(si.po_number))
                 )
                 SELECT
                     p.po_number, p.asin,
                     p.merchant_sku       AS internal_sku,
                     p.sku_name           AS product_name,
-                    p.accepted_qty, p.case_pack, p.per_liter, p.total_accepted_liters,
+                    (p.accepted_qty - COALESCE(c.committed_qty, 0)) AS accepted_qty,
+                    p.accepted_qty       AS original_accepted_qty,
+                    COALESCE(c.committed_qty, 0) AS committed_qty,
+                    p.case_pack, p.per_liter,
+                    round((p.accepted_qty - COALESCE(c.committed_qty, 0)) * COALESCE(p.per_liter, 0), 4) AS total_accepted_liters,
                     p.days_to_expiry, p.expiry_date,
                     p.fulfillment_center AS destination_fc,
                     p.category, p.sub_category, p.brand,
                     p.item_head, p.item,
                     p.availability_status, p.po_status, p.status
                 FROM reporting."Amazon PO" p
-                LEFT JOIN locked_pairs lp
-                    ON lp.asin = p.asin AND lp.po_number = UPPER(TRIM(p.po_number))
-                WHERE {po_where_sql} AND lp.asin IS NULL
+                LEFT JOIN committed c
+                    ON c.asin = p.asin AND c.po_number = UPPER(TRIM(p.po_number))
+                WHERE {po_where_sql} AND (p.accepted_qty - COALESCE(c.committed_qty, 0)) > 0
             """, po_params)
             po_raw = _row_to_dict(cur, cur.fetchall())
 
@@ -2499,6 +2560,9 @@ class PoShipmentLookupView(APIView):
             )
         )
 
+        # Per key: the list of shipments holding the line + the total committed
+        # qty (sum of planned_qty across non-rejected shipments). The UI nets this
+        # against the PO's original accepted_qty to offer the leftover for re-pick.
         result = {}
         for it in items:
             asin = (it.asin or '').strip()
@@ -2526,10 +2590,69 @@ class PoShipmentLookupView(APIView):
                 'product_name': it.product_name or '',
                 'internal_sku': it.internal_sku or '',
             }
-            result.setdefault(key, []).append(entry)
+            bucket = result.setdefault(key, {'shipments': [], 'committed_qty': 0.0})
+            bucket['shipments'].append(entry)
+            bucket['committed_qty'] += float(it.planned_qty or 0)
 
         # Sort each list newest-first
         for k in result:
-            result[k].sort(key=lambda x: x.get('created_at') or '', reverse=True)
+            result[k]['shipments'].sort(key=lambda x: x.get('created_at') or '', reverse=True)
 
         return Response(result)
+
+
+class PoShortSupplyView(APIView):
+    """
+    Global short-supply report: per PO+ASIN line that has been shipped less than
+    ordered. shipped = SUM(planned_qty) across non-rejected shipments (same
+    `committed` definition used in sourcing); ordered = PO original accepted_qty;
+    short = ordered - shipped. Only partially-shipped lines (shipped > 0 AND
+    short > 0) are returned, so a fully-shipped or fully-released line drops off.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        with connection.cursor() as cur:
+            cur.execute("""
+                WITH committed AS (
+                    SELECT si.asin,
+                           UPPER(TRIM(si.po_number)) AS po_up,
+                           MAX(si.po_number)        AS po_number,
+                           MAX(si.destination_fc)   AS destination_fc,
+                           MAX(si.product_name)     AS product_name,
+                           MAX(si.internal_sku)     AS internal_sku,
+                           SUM(COALESCE(si.planned_qty, 0)) AS committed_qty
+                    FROM sp_items si
+                    JOIN sp_shipments s ON s.id = si.shipment_id
+                    WHERE si.not_loaded = FALSE
+                      AND s.status != 'rejected'
+                    GROUP BY si.asin, UPPER(TRIM(si.po_number))
+                )
+                SELECT c.po_number, c.asin, c.product_name, c.internal_sku,
+                       c.destination_fc,
+                       po.accepted_qty                    AS ordered_qty,
+                       c.committed_qty                    AS shipped_qty,
+                       (po.accepted_qty - c.committed_qty) AS short_qty
+                FROM committed c
+                JOIN LATERAL (
+                    SELECT p.accepted_qty
+                    FROM reporting."Amazon PO" p
+                    WHERE p.asin = c.asin
+                      AND UPPER(TRIM(p.po_number)) = c.po_up
+                    ORDER BY (p.fulfillment_center = c.destination_fc) DESC,
+                             p.accepted_qty DESC NULLS LAST
+                    LIMIT 1
+                ) po ON TRUE
+                WHERE c.committed_qty > 0
+                  AND (po.accepted_qty - c.committed_qty) > 0
+                ORDER BY (po.accepted_qty - c.committed_qty) DESC
+            """)
+            rows = _row_to_dict(cur, cur.fetchall())
+
+        results = [_serialize_row(r) for r in rows]
+        total_short_units = sum(float(r.get('short_qty') or 0) for r in results)
+        return Response({
+            'results': results,
+            'count': len(results),
+            'total_short_units': round(total_short_units, 4),
+        })
