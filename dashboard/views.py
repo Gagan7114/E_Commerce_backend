@@ -461,6 +461,117 @@ def primary_po_litres(request):
     return Response({"platforms": results, "errors": errors, "month": month_name, "year": year})
 
 
+# ─── /category-litres ───
+# Slug → master_po `format` value (Amazon is handled via reporting."Amazon PO").
+_CATEGORY_SLUG_TO_FORMAT = {
+    'blinkit': 'BLINKIT',
+    'zepto': 'ZEPTO',
+    'swiggy': 'SWIGGY',
+    'bigbasket': 'BIG BASKET',
+    'flipkart_grocery': 'FLIPKART GROCERY',
+    'zomato': 'ZOMATO',
+    'citymall': 'CITY MALL',
+}
+
+
+@api_view(["GET"])
+@permission_classes([require("dashboard.view")])
+def category_litres(request):
+    """Delivered litres grouped by oil category for one item head.
+
+    Amazon pulls from reporting."Amazon PO"; every other platform pulls from
+    master_po. With no platform filter both sources are merged (Amazon rows are
+    excluded from master_po so they aren't double counted)."""
+    today = date.today()
+    try:
+        month_num = int(request.GET.get("month") or today.month)
+    except (TypeError, ValueError):
+        month_num = today.month
+    try:
+        year = int(request.GET.get("year") or today.year)
+    except (TypeError, ValueError):
+        year = today.year
+    if not 1 <= month_num <= 12:
+        month_num = today.month
+    month_name = calendar.month_name[month_num].upper()  # e.g. 'MAY'
+
+    head = (request.GET.get("head") or "premium").strip().lower()
+    head_sql = "COMMODITY" if head == "commodity" else "PREMIUM"
+    head = "commodity" if head == "commodity" else "premium"
+
+    platform = (request.GET.get("platform") or "").strip().lower() or None
+
+    use_master = platform != "amazon"
+    use_amazon = platform is None or platform == "amazon"
+
+    totals = {}
+    errors = []
+
+    def add(category, ltrs):
+        label = (str(category).strip() if category else "") or "Uncategorized"
+        totals[label] = totals.get(label, 0.0) + float(ltrs or 0)
+
+    with connection.cursor() as cur:
+        if use_master:
+            sql = """
+                SELECT COALESCE(NULLIF(TRIM(category::text), ''), 'Uncategorized') AS category,
+                       COALESCE(SUM(total_delivered_liters), 0) AS ltrs
+                FROM public.master_po
+                WHERE UPPER(TRIM(delivery_month::text)) = %s
+                  AND delivered_year = %s
+                  AND UPPER(TRIM(item_head::text)) = %s
+            """
+            params = [month_name, year, head_sql]
+            if platform:
+                fmt = _CATEGORY_SLUG_TO_FORMAT.get(
+                    platform, platform.replace("_", " ").upper()
+                )
+                sql += " AND UPPER(TRIM(format::text)) = %s"
+                params.append(fmt)
+            else:
+                sql += " AND UPPER(TRIM(format::text)) <> 'AMAZON'"
+            sql += " GROUP BY 1"
+            try:
+                cur.execute(sql, params)
+                for row in cur.fetchall():
+                    add(row[0], row[1])
+            except Exception as e:
+                errors.append({"source": "master_po", "error": str(e)})
+
+        if use_amazon:
+            try:
+                cur.execute("""
+                    SELECT COALESCE(NULLIF(TRIM(category::text), ''), 'Uncategorized') AS category,
+                           COALESCE(SUM(total_delivered_liters), 0) AS ltrs
+                    FROM reporting."Amazon PO"
+                    WHERE po_month = %s
+                      AND year = %s
+                      AND UPPER(TRIM(item_head::text)) = %s
+                    GROUP BY 1
+                """, [month_num, year, head_sql])
+                for row in cur.fetchall():
+                    add(row[0], row[1])
+            except Exception as e:
+                errors.append({"source": "amazon_po", "error": str(e)})
+
+    categories = sorted(
+        ({"category": name, "ltrs": round(ltrs, 2)} for name, ltrs in totals.items() if ltrs > 0),
+        key=lambda c: c["ltrs"],
+        reverse=True,
+    )
+    total_ltrs = round(sum(c["ltrs"] for c in categories), 2)
+
+    return Response({
+        "head": head,
+        "platform": platform,
+        "month": month_num,
+        "year": year,
+        "total_ltrs": total_ltrs,
+        "categories": categories,
+        "errors": errors,
+    })
+
+
 # ─── /platform-expiry-alerts ───
 @api_view(["GET"])
 @permission_classes([require("dashboard.view")])

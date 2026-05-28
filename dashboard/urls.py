@@ -13,6 +13,7 @@ urlpatterns = [
     path("expiry-alerts/<str:table_name>", views.expiry_alerts, name="dashboard-expiry-alerts"),
     path("inventory-charts", views.inventory_charts, name="dashboard-inventory-charts"),
     path("primary-po-litres", views.primary_po_litres, name="dashboard-primary-po-litres"),
+    path("category-litres", views.category_litres, name="dashboard-category-litres"),
     path("platform-expiry-alerts", views.platform_expiry_alerts, name="dashboard-platform-expiry-alerts"),
     path("platform-expiry-alerts/<str:slug>/pos", views.platform_expiry_alert_pos, name="dashboard-platform-expiry-alert-pos"),
     path("platform-expiry-alerts/<str:slug>/pos/<str:po_number>/items", views.platform_expiry_alert_po_items, name="dashboard-platform-expiry-alert-po-items"),
