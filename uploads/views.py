@@ -106,6 +106,29 @@ PRIMARY_UPLOAD_REPLACE_KEYS = {
     "total_po_zbs": (("po_number",), ("sku_code",)),
 }
 
+PRIMARY_UPLOAD_AUTHORITATIVE_COLUMNS = [
+    "po_date",
+    "po_expiry_date",
+    "grn_date",
+    "vendor_name",
+    "status",
+    "sku_name",
+    "order_qty",
+    "delivered_qty",
+    "basic_rate",
+    "landing_rate",
+    "location",
+    "format",
+    "remark",
+]
+
+PRIMARY_UPLOAD_TABLES = {
+    "total_po",
+    "total_po_zbs",
+    "total_po_grn_update",
+    "total_po_zbs_grn_update",
+}
+
 INVENTORY_DOH_UPLOAD_PLATFORMS = {
     "blinkit_inventory": "blinkit",
     "zepto_inventory": "zepto",
@@ -1162,6 +1185,47 @@ def _normalize_upload_key(value) -> str:
     return str(value or "").strip().lower()
 
 
+def _normalize_platform_format(value) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(value or "").strip().lower())
+
+
+def _validate_primary_upload_format(table: str, data: list[dict], expected_format: str | None):
+    if table not in PRIMARY_UPLOAD_TABLES or not expected_format:
+        return None
+
+    expected_key = _normalize_platform_format(expected_format)
+    if not expected_key:
+        return None
+
+    mismatches = []
+    for index, row in enumerate(data, start=1):
+        actual = row.get("format")
+        actual_key = _normalize_platform_format(actual)
+        if not actual_key or actual_key != expected_key:
+            mismatches.append(
+                {
+                    "row": index,
+                    "format": actual,
+                    "expected": expected_format,
+                }
+            )
+            if len(mismatches) >= 5:
+                break
+
+    if mismatches:
+        return Response(
+            {
+                "detail": (
+                    f"{expected_format} primary uploader only accepts "
+                    f"{expected_format} data. Found another platform format."
+                ),
+                "mismatches": mismatches,
+            },
+            status=400,
+        )
+    return None
+
+
 def _primary_upload_key_parts(table: str, row: dict) -> tuple[str, ...] | None:
     key_specs = PRIMARY_UPLOAD_REPLACE_KEYS.get(table)
     if not key_specs:
@@ -1184,71 +1248,61 @@ def _primary_upload_key_sql(spec: tuple[str, ...]) -> str:
     return f"LOWER(TRIM(COALESCE({value_sql}, '')))"
 
 
-def _delete_existing_primary_upload_row(cur, table: str, row: dict) -> int:
-    """Remove existing platform-primary rows with the same PO + SKU.
-
-    The source tables do not all have a database unique constraint on this
-    business key, so using DELETE + INSERT is the most reliable way to make a
-    status refresh replace the old row instead of creating a duplicate.
-    """
+def _update_existing_primary_upload_row(
+    cur,
+    table: str,
+    row: dict,
+    columns: list[str],
+    column_types: dict[str, str],
+) -> int:
+    """Update existing platform-primary rows with the same PO + SKU."""
     key_parts = _primary_upload_key_parts(table, row)
     key_specs = PRIMARY_UPLOAD_REPLACE_KEYS.get(table)
     if not key_parts or not key_specs:
         return 0
 
+    assignments = ", ".join(
+        f"{_quote_ident(column)} = %s"
+        for column in columns
+    )
     where = " AND ".join(
         f"{_primary_upload_key_sql(spec)} = %s"
         for spec in key_specs
     )
     cur.execute(
-        f"DELETE FROM {_quote_ident(table)} AS t WHERE {where}",
-        list(key_parts),
+        f"UPDATE {_quote_ident(table)} AS t SET {assignments} WHERE {where}",
+        [
+            *_upload_row_values(row, columns, column_types),
+            *key_parts,
+        ],
     )
     return cur.rowcount or 0
 
 
-def _delete_existing_primary_upload_rows(cur, table: str, rows: list[dict]) -> int:
-    """Bulk-remove existing primary rows for the batch's business keys."""
-    key_specs = PRIMARY_UPLOAD_REPLACE_KEYS.get(table)
-    if not key_specs:
-        return 0
+def _upsert_primary_upload_row(
+    cur,
+    table: str,
+    row: dict,
+    columns: list[str],
+    column_types: dict[str, str],
+    insert_sql: str,
+) -> bool:
+    """Update matching primary row; insert only when no PO + SKU row exists.
 
-    keys = []
-    seen = set()
-    for row in rows:
-        key_parts = _primary_upload_key_parts(table, row)
-        if not key_parts or key_parts in seen:
-            continue
-        seen.add(key_parts)
-        keys.append(key_parts)
-
-    if not keys:
-        return 0
-
-    key_columns = [f"k{index}" for index in range(len(key_specs))]
-    values_sql = ", ".join(
-        "(" + ", ".join(["%s"] * len(key_specs)) + ")"
-        for _ in keys
+    Returns True when a new row was inserted, False when an existing row was
+    updated.
+    """
+    updated_rows = _update_existing_primary_upload_row(
+        cur,
+        table,
+        row,
+        columns,
+        column_types,
     )
-    where = " AND ".join(
-        f"{_primary_upload_key_sql(spec)} = k.{column}"
-        for spec, column in zip(key_specs, key_columns)
-    )
-    params = [part for key in keys for part in key]
-
-    cur.execute(
-        f"""
-        WITH upload_keys({", ".join(key_columns)}) AS (
-            VALUES {values_sql}
-        )
-        DELETE FROM {_quote_ident(table)} AS t
-        USING upload_keys AS k
-        WHERE {where}
-        RETURNING {", ".join(_primary_upload_key_sql(spec) for spec in key_specs)}
-        """,
-        params,
-    )
-    return len({tuple(row) for row in cur.fetchall()})
+    if updated_rows:
+        return False
+    cur.execute(insert_sql, _upload_row_values(row, columns, column_types))
+    return True
 
 
 def _execute_batch_insert_rows(
@@ -1275,11 +1329,12 @@ def _execute_batch_insert_rows(
 def _update_total_po_grn_dates(data: list[dict], target_table: str = "total_po") -> Response:
     """Update existing PO rows in a primary PO table from a lean GRN upload.
 
-    The GRN sheet supplies po_number and grn_date. It may also supply sku_code
-    and delivered_qty; delivered_qty is updated only when sku_code is present so
-    a PO-level GRN date update does not overwrite every SKU line with one qty.
-    When format is supplied, the update is limited to that platform. No new rows
-    are inserted from GRN files.
+    The GRN sheet supplies po_number and grn_date. When it also supplies
+    sku_code, updates target that exact PO + SKU row and uploaded values win for
+    any primary fields included in the payload. PO-only GRN sheets keep their
+    existing PO-level date update; delivered_qty is not applied without SKU so a
+    single PO-level GRN row cannot overwrite every SKU line with one qty. No new
+    rows are inserted from GRN files.
     """
     if target_table not in {"total_po", "total_po_zbs"}:
         return Response(
@@ -1288,19 +1343,20 @@ def _update_total_po_grn_dates(data: list[dict], target_table: str = "total_po")
         )
 
     quoted_target_table = _quote_ident(target_table)
-    prepared: dict[tuple[str, str], tuple[str, str, str, object]] = {}
+    column_types = _upload_table_column_types(target_table)
+    table_columns = set(column_types)
+    allowed_update_columns = [
+        column
+        for column in PRIMARY_UPLOAD_AUTHORITATIVE_COLUMNS
+        if column in table_columns
+    ]
+    prepared: dict[tuple[str, str], dict] = {}
     skipped = 0
 
     for row in data:
         po_number = str(row.get("po_number") or "").strip()
         sku_code = str(row.get("sku_code") or "").strip()
         grn_date = str(row.get("grn_date") or "").strip()
-        format_value = str(row.get("format") or "").strip().upper()
-        delivered_qty_raw = row.get("delivered_qty")
-        has_delivered_qty = (
-            delivered_qty_raw is not None
-            and str(delivered_qty_raw).strip() != ""
-        )
         if not po_number or not grn_date:
             skipped += 1
             continue
@@ -1309,13 +1365,7 @@ def _update_total_po_grn_dates(data: list[dict], target_table: str = "total_po")
         if key in prepared:
             skipped += 1
             continue
-        prepared[key] = (
-            po_number,
-            sku_code,
-            grn_date,
-            format_value,
-            delivered_qty_raw if has_delivered_qty else None,
-        )
+        prepared[key] = row
 
     success = 0
     updated = 0
@@ -1325,64 +1375,40 @@ def _update_total_po_grn_dates(data: list[dict], target_table: str = "total_po")
     if prepared:
         try:
             with transaction.atomic(), connection.cursor() as cur:
-                cur.execute(
-                    """
-                    CREATE TEMP TABLE tmp_total_po_grn_update (
-                        po_number text,
-                        sku_code text,
-                        grn_date date,
-                        format text,
-                        delivered_qty numeric
-                    ) ON COMMIT DROP
-                    """
-                )
-                cur.executemany(
-                    """
-                    INSERT INTO tmp_total_po_grn_update
-                        (po_number, sku_code, grn_date, format, delivered_qty)
-                    VALUES (%s, %s, %s, %s, %s)
-                    """,
-                    list(prepared.values()),
-                )
-                cur.execute(
-                    f"""
-                    WITH changed AS (
-                        UPDATE {quoted_target_table} AS t
-                           SET grn_date = u.grn_date,
-                               delivered_qty = u.delivered_qty
-                          FROM tmp_total_po_grn_update AS u
-                         WHERE NULLIF(TRIM(u.sku_code), '') IS NOT NULL
-                           AND u.delivered_qty IS NOT NULL
-                           AND LOWER(TRIM(t.po_number::text)) = LOWER(TRIM(u.po_number))
-                           AND LOWER(TRIM(t.sku_code::text)) = LOWER(TRIM(u.sku_code))
-                           AND (NULLIF(TRIM(u.format), '') IS NULL OR UPPER(TRIM(t.format::text)) = UPPER(TRIM(u.format)))
-                     RETURNING LOWER(TRIM(u.po_number)) AS po_key, LOWER(TRIM(u.sku_code)) AS sku_key
+                for row in prepared.values():
+                    po_number = str(row.get("po_number") or "").strip()
+                    sku_code = str(row.get("sku_code") or "").strip()
+                    has_sku = bool(sku_code)
+                    update_columns = [
+                        column
+                        for column in allowed_update_columns
+                        if column in row and (has_sku or column in {"grn_date", "format", "remark"})
+                    ]
+                    if not has_sku and "delivered_qty" in update_columns:
+                        update_columns.remove("delivered_qty")
+                    if not update_columns:
+                        skipped += 1
+                        continue
+
+                    assignments = ", ".join(
+                        f"{_quote_ident(column)} = %s"
+                        for column in update_columns
                     )
-                    SELECT COUNT(*) AS updated_rows,
-                           COUNT(DISTINCT po_key || '::' || sku_key) AS matched_rows
-                      FROM changed
-                    """
-                )
-                sku_updated, sku_matched = cur.fetchone() or (0, 0)
-                cur.execute(
-                    f"""
-                    WITH changed AS (
-                        UPDATE {quoted_target_table} AS t
-                           SET grn_date = u.grn_date
-                          FROM tmp_total_po_grn_update AS u
-                         WHERE (NULLIF(TRIM(u.sku_code), '') IS NULL OR u.delivered_qty IS NULL)
-                           AND LOWER(TRIM(t.po_number::text)) = LOWER(TRIM(u.po_number))
-                           AND (NULLIF(TRIM(u.format), '') IS NULL OR UPPER(TRIM(t.format::text)) = UPPER(TRIM(u.format)))
-                     RETURNING LOWER(TRIM(u.po_number)) AS po_key, LOWER(TRIM(COALESCE(u.sku_code, ''))) AS sku_key
+                    values = _upload_row_values(row, update_columns, column_types)
+                    where = "LOWER(TRIM(t.po_number::text)) = %s"
+                    where_values = [po_number.lower()]
+                    if has_sku:
+                        where += " AND LOWER(TRIM(t.sku_code::text)) = %s"
+                        where_values.append(sku_code.lower())
+
+                    cur.execute(
+                        f"UPDATE {quoted_target_table} AS t SET {assignments} WHERE {where}",
+                        [*values, *where_values],
                     )
-                    SELECT COUNT(*) AS updated_rows,
-                           COUNT(DISTINCT po_key || '::' || sku_key) AS matched_rows
-                      FROM changed
-                    """
-                )
-                po_updated, po_matched = cur.fetchone() or (0, 0)
-                updated = int(sku_updated or 0) + int(po_updated or 0)
-                success = int(sku_matched or 0) + int(po_matched or 0)
+                    rowcount = cur.rowcount or 0
+                    if rowcount:
+                        updated += rowcount
+                        success += 1
         except Exception as exc:
             failed = len(prepared)
             last_error = str(exc)
@@ -1412,6 +1438,7 @@ def _batch_upload(body, *, forced_table: str | None = None):
     data = body.get("data") or []
     unique_key = body.get("unique_key") or ""
     upsert = bool(body.get("upsert", True))
+    expected_platform_format = body.get("expected_platform_format")
 
     if table not in UPLOAD_ALLOWED_TABLES:
         return Response(
@@ -1430,6 +1457,10 @@ def _batch_upload(body, *, forced_table: str | None = None):
     ]
     if not data:
         return Response({"success": 0, "failed": 0, "error": None})
+
+    format_error = _validate_primary_upload_format(table, data, expected_platform_format)
+    if format_error is not None:
+        return format_error
 
     if table == "total_po_grn_update":
         return _update_total_po_grn_dates(data)
@@ -1505,20 +1536,26 @@ def _batch_upload(body, *, forced_table: str | None = None):
             if batch and replace_by_primary_key:
                 try:
                     with transaction.atomic():
-                        replaced_keys = _delete_existing_primary_upload_rows(cur, table, batch)
-                        cur.executemany(
-                            sql,
-                            [
-                                _upload_row_values(row, columns, column_types)
-                                for row in batch
-                            ],
-                        )
-                    updated += replaced_keys
-                    platform_updated += replaced_keys
-                    inserted_count = max(0, len(batch) - replaced_keys)
-                    created += inserted_count
-                    platform_created += inserted_count
-                    success += len(batch)
+                        batch_created = 0
+                        batch_updated = 0
+                        for row in batch:
+                            inserted = _upsert_primary_upload_row(
+                                cur,
+                                table,
+                                row,
+                                columns,
+                                column_types,
+                                sql,
+                            )
+                            if inserted:
+                                batch_created += 1
+                            else:
+                                batch_updated += 1
+                    created += batch_created
+                    platform_created += batch_created
+                    updated += batch_updated
+                    platform_updated += batch_updated
+                    success += batch_created + batch_updated
                     continue
                 except Exception as batch_exc:
                     last_error = str(batch_exc)
@@ -1564,21 +1601,26 @@ def _batch_upload(body, *, forced_table: str | None = None):
 
             for row in batch:
                 try:
-                    replaced_rows = 0
                     if replace_by_primary_key:
                         with transaction.atomic():
-                            replaced_rows = _delete_existing_primary_upload_row(cur, table, row)
-                            cur.execute(sql, _upload_row_values(row, columns, column_types))
+                            inserted = _upsert_primary_upload_row(
+                                cur,
+                                table,
+                                row,
+                                columns,
+                                column_types,
+                                sql,
+                            )
                     else:
                         cur.execute(sql, _upload_row_values(row, columns, column_types))
 
                     if replace_by_primary_key:
-                        if replaced_rows:
-                            updated += 1
-                            platform_updated += 1
-                        else:
+                        if inserted:
                             created += 1
                             platform_created += 1
+                        else:
+                            updated += 1
+                            platform_updated += 1
                     elif tracks_upsert_counts:
                         result = cur.fetchone()
                         if result is None:

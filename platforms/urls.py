@@ -15,6 +15,11 @@ urlpatterns = [
         monthly_targets.month_targets_refresh_all,
         name="month-targets-refresh-all",
     ),
+    path(
+        "primary-overview-total",
+        views.primary_overview_total,
+        name="platform-primary-overview-total",
+    ),
 
     path("<slug:slug>/stats", views.platform_stats, name="platform-stats"),
     path("<slug:slug>/pos", views.platform_pos, name="platform-pos"),

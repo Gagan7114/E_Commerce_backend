@@ -80,7 +80,7 @@ def _drop_primary_normalized() -> None:
 _PRIMARY_CTE_STUB = "WITH _stub AS (SELECT 1)"
 
 _PRIMARY_DASHBOARD_CACHE_TTL = 60  # seconds
-_PRIMARY_DASHBOARD_CACHE_VERSION = 10
+_PRIMARY_DASHBOARD_CACHE_VERSION = 21
 
 
 def _get_platform(slug: str) -> PlatformConfig:
@@ -297,9 +297,12 @@ _PRIMARY_DASHBOARD_DONE_VALUE_COLUMNS = {
     ("zomato", "DEL MONTH"): "total_order_amt_exclusive",
     ("zomato", "PO MONTH"): "total_delivered_amt_exclusive",
 }
-_TOTAL_PO_KPI_DASHBOARD_SLUGS = {
+_TOTAL_PO_KPI_DASHBOARD_SLUGS = set()
+_MASTER_PO_ORDER_MINUS_DELIVER_KPI_SLUGS = {
     "bigbasket",
-    "zomato",
+    "citymall",
+    "flipkart",
+    "flipkart_grocery",
 }
 
 
@@ -389,6 +392,56 @@ def _primary_total_po_kpi_total(
             COALESCE(SUM(pending_qty), 0) AS pending_qty,
             COALESCE(SUM(pending_qty * effective_per_liter), 0) AS missed_ltrs
         FROM metric_base
+        """,
+        [format_key, period_start, period_end],
+    )
+    return _primary_metrics(rows[0] if rows else None)
+
+
+def _primary_master_po_order_minus_deliver_kpi_total(
+    platform_format: str,
+    mode: str,
+    month: int,
+    year: int,
+) -> dict:
+    period_col = "po_date" if mode == "PO MONTH" else "delivery_date"
+    period_start = date(year, month, 1)
+    next_month, next_year = _shift_month(month, year, 1)
+    period_end = date(next_year, next_month, 1)
+    format_key = re.sub(
+        r"[^a-z0-9]+",
+        "",
+        str(platform_format or "").strip().lower(),
+    )
+    rows = _dict_rows(
+        f"""
+        SELECT
+            COALESCE(SUM(COALESCE(total_order_amt_exclusive, 0)), 0) AS order_value,
+            COALESCE(SUM(COALESCE(total_order_liters, 0)), 0) AS order_ltrs,
+            COALESCE(SUM(COALESCE(order_qty, 0)), 0) AS order_qty,
+            COALESCE(SUM(COALESCE(total_delivered_amt_exclusive, 0)), 0) AS done_value,
+            COALESCE(SUM(COALESCE(total_delivered_liters, 0)), 0) AS done_ltrs,
+            COALESCE(SUM(COALESCE(delivered_qty, 0)), 0) AS done_qty,
+            COALESCE(SUM(CASE
+                WHEN UPPER(TRIM(COALESCE(open_close::text, ''))) = 'OPEN'
+                THEN COALESCE(total_order_amt_exclusive, 0)
+                ELSE 0 END), 0) AS pending_value,
+            COALESCE(SUM(CASE
+                WHEN UPPER(TRIM(COALESCE(open_close::text, ''))) = 'OPEN'
+                THEN COALESCE(total_order_liters, 0)
+                ELSE 0 END), 0) AS pending_ltrs,
+            COALESCE(SUM(CASE
+                WHEN UPPER(TRIM(COALESCE(open_close::text, ''))) = 'OPEN'
+                THEN COALESCE(order_qty, 0)
+                ELSE 0 END), 0) AS pending_qty,
+            COALESCE(SUM(CASE
+                WHEN UPPER(TRIM(COALESCE(open_close::text, ''))) = 'OPEN'
+                THEN COALESCE(total_order_liters, 0)
+                ELSE 0 END), 0) AS missed_ltrs
+        FROM public.master_po
+        WHERE REGEXP_REPLACE(LOWER(TRIM(format::text)), '[^a-z0-9]+', '', 'g') = %s
+          AND {period_col} >= %s
+          AND {period_col} < %s
         """,
         [format_key, period_start, period_end],
     )
@@ -568,18 +621,17 @@ def _bigbasket_primary_dashboard_response(request, slug: str):
     ]
 
     item_total = _bigbasket_primary_total(items, include_cancelled=False)
-    kpi_total = _primary_total_po_kpi_total(
+    kpi_total = _primary_master_po_order_minus_deliver_kpi_total(
         platform_format,
         month_type,
         _MONTH_NAME_TO_NUM.get(month_name),
         year,
-        period_end - timedelta(days=1),
     )
     return Response({
         "source": "master_po",
         "format": f"{slug.upper()}_PRIMARY",
         "source_format": platform_format,
-        "kpi_source": "total_po",
+        "kpi_source": "master_po_order_minus_deliver",
         "kpi_total": kpi_total,
         "defaulted_to_latest": defaulted_to_latest,
         "mode": month_type,
@@ -630,10 +682,14 @@ _PRIMARY_METRIC_SQL = """
     COALESCE(SUM(COALESCE(metric_delivered_value, 0)), 0) AS done_value,
     COALESCE(SUM(COALESCE(metric_delivered_liters, 0)), 0) AS done_ltrs,
     COALESCE(SUM(COALESCE(metric_delivered_qty, 0)), 0) AS done_qty,
-    COALESCE(SUM(COALESCE(metric_pending_liters, 0)), 0) AS missed_ltrs,
-    COALESCE(SUM(COALESCE(metric_pending_value, 0)), 0) AS pending_value,
-    COALESCE(SUM(COALESCE(metric_pending_liters, 0)), 0) AS pending_ltrs,
-    COALESCE(SUM(COALESCE(metric_pending_qty, 0)), 0) AS pending_qty,
+    COALESCE(SUM(CASE WHEN open_close_key = 'OPEN'
+        THEN COALESCE(metric_order_liters, 0) ELSE 0 END), 0) AS missed_ltrs,
+    COALESCE(SUM(CASE WHEN open_close_key = 'OPEN'
+        THEN COALESCE(metric_order_value, 0) ELSE 0 END), 0) AS pending_value,
+    COALESCE(SUM(CASE WHEN open_close_key = 'OPEN'
+        THEN COALESCE(metric_order_liters, 0) ELSE 0 END), 0) AS pending_ltrs,
+    COALESCE(SUM(CASE WHEN open_close_key = 'OPEN'
+        THEN COALESCE(metric_order_qty, 0) ELSE 0 END), 0) AS pending_qty,
     COALESCE(SUM(CASE WHEN status_key = 'EXPIRED'
         THEN COALESCE(metric_order_value, 0) ELSE 0 END), 0) AS expired_value,
     COALESCE(SUM(CASE WHEN status_key = 'EXPIRED'
@@ -652,9 +708,12 @@ _PRIMARY_TREND_METRIC_SQL = """
     COALESCE(SUM(COALESCE(metric_delivered_value, 0)), 0) AS done_value,
     COALESCE(SUM(COALESCE(metric_delivered_liters, 0)), 0) AS done_ltrs,
     COALESCE(SUM(COALESCE(metric_delivered_qty, 0)), 0) AS done_qty,
-    COALESCE(SUM(COALESCE(metric_pending_value, 0)), 0) AS pending_value,
-    COALESCE(SUM(COALESCE(metric_pending_liters, 0)), 0) AS pending_ltrs,
-    COALESCE(SUM(COALESCE(metric_pending_qty, 0)), 0) AS pending_qty,
+    COALESCE(SUM(CASE WHEN open_close_key = 'OPEN'
+        THEN COALESCE(metric_order_value, 0) ELSE 0 END), 0) AS pending_value,
+    COALESCE(SUM(CASE WHEN open_close_key = 'OPEN'
+        THEN COALESCE(metric_order_liters, 0) ELSE 0 END), 0) AS pending_ltrs,
+    COALESCE(SUM(CASE WHEN open_close_key = 'OPEN'
+        THEN COALESCE(metric_order_qty, 0) ELSE 0 END), 0) AS pending_qty,
     COALESCE(SUM(COALESCE(metric_order_value, 0)), 0) AS order_value,
     COALESCE(SUM(COALESCE(metric_order_liters, 0)), 0) AS order_ltrs,
     COALESCE(SUM(COALESCE(metric_order_qty, 0)), 0) AS order_qty
@@ -1702,9 +1761,9 @@ def _primary_dashboard_payload(
                 COALESCE(metric_delivered_liters, 0) AS delivered_ltrs_row,
                 COALESCE(metric_order_qty, 0) AS order_qty_row,
                 COALESCE(metric_delivered_qty, 0) AS delivered_qty_row,
-                COALESCE(metric_pending_value, 0) AS pending_value_row,
-                COALESCE(metric_pending_liters, 0) AS pending_ltrs_row,
-                COALESCE(metric_pending_qty, 0) AS pending_qty_row,
+                COALESCE(metric_order_value, 0) AS pending_value_row,
+                COALESCE(metric_order_liters, 0) AS pending_ltrs_row,
+                COALESCE(metric_order_qty, 0) AS pending_qty_row,
                 lead_time AS lead_time_row,
                 COALESCE(NULLIF(UPPER(TRIM(open_close::text)), ''), 'CLOSED') AS open_close_key
             FROM normalized
@@ -1828,6 +1887,33 @@ def _primary_dashboard_payload(
     monthly_trend = []
     yearly_trend = []
 
+    kpi_source = (
+        "total_po"
+        if slug in _TOTAL_PO_KPI_DASHBOARD_SLUGS
+        else "master_po_order_minus_deliver"
+        if slug in _MASTER_PO_ORDER_MINUS_DELIVER_KPI_SLUGS
+        else "master_po"
+    )
+    kpi_total = (
+        _primary_total_po_kpi_total(
+            platform_format,
+            mode,
+            month,
+            year,
+            period_end_cap,
+        )
+        if slug in _TOTAL_PO_KPI_DASHBOARD_SLUGS
+        else _primary_master_po_order_minus_deliver_kpi_total(
+            platform_format,
+            mode,
+            month,
+            year,
+        )
+        if slug in _MASTER_PO_ORDER_MINUS_DELIVER_KPI_SLUGS
+        else None
+    )
+    card_total = kpi_total or summary_total
+
     payload = {
         "source": "master_po",
         "format": platform_format,
@@ -1839,19 +1925,9 @@ def _primary_dashboard_payload(
         "defaulted_to_latest": defaulted_to_latest,
         "max_date": max_date.isoformat() if hasattr(max_date, "isoformat") else max_date,
         "summary": summary,
-        "summary_total": summary_total,
-        "kpi_source": "total_po" if slug in _TOTAL_PO_KPI_DASHBOARD_SLUGS else "master_po",
-        "kpi_total": (
-            _primary_total_po_kpi_total(
-                platform_format,
-                mode,
-                month,
-                year,
-                period_end_cap,
-            )
-            if slug in _TOTAL_PO_KPI_DASHBOARD_SLUGS
-            else None
-        ),
+        "summary_total": card_total,
+        "kpi_source": kpi_source,
+        "kpi_total": kpi_total,
         "fill_rate_summary": fill_rate_summary,
         "fill_rate_total": fill_rate_total,
         "lead_time_days": lead_time_days,
@@ -1872,6 +1948,156 @@ def _primary_dashboard_payload(
         },
         "detail_rows_fixed": slug == "zepto",
         "extra_detail_rows_included": True,
+    }
+    cache.set(cache_key, payload, _PRIMARY_DASHBOARD_CACHE_TTL)
+    return Response(payload)
+
+
+@api_view(["GET"])
+@permission_classes([require("platform.po.view")])
+def primary_overview_total(request):
+    """Fast aggregate used by the home dashboard Primary card."""
+    raw_month = str(request.query_params.get("month") or date.today().month).strip()
+    raw_year = str(request.query_params.get("year") or date.today().year).strip()
+    try:
+        month = int(raw_month)
+        year = int(raw_year)
+    except ValueError:
+        raise ValidationError("`month` and `year` must be numeric.")
+    if not 1 <= month <= 12:
+        raise ValidationError("`month` must be 1-12.")
+    if year < 2000 or year > 2100:
+        raise ValidationError("`year` looks out of range.")
+
+    requested_slugs = [
+        slug.strip().lower()
+        for slug in str(request.query_params.get("slugs") or "").split(",")
+        if slug.strip()
+    ]
+    if not requested_slugs:
+        requested_slugs = ["amazon", *_PRIMARY_DASHBOARD_FORMATS.keys()]
+
+    allowed_slugs = [slug for slug in requested_slugs if can_access_platform(request.user, slug)]
+    month_name = _month_name(month)
+    period_end_cap = min(date(year, month, monthrange(year, month)[1]), date.today())
+    cache_key = (
+        f"primary_overview:v{_PRIMARY_DASHBOARD_CACHE_VERSION}:"
+        f"{month}:{year}:{period_end_cap.isoformat()}:{','.join(allowed_slugs)}"
+    )
+    cached = cache.get(cache_key)
+    if cached is not None:
+        return Response(cached)
+
+    master_format_keys = []
+    include_amazon = False
+    for slug in allowed_slugs:
+        if slug == "amazon":
+            include_amazon = True
+            continue
+        platform_format = _PRIMARY_DASHBOARD_FORMATS.get(slug)
+        if not platform_format:
+            continue
+        master_format_keys.append(
+            re.sub(r"[^a-z0-9]+", "", str(platform_format).strip().lower())
+        )
+
+    total_ltrs = Decimal("0")
+    total_value = Decimal("0")
+    item_heads = {
+        "PREMIUM": {"done_ltrs": Decimal("0"), "done_value": Decimal("0")},
+        "COMMODITY": {"done_ltrs": Decimal("0"), "done_value": Decimal("0")},
+        "OTHER": {"done_ltrs": Decimal("0"), "done_value": Decimal("0")},
+    }
+
+    def add_item_head_total(row):
+        nonlocal total_ltrs, total_value
+        head = str(row.get("item_head") or "OTHER").strip().upper()
+        if head not in item_heads:
+            head = "OTHER"
+        done_ltrs = Decimal(str(row.get("done_ltrs") or 0))
+        done_value = Decimal(str(row.get("done_value") or 0))
+        total_ltrs += done_ltrs
+        total_value += done_value
+        item_heads[head]["done_ltrs"] += done_ltrs
+        item_heads[head]["done_value"] += done_value
+
+    if master_format_keys:
+        values_sql = ", ".join(["(%s)"] * len(master_format_keys))
+        delivery_expr = _prim_safe_date_expr("delivery_date", "p")
+        rows = _dict_rows(
+            f"""
+            WITH requested(format_key) AS (
+                VALUES {values_sql}
+            ),
+            base AS (
+                SELECT
+                    p.total_delivered_liters,
+                    p.total_delivered_amt_exclusive,
+                    {delivery_expr} AS delivery_dt,
+                    CASE
+                        WHEN UPPER(TRIM(p.item_head::text)) = 'PREMIUM' THEN 'PREMIUM'
+                        WHEN UPPER(TRIM(p.item_head::text)) = 'COMMODITY' THEN 'COMMODITY'
+                        ELSE 'OTHER'
+                    END AS item_head,
+                    COALESCE(
+                        NULLIF(UPPER(TRIM(p.delivery_month::text)), ''),
+                        UPPER(TRIM(TO_CHAR({delivery_expr}, 'FMMONTH')))
+                    ) AS delivery_month_key
+                FROM public.master_po p
+                JOIN requested r
+                  ON REGEXP_REPLACE(LOWER(TRIM(p.format::text)), '[^a-z0-9]+', '', 'g') = r.format_key
+            )
+            SELECT
+                item_head,
+                COALESCE(SUM(COALESCE(total_delivered_liters, 0)), 0) AS done_ltrs,
+                COALESCE(SUM(COALESCE(total_delivered_amt_exclusive, 0)), 0) AS done_value
+            FROM base
+            WHERE delivery_month_key = %s
+              AND EXTRACT(YEAR FROM delivery_dt)::integer = %s
+              AND delivery_dt <= %s
+            GROUP BY item_head
+            """,
+            [*master_format_keys, month_name, year, period_end_cap],
+        )
+        for row in rows:
+            add_item_head_total(row)
+
+    if include_amazon:
+        amazon_rows = _dict_rows(
+            f"""
+            {_amazon_primary_po_cte()}
+            SELECT
+                CASE
+                    WHEN item_head_key = 'PREMIUM' THEN 'PREMIUM'
+                    WHEN item_head_key = 'COMMODITY' THEN 'COMMODITY'
+                    ELSE 'OTHER'
+                END AS item_head,
+                COALESCE(SUM(COALESCE(total_delivered_liters, 0)), 0) AS done_ltrs,
+                COALESCE(SUM(COALESCE(total_received_cost, 0)), 0) AS done_value
+            FROM normalized
+            WHERE po_month_key = %s
+              AND po_year = %s
+            GROUP BY 1
+            """,
+            [month_name, year],
+        )
+        for row in amazon_rows:
+            add_item_head_total(row)
+
+    payload = {
+        "done_ltrs": float(total_ltrs),
+        "done_value": float(total_value),
+        "item_heads": {
+            key: {
+                "done_ltrs": float(value["done_ltrs"]),
+                "done_value": float(value["done_value"]),
+            }
+            for key, value in item_heads.items()
+        },
+        "month": month,
+        "month_name": month_name,
+        "year": year,
+        "platforms": allowed_slugs,
     }
     cache.set(cache_key, payload, _PRIMARY_DASHBOARD_CACHE_TTL)
     return Response(payload)
