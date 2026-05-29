@@ -13,6 +13,8 @@ from rest_framework.exceptions import ValidationError
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
+from . import reports_sap
+
 
 REPORT_VIEW_CATALOG = {
     "all_platform_inventory": {
@@ -72,7 +74,17 @@ def _normalised_format(value: str) -> str:
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def report_columns(request):
-    view = _safe_view(request.query_params.get("view", ""))
+    view_raw = request.query_params.get("view", "")
+    if reports_sap.is_sap_view(view_raw):
+        try:
+            sap_cols = reports_sap.columns_for(view_raw)
+        except ValueError as exc:
+            raise ValidationError(str(exc))
+        return Response({
+            "view": view_raw,
+            "columns": [{"key": name, "type": dtype} for name, dtype in sap_cols],
+        })
+    view = _safe_view(view_raw)
     with connection.cursor() as cur:
         cur.execute(
             """
@@ -93,7 +105,53 @@ def report_columns(request):
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def report_raw(request):
-    view = _safe_view(request.query_params.get("view", ""))
+    view_raw = request.query_params.get("view", "")
+    if reports_sap.is_sap_view(view_raw):
+        try:
+            page = max(0, int(request.query_params.get("page") or 0))
+        except ValueError:
+            page = 0
+        try:
+            page_size = int(request.query_params.get("page_size") or 200)
+        except ValueError:
+            page_size = 200
+        page_size = max(1, min(50000, page_size))
+        date_from = (request.query_params.get("date_from") or "").strip()
+        date_to = (request.query_params.get("date_to") or "").strip()
+        if date_from and not _DATE.match(date_from):
+            raise ValidationError("`date_from` must be YYYY-MM-DD.")
+        if date_to and not _DATE.match(date_to):
+            raise ValidationError("`date_to` must be YYYY-MM-DD.")
+        try:
+            rows, count = reports_sap.fetch_for(
+                view_raw,
+                from_date=date_from,
+                to_date=date_to,
+                page=page,
+                page_size=page_size,
+            )
+        except ValueError as exc:
+            raise ValidationError(str(exc))
+        except Exception as exc:  # noqa: BLE001 — surface SAP errors to the UI
+            return Response({
+                "view": view_raw,
+                "rows": [],
+                "columns": [],
+                "count": 0,
+                "page": page,
+                "page_size": page_size,
+                "error": str(exc),
+            })
+        response_columns = list(rows[0].keys()) if rows else []
+        return Response({
+            "view": view_raw,
+            "rows": rows,
+            "columns": response_columns,
+            "count": count,
+            "page": page,
+            "page_size": page_size,
+        })
+    view = _safe_view(view_raw)
     catalog = REPORT_VIEW_CATALOG[view]
 
     requested_columns = (request.query_params.get("columns") or "").strip()

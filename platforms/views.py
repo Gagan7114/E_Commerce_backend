@@ -6236,6 +6236,170 @@ def _amazon_sec_dashboard_response(request):
     })
 
 
+# Amazon MP (Marketplace GST MTR) dashboard. Aggregates the amazon_mp_master
+# view, filtered by shipment_month (NAME) + shipment_year. Show By toggle picks
+# the metric: Values -> invoice_amount (inclusive) & tax_exclusive_gross
+# (exclusive), LTRS -> delivered_ltr, Quantity -> quantity.
+_MONTH_NUM_BY_NAME = {
+    date(2000, _m, 1).strftime("%B").upper(): _m for _m in range(1, 13)
+}
+
+
+def _amazon_mp_dashboard_latest(default_month: int, default_year: int):
+    rows = _dict_rows(
+        """
+        SELECT DISTINCT shipment_year AS year,
+                        UPPER(TRIM(shipment_month)) AS month_name
+        FROM amazon_mp_master
+        WHERE shipment_year IS NOT NULL
+          AND NULLIF(TRIM(shipment_month), '') IS NOT NULL
+        """,
+        [],
+    )
+    best = None
+    for row in rows:
+        try:
+            year = int(row.get("year"))
+        except (TypeError, ValueError):
+            continue
+        month = _MONTH_NUM_BY_NAME.get(str(row.get("month_name") or "").strip().upper())
+        if not month:
+            continue
+        if best is None or (year, month) > best:
+            best = (year, month)
+    return (best[1], best[0]) if best else (default_month, default_year)
+
+
+def _amazon_mp_dashboard_response(request):
+    today = date.today()
+    month_raw = request.query_params.get("month")
+    year_raw = request.query_params.get("year")
+    defaulted_to_latest = False
+    if month_raw and year_raw:
+        try:
+            month = int(month_raw)
+            year = int(year_raw)
+        except (TypeError, ValueError):
+            raise ValidationError("`month` and `year` must be integers.")
+        if not 1 <= month <= 12:
+            raise ValidationError("`month` must be between 1 and 12.")
+        if not 2000 <= year <= 2100:
+            raise ValidationError("`year` must be between 2000 and 2100.")
+    else:
+        month, year = _amazon_mp_dashboard_latest(today.month, today.year)
+        defaulted_to_latest = True
+
+    month_name = _month_name(month)
+    where = "WHERE shipment_year = %s AND UPPER(TRIM(shipment_month)) = %s"
+    params = [year, month_name]
+
+    kpi_rows = _dict_rows(
+        f"""
+        SELECT
+            COALESCE(SUM(invoice_amount), 0) AS inclusive,
+            COALESCE(SUM(tax_exclusive_gross), 0) AS exclusive,
+            COALESCE(SUM(delivered_ltr), 0) AS ltrs,
+            COALESCE(SUM(quantity), 0) AS quantity,
+            COUNT(*) AS row_count
+        FROM amazon_mp_master
+        {where}
+        """,
+        params,
+    )
+    kpi_row = kpi_rows[0] if kpi_rows else {}
+
+    def _group(col_expr: str, *, limit: int | None = None) -> list[dict]:
+        sql = f"""
+            SELECT
+                {col_expr} AS label,
+                COALESCE(SUM(invoice_amount), 0) AS value,
+                COALESCE(SUM(delivered_ltr), 0) AS ltrs,
+                COALESCE(SUM(quantity), 0) AS quantity
+            FROM amazon_mp_master
+            {where}
+            GROUP BY {col_expr}
+            ORDER BY value DESC
+        """
+        if limit:
+            sql += f"\nLIMIT {int(limit)}"
+        return [
+            {
+                "label": row.get("label") or "-",
+                "value": _num(row.get("value")),
+                "ltrs": _num(row.get("ltrs")),
+                "quantity": _num(row.get("quantity")),
+            }
+            for row in _dict_rows(sql, params)
+        ]
+
+    item_head = _group("COALESCE(NULLIF(UPPER(TRIM(item_head)), ''), 'OTHER')")
+    sub_category = _group("COALESCE(NULLIF(UPPER(TRIM(sub_category)), ''), '-')", limit=10)
+    brand = _group("COALESCE(NULLIF(UPPER(TRIM(brand)), ''), '-')", limit=10)
+    state = _group("COALESCE(NULLIF(UPPER(TRIM(ship_to_state)), ''), '-')", limit=10)
+
+    trend_raw = _dict_rows(
+        """
+        SELECT
+            UPPER(TRIM(shipment_month)) AS month_name,
+            COALESCE(SUM(invoice_amount), 0) AS value,
+            COALESCE(SUM(delivered_ltr), 0) AS ltrs,
+            COALESCE(SUM(quantity), 0) AS quantity
+        FROM amazon_mp_master
+        WHERE shipment_year = %s
+          AND NULLIF(TRIM(shipment_month), '') IS NOT NULL
+        GROUP BY UPPER(TRIM(shipment_month))
+        """,
+        [year],
+    )
+    trend = []
+    for row in trend_raw:
+        num_month = _MONTH_NUM_BY_NAME.get(str(row.get("month_name") or "").strip().upper())
+        if not num_month:
+            continue
+        trend.append(
+            {
+                "month": num_month,
+                "label": date(2000, num_month, 1).strftime("%b").upper(),
+                "value": _num(row.get("value")),
+                "ltrs": _num(row.get("ltrs")),
+                "quantity": _num(row.get("quantity")),
+            }
+        )
+    trend.sort(key=lambda item: item["month"])
+
+    return Response(
+        {
+            "dashboard_title": "Amazon MP Dashboard",
+            "available": True,
+            "defaulted_to_latest": defaulted_to_latest,
+            "month": month,
+            "month_name": month_name,
+            "year": year,
+            "row_count": int(_num(kpi_row.get("row_count"))),
+            "kpi": {
+                "inclusive": _num(kpi_row.get("inclusive")),
+                "exclusive": _num(kpi_row.get("exclusive")),
+                "ltrs": _num(kpi_row.get("ltrs")),
+                "quantity": _num(kpi_row.get("quantity")),
+            },
+            "item_head": item_head,
+            "sub_category": sub_category,
+            "brand": brand,
+            "state": state,
+            "trend": trend,
+        }
+    )
+
+
+@api_view(["GET"])
+@permission_classes([require("platform.secondary.view")])
+def amazon_mp_dashboard(request, slug: str):
+    _ensure_scope(request.user, slug)
+    if slug != "amazon":
+        raise ValidationError("MP Dashboard is available only for Amazon.")
+    return _amazon_mp_dashboard_response(request)
+
+
 def _bigbasket_sec_dashboard_response(request):
     month, year, defaulted_to_latest = _parse_sec_month_year(
         request.query_params,
