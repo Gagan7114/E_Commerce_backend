@@ -1627,6 +1627,146 @@ def _transform_amazon_po(cur, upload_id: int) -> tuple[int, int]:
     return flags.count(True), flags.count(False)
 
 
+# per_unit_value derivation, copied verbatim from _transform_amazon_po so a
+# refresh produces the exact same per_liter a fresh upload would (alias `m`).
+_MASTER_PER_LITER_CALC = r"""
+COALESCE(
+    NULLIF(m.per_unit_value::numeric, 0),
+    CASE
+        WHEN NULLIF(TRIM(m.per_unit::text), '') IS NULL THEN NULL
+        WHEN substring(m.per_unit::text from '([0-9]+(?:\.[0-9]+)?)') IS NULL THEN NULL
+        WHEN UPPER(COALESCE(m.uom, '')) IN ('ML', 'MLS')
+             OR UPPER(m.per_unit::text) LIKE '%%ML%%'
+             THEN substring(m.per_unit::text from '([0-9]+(?:\.[0-9]+)?)')::numeric / 1000
+        WHEN UPPER(COALESCE(m.uom, '')) IN ('LTR', 'LITRE', 'LITRES')
+             OR UPPER(m.per_unit::text) LIKE '%%LTR%%'
+             OR UPPER(m.per_unit::text) LIKE '%%LITRE%%'
+             THEN substring(m.per_unit::text from '([0-9]+(?:\.[0-9]+)?)')::numeric
+        ELSE NULL
+    END
+)
+"""
+
+
+def refresh_amazon_po_from_master_sheet(cur, format_sku_codes=None, items=None) -> int:
+    """Re-derive every master_sheet-sourced column on existing
+    reporting."Amazon PO" rows (and the litre/box columns that depend on
+    per_liter / case_pack), so a master_sheet edit propagates to Amazon the way
+    it already does for the view-backed platforms.
+
+    Matching mirrors the upload transform: master_sheet is matched by asin
+    (rank 1), external_id (rank 2) or merchant_sku=item (rank 3), tie-broken
+    toward format='AMAZON'. (Rank 4 — product_name only — is not reproduced;
+    those rare rows keep their existing values.) Operational columns
+    (po_status, dates, costs, fill/miss rates, margin, city/state) are never
+    touched.
+
+    Scope: pass `format_sku_codes` and/or `items` (the changed master_sheet
+    rows) to refresh only the affected Amazon rows; pass nothing to refresh the
+    whole table (backfill). Returns the number of rows updated.
+    """
+    codes = None
+    if format_sku_codes:
+        codes = sorted({str(c).strip().upper() for c in format_sku_codes if c and str(c).strip()})
+        codes = codes or None
+    its = None
+    if items:
+        its = sorted({str(i).strip().upper() for i in items if i and str(i).strip()})
+        its = its or None
+
+    params: dict = {}
+    target_filter = ""
+    if codes is not None or its is not None:
+        conds = []
+        if codes is not None:
+            conds.append("UPPER(TRIM(a.asin::text)) = ANY(%(codes)s)")
+            conds.append("UPPER(TRIM(a.external_id::text)) = ANY(%(codes)s)")
+            params["codes"] = codes
+        if its is not None:
+            conds.append("UPPER(TRIM(a.merchant_sku::text)) = ANY(%(items)s)")
+            params["items"] = its
+        target_filter = "WHERE " + " OR ".join(conds)
+
+    def _match_branch(join_sql: str, rank: int) -> str:
+        return f"""
+            SELECT t.source_line_key,
+                   m.item, m.sku_sap_name, m.sku_sap_code, m.category,
+                   m.sub_category, m.item_head, m.brand, m.category_head,
+                   m.tax_rate::numeric AS tax_rate, m.per_unit,
+                   m.case_pack AS master_case_pack,
+                   {_MASTER_PER_LITER_CALC} AS per_liter_calc,
+                   m.format AS mfmt, {rank} AS match_rank
+              FROM targets t
+              JOIN public.master_sheet m ON {join_sql}
+        """
+
+    sql = f"""
+        WITH targets AS (
+            SELECT a.source_line_key, a.asin, a.external_id, a.merchant_sku,
+                   a.requested_qty, a.accepted_qty, a.received_qty,
+                   a.po_status, a.case_pack AS existing_case_pack
+              FROM reporting."Amazon PO" a
+              {target_filter}
+        ),
+        product_matches AS (
+            {_match_branch("NULLIF(t.asin, '') IS NOT NULL AND UPPER(TRIM(m.format_sku_code::text)) = UPPER(TRIM(t.asin::text))", 1)}
+            UNION ALL
+            {_match_branch("NULLIF(t.external_id, '') IS NOT NULL AND UPPER(TRIM(m.format_sku_code::text)) = UPPER(TRIM(t.external_id::text))", 2)}
+            UNION ALL
+            {_match_branch("NULLIF(t.merchant_sku, '') IS NOT NULL AND UPPER(TRIM(m.item::text)) = UPPER(TRIM(t.merchant_sku::text))", 3)}
+        ),
+        ranked AS (
+            SELECT pm.*,
+                   row_number() OVER (
+                       PARTITION BY source_line_key
+                       ORDER BY CASE
+                           WHEN UPPER(COALESCE(mfmt, '')) = 'AMAZON' THEN match_rank
+                           ELSE 5
+                       END
+                   ) AS rk
+              FROM product_matches pm
+        ),
+        winner AS (
+            SELECT r.*, t.requested_qty, t.accepted_qty, t.received_qty,
+                   t.po_status, t.existing_case_pack
+              FROM ranked r
+              JOIN targets t USING (source_line_key)
+             WHERE r.rk = 1
+        )
+        UPDATE reporting."Amazon PO" a
+           SET item = w.item,
+               sap_sku_name = w.sku_sap_name,
+               sap_sku_code = w.sku_sap_code,
+               category = w.category,
+               sub_category = w.sub_category,
+               item_head = w.item_head,
+               brand = w.brand,
+               category_head = w.category_head,
+               tax = w.tax_rate,
+               per_ltr_unit = w.per_unit,
+               per_liter = w.per_liter_calc,
+               case_pack = COALESCE(w.master_case_pack, w.existing_case_pack),
+               requested_boxes = w.requested_qty / NULLIF(COALESCE(w.master_case_pack, w.existing_case_pack), 0),
+               accepted_boxes = w.accepted_qty / NULLIF(COALESCE(w.master_case_pack, w.existing_case_pack), 0),
+               total_order_liters = w.requested_qty * COALESCE(w.per_liter_calc, 0),
+               total_accepted_liters = w.accepted_qty * COALESCE(w.per_liter_calc, 0),
+               total_delivered_liters = w.received_qty * COALESCE(w.per_liter_calc, 0),
+               order_ltrs_cl = w.requested_qty * COALESCE(w.per_liter_calc, 0),
+               missed_ltrs = CASE
+                   WHEN w.po_status IN ('MOV', 'CANCELLED') THEN NULL
+                   WHEN w.po_status IN ('COMPLETED', 'EXPIRED')
+                       THEN (w.requested_qty - w.received_qty) * COALESCE(w.per_liter_calc, 0)
+                   ELSE 0
+               END,
+               filled_ltrs = w.received_qty * COALESCE(w.per_liter_calc, 0),
+               updated_at = now()
+          FROM winner w
+         WHERE a.source_line_key = w.source_line_key
+    """
+    cur.execute(sql, params)
+    return cur.rowcount
+
+
 def _run_transform(cur, *, config: ReportConfig, upload_id: int) -> tuple[int, int]:
     if config.report_type == "APPOINTMENT":
         return _transform_appointment(cur, upload_id)

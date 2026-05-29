@@ -16,6 +16,7 @@ from __future__ import annotations
 from datetime import date, datetime
 from decimal import Decimal
 from difflib import SequenceMatcher
+import logging
 import re
 
 from django.db import connection, transaction
@@ -23,6 +24,8 @@ from rest_framework.decorators import api_view, permission_classes
 from rest_framework.response import Response
 
 from accounts.permissions import require
+
+logger = logging.getLogger(__name__)
 
 _IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
@@ -249,6 +252,16 @@ def _coerce_master_sheet_value(column: str, value):
         return None
     if column not in MASTER_SHEET_NUMERIC_COLUMNS:
         return str(value).strip()
+
+    text = str(value).strip()
+    # Excel renders percentages like "5%" for an underlying 0.05; pasting the
+    # cell carries the literal "5%". Strip the sign and divide by 100 so the
+    # stored value stays a fraction, matching existing rows (e.g. tax_rate=0.05).
+    if text.endswith("%"):
+        try:
+            return Decimal(text[:-1].strip()) / Decimal(100)
+        except Exception:
+            raise ValueError(f"{column} must be a number.")
 
     try:
         if column == "case_pack":
@@ -497,6 +510,26 @@ def master_sheet_bulk_preview(request):
     return Response(_master_sheet_bulk_preview_payload(parsed_rows))
 
 
+def _propagate_master_sheet_to_amazon(format_sku_codes=None, items=None):
+    """After a master_sheet edit, re-derive the matching reporting."Amazon PO"
+    rows so the change propagates to Amazon the way it already does for the
+    view-backed platforms. Runs in its own transaction and never fails the
+    caller's save (logs and moves on)."""
+    codes = [c for c in (format_sku_codes or []) if c and str(c).strip()]
+    items = [i for i in (items or []) if i and str(i).strip()]
+    if not codes and not items:
+        return
+    try:
+        from .amazon_uploads import refresh_amazon_po_from_master_sheet
+
+        with transaction.atomic(), connection.cursor() as cur:
+            refresh_amazon_po_from_master_sheet(
+                cur, format_sku_codes=codes, items=items
+            )
+    except Exception:
+        logger.exception("Amazon PO master_sheet propagation failed")
+
+
 @api_view(["POST"])
 @permission_classes([require("upload.use")])
 def master_sheet_bulk_upsert(request):
@@ -584,6 +617,12 @@ def master_sheet_bulk_upsert(request):
                 "row": saved_row,
             })
 
+    touched = [r["row"] for r in result_rows if r["action"] in ("update", "insert")]
+    _propagate_master_sheet_to_amazon(
+        format_sku_codes=[r.get("format_sku_code") for r in touched],
+        items=[r.get("item") for r in touched],
+    )
+
     return Response({
         "ok": True,
         "columns": MASTER_SHEET_COLUMNS,
@@ -619,6 +658,11 @@ def master_sheet_create(request):
         cols = [c[0] for c in cur.description]
         created = dict(zip(cols, cur.fetchone()))
 
+    _propagate_master_sheet_to_amazon(
+        format_sku_codes=[created.get("format_sku_code")],
+        items=[created.get("item")],
+    )
+
     return Response({"ok": True, "row": created})
 
 
@@ -652,7 +696,13 @@ def master_sheet_update(request):
             return Response({"detail": "Row was not found. Please search again."}, status=404)
         cols = [c[0] for c in cur.description]
 
-    return Response({"ok": True, "row": dict(zip(cols, updated_row))})
+    saved = dict(zip(cols, updated_row))
+    _propagate_master_sheet_to_amazon(
+        format_sku_codes=[saved.get("format_sku_code")],
+        items=[saved.get("item")],
+    )
+
+    return Response({"ok": True, "row": saved})
 
 
 @api_view(["POST"])
