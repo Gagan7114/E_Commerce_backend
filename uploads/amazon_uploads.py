@@ -3915,6 +3915,7 @@ def appointment_summary(request):
                 r"""
                 SELECT p.asin,
                        COALESCE(p.sku_name, '') AS sku_name,
+                       MIN(NULLIF(TRIM(p.item::text), '')) AS item,
                        COUNT(DISTINCT a.appointment_id) AS appointment_count,
                        COALESCE(SUM(p.accepted_qty), 0)::bigint AS total_qty
                 FROM reporting."appointment" a
@@ -3931,15 +3932,19 @@ def appointment_summary(request):
             )
             raw_rows = cur.fetchall()
 
-            # Collapse by ASIN; keep the longest non-empty product_name.
+            # Collapse by ASIN; keep the longest non-empty product_name and the
+            # short master-sheet item name (for compact chart labels).
             agg = {}
-            for asin, pname, appt_count, total_qty in raw_rows:
-                a = agg.setdefault(asin, {"asin": asin, "product_name": "", "appointment_count": 0, "total_qty": 0})
+            for asin, pname, item, appt_count, total_qty in raw_rows:
+                a = agg.setdefault(asin, {"asin": asin, "product_name": "", "item": "", "appointment_count": 0, "total_qty": 0})
                 a["appointment_count"] += int(appt_count or 0)
                 a["total_qty"] += int(total_qty or 0)
                 pname = (pname or "").strip()
                 if pname and len(pname) > len(a["product_name"]):
                     a["product_name"] = pname
+                item = (item or "").strip()
+                if item and not a["item"]:
+                    a["item"] = item
 
             sku_breakdown = sorted(
                 agg.values(),
