@@ -15,8 +15,16 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
+from time import sleep as _retry_sleep
+
 from django.conf import settings
-from django.db import close_old_connections, connection, transaction
+from django.db import (
+    InterfaceError,
+    OperationalError,
+    close_old_connections,
+    connection,
+    transaction,
+)
 from django.utils import timezone
 from rest_framework import status
 from rest_framework.decorators import api_view, permission_classes
@@ -2906,30 +2914,74 @@ def _ensure_amazon_access(user) -> None:
 @permission_classes([require("upload.use")])
 def uploads_collection(request):
     if request.method == "POST":
-        try:
-            payload, http_status = process_upload(request)
-        except Exception as exc:
-            logger.exception("Unhandled error in process_upload")
-            return Response(
-                {
-                    "status": "failed",
-                    "error_count": 1,
-                    "warning_count": 0,
-                    "errors": [
-                        {
-                            "severity": "error",
-                            "error_type": "internal_error",
-                            "error_message": _upload_exception_message(
-                                "Upload failed due to an unexpected server error. Please try again or contact support.",
-                                exc,
-                            ),
-                        }
-                    ],
-                    "warnings": [],
-                },
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-        return Response(payload, status=http_status)
+        # Transient DB errors (deadlock, lock/statement timeout, a dropped
+        # connection) are common when the big upsert into reporting."Amazon PO"
+        # collides with concurrent reads. They clear on their own, so retry a
+        # couple of times before surfacing — this is why an upload that failed
+        # used to succeed on the 2nd/3rd manual try.
+        max_attempts = 3
+        for attempt in range(1, max_attempts + 1):
+            try:
+                payload, http_status = process_upload(request)
+                return Response(payload, status=http_status)
+            except (OperationalError, InterfaceError) as exc:
+                logger.warning(
+                    "Transient DB error on upload (attempt %s/%s): %s",
+                    attempt,
+                    max_attempts,
+                    exc,
+                )
+                close_old_connections()  # drop a possibly-broken connection
+                upload_file = request.FILES.get("file")
+                if upload_file is not None:
+                    try:
+                        upload_file.seek(0)  # let read() work again on retry
+                    except Exception:  # noqa: BLE001
+                        pass
+                if attempt < max_attempts:
+                    _retry_sleep(0.4 * attempt)
+                    continue
+                logger.exception("Upload failed after %s attempts", max_attempts)
+                return Response(
+                    {
+                        "status": "failed",
+                        "error_count": 1,
+                        "warning_count": 0,
+                        "errors": [
+                            {
+                                "severity": "error",
+                                "error_type": "internal_error",
+                                "error_message": _upload_exception_message(
+                                    "Upload failed after automatic retries due to a temporary database error. Please try again in a moment.",
+                                    exc,
+                                ),
+                            }
+                        ],
+                        "warnings": [],
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            except Exception as exc:
+                logger.exception("Unhandled error in process_upload")
+                return Response(
+                    {
+                        "status": "failed",
+                        "error_count": 1,
+                        "warning_count": 0,
+                        "errors": [
+                            {
+                                "severity": "error",
+                                "error_type": "internal_error",
+                                "error_message": _upload_exception_message(
+                                    "Upload failed due to an unexpected server error. Please try again or contact support.",
+                                    exc,
+                                ),
+                            }
+                        ],
+                        "warnings": [],
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
 
     report_type = str(request.query_params.get("report_type") or "").strip().upper()
     status_filter = str(request.query_params.get("status") or "").strip()
