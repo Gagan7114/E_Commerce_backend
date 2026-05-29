@@ -572,6 +572,162 @@ def category_litres(request):
     })
 
 
+# ─── /category-breakdown ───
+@api_view(["GET"])
+@permission_classes([require("dashboard.view")])
+def category_breakdown(request):
+    """Litres by category AND sub_category, for BOTH heads, from one source.
+
+    source=primary  → master_po (non-AMZ) + reporting."Amazon PO".
+    source=secondary → "SecMaster" (non-AMZ) + amazon_sec_range_master_view (AMZ,
+                       latest cumulative month_day snapshot only).
+    Powers the home "Category Split" 2x2 grid in a single call."""
+    today = date.today()
+    try:
+        month_num = int(request.GET.get("month") or today.month)
+    except (TypeError, ValueError):
+        month_num = today.month
+    try:
+        year = int(request.GET.get("year") or today.year)
+    except (TypeError, ValueError):
+        year = today.year
+    if not 1 <= month_num <= 12:
+        month_num = today.month
+    month_name = calendar.month_name[month_num].upper()  # e.g. 'MAY'
+
+    source = "secondary" if (request.GET.get("source") or "").strip().lower() == "secondary" else "primary"
+    platform = (request.GET.get("platform") or "").strip().lower() or None
+
+    use_amazon = platform is None or platform == "amazon"
+    use_other = platform != "amazon"
+    fmt = None
+    if platform and platform != "amazon":
+        fmt = _CATEGORY_SLUG_TO_FORMAT.get(platform, platform.replace("_", " ").upper())
+
+    errors = []
+    # cat[HEAD][name] and sub[HEAD][name] accumulate litres. One DB scan per
+    # source table (grouped by head + category + sub_category) feeds both — far
+    # cheaper than a query per head×dimension.
+    cat = {"PREMIUM": {}, "COMMODITY": {}}
+    sub = {"PREMIUM": {}, "COMMODITY": {}}
+
+    def absorb(rows):
+        for head_val, c, s, ltrs in rows:
+            head = (str(head_val).strip().upper() if head_val else "")
+            if head not in cat:
+                continue
+            val = float(ltrs or 0)
+            if val == 0:
+                continue
+            clabel = (str(c).strip() if c else "") or "Uncategorized"
+            slabel = (str(s).strip() if s else "") or "Uncategorized"
+            cat[head][clabel] = cat[head].get(clabel, 0.0) + val
+            sub[head][slabel] = sub[head].get(slabel, 0.0) + val
+
+    def run(label, sql, params):
+        try:
+            cur.execute(sql, params)
+            absorb(cur.fetchall())
+        except Exception as e:  # noqa: BLE001
+            errors.append({"source": label, "error": str(e)})
+
+    with connection.cursor() as cur:
+        if source == "primary":
+            if use_other:
+                sql = """
+                    SELECT UPPER(TRIM(item_head::text)) AS head, category, sub_category,
+                           COALESCE(SUM(total_delivered_liters), 0) AS ltrs
+                    FROM public.master_po
+                    WHERE UPPER(TRIM(delivery_month::text)) = %s
+                      AND delivered_year = %s
+                      AND UPPER(TRIM(item_head::text)) IN ('PREMIUM', 'COMMODITY')
+                """
+                params = [month_name, year]
+                if fmt:
+                    sql += " AND UPPER(TRIM(format::text)) = %s"
+                    params.append(fmt)
+                else:
+                    sql += " AND UPPER(TRIM(format::text)) <> 'AMAZON'"
+                sql += " GROUP BY 1, 2, 3"
+                run("master_po", sql, params)
+            if use_amazon:
+                run("amazon_po", """
+                    SELECT UPPER(TRIM(item_head::text)) AS head, category, sub_category,
+                           COALESCE(SUM(total_delivered_liters), 0) AS ltrs
+                    FROM reporting."Amazon PO"
+                    WHERE po_month = %s AND year = %s
+                      AND UPPER(TRIM(item_head::text)) IN ('PREMIUM', 'COMMODITY')
+                    GROUP BY 1, 2, 3
+                """, [month_num, year])
+        else:  # secondary
+            if use_other:
+                sql = """
+                    SELECT UPPER(TRIM(item_head::text)) AS head, category, sub_category,
+                           COALESCE(SUM(ltr_sold), 0) AS ltrs
+                    FROM "SecMaster"
+                    WHERE UPPER(TRIM(month::text)) = %s
+                      AND year::numeric = %s
+                      AND UPPER(TRIM(item_head::text)) IN ('PREMIUM', 'COMMODITY')
+                """
+                params = [month_name, year]
+                if fmt:
+                    sql += " AND LOWER(TRIM(format::text)) = LOWER(%s)"
+                    params.append(fmt)
+                else:
+                    sql += " AND UPPER(TRIM(format::text)) <> 'AMAZON'"
+                sql += " GROUP BY 1, 2, 3"
+                run("secmaster", sql, params)
+            if use_amazon:
+                # Mirror amazon_sec_range_master_view against the raw table for
+                # speed (the view is ~140s): join master_sheet for category/head,
+                # shipped_litres = shipped_units * per_unit_value, and use only the
+                # latest cumulative snapshot (max to_date day within the month).
+                run("amazon_sec_range", """
+                    WITH ml AS (
+                        SELECT DISTINCT ON (format_sku_code)
+                               format_sku_code, category, sub_category, item_head, per_unit_value
+                        FROM master_sheet
+                        WHERE format_sku_code IS NOT NULL AND format_sku_code::text <> ''
+                        ORDER BY format_sku_code
+                    ),
+                    base AS (
+                        SELECT r.asin,
+                               COALESCE(r.shipped_units, 0) AS units,
+                               EXTRACT(DAY FROM r.to_date)::int AS to_day
+                        FROM amazon_sec_range r
+                        WHERE EXTRACT(YEAR FROM r.from_date) = %s
+                          AND UPPER(to_char(r.from_date, 'FMMonth')) = %s
+                    ),
+                    latest AS (SELECT MAX(to_day) AS md FROM base)
+                    SELECT UPPER(TRIM(ml.item_head::text)) AS head, ml.category, ml.sub_category,
+                           COALESCE(SUM(b.units * COALESCE(ml.per_unit_value::numeric, 0)), 0) AS ltrs
+                    FROM base b
+                    CROSS JOIN latest l
+                    JOIN ml ON UPPER(TRIM(ml.format_sku_code::text)) = UPPER(TRIM(b.asin::text))
+                    WHERE b.to_day = l.md
+                      AND UPPER(TRIM(ml.item_head::text)) IN ('PREMIUM', 'COMMODITY')
+                    GROUP BY 1, 2, 3
+                """, [year, month_name])
+
+    def to_list(d):
+        return sorted(
+            ({"name": n, "ltrs": round(v, 2)} for n, v in d.items() if v > 0),
+            key=lambda c: c["ltrs"],
+            reverse=True,
+        )
+
+    out = {"source": source, "platform": platform, "month": month_num, "year": year}
+    for head_key, head_sql in (("premium", "PREMIUM"), ("commodity", "COMMODITY")):
+        cats = to_list(cat[head_sql])
+        out[head_key] = {
+            "categories": cats,
+            "sub_categories": to_list(sub[head_sql]),
+            "total_ltrs": round(sum(c["ltrs"] for c in cats), 2),
+        }
+    out["errors"] = errors
+    return Response(out)
+
+
 # ─── /platform-expiry-alerts ───
 @api_view(["GET"])
 @permission_classes([require("dashboard.view")])
