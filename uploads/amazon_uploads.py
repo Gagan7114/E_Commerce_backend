@@ -1823,19 +1823,14 @@ def _estimate_csv_row_count(content: bytes) -> int | None:
 
 def _should_queue_upload(*, config: ReportConfig, content: bytes, extension: str) -> tuple[bool, int | None]:
     estimated_rows = _estimate_csv_row_count(content) if extension == ".csv" else None
-    # Queue when:
-    #  - csv has enough rows to risk a worker timeout, OR
-    #  - ANY Amazon PO xlsx upload — openpyxl parse + the upsert into
-    #    reporting."Amazon PO" routinely exceeds the gunicorn worker timeout
-    #    even for modest files, so we don't use size as a discriminator and
-    #    queue every xlsx unconditionally to guarantee no sync timeout.
-    queue_by_rows = (
-        estimated_rows is not None
-        and estimated_rows >= ASYNC_UPLOAD_ROW_THRESHOLD
-    )
-    queue_xlsx = extension == ".xlsx"
+    # Always queue Amazon PO uploads — regardless of file vs paste, csv vs xlsx,
+    # or row count. The upsert into reporting."Amazon PO" routinely exceeds the
+    # gunicorn worker timeout for non-trivial row counts in any format, so we
+    # don't trust any threshold and queue everything to guarantee no sync
+    # timeout. Small uploads still process in a few seconds via the background
+    # thread; the UX cost is negligible compared to the failure mode.
     return (
-        config.report_type == "AMAZON_PO" and (queue_by_rows or queue_xlsx),
+        config.report_type == "AMAZON_PO",
         estimated_rows,
     )
 
