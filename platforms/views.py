@@ -1429,6 +1429,30 @@ def pendency_dashboard(request, slug: str):
         params,
     )
 
+    by_po = _dict_rows(
+        f'''
+        SELECT
+            COALESCE(NULLIF(TRIM("po_number"::text), ''), 'UNMAPPED') AS po_number,
+            TO_CHAR(
+                MAX(
+                    CASE
+                        WHEN TRIM("po_date"::text) ~ '^[0-9]{{2}}-[0-9]{{2}}-[0-9]{{4}}$'
+                            THEN TO_DATE(TRIM("po_date"::text), 'DD-MM-YYYY')
+                        WHEN TRIM("po_date"::text) ~ '^[0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}$'
+                            THEN TRIM("po_date"::text)::date
+                    END
+                ),
+                'DD-MM-YYYY'
+            ) AS po_date,
+            {metric_cols}
+        FROM "master_po"
+        {full_where}
+        GROUP BY 1
+        {order_clause}
+        ''',
+        params,
+    )
+
     return Response({
         "platform": slug,
         "format": fmt,
@@ -1448,6 +1472,7 @@ def pendency_dashboard(request, slug: str):
         "by_sku": by_sku,
         "by_warehouse": by_warehouse,
         "by_distributor": by_distributor,
+        "by_po": by_po,
     })
 
 

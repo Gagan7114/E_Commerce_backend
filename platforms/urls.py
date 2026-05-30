@@ -1,6 +1,6 @@
 from django.urls import path
 
-from . import views, monthly_targets
+from . import views, monthly_targets, primary_monthly_targets
 
 urlpatterns = [
     # Cross-platform dashboard — registered before the <slug:slug> routes so
@@ -14,6 +14,16 @@ urlpatterns = [
         "month-targets/refresh",
         monthly_targets.month_targets_refresh_all,
         name="month-targets-refresh-all",
+    ),
+    path(
+        "primary-month-targets/dashboard",
+        primary_monthly_targets.primary_month_targets_dashboard,
+        name="primary-month-targets-dashboard",
+    ),
+    path(
+        "primary-month-targets/refresh",
+        primary_monthly_targets.primary_month_targets_refresh_all,
+        name="primary-month-targets-refresh-all",
     ),
     path(
         "primary-overview-total",
@@ -69,6 +79,26 @@ urlpatterns = [
     path("<slug:slug>/landing-rate/bulk-upsert", views.landing_rate_bulk_upsert, name="platform-landing-rate-bulk-upsert"),
 
     # Monthly Targets — per-platform.
+    path(
+        "<slug:slug>/primary-month-targets",
+        primary_monthly_targets.primary_month_targets_list,
+        name="platform-primary-month-targets-list",
+    ),
+    path(
+        "<slug:slug>/primary-month-targets/add",
+        primary_monthly_targets.primary_month_targets_create,
+        name="platform-primary-month-targets-add",
+    ),
+    path(
+        "<slug:slug>/primary-month-targets/refresh",
+        primary_monthly_targets.primary_month_targets_refresh_platform,
+        name="platform-primary-month-targets-refresh-platform",
+    ),
+    path(
+        "<slug:slug>/primary-month-targets/<int:row_id>/update",
+        primary_monthly_targets.primary_month_targets_update,
+        name="platform-primary-month-targets-update",
+    ),
     path(
         "<slug:slug>/month-targets",
         monthly_targets.month_targets_list,
