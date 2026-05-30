@@ -1186,16 +1186,23 @@ class AppointmentItemsView(APIView):
                 ),
                 committed AS (
                     -- Quantity already committed to non-rejected shipments per
-                    -- PO+ASIN. The remainder (accepted - committed) is what's
+                    -- (ASIN, PO, FC). The remainder (accepted - committed) is what's
                     -- still shippable, so a partially-shipped line reappears with
-                    -- its leftover. Rejected shipments release their qty.
-                    SELECT si.asin, UPPER(TRIM(si.po_number)) AS po_number,
+                    -- its leftover. FC is included in the key so commitments at
+                    -- one FC never leak into another FC's availability calculation
+                    -- (defence-in-depth for any data glitch that ever puts the
+                    -- same PO at more than one FC).
+                    SELECT si.asin,
+                           UPPER(TRIM(si.po_number)) AS po_number,
+                           UPPER(TRIM(COALESCE(si.destination_fc, ''))) AS fc_key,
                            SUM(COALESCE(si.planned_qty, 0)) AS committed_qty
                     FROM sp_items si
                     JOIN sp_shipments s ON s.id = si.shipment_id
                     WHERE si.not_loaded = FALSE
                       AND s.status != 'rejected'
-                    GROUP BY si.asin, UPPER(TRIM(si.po_number))
+                    GROUP BY si.asin,
+                             UPPER(TRIM(si.po_number)),
+                             UPPER(TRIM(COALESCE(si.destination_fc, '')))
                 ),
                 doh_data AS (
                     -- placeholder; DOH joined in Python via _live_doh_by_asin() below
@@ -1234,6 +1241,7 @@ class AppointmentItemsView(APIView):
                 LEFT JOIN committed c
                     ON c.asin = p.asin
                     AND c.po_number = UPPER(TRIM(p.po_number))
+                    AND c.fc_key = UPPER(TRIM(COALESCE(p.fulfillment_center, '')))
                 WHERE p.status = 'Confirmed'
                   AND p.availability_status = 'AC - Accepted: In stock'
                   AND p.accepted_qty > 0
@@ -1805,19 +1813,22 @@ def _check_qty_conflicts(shipment):
     loaded_items = shipment.items.filter(not_loaded=False)
     for item in loaded_items:
         with connection.cursor() as cur:
-            # Qty committed to OTHER non-rejected shipments for this PO+ASIN.
+            # Qty committed to OTHER non-rejected shipments for this (ASIN, PO, FC).
             # Any non-rejected shipment reserves its planned_qty, so the leftover
             # available to this shipment is (PO original) - (others' committed).
+            # FC is part of the key so a commitment at one FC never reduces another
+            # FC's availability (matches the FC-specific ceiling read below).
             cur.execute("""
                 SELECT s.id, si.planned_qty
                 FROM sp_items si
                 JOIN sp_shipments s ON s.id = si.shipment_id
                 WHERE si.asin = %s
                   AND UPPER(TRIM(si.po_number)) = UPPER(TRIM(%s))
+                  AND UPPER(TRIM(COALESCE(si.destination_fc, ''))) = UPPER(TRIM(COALESCE(%s, '')))
                   AND s.status != 'rejected'
                   AND s.id != %s
                   AND si.not_loaded = FALSE
-            """, [item.asin, item.po_number, shipment.id])
+            """, [item.asin, item.po_number, item.destination_fc or '', shipment.id])
             locked = cur.fetchall()
             # The item's stored accepted_qty may itself be a leftover remainder
             # (it's set to "orderable at creation"), so read the PO's original
@@ -2292,15 +2303,20 @@ class DOHAutoFillView(APIView):
         with connection.cursor() as cur:
             cur.execute(f"""
                 WITH committed AS (
-                    -- Quantity already committed to non-rejected shipments per
-                    -- PO+ASIN; the leftover (accepted - committed) stays shippable.
-                    SELECT si.asin, UPPER(TRIM(si.po_number)) AS po_number,
+                    -- Quantity already committed per (ASIN, PO, FC); the leftover
+                    -- (accepted - committed) stays shippable. FC is in the key so
+                    -- a commitment at one FC never reduces another FC's availability.
+                    SELECT si.asin,
+                           UPPER(TRIM(si.po_number)) AS po_number,
+                           UPPER(TRIM(COALESCE(si.destination_fc, ''))) AS fc_key,
                            SUM(COALESCE(si.planned_qty, 0)) AS committed_qty
                     FROM sp_items si
                     JOIN sp_shipments s ON s.id = si.shipment_id
                     WHERE si.not_loaded = FALSE
                       AND s.status != 'rejected'
-                    GROUP BY si.asin, UPPER(TRIM(si.po_number))
+                    GROUP BY si.asin,
+                             UPPER(TRIM(si.po_number)),
+                             UPPER(TRIM(COALESCE(si.destination_fc, '')))
                 )
                 SELECT
                     p.po_number, p.asin,
@@ -2318,7 +2334,9 @@ class DOHAutoFillView(APIView):
                     p.availability_status, p.po_status, p.status
                 FROM reporting."Amazon PO" p
                 LEFT JOIN committed c
-                    ON c.asin = p.asin AND c.po_number = UPPER(TRIM(p.po_number))
+                    ON c.asin = p.asin
+                    AND c.po_number = UPPER(TRIM(p.po_number))
+                    AND c.fc_key = UPPER(TRIM(COALESCE(p.fulfillment_center, '')))
                 WHERE {po_where_sql} AND (p.accepted_qty - COALESCE(c.committed_qty, 0)) > 0
             """, po_params)
             po_raw = _row_to_dict(cur, cur.fetchall())
@@ -2550,7 +2568,8 @@ class PoShipmentLookupView(APIView):
             .exclude(shipment__status=Shipment.Status.REJECTED)
             .select_related('shipment', 'shipment__created_by')
             .only(
-                'asin', 'po_number', 'planned_qty', 'planned_liters', 'accepted_qty',
+                'asin', 'po_number', 'destination_fc',
+                'planned_qty', 'planned_liters', 'accepted_qty',
                 'product_name', 'internal_sku',
                 'shipment__id', 'shipment__status', 'shipment__appointment_id',
                 'shipment__destination_fc', 'shipment__truck_size',
@@ -2560,16 +2579,19 @@ class PoShipmentLookupView(APIView):
             )
         )
 
-        # Per key: the list of shipments holding the line + the total committed
-        # qty (sum of planned_qty across non-rejected shipments). The UI nets this
-        # against the PO's original accepted_qty to offer the leftover for re-pick.
+        # Per (ASIN, PO, FC) key: the list of shipments holding the line + total
+        # committed qty (sum of planned_qty across non-rejected shipments). FC is
+        # part of the key so commitments at one FC never net against another FC's
+        # availability. The UI keys lookups the same way (see CreateShipment.jsx
+        # loadData / getBlockReason).
         result = {}
         for it in items:
             asin = (it.asin or '').strip()
             po = (it.po_number or '').strip()
             if not asin or not po:
                 continue
-            key = f"{asin}__{po}"
+            fc_key = (it.destination_fc or '').strip().upper()
+            key = f"{asin}__{po}__{fc_key}"
             s = it.shipment
             entry = {
                 'shipment_id': s.id,
@@ -2615,8 +2637,11 @@ class PoShortSupplyView(APIView):
         with connection.cursor() as cur:
             cur.execute("""
                 WITH committed AS (
+                    -- Group by (ASIN, PO, FC) so short qty is computed per-FC and
+                    -- a commitment at one FC never appears as short at another FC.
                     SELECT si.asin,
                            UPPER(TRIM(si.po_number)) AS po_up,
+                           UPPER(TRIM(COALESCE(si.destination_fc, ''))) AS fc_key,
                            MAX(si.po_number)        AS po_number,
                            MAX(si.destination_fc)   AS destination_fc,
                            MAX(si.product_name)     AS product_name,
@@ -2626,7 +2651,9 @@ class PoShortSupplyView(APIView):
                     JOIN sp_shipments s ON s.id = si.shipment_id
                     WHERE si.not_loaded = FALSE
                       AND s.status != 'rejected'
-                    GROUP BY si.asin, UPPER(TRIM(si.po_number))
+                    GROUP BY si.asin,
+                             UPPER(TRIM(si.po_number)),
+                             UPPER(TRIM(COALESCE(si.destination_fc, '')))
                 )
                 SELECT c.po_number, c.asin, c.product_name, c.internal_sku,
                        c.destination_fc,
@@ -2639,8 +2666,8 @@ class PoShortSupplyView(APIView):
                     FROM reporting."Amazon PO" p
                     WHERE p.asin = c.asin
                       AND UPPER(TRIM(p.po_number)) = c.po_up
-                    ORDER BY (p.fulfillment_center = c.destination_fc) DESC,
-                             p.accepted_qty DESC NULLS LAST
+                      AND UPPER(TRIM(COALESCE(p.fulfillment_center, ''))) = c.fc_key
+                    ORDER BY p.accepted_qty DESC NULLS LAST
                     LIMIT 1
                 ) po ON TRUE
                 WHERE c.committed_qty > 0

@@ -45,6 +45,11 @@ UPLOAD_DIR = Path(settings.BASE_DIR) / "uploaded_files" / "amazon"
 logger = logging.getLogger(__name__)
 SYNC_BUSINESS_WARNING_ROW_LIMIT = 1000
 ASYNC_UPLOAD_ROW_THRESHOLD = 5000
+# XLSX uploads can't be cheaply row-counted up front, but a large xlsx is the
+# main cause of gunicorn worker-timeout 500s on Amazon PO uploads. Route any
+# xlsx above this byte size to the background thread (status "queued") so the
+# heavy upsert into reporting."Amazon PO" doesn't run inside the request worker.
+ASYNC_UPLOAD_XLSX_BYTE_THRESHOLD = 500 * 1024  # ~500 KB
 ACTIVE_DUPLICATE_STATUSES = (
     "completed",
     "partially_successful",
@@ -1818,10 +1823,21 @@ def _estimate_csv_row_count(content: bytes) -> int | None:
 
 def _should_queue_upload(*, config: ReportConfig, content: bytes, extension: str) -> tuple[bool, int | None]:
     estimated_rows = _estimate_csv_row_count(content) if extension == ".csv" else None
+    # Queue when:
+    #  - csv has enough rows to risk a worker timeout, OR
+    #  - xlsx is large enough that the openpyxl parse + upsert won't finish in
+    #    the gunicorn worker window. Rows can't be cheaply counted up front for
+    #    xlsx, so use byte size as the proxy.
+    queue_by_rows = (
+        estimated_rows is not None
+        and estimated_rows >= ASYNC_UPLOAD_ROW_THRESHOLD
+    )
+    queue_by_size = (
+        extension == ".xlsx"
+        and len(content) >= ASYNC_UPLOAD_XLSX_BYTE_THRESHOLD
+    )
     return (
-        config.report_type == "AMAZON_PO"
-        and estimated_rows is not None
-        and estimated_rows >= ASYNC_UPLOAD_ROW_THRESHOLD,
+        config.report_type == "AMAZON_PO" and (queue_by_rows or queue_by_size),
         estimated_rows,
     )
 
