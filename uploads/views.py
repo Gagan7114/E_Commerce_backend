@@ -19,6 +19,7 @@ from difflib import SequenceMatcher
 import logging
 import re
 
+from django.core.cache import cache
 from django.db import connection, transaction
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.response import Response
@@ -125,6 +126,8 @@ PRIMARY_UPLOAD_AUTHORITATIVE_COLUMNS = [
     "remark",
 ]
 
+PRIMARY_GRN_COMPLETED_STATUS = "Fulfilled"
+
 PRIMARY_UPLOAD_TABLES = {
     "total_po",
     "total_po_zbs",
@@ -155,6 +158,13 @@ INVENTORY_DOH_UPLOAD_PLATFORMS = {
     "amazon_sec_range": "amazon",
 }
 
+
+def _clear_upload_dependent_cache() -> None:
+    """Uploads change dashboard source tables, so cached dashboard payloads are stale."""
+    try:
+        cache.clear()
+    except Exception:  # noqa: BLE001 - cache invalidation should not fail uploads
+        logger.exception("Failed to clear cache after upload write")
 
 
 def _quote_ident(name: str) -> str:
@@ -632,6 +642,8 @@ def master_sheet_bulk_upsert(request):
         format_sku_codes=[r.get("format_sku_code") for r in touched],
         items=[r.get("item") for r in touched],
     )
+    if summary["inserted"] or summary["updated"]:
+        _clear_upload_dependent_cache()
 
     return Response({
         "ok": True,
@@ -672,6 +684,7 @@ def master_sheet_create(request):
         format_sku_codes=[created.get("format_sku_code")],
         items=[created.get("item")],
     )
+    _clear_upload_dependent_cache()
 
     return Response({"ok": True, "row": created})
 
@@ -711,6 +724,7 @@ def master_sheet_update(request):
         format_sku_codes=[saved.get("format_sku_code")],
         items=[saved.get("item")],
     )
+    _clear_upload_dependent_cache()
 
     return Response({"ok": True, "row": saved})
 
@@ -733,6 +747,7 @@ def master_sheet_delete(request):
         deleted = cur.fetchone()
         if not deleted:
             return Response({"detail": "Row was not found. Please search again."}, status=404)
+    _clear_upload_dependent_cache()
 
     return Response({
         "ok": True,
@@ -884,6 +899,7 @@ def ads_master_create(request):
         cols = [c[0] for c in cur.description]
         created = dict(zip(cols, cur.fetchone()))
 
+    _clear_upload_dependent_cache()
     return Response({"ok": True, "row": created})
 
 
@@ -932,6 +948,7 @@ def ads_master_update(request):
             return Response({"detail": "Row was not found. Please search again."}, status=404)
         cols = [c[0] for c in cur.description]
 
+    _clear_upload_dependent_cache()
     return Response({"ok": True, "row": dict(zip(cols, updated_row))})
 
 
@@ -954,6 +971,7 @@ def ads_master_delete(request):
         if not deleted:
             return Response({"detail": "Row was not found. Please search again."}, status=404)
 
+    _clear_upload_dependent_cache()
     return Response({
         "ok": True,
         "deleted": {
@@ -1213,6 +1231,9 @@ def ads_master_bulk_upsert(request):
                 "row": saved_row,
             })
 
+    if summary["inserted"] or summary["updated"]:
+        _clear_upload_dependent_cache()
+
     return Response({
         "ok": True,
         "columns": ADS_MASTER_COLUMNS,
@@ -1287,6 +1308,9 @@ def delete_upload_rows_by_date(request):
                 [start_date, end_date],
             )
             deleted = cur.rowcount
+
+    if deleted:
+        _clear_upload_dependent_cache()
 
     return Response({
         "ok": True,
@@ -1507,12 +1531,10 @@ def _execute_batch_insert_rows(
 def _update_total_po_grn_dates(data: list[dict], target_table: str = "total_po") -> Response:
     """Update existing PO rows in a primary PO table from a lean GRN upload.
 
-    The GRN sheet supplies po_number and grn_date. When it also supplies
-    sku_code, updates target that exact PO + SKU row and uploaded values win for
-    any primary fields included in the payload. PO-only GRN sheets keep their
-    existing PO-level date update; delivered_qty is not applied without SKU so a
-    single PO-level GRN row cannot overwrite every SKU line with one qty. No new
-    rows are inserted from GRN files.
+    The GRN sheet supplies po_number and grn_date. A GRN means the PO has moved
+    out of the open bucket, so status/grn_date are applied to every matching PO
+    row. When a SKU is present, SKU-specific values such as delivered_qty are
+    applied only to that PO + SKU row. No new rows are inserted from GRN files.
     """
     if target_table not in {"total_po", "total_po_zbs"}:
         return Response(
@@ -1557,24 +1579,65 @@ def _update_total_po_grn_dates(data: list[dict], target_table: str = "total_po")
                     po_number = str(row.get("po_number") or "").strip()
                     sku_code = str(row.get("sku_code") or "").strip()
                     has_sku = bool(sku_code)
+                    row_for_update = dict(row)
+                    if (
+                        "status" in table_columns
+                        and "grn_date" in row_for_update
+                        and not str(row_for_update.get("status") or "").strip()
+                    ):
+                        row_for_update["status"] = PRIMARY_GRN_COMPLETED_STATUS
+
+                    format_value = str(row_for_update.get("format") or "").strip()
+                    po_where = "LOWER(TRIM(t.po_number::text)) = %s"
+                    po_where_values = [po_number.lower()]
+                    if format_value and "format" in table_columns:
+                        po_where += " AND UPPER(TRIM(t.format::text)) = UPPER(TRIM(%s))"
+                        po_where_values.append(format_value)
+
+                    po_update_columns = [
+                        column
+                        for column in ("grn_date", "status")
+                        if column in table_columns and column in row_for_update
+                    ]
+                    row_updated = 0
+                    if po_update_columns:
+                        assignments = ", ".join(
+                            f"{_quote_ident(column)} = %s"
+                            for column in po_update_columns
+                        )
+                        values = _upload_row_values(row_for_update, po_update_columns, column_types)
+                        cur.execute(
+                            f"UPDATE {quoted_target_table} AS t SET {assignments} WHERE {po_where}",
+                            [*values, *po_where_values],
+                        )
+                        row_updated += cur.rowcount or 0
+
                     update_columns = [
                         column
                         for column in allowed_update_columns
-                        if column in row and (has_sku or column in {"grn_date", "format", "remark"})
+                        if (
+                            column in row_for_update
+                            and column not in {"grn_date", "status"}
+                            and (has_sku or column in {"format", "remark"})
+                        )
                     ]
                     if not has_sku and "delivered_qty" in update_columns:
                         update_columns.remove("delivered_qty")
                     if not update_columns:
-                        skipped += 1
+                        if row_updated:
+                            updated += row_updated
+                            success += 1
+                        else:
+                            skipped += 1
                         continue
 
                     assignments = ", ".join(
                         f"{_quote_ident(column)} = %s"
                         for column in update_columns
                     )
-                    values = _upload_row_values(row, update_columns, column_types)
-                    where = "LOWER(TRIM(t.po_number::text)) = %s"
-                    where_values = [po_number.lower()]
+                    values = _upload_row_values(row_for_update, update_columns, column_types)
+                    where = po_where
+                    where_values = list(po_where_values)
                     if has_sku:
                         where += " AND LOWER(TRIM(t.sku_code::text)) = %s"
                         where_values.append(sku_code.lower())
@@ -1584,14 +1647,17 @@ def _update_total_po_grn_dates(data: list[dict], target_table: str = "total_po")
                         [*values, *where_values],
                     )
                     rowcount = cur.rowcount or 0
-                    if rowcount:
-                        updated += rowcount
+                    row_updated += rowcount
+                    if row_updated:
+                        updated += row_updated
                         success += 1
         except Exception as exc:
             failed = len(prepared)
             last_error = str(exc)
 
     skipped += max(0, len(prepared) - success)
+    if updated:
+        _clear_upload_dependent_cache()
 
     return Response(
         {
@@ -1839,6 +1905,9 @@ def _batch_upload(body, *, forced_table: str | None = None):
             )
         except Exception as exc:
             notification_result = {"error": str(exc)}
+
+    if success:
+        _clear_upload_dependent_cache()
 
     return Response({
         "success": success,
@@ -2310,6 +2379,9 @@ def fk_grocery_master_upload(request):
 
             cur.executemany(sql, rows)
 
+        if rows:
+            _clear_upload_dependent_cache()
+
         return Response(
             {
                 "success": len(rows),
@@ -2414,6 +2486,9 @@ def fk_grocery_master_reprocess(request):
                 period_params,
             )
             missing_rate_skus = sorted(r[0] for r in cur.fetchall())
+
+        if master_updated or price_updated:
+            _clear_upload_dependent_cache()
 
         return Response({
             "master_updated": master_updated,
