@@ -5,6 +5,7 @@ urlpatterns = [
     path('appointments/dates/', views.AppointmentDatesView.as_view(), name='appointment-dates'),
     path('appointments/', views.AppointmentListView.as_view(), name='appointment-list'),
     path('appointments/<str:appointment_id>/items/', views.AppointmentItemsView.as_view(), name='appointment-items'),
+    path('appointments/<str:appointment_id>/extra-pos/', views.AppointmentExtraPosView.as_view(), name='appointment-extra-pos'),
     path('po-items/', views.POListView.as_view(), name='po-items'),
     path('asin-catalog/', views.AsinCatalogView.as_view(), name='asin-catalog'),
     path('all-appointments/', views.AllAppointmentsView.as_view(), name='all-appointments'),

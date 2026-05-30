@@ -781,12 +781,18 @@ class AppointmentListView(APIView):
         with connection.cursor() as cur:
             cur.execute("""
                 WITH appt_dedup AS (
-                    SELECT DISTINCT ON (a.appointment_id)
-                        a.appointment_id, a.status, a.appointment_time,
-                        a.destination_fc, a.pro, a.pos
+                    -- Ingest stores one row per (appointment_id, PO). Aggregate
+                    -- to one row per appointment_id, stitching POs into a single
+                    -- comma list so the LATERAL split below sees the full PO set.
+                    SELECT a.appointment_id,
+                           MAX(a.status)           AS status,
+                           MAX(a.appointment_time) AS appointment_time,
+                           MAX(a.destination_fc)   AS destination_fc,
+                           MAX(a.pro)              AS pro,
+                           STRING_AGG(DISTINCT NULLIF(TRIM(COALESCE(a.pos,'')),''), ',') AS pos
                     FROM reporting."appointment" a
                     WHERE DATE(a.appointment_time) = %s
-                    ORDER BY a.appointment_id, a.appointment_time DESC NULLS LAST
+                    GROUP BY a.appointment_id
                 ),
                 appt_po_pairs AS (
                     SELECT
@@ -854,6 +860,7 @@ class AppointmentListView(APIView):
                     ad.appointment_time,
                     ad.destination_fc,
                     ad.pro,
+                    ad.pos,
                     COALESCE(ac.total_po,        0) AS po_count,
                     COALESCE(ac.eligible_po,     0) AS eligible_po_count,
                     COALESCE(ac.no_fc_match_po,  0) AS no_fc_match_count,
@@ -874,23 +881,57 @@ class AppointmentListView(APIView):
         with connection.cursor() as cur:
             cur.execute("""
                 WITH appt_dedup AS (
-                    SELECT DISTINCT ON (a.appointment_id)
-                        a.appointment_id, a.appointment_time,
-                        a.destination_fc, a.pos
+                    -- Aggregate per-PO rows into one row per appointment_id,
+                    -- stitching POs so the LATERAL split sees the full set.
+                    SELECT a.appointment_id,
+                           MAX(a.appointment_time) AS appointment_time,
+                           MAX(a.destination_fc)   AS destination_fc,
+                           STRING_AGG(DISTINCT NULLIF(TRIM(COALESCE(a.pos,'')),''), ',') AS pos
                     FROM reporting."appointment" a
                     WHERE DATE(a.appointment_time) = %s
-                    ORDER BY a.appointment_id, a.appointment_time DESC NULLS LAST
+                    GROUP BY a.appointment_id
                 ),
                 appt_po_pairs AS (
                     SELECT
                         ad.appointment_id,
                         ad.destination_fc,
-                        UPPER(TRIM(pv)) AS po_upper
+                        UPPER(TRIM(pv)) AS po_upper,
+                        TRUE AS in_appointment
                     FROM appt_dedup ad,
                     LATERAL unnest(
                         regexp_split_to_array(COALESCE(ad.pos, ''), '\s*[,;]\s*')
                     ) AS pv
                     WHERE NULLIF(TRIM(pv), '') IS NOT NULL
+                ),
+                appt_po_set AS (
+                    -- Set of POs already in the appointment, per appointment.
+                    SELECT DISTINCT appointment_id, po_upper FROM appt_po_pairs
+                ),
+                extra_po_pairs AS (
+                    -- Same-FC PENDING + in-stock POs that AREN'T on the appointment;
+                    -- these become the "EXTRA" pool a planner can swap/add.
+                    SELECT
+                        ad.appointment_id,
+                        ad.destination_fc,
+                        UPPER(TRIM(p.po_number)) AS po_upper,
+                        FALSE AS in_appointment
+                    FROM appt_dedup ad
+                    JOIN reporting."Amazon PO" p
+                        ON p.fulfillment_center = ad.destination_fc
+                       AND p.status = 'Confirmed'
+                       AND p.po_status = 'PENDING'
+                       AND p.availability_status = 'AC - Accepted: In stock'
+                       AND COALESCE(p.accepted_qty, 0) > 0
+                    LEFT JOIN appt_po_set s
+                        ON s.appointment_id = ad.appointment_id
+                       AND s.po_upper = UPPER(TRIM(p.po_number))
+                    WHERE s.po_upper IS NULL
+                    GROUP BY ad.appointment_id, ad.destination_fc, UPPER(TRIM(p.po_number))
+                ),
+                all_po_pairs AS (
+                    SELECT * FROM appt_po_pairs
+                    UNION ALL
+                    SELECT * FROM extra_po_pairs
                 ),
                 latest_inv AS (
                     SELECT
@@ -915,6 +956,7 @@ class AppointmentListView(APIView):
                 SELECT
                     app.appointment_id,
                     app.destination_fc      AS expected_fc,
+                    app.in_appointment,
                     p.po_number,
                     p.asin,
                     p.sku_name             AS product_name,
@@ -943,7 +985,7 @@ class AppointmentListView(APIView):
                         AND COALESCE(p.accepted_qty, 0) > 0
                         AND lk.po_upper IS NULL
                     ) AS is_eligible
-                FROM appt_po_pairs app
+                FROM all_po_pairs app
                 LEFT JOIN reporting."Amazon PO" p
                     ON UPPER(TRIM(p.po_number)) = app.po_upper
                 LEFT JOIN latest_inv li
@@ -952,7 +994,7 @@ class AppointmentListView(APIView):
                     ON lk.po_upper   = app.po_upper
                    AND lk.asin_upper = UPPER(TRIM(COALESCE(p.asin::text, '')))
                 WHERE p.po_number IS NOT NULL
-                ORDER BY app.appointment_id, p.po_number, p.asin
+                ORDER BY app.appointment_id, app.in_appointment DESC, p.po_number, p.asin
             """, [date_str])
             detail_rows = _row_to_dict(cur, cur.fetchall())
 
@@ -981,11 +1023,13 @@ class AppointmentListView(APIView):
         with connection.cursor() as cur:
             cur.execute("""
                 WITH appt_dedup AS (
-                    SELECT DISTINCT ON (a.appointment_id)
-                        a.appointment_id, a.pos
+                    -- Aggregate per-PO rows into one row per appointment_id so
+                    -- the LATERAL split below sees the full PO list.
+                    SELECT a.appointment_id,
+                           STRING_AGG(DISTINCT NULLIF(TRIM(COALESCE(a.pos,'')),''), ',') AS pos
                     FROM reporting."appointment" a
                     WHERE DATE(a.appointment_time) = %s
-                    ORDER BY a.appointment_id, a.appointment_time DESC NULLS LAST
+                    GROUP BY a.appointment_id
                 ),
                 appt_po_pairs AS (
                     SELECT ad.appointment_id, UPPER(TRIM(pv)) AS po_upper
@@ -1112,6 +1156,16 @@ class AppointmentItemsView(APIView):
         ]
         all_appt_ids = [appointment_id] + extra_ids
 
+        # Optional explicit PO selection: when provided, the candidate pool is
+        # built from this list (still scoped to the appointment's FC, still
+        # PENDING+in-stock) instead of the appointment's own PO list. Lets the
+        # planner add same-FC extras, drop appointment POs, or completely replace.
+        selected_pos_raw = request.query_params.get('selected_pos') or ''
+        selected_pos = [
+            x.strip().upper() for x in selected_pos_raw.split(',')
+            if x.strip()
+        ]
+
         with connection.cursor() as cur:
             cur.execute("""
                 SELECT DISTINCT ON (appointment_id)
@@ -1171,9 +1225,41 @@ class AppointmentItemsView(APIView):
 
         all_appts = [appts_by_id[a] for a in all_appt_ids if a in appts_by_id]
 
+        # Build the appointment's own PO set in Python so we can both override
+        # the candidate pool with selected_pos AND know which candidates were
+        # "from the appointment" vs "extras" for downstream tagging.
+        with connection.cursor() as cur:
+            cur.execute("""
+                SELECT DISTINCT UPPER(TRIM(pv)) AS po_number
+                FROM reporting."appointment" a,
+                LATERAL unnest(
+                    regexp_split_to_array(COALESCE(a.pos, ''), '\s*[,;]\s*')
+                ) AS pv
+                WHERE a.appointment_id = ANY(%s::text[])
+                  AND NULLIF(TRIM(pv), '') IS NOT NULL
+            """, [all_appt_ids])
+            appt_pos_set = {r[0] for r in cur.fetchall() if r[0]}
+
+        # Final candidate-PO list: caller's explicit selection (if any) else the
+        # appointment's own POs.
+        candidate_pos = selected_pos if selected_pos else sorted(appt_pos_set)
+
         with connection.cursor() as cur:
             cur.execute("""
                 WITH appt_pos AS (
+                    -- Candidate PO pool. When the caller passed selected_pos the
+                    -- list is the explicit selection; otherwise it's the union of
+                    -- all selected appointments' POs (mapping back to which
+                    -- appointment each PO came from is done via appt_po_map).
+                    SELECT DISTINCT UPPER(TRIM(po_number)) AS po_number,
+                           %s AS appointment_id  -- default: primary appt as source
+                    FROM unnest(%s::text[]) AS po_number
+                    WHERE NULLIF(TRIM(po_number), '') IS NOT NULL
+                ),
+                appt_po_map AS (
+                    -- For multi-appointment combine without selected_pos, map each
+                    -- PO back to the appointment it originally came from so the
+                    -- source_appointment_id below is per-appointment, not primary.
                     SELECT DISTINCT
                         UPPER(TRIM(pv)) AS po_number,
                         a.appointment_id
@@ -1233,11 +1319,19 @@ class AppointmentItemsView(APIView):
                     p.status,
                     p.fulfillment_center,
                     p.fulfillment_center  AS destination_fc,
-                    ap.appointment_id     AS source_appointment_id
+                    -- Source appointment: real per-PO mapping when the PO is on
+                    -- one of the selected appointments; primary appointment when
+                    -- it's a planner-added extra (not on any selected appt).
+                    COALESCE(m.appointment_id, ap.appointment_id) AS source_appointment_id,
+                    -- Tag the row so the UI can render "IN APPT" vs "EXTRA" chips
+                    -- on the loaded items without re-querying.
+                    (m.appointment_id IS NOT NULL)                 AS is_appointment_po
                 FROM appt_pos ap
                 JOIN reporting."Amazon PO" p
                     ON UPPER(TRIM(p.po_number)) = ap.po_number
                     AND p.fulfillment_center = %s
+                LEFT JOIN appt_po_map m
+                    ON m.po_number = ap.po_number
                 LEFT JOIN committed c
                     ON c.asin = p.asin
                     AND c.po_number = UPPER(TRIM(p.po_number))
@@ -1247,7 +1341,7 @@ class AppointmentItemsView(APIView):
                   AND p.accepted_qty > 0
                   AND p.po_status = 'PENDING'
                   AND (p.accepted_qty - COALESCE(c.committed_qty, 0)) > 0
-            """, [all_appt_ids, primary_fc_value])
+            """, [appointment_id, candidate_pos, all_appt_ids, primary_fc_value])
             raw = _row_to_dict(cur, cur.fetchall())
 
         # Attach LIVE DOH/DRR/SOH (matches SOH/DOH dashboard exactly)
@@ -1400,6 +1494,81 @@ class AppointmentItemsView(APIView):
                 'load_percentage': load_pct,
             },
             'truck_suggestion': truck_suggestion,
+        })
+
+
+class AppointmentExtraPosView(APIView):
+    """
+    Lists same-FC PENDING + in-stock POs that AREN'T on the appointment(s).
+    Powers the PO picker that lets a planner add "extra" POs alongside (or in
+    place of) the appointment's own PO list. Same shape as the appointment
+    items, minus DOH (the planner doesn't need it for the picker view).
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, appointment_id):
+        extra_ids_raw = request.query_params.get('appointment_ids') or ''
+        extra_ids = [
+            x.strip() for x in extra_ids_raw.split(',')
+            if x.strip() and x.strip() != appointment_id
+        ]
+        all_appt_ids = [appointment_id] + extra_ids
+
+        with connection.cursor() as cur:
+            cur.execute("""
+                SELECT DISTINCT ON (appointment_id)
+                    appointment_id, status, destination_fc, pos
+                FROM reporting."appointment"
+                WHERE appointment_id = ANY(%s::text[])
+                ORDER BY appointment_id, appointment_time DESC NULLS LAST
+            """, [all_appt_ids])
+            appt_rows = cur.fetchall()
+
+        if not appt_rows:
+            return Response({'error': 'Appointment not found'}, status=404)
+
+        fcs = {r[2] for r in appt_rows if r[2]}
+        if len(fcs) > 1:
+            return Response({'error': 'Combined appointments must share an FC'}, status=400)
+        fc = next(iter(fcs), None)
+        if not fc:
+            return Response({'extra_pos': [], 'count': 0, 'fc': None})
+
+        # Collect the appointments' own POs to exclude from the "extra" list.
+        own_pos = set()
+        for _, _, _, pos_str in appt_rows:
+            for p in (pos_str or '').replace(';', ',').split(','):
+                p = p.strip().upper()
+                if p:
+                    own_pos.add(p)
+
+        with connection.cursor() as cur:
+            cur.execute("""
+                SELECT
+                    p.po_number,
+                    MAX(p.sku_name) AS product_name,
+                    COUNT(DISTINCT p.asin) AS sku_count,
+                    SUM(COALESCE(p.accepted_qty, 0))::bigint AS total_accepted_qty,
+                    ROUND(SUM(COALESCE(p.accepted_qty, 0) * COALESCE(p.per_liter, 0))::numeric, 2) AS total_liters,
+                    MIN(p.days_to_expiry) AS earliest_days_to_expiry,
+                    MAX(p.order_date)     AS order_date,
+                    MAX(p.item_head)      AS item_head
+                FROM reporting."Amazon PO" p
+                WHERE p.fulfillment_center = %s
+                  AND p.status = 'Confirmed'
+                  AND p.po_status = 'PENDING'
+                  AND p.availability_status = 'AC - Accepted: In stock'
+                  AND COALESCE(p.accepted_qty, 0) > 0
+                  AND NOT (UPPER(TRIM(p.po_number)) = ANY(%s::text[]))
+                GROUP BY p.po_number
+                ORDER BY MIN(p.days_to_expiry) NULLS LAST, p.po_number
+            """, [fc, sorted(own_pos)])
+            raw = _row_to_dict(cur, cur.fetchall())
+
+        return Response({
+            'fc': fc,
+            'count': len(raw),
+            'extra_pos': [_serialize_row(r) for r in raw],
         })
 
 
@@ -2040,32 +2209,28 @@ class AllAppointmentsView(APIView):
             """, params)
             total = cur.fetchone()[0]
 
+            # The ingest stores one row per (appointment_id, PO). Aggregate
+            # back to one row per appointment_id by stitching the POs with
+            # STRING_AGG, so the View page shows the full PO list per row.
             cur.execute(f"""
-                SELECT * FROM (
-                    SELECT DISTINCT ON (appointment_id)
-                        appointment_id, status, appointment_time,
-                        creation_date, destination_fc, pro,
-                        array_to_string(
-                            ARRAY(
-                                SELECT DISTINCT NULLIF(TRIM(pv),'')
-                                FROM unnest(regexp_split_to_array(
-                                    COALESCE(pos,''), '\s*[,;]\s*'
-                                )) pv
-                                WHERE NULLIF(TRIM(pv),'') IS NOT NULL
-                            ), ', '
-                        ) AS pos,
-                        (
-                            SELECT COUNT(DISTINCT NULLIF(TRIM(pv),''))
-                            FROM unnest(regexp_split_to_array(COALESCE(pos,''),'\s*[,;]\s*')) pv
-                            WHERE NULLIF(TRIM(pv),'') IS NOT NULL
-                        ) AS po_count
-                    FROM reporting."appointment"
-                    WHERE {where_sql}
-                    ORDER BY appointment_id, appointment_time DESC NULLS LAST
-                ) deduped
-                ORDER BY appointment_time DESC NULLS LAST
+                SELECT appointment_id,
+                       MAX(status)            AS status,
+                       MAX(appointment_time)  AS appointment_time,
+                       MAX(creation_date)     AS creation_date,
+                       MAX(destination_fc)    AS destination_fc,
+                       MAX(pro)               AS pro,
+                       STRING_AGG(
+                           DISTINCT NULLIF(TRIM(COALESCE(pos,'')),''),
+                           ', '
+                           ORDER BY NULLIF(TRIM(COALESCE(pos,'')),'')
+                       ) AS pos,
+                       COUNT(DISTINCT NULLIF(TRIM(COALESCE(pos,'')),'')) AS po_count
+                FROM reporting."appointment"
+                WHERE {where_sql}
+                GROUP BY appointment_id
+                ORDER BY MAX(appointment_time) DESC NULLS LAST
                 LIMIT %s OFFSET %s
-            """, params + params + [page_size, offset])
+            """, params + [page_size, offset])
             rows = _row_to_dict(cur, cur.fetchall())
 
         return Response({

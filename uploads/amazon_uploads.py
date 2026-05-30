@@ -1066,10 +1066,16 @@ def _transform_appointment(cur, upload_id: int) -> tuple[int, int]:
     cur.execute(
         """
         WITH src AS (
+            -- Skip Vendor Central's placeholder appointment_ids (they all end in
+            -- "000000" — a base/dummy ID Amazon emits alongside the real ID for
+            -- the same physical dock slot). Storing both creates phantom rows in
+            -- the planner's appointment list, so we drop the placeholder at
+            -- ingest and only keep the real Amazon-assigned ID.
             SELECT *
               FROM staging."appointment data"
              WHERE upload_id = %s
                AND NULLIF(TRIM(appointment_id), '') IS NOT NULL
+               AND TRIM(appointment_id) !~ '000000$'
         ),
         expanded AS (
             SELECT md5(concat_ws('|',
