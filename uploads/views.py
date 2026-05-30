@@ -132,6 +132,16 @@ PRIMARY_UPLOAD_TABLES = {
     "total_po_zbs_grn_update",
 }
 
+UPLOAD_DATE_DELETE_TABLES = {
+    "amazon_ads": "date",
+    "blinkit_ads": "date",
+    "swiggy_ads": "date",
+    "zepto_ads": "date",
+    "bigbasket_ads": "date",
+    "flipkart_ads": "date",
+    "amazon_coupon": "date",
+}
+
 INVENTORY_DOH_UPLOAD_PLATFORMS = {
     "blinkit_inventory": "blinkit",
     "zepto_inventory": "zepto",
@@ -1217,6 +1227,77 @@ def batch_upload(request):
     return _batch_upload(request.data or {})
 
 
+def _parse_upload_delete_date(value):
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return date.fromisoformat(text)
+    except ValueError:
+        pass
+    match = re.match(r"^(\d{1,2})[-/](\d{1,2})[-/](\d{4})$", text)
+    if match:
+        day, month, year = match.groups()
+        try:
+            return date(int(year), int(month), int(day))
+        except ValueError:
+            return None
+    return None
+
+
+@api_view(["POST"])
+@permission_classes([require("upload.use")])
+def delete_upload_rows_by_date(request):
+    body = request.data or {}
+    table = str(body.get("table") or "").strip()
+    requested_column = str(body.get("date_column") or "").strip()
+    start_date = _parse_upload_delete_date(
+        body.get("from_date")
+        or body.get("date_from")
+        or body.get("start_date")
+        or body.get("date")
+    )
+    end_date = _parse_upload_delete_date(
+        body.get("to_date")
+        or body.get("date_to")
+        or body.get("end_date")
+        or body.get("date")
+    )
+
+    date_column = UPLOAD_DATE_DELETE_TABLES.get(table)
+    if not date_column:
+        return Response(
+            {"detail": "Date delete is allowed only for Ads and Coupon upload tables."},
+            status=400,
+        )
+    if requested_column and requested_column != date_column:
+        return Response({"detail": "Invalid date column for this upload table."}, status=400)
+    if not start_date or not end_date:
+        return Response({"detail": "Select a valid from date and to date before deleting rows."}, status=400)
+    if start_date > end_date:
+        return Response({"detail": "From date cannot be after to date."}, status=400)
+
+    with transaction.atomic():
+        with connection.cursor() as cur:
+            cur.execute(
+                f"""
+                DELETE FROM {_quote_ident(table)}
+                WHERE {_quote_ident(date_column)} BETWEEN %s AND %s
+                """,
+                [start_date, end_date],
+            )
+            deleted = cur.rowcount
+
+    return Response({
+        "ok": True,
+        "table": table,
+        "date_column": date_column,
+        "from_date": start_date.isoformat(),
+        "to_date": end_date.isoformat(),
+        "deleted": deleted,
+    })
+
+
 def _is_blank(value) -> bool:
     return value is None or (isinstance(value, str) and value.strip() == "")
 
@@ -1270,6 +1351,53 @@ def _validate_primary_upload_format(table: str, data: list[dict], expected_forma
                     f"{expected_format} data. Found another platform format."
                 ),
                 "mismatches": mismatches,
+            },
+            status=400,
+        )
+    return None
+
+
+def _validate_primary_upload_source(
+    table: str,
+    data: list[dict],
+    expected_format: str | None,
+    source_format: str | None,
+):
+    if table not in PRIMARY_UPLOAD_TABLES or not expected_format:
+        return None
+
+    expected_key = _normalize_platform_format(expected_format)
+    if not expected_key:
+        return None
+
+    source_key = _normalize_platform_format(source_format)
+    if source_key and source_key != expected_key:
+        return Response(
+            {
+                "detail": (
+                    f"{expected_format} primary uploader only accepts "
+                    f"{expected_format} data. The upload source was marked as another platform."
+                )
+            },
+            status=400,
+        )
+
+    mismatches = []
+    for index, row in enumerate(data, start=1):
+        actual_key = _normalize_platform_format(row.get("__source_platform"))
+        if actual_key and actual_key != expected_key:
+            mismatches.append(index)
+            if len(mismatches) >= 5:
+                break
+
+    if mismatches:
+        return Response(
+            {
+                "detail": (
+                    f"{expected_format} primary uploader only accepts "
+                    f"{expected_format} data. Found another platform source marker."
+                ),
+                "rows": mismatches,
             },
             status=400,
         )
@@ -1489,6 +1617,7 @@ def _batch_upload(body, *, forced_table: str | None = None):
     unique_key = body.get("unique_key") or ""
     upsert = bool(body.get("upsert", True))
     expected_platform_format = body.get("expected_platform_format")
+    source_platform_format = body.get("source_platform_format")
 
     if table not in UPLOAD_ALLOWED_TABLES:
         return Response(
@@ -1499,6 +1628,15 @@ def _batch_upload(body, *, forced_table: str | None = None):
         return Response({"detail": "Invalid table name."}, status=400)
     if not isinstance(data, list) or not data:
         return Response({"success": 0, "failed": 0, "error": None})
+
+    source_error = _validate_primary_upload_source(
+        table,
+        [row for row in data if isinstance(row, dict)],
+        expected_platform_format,
+        source_platform_format,
+    )
+    if source_error is not None:
+        return source_error
 
     data = [
         {key: value for key, value in row.items() if not str(key).startswith("__")}

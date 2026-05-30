@@ -4,6 +4,7 @@ from . import views
 
 urlpatterns = [
     path("batch", views.batch_upload, name="upload-batch"),
+    path("delete-by-date", views.delete_upload_rows_by_date, name="upload-delete-by-date"),
     path("master-sheet", views.master_sheet_list, name="master-sheet-list"),
     path("master-sheet/add", views.master_sheet_create, name="master-sheet-add"),
     path("master-sheet/preview", views.master_sheet_bulk_preview, name="master-sheet-preview"),
