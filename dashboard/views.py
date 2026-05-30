@@ -728,6 +728,523 @@ def category_breakdown(request):
     return Response(out)
 
 
+# Month name (UPPER) → month number, for normalising the text month columns
+# (master_po.delivery_month, SecMaster.month) back to integers.
+_MONTH_NUM = {calendar.month_name[i].upper(): i for i in range(1, 13)}
+
+
+def _trailing_months(end_month, end_year, n):
+    """(month_num, year, MONTH_NAME) for the n months ending at end (oldest→newest)."""
+    out = []
+    m, y = end_month, end_year
+    for _ in range(n):
+        out.append((m, y, calendar.month_name[m].upper()))
+        m -= 1
+        if m == 0:
+            m, y = 12, y - 1
+    out.reverse()
+    return out
+
+
+def _month_token_to_num(tok):
+    """Accept a numeric month (int/Decimal/'7'/'7.0') or an (UPPER) month name
+    and return its month number, or None."""
+    if tok is None:
+        return None
+    s = str(tok).strip().upper()
+    if not s:
+        return None
+    try:
+        return int(float(s))  # '7', '7.0', Decimal('7') → 7
+    except ValueError:
+        return _MONTH_NUM.get(s)  # 'MAY' → 5
+
+
+# ─── /category-trend ───
+@api_view(["GET"])
+@permission_classes([require("dashboard.view")])
+def category_trend(request):
+    """Premium / Commodity delivered litres over the trailing N months.
+
+    Same source semantics as /category-breakdown (primary = master_po + Amazon
+    PO; secondary = SecMaster + amazon_sec_range), but aggregated to a single
+    {premium, commodity} pair per month so the home "Category Trend" line chart
+    can plot the product mix over time. Honours the platform filter; month/year
+    is the END of the window."""
+    today = date.today()
+    try:
+        end_month = int(request.GET.get("month") or today.month)
+    except (TypeError, ValueError):
+        end_month = today.month
+    try:
+        end_year = int(request.GET.get("year") or today.year)
+    except (TypeError, ValueError):
+        end_year = today.year
+    if not 1 <= end_month <= 12:
+        end_month = today.month
+    try:
+        n_months = int(request.GET.get("months") or 6)
+    except (TypeError, ValueError):
+        n_months = 6
+    n_months = max(1, min(n_months, 24))
+
+    source = "secondary" if (request.GET.get("source") or "").strip().lower() == "secondary" else "primary"
+    platform = (request.GET.get("platform") or "").strip().lower() or None
+    use_amazon = platform is None or platform == "amazon"
+    use_other = platform != "amazon"
+    fmt = None
+    if platform and platform != "amazon":
+        fmt = _CATEGORY_SLUG_TO_FORMAT.get(platform, platform.replace("_", " ").upper())
+
+    window = _trailing_months(end_month, end_year, n_months)
+    # bucket[(year, month_num)] = {"PREMIUM": x, "COMMODITY": y}
+    bucket = {(y, m): {"PREMIUM": 0.0, "COMMODITY": 0.0} for (m, y, _) in window}
+    errors = []
+
+    def absorb(rows):
+        # rows: (year, month_token, head, ltrs)
+        for yr, mon_tok, head_val, ltrs in rows:
+            mnum = _month_token_to_num(mon_tok)
+            key = (int(yr), mnum) if mnum else None
+            if key is None or key not in bucket:
+                continue
+            head = (str(head_val).strip().upper() if head_val else "")
+            if head not in bucket[key]:
+                continue
+            bucket[key][head] += float(ltrs or 0)
+
+    def run(label, sql, params):
+        try:
+            cur.execute(sql, params)
+            absorb(cur.fetchall())
+        except Exception as e:  # noqa: BLE001
+            errors.append({"source": label, "error": str(e)})
+
+    name_year_pairs = [(mon, y) for (_, y, mon) in window]  # (MONTH_NAME, year)
+    num_year_pairs = [(m, y) for (m, y, _) in window]       # (month_num, year)
+
+    with connection.cursor() as cur:
+        if source == "primary":
+            if use_other:
+                ph = ", ".join(["(%s, %s)"] * len(name_year_pairs))
+                sql = f"""
+                    SELECT delivered_year AS yr,
+                           UPPER(TRIM(delivery_month::text)) AS mon,
+                           UPPER(TRIM(item_head::text)) AS head,
+                           COALESCE(SUM(total_delivered_liters), 0) AS ltrs
+                    FROM public.master_po
+                    WHERE (UPPER(TRIM(delivery_month::text)), delivered_year) IN ({ph})
+                      AND UPPER(TRIM(item_head::text)) IN ('PREMIUM', 'COMMODITY')
+                """
+                params = [v for pair in name_year_pairs for v in pair]
+                if fmt:
+                    sql += " AND UPPER(TRIM(format::text)) = %s"
+                    params.append(fmt)
+                else:
+                    sql += " AND UPPER(TRIM(format::text)) <> 'AMAZON'"
+                sql += " GROUP BY 1, 2, 3"
+                run("master_po", sql, params)
+            if use_amazon:
+                ph = ", ".join(["(%s, %s)"] * len(num_year_pairs))
+                run("amazon_po", f"""
+                    SELECT year AS yr, po_month AS mon,
+                           UPPER(TRIM(item_head::text)) AS head,
+                           COALESCE(SUM(total_delivered_liters), 0) AS ltrs
+                    FROM reporting."Amazon PO"
+                    WHERE (po_month, year) IN ({ph})
+                      AND UPPER(TRIM(item_head::text)) IN ('PREMIUM', 'COMMODITY')
+                    GROUP BY 1, 2, 3
+                """, [v for pair in num_year_pairs for v in pair])
+        else:  # secondary
+            if use_other:
+                ph = ", ".join(["(%s, %s)"] * len(name_year_pairs))
+                sql = f"""
+                    SELECT year::int AS yr, UPPER(TRIM(month::text)) AS mon,
+                           UPPER(TRIM(item_head::text)) AS head,
+                           COALESCE(SUM(ltr_sold), 0) AS ltrs
+                    FROM "SecMaster"
+                    WHERE (UPPER(TRIM(month::text)), year::numeric) IN ({ph})
+                      AND UPPER(TRIM(item_head::text)) IN ('PREMIUM', 'COMMODITY')
+                """
+                params = [v for pair in name_year_pairs for v in pair]
+                if fmt:
+                    sql += " AND LOWER(TRIM(format::text)) = LOWER(%s)"
+                    params.append(fmt)
+                else:
+                    sql += " AND UPPER(TRIM(format::text)) <> 'AMAZON'"
+                sql += " GROUP BY 1, 2, 3"
+                run("secmaster", sql, params)
+            if use_amazon:
+                ph = ", ".join(["(%s, %s)"] * len(name_year_pairs))  # (year, MONTH_NAME)
+                run("amazon_sec_range", f"""
+                    WITH ml AS (
+                        SELECT DISTINCT ON (format_sku_code)
+                               format_sku_code, item_head, per_unit_value
+                        FROM master_sheet
+                        WHERE format_sku_code IS NOT NULL AND format_sku_code::text <> ''
+                        ORDER BY format_sku_code
+                    ),
+                    base AS (
+                        SELECT r.asin,
+                               COALESCE(r.shipped_units, 0) AS units,
+                               EXTRACT(YEAR FROM r.from_date)::int AS yr,
+                               UPPER(to_char(r.from_date, 'FMMonth')) AS mon,
+                               EXTRACT(DAY FROM r.to_date)::int AS to_day
+                        FROM amazon_sec_range r
+                        WHERE (EXTRACT(YEAR FROM r.from_date)::int,
+                               UPPER(to_char(r.from_date, 'FMMonth'))) IN ({ph})
+                    ),
+                    latest AS (SELECT yr, mon, MAX(to_day) AS md FROM base GROUP BY yr, mon)
+                    SELECT b.yr, b.mon, UPPER(TRIM(ml.item_head::text)) AS head,
+                           COALESCE(SUM(b.units * COALESCE(ml.per_unit_value::numeric, 0)), 0) AS ltrs
+                    FROM base b
+                    JOIN latest l ON b.yr = l.yr AND b.mon = l.mon AND b.to_day = l.md
+                    JOIN ml ON UPPER(TRIM(ml.format_sku_code::text)) = UPPER(TRIM(b.asin::text))
+                    WHERE UPPER(TRIM(ml.item_head::text)) IN ('PREMIUM', 'COMMODITY')
+                    GROUP BY 1, 2, 3
+                """, [v for (m, y, mon) in window for v in (y, mon)])
+
+    series = []
+    for (m, y, _) in window:
+        b = bucket[(y, m)]
+        prem = round(b["PREMIUM"], 2)
+        comm = round(b["COMMODITY"], 2)
+        series.append({
+            "month": m,
+            "year": y,
+            "label": f"{calendar.month_abbr[m]} '{str(y)[2:]}",  # "May '26"
+            "premium_ltrs": prem,
+            "commodity_ltrs": comm,
+            "total_ltrs": round(prem + comm, 2),
+        })
+    return Response({
+        "source": source, "platform": platform, "months": n_months,
+        "series": series, "errors": errors,
+    })
+
+
+# ─── /fulfilment-health ───
+@api_view(["GET"])
+@permission_classes([require("dashboard.view")])
+def fulfilment_health(request):
+    """Fill / miss rate for primary POs over a trailing date window.
+
+    master_po (non-AMZ, by po_date) + reporting."Amazon PO" (AMZ, by order_date).
+    The window is a `window_days`-day span ending `lag_days` before today, so
+    recent in-flight POs (not yet fulfilled) are excluded:
+        end   = today - lag_days        (default 7)
+        start = end  - window_days      (default 30)
+
+    Rates use the litre columns the business reports on:
+        fill_rate = SUM(filled_ltrs) / SUM(order_ltrs_cl) * 100
+        miss_rate = SUM(missed_ltrs) / SUM(order_ltrs_cl) * 100
+    Honours the platform filter."""
+    today = date.today()
+    try:
+        lag_days = int(request.GET.get("lag_days") or 7)
+    except (TypeError, ValueError):
+        lag_days = 7
+    try:
+        window_days = int(request.GET.get("window_days") or 30)
+    except (TypeError, ValueError):
+        window_days = 30
+    lag_days = max(0, min(lag_days, 366))
+    window_days = max(1, min(window_days, 366))
+    end_date = today - timedelta(days=lag_days)
+    start_date = end_date - timedelta(days=window_days)
+
+    platform = (request.GET.get("platform") or "").strip().lower() or None
+    use_amazon = platform is None or platform == "amazon"
+    use_other = platform != "amazon"
+    fmt = None
+    if platform and platform != "amazon":
+        fmt = _CATEGORY_SLUG_TO_FORMAT.get(platform, platform.replace("_", " ").upper())
+
+    slug_by_format = {v: k for k, v in _CATEGORY_SLUG_TO_FORMAT.items()}
+    rows = []
+    errors = []
+    with connection.cursor() as cur:
+        if use_other:
+            # The base master_po table has no `order_ltrs_cl` column (only the
+            # prim_master_po view computes it). Reconstruct "ORDER LTRS - CL"
+            # the same way the view does — total_order_liters, zeroed for
+            # cancelled POs. filled_ltrs / missed_ltrs are already materialised.
+            sql = """
+                SELECT UPPER(TRIM(format::text)) AS fmt,
+                       COALESCE(SUM(CASE WHEN UPPER(TRIM(po_status::text)) = 'CANCELLED'
+                                         THEN 0 ELSE COALESCE(total_order_liters, 0) END), 0) AS ordered,
+                       COALESCE(SUM(filled_ltrs), 0)   AS filled,
+                       COALESCE(SUM(missed_ltrs), 0)   AS missed,
+                       COUNT(DISTINCT po_number)       AS po_count
+                FROM public.master_po
+                WHERE public._pm_parse_date(po_date::text) >= %s
+                  AND public._pm_parse_date(po_date::text) <= %s
+            """
+            params = [start_date, end_date]
+            if fmt:
+                sql += " AND UPPER(TRIM(format::text)) = %s"
+                params.append(fmt)
+            else:
+                sql += " AND UPPER(TRIM(format::text)) <> 'AMAZON'"
+            sql += " GROUP BY 1"
+            try:
+                cur.execute(sql, params)
+                for f, o, fi, mi, pc in cur.fetchall():
+                    rows.append({
+                        "format": f,
+                        "slug": slug_by_format.get(f, (f or "").lower().replace(" ", "_")),
+                        "ordered_ltrs": float(o or 0),
+                        "filled_ltrs": float(fi or 0),
+                        "missed_ltrs": float(mi or 0),
+                        "po_count": int(pc or 0),
+                    })
+            except Exception as e:  # noqa: BLE001
+                errors.append({"source": "master_po", "error": str(e)})
+        if use_amazon:
+            try:
+                cur.execute("""
+                    SELECT COALESCE(SUM(order_ltrs_cl), 0),
+                           COALESCE(SUM(filled_ltrs), 0),
+                           COALESCE(SUM(missed_ltrs), 0),
+                           COUNT(DISTINCT po_number)
+                    FROM reporting."Amazon PO"
+                    WHERE public._pm_parse_date(order_date::text) >= %s
+                      AND public._pm_parse_date(order_date::text) <= %s
+                """, [start_date, end_date])
+                o, fi, mi, pc = cur.fetchone()
+                if (float(o or 0) + float(fi or 0) + float(mi or 0)) > 0:
+                    rows.append({
+                        "format": "AMAZON", "slug": "amazon",
+                        "ordered_ltrs": float(o or 0),
+                        "filled_ltrs": float(fi or 0),
+                        "missed_ltrs": float(mi or 0),
+                        "po_count": int(pc or 0),
+                    })
+            except Exception as e:  # noqa: BLE001
+                errors.append({"source": "amazon_po", "error": str(e)})
+
+    for r in rows:
+        ordered = r["ordered_ltrs"]
+        r["fill_rate"] = round((r["filled_ltrs"] / ordered * 100) if ordered > 0 else 0, 1)
+        r["miss_rate"] = round((r["missed_ltrs"] / ordered * 100) if ordered > 0 else 0, 1)
+        r["ordered_ltrs"] = round(ordered, 2)
+        r["filled_ltrs"] = round(r["filled_ltrs"], 2)
+        r["missed_ltrs"] = round(r["missed_ltrs"], 2)
+    # Worst fill rate first (lowest %), best last — so the platforms that need
+    # attention surface at the top of the list.
+    rows.sort(key=lambda x: x["fill_rate"])
+
+    tot_ord = round(sum(r["ordered_ltrs"] for r in rows), 2)
+    tot_fill = round(sum(r["filled_ltrs"] for r in rows), 2)
+    tot_miss = round(sum(r["missed_ltrs"] for r in rows), 2)
+    total = {
+        "ordered_ltrs": tot_ord,
+        "filled_ltrs": tot_fill,
+        "missed_ltrs": tot_miss,
+        "fill_rate": round((tot_fill / tot_ord * 100) if tot_ord > 0 else 0, 1),
+        "miss_rate": round((tot_miss / tot_ord * 100) if tot_ord > 0 else 0, 1),
+        "po_count": sum(r["po_count"] for r in rows),
+    }
+    return Response({
+        "platform": platform,
+        "window": {
+            "start": start_date.isoformat(),
+            "end": end_date.isoformat(),
+            "window_days": window_days,
+            "lag_days": lag_days,
+        },
+        "total": total, "by_platform": rows, "errors": errors,
+    })
+
+
+# ─── /top-skus ───
+@api_view(["GET"])
+@permission_classes([require("dashboard.view")])
+def top_skus(request):
+    """Top SKUs by delivered litres for a month, with prior-month delta.
+
+    Same source semantics as /category-breakdown. Powers the home "Top Movers"
+    leaderboard: current-month top-N SKUs (name + item head + litres) plus each
+    SKU's previous-month litres so the UI can show % change and risers/fallers.
+    Honours the platform filter."""
+    today = date.today()
+    try:
+        month_num = int(request.GET.get("month") or today.month)
+    except (TypeError, ValueError):
+        month_num = today.month
+    try:
+        year = int(request.GET.get("year") or today.year)
+    except (TypeError, ValueError):
+        year = today.year
+    if not 1 <= month_num <= 12:
+        month_num = today.month
+    try:
+        limit = int(request.GET.get("limit") or 10)
+    except (TypeError, ValueError):
+        limit = 10
+    limit = max(1, min(limit, 50))
+
+    source = "secondary" if (request.GET.get("source") or "").strip().lower() == "secondary" else "primary"
+    platform = (request.GET.get("platform") or "").strip().lower() or None
+    use_amazon = platform is None or platform == "amazon"
+    use_other = platform != "amazon"
+    fmt = None
+    if platform and platform != "amazon":
+        fmt = _CATEGORY_SLUG_TO_FORMAT.get(platform, platform.replace("_", " ").upper())
+
+    prev_month = month_num - 1 if month_num > 1 else 12
+    prev_year = year if month_num > 1 else year - 1
+
+    errors = []
+    # acc[(month_num, year)][upper_name] = {"name": display, "head": h, "ltrs": x}
+    acc = {(month_num, year): {}, (prev_month, prev_year): {}}
+
+    def absorb(dest, rows):
+        # rows: (name, head, ltrs)
+        for name_val, head_val, ltrs in rows:
+            val = float(ltrs or 0)
+            if val == 0:
+                continue
+            name = (str(name_val).strip() if name_val else "") or "Unknown"
+            key = name.upper()
+            head = (str(head_val).strip().upper() if head_val else "")
+            if head not in ("PREMIUM", "COMMODITY"):
+                head = "OTHER"
+            slot = dest.get(key)
+            if slot is None:
+                dest[key] = {"name": name, "head": head, "ltrs": val}
+            else:
+                slot["ltrs"] += val
+
+    def run(label, dest, sql, params):
+        try:
+            cur.execute(sql, params)
+            absorb(dest, cur.fetchall())
+        except Exception as e:  # noqa: BLE001
+            errors.append({"source": label, "error": str(e)})
+
+    with connection.cursor() as cur:
+        for (m, y) in ((month_num, year), (prev_month, prev_year)):
+            dest = acc[(m, y)]
+            mname = calendar.month_name[m].upper()
+            if source == "primary":
+                if use_other:
+                    sql = """
+                        SELECT COALESCE(NULLIF(TRIM(item::text), ''),
+                                        NULLIF(TRIM(sku_name::text), ''), 'Unknown') AS name,
+                               UPPER(TRIM(item_head::text)) AS head,
+                               COALESCE(SUM(total_delivered_liters), 0) AS ltrs
+                        FROM public.master_po
+                        WHERE UPPER(TRIM(delivery_month::text)) = %s AND delivered_year = %s
+                          AND UPPER(TRIM(item_head::text)) IN ('PREMIUM', 'COMMODITY')
+                    """
+                    params = [mname, y]
+                    if fmt:
+                        sql += " AND UPPER(TRIM(format::text)) = %s"
+                        params.append(fmt)
+                    else:
+                        sql += " AND UPPER(TRIM(format::text)) <> 'AMAZON'"
+                    sql += " GROUP BY 1, 2"
+                    run("master_po", dest, sql, params)
+                if use_amazon:
+                    run("amazon_po", dest, """
+                        SELECT COALESCE(NULLIF(TRIM(item::text), ''),
+                                        NULLIF(TRIM(sku_name::text), ''), 'Unknown') AS name,
+                               UPPER(TRIM(item_head::text)) AS head,
+                               COALESCE(SUM(total_delivered_liters), 0) AS ltrs
+                        FROM reporting."Amazon PO"
+                        WHERE po_month = %s AND year = %s
+                          AND UPPER(TRIM(item_head::text)) IN ('PREMIUM', 'COMMODITY')
+                        GROUP BY 1, 2
+                    """, [m, y])
+            else:  # secondary
+                if use_other:
+                    sql = """
+                        SELECT COALESCE(NULLIF(TRIM(item::text), ''), 'Unknown') AS name,
+                               UPPER(TRIM(item_head::text)) AS head,
+                               COALESCE(SUM(ltr_sold), 0) AS ltrs
+                        FROM "SecMaster"
+                        WHERE UPPER(TRIM(month::text)) = %s AND year::numeric = %s
+                          AND UPPER(TRIM(item_head::text)) IN ('PREMIUM', 'COMMODITY')
+                    """
+                    params = [mname, y]
+                    if fmt:
+                        sql += " AND LOWER(TRIM(format::text)) = LOWER(%s)"
+                        params.append(fmt)
+                    else:
+                        sql += " AND UPPER(TRIM(format::text)) <> 'AMAZON'"
+                    sql += " GROUP BY 1, 2"
+                    run("secmaster", dest, sql, params)
+                if use_amazon:
+                    run("amazon_sec_range", dest, """
+                        WITH ml AS (
+                            SELECT DISTINCT ON (format_sku_code)
+                                   format_sku_code, item_head, per_unit_value,
+                                   COALESCE(NULLIF(TRIM(product_name::text), ''),
+                                            NULLIF(TRIM(item::text), '')) AS name
+                            FROM master_sheet
+                            WHERE format_sku_code IS NOT NULL AND format_sku_code::text <> ''
+                            ORDER BY format_sku_code
+                        ),
+                        base AS (
+                            SELECT r.asin,
+                                   COALESCE(r.shipped_units, 0) AS units,
+                                   EXTRACT(DAY FROM r.to_date)::int AS to_day
+                            FROM amazon_sec_range r
+                            WHERE EXTRACT(YEAR FROM r.from_date) = %s
+                              AND UPPER(to_char(r.from_date, 'FMMonth')) = %s
+                        ),
+                        latest AS (SELECT MAX(to_day) AS md FROM base)
+                        SELECT COALESCE(ml.name, b.asin) AS name,
+                               UPPER(TRIM(ml.item_head::text)) AS head,
+                               COALESCE(SUM(b.units * COALESCE(ml.per_unit_value::numeric, 0)), 0) AS ltrs
+                        FROM base b
+                        CROSS JOIN latest l
+                        JOIN ml ON UPPER(TRIM(ml.format_sku_code::text)) = UPPER(TRIM(b.asin::text))
+                        WHERE b.to_day = l.md
+                          AND UPPER(TRIM(ml.item_head::text)) IN ('PREMIUM', 'COMMODITY')
+                        GROUP BY 1, 2
+                    """, [y, mname])
+
+    cur_map = acc[(month_num, year)]
+    prev_map = acc[(prev_month, prev_year)]
+    ranked = sorted(cur_map.values(), key=lambda s: s["ltrs"], reverse=True)[:limit]
+
+    skus = []
+    for s in ranked:
+        prev = prev_map.get(s["name"].upper())
+        prev_ltrs = round(prev["ltrs"], 2) if prev else 0.0
+        ltrs = round(s["ltrs"], 2)
+        if prev_ltrs > 0:
+            delta_pct = round((ltrs - prev_ltrs) / prev_ltrs * 100, 1)
+        else:
+            delta_pct = None  # no prior baseline → "NEW"
+        skus.append({
+            "name": s["name"],
+            "head": s["head"],
+            "ltrs": ltrs,
+            "prev_ltrs": prev_ltrs,
+            "delta_pct": delta_pct,
+            "is_new": prev is None,
+        })
+
+    # A riser must actually have grown (> 0) and a faller must actually have
+    # shrunk (< 0). Without the sign guard, an all-rising month would report the
+    # slowest riser as the "biggest faller".
+    movers = [s for s in skus if s["delta_pct"] is not None]
+    risers = [s for s in movers if s["delta_pct"] > 0]
+    fallers = [s for s in movers if s["delta_pct"] < 0]
+    top_riser = max(risers, key=lambda s: s["delta_pct"], default=None)
+    top_faller = min(fallers, key=lambda s: s["delta_pct"], default=None)
+    return Response({
+        "source": source, "platform": platform,
+        "month": month_num, "year": year,
+        "prev_month": prev_month, "prev_year": prev_year,
+        "skus": skus, "top_riser": top_riser, "top_faller": top_faller,
+        "errors": errors,
+    })
+
+
 # ─── /platform-expiry-alerts ───
 @api_view(["GET"])
 @permission_classes([require("dashboard.view")])
