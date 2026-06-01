@@ -740,10 +740,6 @@ def primary_month_targets_refresh_platform(request, slug: str):
 
     body = request.data if request.data else request.query_params
     month, year = _parse_month_year_or_current(body)
-    if not _is_current_month(month, year):
-        raise ValidationError(
-            f"{month:02d}-{year} is closed. Refresh only applies to the current calendar month."
-        )
 
     with transaction.atomic():
         rows = _refresh_format_rows(fmt, month, year)
@@ -1247,10 +1243,6 @@ def primary_month_targets_dashboard(request):
 def primary_month_targets_refresh_all(request):
     body = request.data if request.data else request.query_params
     month, year = _parse_month_year_or_current(body)
-    if not _is_current_month(month, year):
-        raise ValidationError(
-            f"{month:02d}-{year} is closed. Refresh only applies to the current calendar month."
-        )
 
     row_defs = _dashboard_row_defs(request.user)
     formats = [d["format"] for d in row_defs]
@@ -1276,13 +1268,36 @@ def primary_month_targets_refresh_all(request):
         cur.execute(sql, [month, year] + formats)
         rows = [_row_to_dict(r) for r in cur.fetchall()]
 
+    secondary_refreshed: list[dict] = []
     with transaction.atomic():
         refreshed = [_refresh_existing_row(row) for row in rows]
+        secondary_target_defs = [
+            d for d in row_defs if d.get("target_source") == "month_targets"
+        ]
+        if secondary_target_defs:
+            from . import monthly_targets as secondary_targets
+
+            platform_slugs = {
+                d["access_slug"] for d in secondary_target_defs if d.get("access_slug")
+            }
+            platforms = {
+                p.slug: p
+                for p in PlatformConfig.objects.filter(slug__in=platform_slugs, is_active=True)
+            }
+            for defn in secondary_target_defs:
+                slug = defn.get("access_slug")
+                platform = platforms.get(slug)
+                if not slug or not platform:
+                    continue
+                secondary_refreshed.extend(
+                    secondary_targets._refresh_platform_rows(slug, platform, month, year)
+                )
 
     return Response({
         "ok": True,
         "month": month,
         "year": year,
-        "updated": len(refreshed),
+        "updated": len(refreshed) + len(secondary_refreshed),
         "rows": refreshed,
+        "secondary_rows": secondary_refreshed,
     })

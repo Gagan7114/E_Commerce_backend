@@ -4,6 +4,7 @@ from . import views
 
 urlpatterns = [
     path("table-counts", views.table_counts, name="dashboard-table-counts"),
+    path("latest-month", views.latest_month, name="dashboard-latest-month"),
     path("table-count/<str:table_name>", views.table_count, name="dashboard-table-count"),
     path("table-columns/<str:table_name>", views.table_columns, name="dashboard-table-columns"),
     path("table-distinct/<str:table_name>/<str:column_name>", views.table_distinct_values, name="dashboard-table-distinct-values"),

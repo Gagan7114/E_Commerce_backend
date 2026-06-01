@@ -140,6 +140,31 @@ def table_counts(request):
     return Response({t: _count(t) for t in tables})
 
 
+def _fetch_latest_reporting_date(sql: str, params=None):
+    try:
+        with connection.cursor() as cur:
+            cur.execute(sql, params or [])
+            row = cur.fetchone()
+            return row[0] if row and row[0] else None
+    except Exception:
+        return None
+
+
+@api_view(["GET"])
+@permission_classes([require("dashboard.view")])
+def latest_month(request):
+    """Calendar month used as the default dashboard period."""
+    today = date.today()
+    return Response({
+        "month": today.month,
+        "year": today.year,
+        "month_label": calendar.month_name[today.month].upper(),
+        "source_date": today.replace(day=1).isoformat(),
+        "defaulted": False,
+        "source": "calendar",
+    })
+
+
 # ─── /table-columns/{table} ───
 @api_view(["GET"])
 @permission_classes([require("dashboard.table.view")])

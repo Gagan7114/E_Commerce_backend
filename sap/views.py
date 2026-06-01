@@ -2,6 +2,7 @@
 
 import logging
 import re
+from calendar import monthrange
 from datetime import date
 from decimal import InvalidOperation
 
@@ -74,6 +75,22 @@ def _count_of(
         return int(val or 0)
     except (TypeError, ValueError):
         return 0
+
+
+def _month_end_from_params(request) -> str | None:
+    raw_month = str(request.query_params.get("month") or "").strip()
+    raw_year = str(request.query_params.get("year") or "").strip()
+    if not raw_month or not raw_year:
+        return None
+    try:
+        month = int(raw_month)
+        year = int(raw_year)
+        if month < 1 or month > 12 or year < 1900 or year > 2200:
+            return None
+    except ValueError:
+        return None
+    last_day = monthrange(year, month)[1]
+    return date(year, month, last_day).isoformat()
 
 
 # ─── /distributors ───
@@ -802,24 +819,46 @@ def inventory_overview(request):
 @permission_classes([require("sap.view")])
 def inventory_warehouse_comparison(request):
     source, schema = resolve_schema(request.query_params.get("source"))
+    month_end = _month_end_from_params(request)
+    movement_join = ""
+    on_hand_expr = 'T1."OnHand"'
+    params = None
+
+    if month_end:
+        movement_join = """
+        LEFT JOIN (
+            SELECT
+                "ItemCode",
+                "Warehouse",
+                COALESCE(SUM(COALESCE("InQty", 0) - COALESCE("OutQty", 0)), 0)
+                    AS "PostPeriodQty"
+            FROM OINM
+            WHERE "DocDate" > ?
+            GROUP BY "ItemCode", "Warehouse"
+        ) M ON M."ItemCode" = T1."ItemCode" AND M."Warehouse" = T1."WhsCode"
+        """
+        on_hand_expr = '(T1."OnHand" - COALESCE(M."PostPeriodQty", 0))'
+        params = [month_end]
 
     rows = _run(
-        """
+        f"""
         SELECT
             T1."WhsCode",
             T2."WhsName",
             T2."Inactive",
             COUNT(DISTINCT T0."ItemCode") AS "items",
-            COALESCE(SUM(T1."OnHand"), 0) AS "on_hand",
-            COALESCE(SUM(T1."OnHand" * T0."LastPurPrc"), 0) AS "stock_value",
-            COUNT(DISTINCT CASE WHEN T1."OnHand" = 0 THEN T0."ItemCode" END)
+            COALESCE(SUM({on_hand_expr}), 0) AS "on_hand",
+            COALESCE(SUM({on_hand_expr} * T0."LastPurPrc"), 0) AS "stock_value",
+            COUNT(DISTINCT CASE WHEN {on_hand_expr} = 0 THEN T0."ItemCode" END)
                 AS "zero_stock"
         FROM OITM T0
         INNER JOIN OITW T1 ON T1."ItemCode" = T0."ItemCode"
         LEFT  JOIN OWHS T2 ON T2."WhsCode"  = T1."WhsCode"
+        {movement_join}
         GROUP BY T1."WhsCode", T2."WhsName", T2."Inactive"
         ORDER BY T2."WhsName"
         """,
+        params,
         schema=schema,
     )
 
@@ -827,6 +866,7 @@ def inventory_warehouse_comparison(request):
         "warehouses": rows,
         "source": source,
         "sources": sorted(HANA_SCHEMAS),
+        "as_of_date": month_end,
     })
 
 

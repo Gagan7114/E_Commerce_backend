@@ -418,6 +418,38 @@ def _read_source(slug: str, fmt: str, item_head: str, month: int, year: int) -> 
     return _read_master_po(fmt, item_head, month, year)
 
 
+def _read_platform_latest_date(slug: str, fmt: str, month: int, year: int) -> date | None:
+    """Return the same platform-wide max date shown on the secondary dashboard.
+
+    Target rows keep their item-head-specific done_ltrs / done_value, but the
+    DATE column is compared by users against the platform dashboard's Max Date.
+    """
+    month_name = _MONTH_NAMES[month]
+    if slug == "flipkart":
+        sql = """
+            SELECT MAX("Order Date")
+            FROM "flipkart_secondary_all"
+            WHERE UPPER(TRIM("month"::text)) = %s
+              AND "year" = %s
+        """
+        params = [month_name, year]
+    elif slug == "flipkart_grocery":
+        sql = """
+            SELECT MAX("real_date")
+            FROM "flipkart_grocery_master"
+            WHERE "month" = %s
+              AND "year" = %s
+        """
+        params = [month, year]
+    else:
+        return None
+
+    with connection.cursor() as cur:
+        cur.execute(sql, params)
+        row = cur.fetchone()
+    return row[0] if row and row[0] else None
+
+
 def _read_prev_est_ltr(fmt: str, item_head: str, month: int, year: int) -> Decimal:
     """Look up the prior month's stored `est_ltr` for the same (format,
     item_head). Returns 0 if no prior row exists."""
@@ -587,6 +619,9 @@ def _refresh_existing_row(slug: str, row: dict, fmt: str | None = None) -> dict:
     source_format = fmt or str(row.get("format") or "").strip()
 
     source = _read_source(slug, source_format, item_head, month, year)
+    platform_latest_date = _read_platform_latest_date(slug, source_format, month, year)
+    if platform_latest_date:
+        source["latest_date"] = platform_latest_date
     derived = _compute_derived(
         targets=Decimal(str(row["targets"] or 0)),
         done_ltrs=source["done_ltrs"],
@@ -630,15 +665,10 @@ def month_targets_refresh_all(request):
     """POST /api/platform/month-targets/refresh
 
     Refreshes derived columns for every authorized platform row in the
-    selected current month. Targets and last_month stay locked.
+    selected month. Targets and last_month stay locked.
     """
     body = request.data if request.data else request.query_params
     month, year = _parse_month_year_or_current(body)
-    if not _is_current_month(month, year):
-        raise ValidationError(
-            f"{month:02d}-{year} is closed. Refresh only applies to the "
-            "current calendar month."
-        )
 
     allowed_slugs = set(user_platform_slugs(request.user)) & set(IN_SCOPE_SLUGS)
     if not allowed_slugs:
@@ -816,7 +846,7 @@ def month_targets_refresh_platform(request, slug: str):
     """POST /api/platform/<slug>/month-targets/refresh
 
     Refreshes derived columns for all rows on one platform in the selected
-    current month. Targets and last_month stay locked.
+    month. Targets and last_month stay locked.
     """
     _ensure_scope(request.user, slug)
     if slug in SKIPPED_SLUGS:
@@ -826,11 +856,6 @@ def month_targets_refresh_platform(request, slug: str):
 
     body = request.data if request.data else request.query_params
     month, year = _parse_month_year_or_current(body)
-    if not _is_current_month(month, year):
-        raise ValidationError(
-            f"{month:02d}-{year} is closed. Refresh only applies to the "
-            "current calendar month."
-        )
 
     with transaction.atomic():
         rows = _refresh_platform_rows(slug, p, month, year)
@@ -852,9 +877,8 @@ def month_targets_refresh_platform(request, slug: str):
 def month_targets_refresh(request, slug: str, row_id: int):
     """POST /api/platform/<slug>/month-targets/<id>/refresh
 
-    Phase B. Recomputes the derived columns on an existing current-month
-    row. `targets` and `last_month` are not touched. Rejects with 400 if
-    the row is for a closed calendar month.
+    Phase B. Recomputes the derived columns on an existing row. `targets`
+    and `last_month` are not touched.
     """
     _ensure_scope(request.user, slug)
     if slug in SKIPPED_SLUGS:
@@ -873,12 +897,6 @@ def month_targets_refresh(request, slug: str, row_id: int):
 
     month = int(existing["month"])
     year = int(existing["year"])
-
-    if not _is_current_month(month, year):
-        raise ValidationError(
-            f"Row is for {month:02d}-{year}, which is closed. "
-            "Refresh only applies to rows in the current calendar month."
-        )
 
     row = _refresh_existing_row(slug, existing, fmt)
     return Response({"ok": True, "row": row})
