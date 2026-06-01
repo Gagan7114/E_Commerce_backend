@@ -244,6 +244,12 @@ def _bigbasket_primary_normalize_row(row: dict, *, include_cancelled: bool = Tru
     result["dp_ltrs"] = result["done_ltrs"] + result["pending_ltrs"]
     if "item" in row:
         result["item"] = row.get("item")
+    if "category" in row:
+        result["category"] = row.get("category")
+    if "sub_category" in row:
+        result["sub_category"] = row.get("sub_category")
+    if "per_ltr" in row:
+        result["per_ltr"] = row.get("per_ltr")
     if include_cancelled:
         result["cancelled_value"] = _num(row.get("cancelled_value"))
         result["cancelled_ltrs"] = _num(row.get("cancelled_ltrs"))
@@ -620,7 +626,164 @@ def _bigbasket_primary_dashboard_response(request, slug: str):
         for row in item_raw
     ]
 
+    detail_raw = _dict_rows(
+        f"""
+        {filtered_cte},
+        grouped AS (
+            SELECT
+                COALESCE(NULLIF(UPPER(TRIM("item_head"::text)), ''), 'OTHER') AS item_head,
+                COALESCE(NULLIF(UPPER(TRIM("category"::text)), ''), 'OTHER') AS category,
+                COALESCE(NULLIF(UPPER(TRIM("sub_category"::text)), ''), 'OTHER') AS sub_category,
+                COALESCE(NULLIF(UPPER(TRIM("per_liter"::text)), ''), '-') AS per_ltr,
+                COALESCE(SUM("total_order_amt_exclusive"), 0) AS order_value,
+                COALESCE(SUM("total_order_liters"), 0) AS order_ltrs,
+                COALESCE(SUM("order_qty"), 0) AS order_qty,
+                COALESCE(SUM(CASE WHEN in_selected_period
+                    AND UPPER(TRIM("po_status"::text)) = 'COMPLETED'
+                    THEN "{done_value_col}" ELSE 0 END), 0) AS done_value,
+                COALESCE(SUM(CASE WHEN in_selected_period
+                    AND UPPER(TRIM("po_status"::text)) = 'COMPLETED'
+                    THEN "total_delivered_liters" ELSE 0 END), 0) AS done_ltrs,
+                COALESCE(SUM(CASE WHEN in_selected_period
+                    AND UPPER(TRIM("po_status"::text)) = 'COMPLETED'
+                    THEN "delivered_qty" ELSE 0 END), 0) AS done_qty,
+                COALESCE(SUM(CASE WHEN in_selected_period
+                    AND {pending_status}
+                    THEN "total_order_amt_exclusive" ELSE 0 END), 0) AS pending_value,
+                COALESCE(SUM(CASE WHEN in_selected_period
+                    AND {pending_status}
+                    THEN "total_order_liters" ELSE 0 END), 0) AS pending_ltrs,
+                COALESCE(SUM(CASE WHEN in_selected_period
+                    AND {pending_status}
+                    THEN "order_qty" ELSE 0 END), 0) AS pending_qty,
+                COALESCE(SUM(CASE WHEN in_selected_period
+                    AND UPPER(TRIM("po_status"::text)) = 'EXPIRED'
+                    THEN "total_order_amt_exclusive" ELSE 0 END), 0) AS expired_value,
+                COALESCE(SUM(CASE WHEN in_selected_period
+                    AND UPPER(TRIM("po_status"::text)) = 'EXPIRED'
+                    THEN "total_order_liters" ELSE 0 END), 0) AS expired_ltrs
+            FROM filtered
+            GROUP BY 1, 2, 3, 4
+        )
+        SELECT *
+        FROM grouped
+        WHERE COALESCE(order_value, 0) <> 0
+           OR COALESCE(done_value, 0) <> 0
+           OR COALESCE(pending_value, 0) <> 0
+           OR COALESCE(order_ltrs, 0) <> 0
+           OR COALESCE(done_ltrs, 0) <> 0
+           OR COALESCE(pending_ltrs, 0) <> 0
+        ORDER BY done_value DESC, done_ltrs DESC, sub_category
+        """,
+        filtered_params,
+    )
+    details = [
+        _bigbasket_primary_normalize_row(row, include_cancelled=False)
+        for row in detail_raw
+    ]
+
+    open_vendor_pending = _dict_rows(
+        f"""
+        {filtered_cte},
+        vendor_rows AS (
+            SELECT
+                COALESCE(
+                    NULLIF(UPPER(TRIM("vendor_new"::text)), ''),
+                    NULLIF(UPPER(TRIM("vendor_name"::text)), ''),
+                    'UNMAPPED'
+                ) AS vendor,
+                COALESCE("total_order_amt_exclusive", 0) AS order_value_row,
+                COALESCE(CASE WHEN UPPER(TRIM("po_status"::text)) = 'COMPLETED'
+                    THEN "{done_value_col}" ELSE 0 END, 0) AS delivered_value_row,
+                COALESCE("total_order_liters", 0) AS order_ltrs_row,
+                COALESCE(CASE WHEN UPPER(TRIM("po_status"::text)) = 'COMPLETED'
+                    THEN "total_delivered_liters" ELSE 0 END, 0) AS delivered_ltrs_row,
+                COALESCE("order_qty", 0) AS order_qty_row,
+                COALESCE(CASE WHEN UPPER(TRIM("po_status"::text)) = 'COMPLETED'
+                    THEN "delivered_qty" ELSE 0 END, 0) AS delivered_qty_row,
+                COALESCE(CASE WHEN {pending_status}
+                    THEN "total_order_amt_exclusive" ELSE 0 END, 0) AS pending_value_row,
+                COALESCE(CASE WHEN {pending_status}
+                    THEN "total_order_liters" ELSE 0 END, 0) AS pending_ltrs_row,
+                COALESCE(CASE WHEN {pending_status}
+                    THEN "order_qty" ELSE 0 END, 0) AS pending_qty_row,
+                CASE
+                    WHEN NULLIF(TRIM("lead_time"::text), '') ~ '^-?[0-9]+(\\.[0-9]+)?$'
+                    THEN "lead_time"::numeric
+                    ELSE NULL
+                END AS lead_time_row
+            FROM filtered
+        ),
+        vendor_agg AS (
+            SELECT
+                vendor,
+                COALESCE(SUM(order_value_row), 0) AS order_value,
+                COALESCE(SUM(delivered_value_row), 0) AS delivered_value,
+                COALESCE(SUM(pending_value_row), 0) AS pending_value,
+                COALESCE(SUM(order_ltrs_row), 0) AS order_ltrs,
+                COALESCE(SUM(delivered_ltrs_row), 0) AS delivered_ltrs,
+                COALESCE(SUM(pending_ltrs_row), 0) AS pending_ltrs,
+                COALESCE(SUM(order_qty_row), 0) AS order_qty,
+                COALESCE(SUM(delivered_qty_row), 0) AS delivered_qty,
+                COALESCE(SUM(pending_qty_row), 0) AS pending_qty,
+                AVG(lead_time_row) FILTER (WHERE lead_time_row IS NOT NULL) AS lead_time_avg
+            FROM vendor_rows
+            GROUP BY 1
+        )
+        SELECT *
+        FROM vendor_agg
+        WHERE order_value <> 0
+           OR delivered_value <> 0
+           OR pending_value <> 0
+           OR order_ltrs <> 0
+           OR delivered_ltrs <> 0
+           OR pending_ltrs <> 0
+           OR order_qty <> 0
+           OR delivered_qty <> 0
+           OR pending_qty <> 0
+        ORDER BY pending_value DESC, order_value DESC, vendor
+        """,
+        filtered_params,
+    )
+    open_vendor_pending_value = sorted(
+        open_vendor_pending,
+        key=lambda row: (
+            _num(row.get("pending_value")),
+            _num(row.get("order_value")),
+            _num(row.get("delivered_value")),
+        ),
+        reverse=True,
+    )
+    open_vendor_pending_ltrs = sorted(
+        open_vendor_pending,
+        key=lambda row: (
+            _num(row.get("pending_ltrs")),
+            _num(row.get("order_ltrs")),
+            _num(row.get("delivered_ltrs")),
+        ),
+        reverse=True,
+    )
+    open_vendor_pending_qty = sorted(
+        open_vendor_pending,
+        key=lambda row: (
+            _num(row.get("pending_qty")),
+            _num(row.get("order_qty")),
+            _num(row.get("delivered_qty")),
+        ),
+        reverse=True,
+    )
+    open_vendor_pending_order = sorted(
+        open_vendor_pending,
+        key=lambda row: (
+            _num(row.get("order_value")),
+            _num(row.get("delivered_value")),
+            _num(row.get("pending_value")),
+        ),
+        reverse=True,
+    )
+
     item_total = _bigbasket_primary_total(items, include_cancelled=False)
+    detail_total = _bigbasket_primary_total(details, include_cancelled=False)
     kpi_total = _primary_master_po_order_minus_deliver_kpi_total(
         platform_format,
         month_type,
@@ -646,9 +809,14 @@ def _bigbasket_primary_dashboard_response(request, slug: str):
         "summary_total": _bigbasket_primary_total(summary),
         "items": items,
         "item_total": item_total,
-        "details": items,
-        "detail_total": item_total,
+        "details": details,
+        "detail_total": detail_total,
         "top_items": items,
+        "open_vendor_pending": open_vendor_pending_value,
+        "open_vendor_pending_value": open_vendor_pending_value,
+        "open_vendor_pending_ltrs": open_vendor_pending_ltrs,
+        "open_vendor_pending_qty": open_vendor_pending_qty,
+        "open_vendor_pending_order": open_vendor_pending_order,
         "notes": [
             "DONE metrics use COMPLETED for every item head.",
             f"Done value uses {done_value_col}.",

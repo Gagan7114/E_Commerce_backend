@@ -882,23 +882,55 @@ def category_trend(request):
                 """, [v for pair in num_year_pairs for v in pair])
         else:  # secondary
             if use_other:
-                ph = ", ".join(["(%s, %s)"] * len(name_year_pairs))
-                sql = f"""
-                    SELECT year::int AS yr, UPPER(TRIM(month::text)) AS mon,
+                secmaster_formats = ("BLINKIT", "SWIGGY", "ZEPTO", "BIG BASKET", "FLIPKART")
+                secmaster_fmt = fmt and fmt.upper() in secmaster_formats
+                target_ph = ", ".join(["(%s, %s)"] * len(num_year_pairs))
+                target_sql = f"""
+                    SELECT year::int AS yr, month::int AS mon,
                            UPPER(TRIM(item_head::text)) AS head,
-                           COALESCE(SUM(ltr_sold), 0) AS ltrs
-                    FROM "SecMaster"
-                    WHERE (UPPER(TRIM(month::text)), year::numeric) IN ({ph})
+                           COALESCE(SUM(done_ltrs), 0) AS ltrs
+                    FROM month_targets
+                    WHERE (month, year) IN ({target_ph})
                       AND UPPER(TRIM(item_head::text)) IN ('PREMIUM', 'COMMODITY')
                 """
-                params = [v for pair in name_year_pairs for v in pair]
+                target_params = [v for pair in num_year_pairs for v in pair]
                 if fmt:
-                    sql += " AND LOWER(TRIM(format::text)) = LOWER(%s)"
-                    params.append(fmt)
+                    target_sql += " AND LOWER(TRIM(format::text)) = LOWER(%s)"
+                    target_params.append(fmt)
+                    if secmaster_fmt:
+                        target_sql += " AND month = %s AND year = %s"
+                        target_params.extend([end_month, end_year])
                 else:
-                    sql += " AND UPPER(TRIM(format::text)) <> 'AMAZON'"
-                sql += " GROUP BY 1, 2, 3"
-                run("secmaster", sql, params)
+                    excluded_formats = (*secmaster_formats, "AMAZON")
+                    fmt_ph = ", ".join(["%s"] * len(excluded_formats))
+                    target_sql += (
+                        f" AND (UPPER(TRIM(format::text)) NOT IN ({fmt_ph}) "
+                        "OR (month = %s AND year = %s AND UPPER(TRIM(format::text)) <> 'AMAZON'))"
+                    )
+                    target_params.extend([*excluded_formats, end_month, end_year])
+                target_sql += " GROUP BY 1, 2, 3"
+                run("month_targets", target_sql, target_params)
+
+                mat_window = [(m, y, mon) for (m, y, mon) in window if not (m == end_month and y == end_year)]
+                if mat_window and (not fmt or secmaster_fmt):
+                    mat_pairs = [(mon, y) for (m, y, mon) in mat_window]
+                    mat_ph = ", ".join(["(%s, %s)"] * len(mat_pairs))
+                    mat_sql = f"""
+                        SELECT year::int AS yr, UPPER(TRIM(month::text)) AS mon,
+                               UPPER(TRIM(item_head::text)) AS head,
+                               COALESCE(SUM(ltr_sold), 0) AS ltrs
+                        FROM "SecMaster_Mat"
+                        WHERE (UPPER(TRIM(month::text)), year::numeric) IN ({mat_ph})
+                          AND UPPER(TRIM(item_head::text)) IN ('PREMIUM', 'COMMODITY')
+                    """
+                    mat_params = [v for pair in mat_pairs for v in pair]
+                    if fmt:
+                        mat_sql += " AND LOWER(TRIM(format::text)) = LOWER(%s)"
+                        mat_params.append(fmt)
+                    else:
+                        mat_sql += " AND UPPER(TRIM(format::text)) <> 'AMAZON'"
+                    mat_sql += " GROUP BY 1, 2, 3"
+                    run("secmaster_mat", mat_sql, mat_params)
             if use_amazon:
                 ph = ", ".join(["(%s, %s)"] * len(name_year_pairs))  # (year, MONTH_NAME)
                 run("amazon_sec_range", f"""
@@ -1086,12 +1118,14 @@ def fulfilment_health(request):
 @api_view(["GET"])
 @permission_classes([require("dashboard.view")])
 def top_skus(request):
-    """Top SKUs by delivered litres for a month, with prior-month delta.
+    """Top SKUs by delivered litres for a month, with prior-period delta.
 
     Same source semantics as /category-breakdown. Powers the home "Top Movers"
     leaderboard: current-month top-N SKUs (name + item head + litres) plus each
-    SKU's previous-month litres so the UI can show % change and risers/fallers.
-    Honours the platform filter."""
+    SKU's previous-period litres so the UI can show % change and risers/fallers.
+    Honours the platform filter. When compare_days is 7/30/60, the current
+    period is the trailing N days ending at the selected month end (or today for
+    the current month), compared with the previous N-day window."""
     today = date.today()
     try:
         month_num = int(request.GET.get("month") or today.month)
@@ -1108,6 +1142,12 @@ def top_skus(request):
     except (TypeError, ValueError):
         limit = 10
     limit = max(1, min(limit, 50))
+    try:
+        compare_days = int(request.GET.get("compare_days") or 0)
+    except (TypeError, ValueError):
+        compare_days = 0
+    if compare_days not in (7, 30, 60):
+        compare_days = 0
 
     source = "secondary" if (request.GET.get("source") or "").strip().lower() == "secondary" else "primary"
     platform = (request.GET.get("platform") or "").strip().lower() or None
@@ -1147,6 +1187,142 @@ def top_skus(request):
             absorb(dest, cur.fetchall())
         except Exception as e:  # noqa: BLE001
             errors.append({"source": label, "error": str(e)})
+
+    def _period_windows():
+        last_day = calendar.monthrange(year, month_num)[1]
+        selected_end = date(year, month_num, last_day)
+        current_month_start = date(today.year, today.month, 1)
+        selected_month_start = date(year, month_num, 1)
+        if selected_month_start >= current_month_start:
+            selected_end = min(selected_end, today)
+        current_start = selected_end - timedelta(days=compare_days - 1)
+        previous_end = current_start - timedelta(days=1)
+        previous_start = previous_end - timedelta(days=compare_days - 1)
+        return current_start, selected_end, previous_start, previous_end
+
+    if compare_days:
+        current_start, current_end, previous_start, previous_end = _period_windows()
+        acc_days = {"current": {}, "previous": {}}
+
+        with connection.cursor() as cur:
+            for bucket, start_dt, end_dt in (
+                ("current", current_start, current_end),
+                ("previous", previous_start, previous_end),
+            ):
+                dest = acc_days[bucket]
+                if source == "primary":
+                    if use_other:
+                        sql = """
+                            SELECT COALESCE(NULLIF(TRIM(item::text), ''),
+                                            NULLIF(TRIM(sku_name::text), ''), 'Unknown') AS name,
+                                   UPPER(TRIM(item_head::text)) AS head,
+                                   COALESCE(SUM(total_delivered_liters), 0) AS ltrs
+                            FROM public.master_po
+                            WHERE public._pm_parse_date(delivery_date::text) >= %s
+                              AND public._pm_parse_date(delivery_date::text) <= %s
+                              AND UPPER(TRIM(item_head::text)) IN ('PREMIUM', 'COMMODITY')
+                        """
+                        params = [start_dt, end_dt]
+                        if fmt:
+                            sql += " AND UPPER(TRIM(format::text)) = %s"
+                            params.append(fmt)
+                        else:
+                            sql += " AND UPPER(TRIM(format::text)) <> 'AMAZON'"
+                        sql += " GROUP BY 1, 2"
+                        run("master_po", dest, sql, params)
+                    if use_amazon:
+                        run("amazon_po", dest, """
+                            SELECT COALESCE(NULLIF(TRIM(item::text), ''),
+                                            NULLIF(TRIM(sku_name::text), ''), 'Unknown') AS name,
+                                   UPPER(TRIM(item_head::text)) AS head,
+                                   COALESCE(SUM(total_delivered_liters), 0) AS ltrs
+                            FROM reporting."Amazon PO"
+                            WHERE public._pm_parse_date(order_date::text) >= %s
+                              AND public._pm_parse_date(order_date::text) <= %s
+                              AND UPPER(TRIM(item_head::text)) IN ('PREMIUM', 'COMMODITY')
+                            GROUP BY 1, 2
+                        """, [start_dt, end_dt])
+                else:
+                    if use_other:
+                        sql = """
+                            SELECT COALESCE(NULLIF(TRIM(item::text), ''), 'Unknown') AS name,
+                                   UPPER(TRIM(item_head::text)) AS head,
+                                   COALESCE(SUM(ltr_sold), 0) AS ltrs
+                            FROM "SecMaster"
+                            WHERE "date" >= %s
+                              AND "date" <= %s
+                              AND UPPER(TRIM(item_head::text)) IN ('PREMIUM', 'COMMODITY')
+                        """
+                        params = [start_dt, end_dt]
+                        if fmt:
+                            sql += " AND LOWER(TRIM(format::text)) = LOWER(%s)"
+                            params.append(fmt)
+                        else:
+                            sql += " AND UPPER(TRIM(format::text)) <> 'AMAZON'"
+                        sql += " GROUP BY 1, 2"
+                        run("secmaster", dest, sql, params)
+                    if use_amazon:
+                        run("amazon_sec_range", dest, """
+                            WITH ml AS (
+                                SELECT DISTINCT ON (format_sku_code)
+                                       format_sku_code, item_head, per_unit_value,
+                                       COALESCE(NULLIF(TRIM(product_name::text), ''),
+                                                NULLIF(TRIM(item::text), '')) AS name
+                                FROM master_sheet
+                                WHERE format_sku_code IS NOT NULL AND format_sku_code::text <> ''
+                                ORDER BY format_sku_code
+                            )
+                            SELECT COALESCE(ml.name, r.asin) AS name,
+                                   UPPER(TRIM(ml.item_head::text)) AS head,
+                                   COALESCE(SUM(COALESCE(r.shipped_units, 0) * COALESCE(ml.per_unit_value::numeric, 0)), 0) AS ltrs
+                            FROM amazon_sec_range r
+                            JOIN ml ON UPPER(TRIM(ml.format_sku_code::text)) = UPPER(TRIM(r.asin::text))
+                            WHERE r.to_date::date >= %s
+                              AND r.to_date::date <= %s
+                              AND UPPER(TRIM(ml.item_head::text)) IN ('PREMIUM', 'COMMODITY')
+                            GROUP BY 1, 2
+                        """, [start_dt, end_dt])
+
+        cur_map = acc_days["current"]
+        prev_map = acc_days["previous"]
+        ranked = sorted(cur_map.values(), key=lambda s: s["ltrs"], reverse=True)[:limit]
+
+        skus = []
+        for s in ranked:
+            prev = prev_map.get(s["name"].upper())
+            prev_ltrs = round(prev["ltrs"], 2) if prev else 0.0
+            ltrs = round(s["ltrs"], 2)
+            if prev_ltrs > 0:
+                delta_pct = round((ltrs - prev_ltrs) / prev_ltrs * 100, 1)
+            else:
+                delta_pct = None
+            skus.append({
+                "name": s["name"],
+                "head": s["head"],
+                "ltrs": ltrs,
+                "prev_ltrs": prev_ltrs,
+                "delta_pct": delta_pct,
+                "is_new": prev is None,
+            })
+
+        movers = [s for s in skus if s["delta_pct"] is not None]
+        risers = [s for s in movers if s["delta_pct"] > 0]
+        fallers = [s for s in movers if s["delta_pct"] < 0]
+        top_riser = max(risers, key=lambda s: s["delta_pct"], default=None)
+        top_faller = min(fallers, key=lambda s: s["delta_pct"], default=None)
+        return Response({
+            "source": source, "platform": platform,
+            "month": month_num, "year": year,
+            "compare_days": compare_days,
+            "window": {
+                "current_start": current_start.isoformat(),
+                "current_end": current_end.isoformat(),
+                "previous_start": previous_start.isoformat(),
+                "previous_end": previous_end.isoformat(),
+            },
+            "skus": skus, "top_riser": top_riser, "top_faller": top_faller,
+            "errors": errors,
+        })
 
     with connection.cursor() as cur:
         for (m, y) in ((month_num, year), (prev_month, prev_year)):
