@@ -205,6 +205,9 @@ def _bigbasket_primary_zero_row(item_head: str | None = None, item: str | None =
         "order_value": 0.0,
         "order_ltrs": 0.0,
         "order_qty": 0.0,
+        "projection_value": 0.0,
+        "projection_ltrs": 0.0,
+        "projection_qty": 0.0,
         "done_value": 0.0,
         "done_ltrs": 0.0,
         "done_qty": 0.0,
@@ -231,6 +234,9 @@ def _bigbasket_primary_normalize_row(row: dict, *, include_cancelled: bool = Tru
         "order_value": _num(row.get("order_value")),
         "order_ltrs": _num(row.get("order_ltrs")),
         "order_qty": _num(row.get("order_qty")),
+        "projection_value": _num(row.get("projection_value")),
+        "projection_ltrs": _num(row.get("projection_ltrs")),
+        "projection_qty": _num(row.get("projection_qty")),
         "done_value": _num(row.get("done_value")),
         "done_ltrs": _num(row.get("done_ltrs")),
         "done_qty": _num(row.get("done_qty")),
@@ -261,6 +267,9 @@ def _bigbasket_primary_total(rows: list[dict], *, include_cancelled: bool = True
         "order_value",
         "order_ltrs",
         "order_qty",
+        "projection_value",
+        "projection_ltrs",
+        "projection_qty",
         "done_value",
         "done_ltrs",
         "done_qty",
@@ -390,6 +399,9 @@ def _primary_total_po_kpi_total(
             COALESCE(SUM(order_qty * basic_rate), 0) AS order_value,
             COALESCE(SUM(order_qty * effective_per_liter), 0) AS order_ltrs,
             COALESCE(SUM(order_qty), 0) AS order_qty,
+            0 AS projection_value,
+            0 AS projection_ltrs,
+            0 AS projection_qty,
             COALESCE(SUM(delivered_qty * basic_rate), 0) AS done_value,
             COALESCE(SUM(delivered_qty * effective_per_liter), 0) AS done_ltrs,
             COALESCE(SUM(delivered_qty), 0) AS done_qty,
@@ -425,6 +437,9 @@ def _primary_master_po_order_minus_deliver_kpi_total(
             COALESCE(SUM(COALESCE(total_order_amt_exclusive, 0)), 0) AS order_value,
             COALESCE(SUM(COALESCE(total_order_liters, 0)), 0) AS order_ltrs,
             COALESCE(SUM(COALESCE(order_qty, 0)), 0) AS order_qty,
+            0 AS projection_value,
+            0 AS projection_ltrs,
+            0 AS projection_qty,
             COALESCE(SUM(COALESCE(total_delivered_amt_exclusive, 0)), 0) AS done_value,
             COALESCE(SUM(COALESCE(total_delivered_liters, 0)), 0) AS done_ltrs,
             COALESCE(SUM(COALESCE(delivered_qty, 0)), 0) AS done_qty,
@@ -443,7 +458,8 @@ def _primary_master_po_order_minus_deliver_kpi_total(
             COALESCE(SUM(CASE
                 WHEN UPPER(TRIM(COALESCE(open_close::text, ''))) = 'OPEN'
                 THEN COALESCE(total_order_liters, 0)
-                ELSE 0 END), 0) AS missed_ltrs
+                ELSE 0 END), 0) AS missed_ltrs,
+            MAX({period_col}) AS projection_max_date
         FROM public.master_po
         WHERE REGEXP_REPLACE(LOWER(TRIM(format::text)), '[^a-z0-9]+', '', 'g') = %s
           AND {period_col} >= %s
@@ -451,7 +467,13 @@ def _primary_master_po_order_minus_deliver_kpi_total(
         """,
         [format_key, period_start, period_end],
     )
-    return _primary_metrics(rows[0] if rows else None)
+    metrics = _primary_metrics(rows[0] if rows else None)
+    elapsed_day = _sec_elapsed_day((rows[0] if rows else {}).get("projection_max_date"))
+    days_in_month = monthrange(year, month)[1]
+    metrics["projection_value"] = _safe_div(metrics["done_value"], elapsed_day) * days_in_month
+    metrics["projection_ltrs"] = _safe_div(metrics["done_ltrs"], elapsed_day) * days_in_month
+    metrics["projection_qty"] = _safe_div(metrics["done_qty"], elapsed_day) * days_in_month
+    return metrics
 
 
 def _bigbasket_primary_period_bounds(month_name: str, year: int) -> tuple[date, date]:
@@ -527,6 +549,7 @@ def _bigbasket_primary_dashboard_response(request, slug: str):
             COALESCE(SUM("total_order_amt_exclusive"), 0) AS order_value,
             COALESCE(SUM("total_order_liters"), 0) AS order_ltrs,
             COALESCE(SUM("order_qty"), 0) AS order_qty,
+            0 AS projection_ltrs,
             COALESCE(SUM(CASE WHEN in_selected_period
                 AND UPPER(TRIM("po_status"::text)) = 'COMPLETED'
                 THEN "{done_value_col}" ELSE 0 END), 0) AS done_value,
@@ -581,6 +604,7 @@ def _bigbasket_primary_dashboard_response(request, slug: str):
                 COALESCE(SUM("total_order_amt_exclusive"), 0) AS order_value,
                 COALESCE(SUM("total_order_liters"), 0) AS order_ltrs,
                 COALESCE(SUM("order_qty"), 0) AS order_qty,
+                0 AS projection_ltrs,
                 COALESCE(SUM(CASE WHEN in_selected_period
                     AND UPPER(TRIM("po_status"::text)) = 'COMPLETED'
                     THEN "{done_value_col}" ELSE 0 END), 0) AS done_value,
@@ -638,6 +662,7 @@ def _bigbasket_primary_dashboard_response(request, slug: str):
                 COALESCE(SUM("total_order_amt_exclusive"), 0) AS order_value,
                 COALESCE(SUM("total_order_liters"), 0) AS order_ltrs,
                 COALESCE(SUM("order_qty"), 0) AS order_qty,
+                0 AS projection_ltrs,
                 COALESCE(SUM(CASE WHEN in_selected_period
                     AND UPPER(TRIM("po_status"::text)) = 'COMPLETED'
                     THEN "{done_value_col}" ELSE 0 END), 0) AS done_value,
@@ -790,6 +815,12 @@ def _bigbasket_primary_dashboard_response(request, slug: str):
         _MONTH_NAME_TO_NUM.get(month_name),
         year,
     )
+    summary_total = _bigbasket_primary_total(summary)
+    summary_total.update({
+        "projection_value": kpi_total.get("projection_value", 0),
+        "projection_ltrs": kpi_total.get("projection_ltrs", 0),
+        "projection_qty": kpi_total.get("projection_qty", 0),
+    })
     return Response({
         "source": "master_po",
         "format": f"{slug.upper()}_PRIMARY",
@@ -806,7 +837,7 @@ def _bigbasket_primary_dashboard_response(request, slug: str):
         "period_end": period_end.isoformat(),
         "max_date": max_date.isoformat() if hasattr(max_date, "isoformat") else None,
         "summary": summary,
-        "summary_total": _bigbasket_primary_total(summary),
+        "summary_total": summary_total,
         "items": items,
         "item_total": item_total,
         "details": details,
@@ -868,7 +899,10 @@ _PRIMARY_METRIC_SQL = """
         THEN COALESCE(metric_order_liters, 0) ELSE 0 END), 0) AS cancelled_ltrs,
     COALESCE(SUM(COALESCE(metric_order_value, 0)), 0) AS order_value,
     COALESCE(SUM(COALESCE(metric_order_liters, 0)), 0) AS order_ltrs,
-    COALESCE(SUM(COALESCE(metric_order_qty, 0)), 0) AS order_qty
+    COALESCE(SUM(COALESCE(metric_order_qty, 0)), 0) AS order_qty,
+    COALESCE(SUM(COALESCE(metric_projection_value, 0)), 0) AS projection_value,
+    COALESCE(SUM(COALESCE(metric_projection_ltrs, 0)), 0) AS projection_ltrs,
+    COALESCE(SUM(COALESCE(metric_projection_qty, 0)), 0) AS projection_qty
 """
 
 
@@ -912,7 +946,10 @@ _AMAZON_PRIMARY_METRIC_SQL = """
     COALESCE(SUM(CASE WHEN status_key NOT IN ('CANCELLED', 'CANCELED', 'CANCEL', 'MOV') AND item_head_key <> 'OTHER'
         THEN COALESCE(order_ltrs_cl, total_order_liters, 0) ELSE 0 END), 0) AS order_ltrs,
     COALESCE(SUM(CASE WHEN status_key NOT IN ('CANCELLED', 'CANCELED', 'CANCEL', 'MOV')
-        THEN COALESCE(order_unit_cl, requested_qty, 0) ELSE 0 END), 0) AS order_qty
+        THEN COALESCE(order_unit_cl, requested_qty, 0) ELSE 0 END), 0) AS order_qty,
+    0 AS projection_value,
+    0 AS projection_ltrs,
+    0 AS projection_qty
 """
 
 
@@ -1376,6 +1413,11 @@ def _amazon_primary_dashboard_payload(
 
     detail_total = _primary_total(details)
     summary_total = _primary_total(summary)
+    elapsed_day = _sec_elapsed_day(max_date)
+    days_in_month = monthrange(year, month)[1]
+    summary_total["projection_value"] = _safe_div(summary_total["done_value"], elapsed_day) * days_in_month
+    summary_total["projection_ltrs"] = _safe_div(summary_total["done_ltrs"], elapsed_day) * days_in_month
+    summary_total["projection_qty"] = _safe_div(summary_total["done_qty"], elapsed_day) * days_in_month
 
     payload = {
         "source": 'reporting."Amazon PO"',
@@ -1612,6 +1654,17 @@ def pendency_dashboard(request, slug: str):
                 ),
                 'DD-MM-YYYY'
             ) AS po_date,
+            TO_CHAR(
+                MAX(
+                    CASE
+                        WHEN TRIM("po_expiry_date"::text) ~ '^[0-9]{{2}}-[0-9]{{2}}-[0-9]{{4}}$'
+                            THEN TO_DATE(TRIM("po_expiry_date"::text), 'DD-MM-YYYY')
+                        WHEN TRIM("po_expiry_date"::text) ~ '^[0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}$'
+                            THEN TRIM("po_expiry_date"::text)::date
+                    END
+                ),
+                'DD-MM-YYYY'
+            ) AS po_expiry_date,
             {metric_cols}
         FROM "master_po"
         {full_where}
@@ -2039,6 +2092,11 @@ def _primary_dashboard_payload(
 
     detail_total = _primary_total(details)
     summary_total = _primary_total(summary)
+    elapsed_day = _sec_elapsed_day(max_date)
+    days_in_month = monthrange(year, month)[1]
+    summary_total["projection_value"] = _safe_div(summary_total["done_value"], elapsed_day) * days_in_month
+    summary_total["projection_ltrs"] = _safe_div(summary_total["done_ltrs"], elapsed_day) * days_in_month
+    summary_total["projection_qty"] = _safe_div(summary_total["done_qty"], elapsed_day) * days_in_month
     trend_date_col = "delivery_dt" if mode == "DEL MONTH" else "po_dt"
     period_start = date(year, month, 1)
     period_end = min(date(year, month, monthrange(year, month)[1]), period_end_cap)
@@ -4826,6 +4884,9 @@ normalized AS (
         COALESCE(total_delivered_amt_exclusive, 0) AS metric_delivered_value,
         COALESCE(order_qty, 0) AS metric_order_qty,
         COALESCE(delivered_qty, 0) AS metric_delivered_qty,
+        0 AS metric_projection_value,
+        0 AS metric_projection_ltrs,
+        0 AS metric_projection_qty,
         COALESCE(missed_ltrs, 0) AS metric_pending_liters,
         COALESCE(missed_qty, 0) AS metric_pending_qty,
         COALESCE(
@@ -4942,6 +5003,9 @@ def _primary_zero_metrics() -> dict:
         "order_value": 0.0,
         "order_ltrs": 0.0,
         "order_qty": 0.0,
+        "projection_value": 0.0,
+        "projection_ltrs": 0.0,
+        "projection_qty": 0.0,
     }
 
 
@@ -4963,6 +5027,9 @@ def _primary_metrics(row: dict | None) -> dict:
             "order_value",
             "order_ltrs",
             "order_qty",
+            "projection_value",
+            "projection_ltrs",
+            "projection_qty",
         ):
             metrics[key] = _num(row.get(key))
     metrics["dp_value"] = metrics["done_value"] + metrics["pending_value"]
@@ -7180,6 +7247,8 @@ def _blinkit_sec_dashboard_response(request):
         """,
         [month_name, year, *date_params],
     )
+    elapsed_day = _sec_elapsed_day(max_date)
+    days_in_month = monthrange(year, month)[1]
 
     summary_raw = _dict_rows(
         f"""
@@ -7290,6 +7359,8 @@ def _blinkit_sec_dashboard_response(request):
         "year": year,
         "selected_date": selected_date.isoformat() if selected_date else None,
         "max_date": max_date.isoformat() if hasattr(max_date, "isoformat") else max_date,
+        "elapsed_day": elapsed_day,
+        "days_in_month": days_in_month,
         "summary": summary,
         "summary_total": summary_total,
         "details": details,
@@ -7603,6 +7674,8 @@ def _zepto_sec_dashboard_response(request):
         """,
         [month_name, year, *date_params],
     )
+    elapsed_day = _sec_elapsed_day(max_date)
+    days_in_month = monthrange(year, month)[1]
 
     summary_raw = _dict_rows(
         f"""
@@ -7704,6 +7777,8 @@ def _zepto_sec_dashboard_response(request):
         "year": year,
         "selected_date": selected_date.isoformat() if selected_date else None,
         "max_date": max_date.isoformat() if hasattr(max_date, "isoformat") else max_date,
+        "elapsed_day": elapsed_day,
+        "days_in_month": days_in_month,
         "summary": summary,
         "summary_total": summary_total,
         "details": details,

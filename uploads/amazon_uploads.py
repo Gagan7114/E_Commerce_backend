@@ -3528,6 +3528,259 @@ def amazon_po_filter_options(request):
 
 @api_view(["GET"])
 @permission_classes([require("platform.po.view")])
+def amazon_po_new_po_dashboard(request):
+    _ensure_amazon_access(request.user)
+    q = request.query_params
+    legacy_date = str(q.get("order_date") or "").strip()
+    date_from = str(q.get("order_date_from") or legacy_date).strip()
+    date_to = str(q.get("order_date_to") or legacy_date).strip()
+    channel = str(q.get("channel") or "ALL").strip().upper() or "ALL"
+    if channel not in {"ALL", "CORE", "FRESH", "NOW"}:
+        channel = "ALL"
+
+    def normalize_date_param(value: str) -> str:
+        try:
+            return date.fromisoformat(value).isoformat() if value else ""
+        except ValueError:
+            return ""
+
+    date_from = normalize_date_param(date_from)
+    date_to = normalize_date_param(date_to)
+
+    channel_sql = ""
+    channel_params: list[Any] = []
+    if channel != "ALL":
+        channel_sql = " AND UPPER(TRIM(COALESCE(core_fresh_now::text, ''))) = %s"
+        channel_params.append(channel)
+
+    with connection.cursor() as cur:
+        if not date_from and not date_to:
+            cur.execute(
+                """
+                SELECT MAX(order_date)
+                  FROM reporting."Amazon PO"
+                 WHERE order_date IS NOT NULL
+                """
+            )
+            max_date = cur.fetchone()[0]
+            latest_date = max_date.isoformat() if max_date else ""
+            date_from = latest_date
+            date_to = latest_date
+        elif date_from and not date_to:
+            date_to = date_from
+        elif date_to and not date_from:
+            date_from = date_to
+
+        if date_from and date_to and date_from > date_to:
+            date_from, date_to = date_to, date_from
+
+        date_sql = "order_date BETWEEN %s AND %s"
+        date_params: list[Any] = [date_from, date_to]
+        selected_date = date_from if date_from == date_to else ""
+
+        cur.execute(
+            """
+            SELECT DISTINCT order_date
+              FROM reporting."Amazon PO"
+             WHERE order_date IS NOT NULL
+             ORDER BY order_date DESC
+             LIMIT 500
+            """
+        )
+        order_dates = [_jsonable(row[0]) for row in cur.fetchall()]
+
+        cur.execute(
+            """
+            SELECT DISTINCT UPPER(TRIM(core_fresh_now::text)) AS channel
+              FROM reporting."Amazon PO"
+             WHERE core_fresh_now IS NOT NULL
+               AND TRIM(core_fresh_now::text) != ''
+             ORDER BY channel ASC
+            """
+        )
+        channels = sorted({row[0] for row in cur.fetchall() if row[0]} | {"CORE", "FRESH", "NOW"})
+
+        empty_payload = {
+            "selected_date": selected_date,
+            "date_from": date_from,
+            "date_to": date_to,
+            "channel": channel,
+            "filter_options": {
+                "order_dates": order_dates,
+                "channels": [{"value": "ALL", "label": "All"}]
+                + [{"value": value, "label": value.title()} for value in channels],
+            },
+            "item_head_summary": [],
+            "channel_summary": {"premium": [], "commodity": []},
+            "po_summary": [],
+            "details": [],
+            "totals": {
+                "count_of_po": 0,
+                "unit_order": 0,
+                "order_ltr": 0,
+                "order_value": 0,
+                "detail_rows": 0,
+            },
+        }
+        if not date_from or not date_to:
+            return Response(empty_payload)
+
+        cur.execute(
+            f"""
+            WITH wanted(item_head, sort_order) AS (
+                VALUES ('PREMIUM', 1), ('COMMODITY', 2), ('OTHER', 3)
+            ),
+            base AS (
+                SELECT
+                    COALESCE(NULLIF(UPPER(TRIM(item_head::text)), ''), 'OTHER') AS item_head,
+                    NULLIF(TRIM(po_number::text), '') AS po_number,
+                    COALESCE(requested_qty, 0) AS requested_qty,
+                    COALESCE(total_order_liters, 0) AS total_order_liters,
+                    COALESCE(total_order_amt_exclusive, 0) AS total_order_amt_exclusive
+                FROM reporting."Amazon PO"
+                WHERE {date_sql}
+                {channel_sql}
+            )
+            SELECT
+                wanted.item_head,
+                COUNT(DISTINCT base.po_number) AS count_of_po,
+                COALESCE(SUM(base.requested_qty), 0) AS unit_order,
+                COALESCE(SUM(base.total_order_liters), 0) AS order_ltr,
+                COALESCE(SUM(base.total_order_amt_exclusive), 0) AS order_value
+            FROM wanted
+            LEFT JOIN base ON base.item_head = wanted.item_head
+            GROUP BY wanted.item_head, wanted.sort_order
+            ORDER BY wanted.sort_order
+            """,
+            [*date_params, *channel_params],
+        )
+        item_head_summary = _rows_to_dicts(cur)
+
+        channel_summary: dict[str, list[dict[str, Any]]] = {}
+        for label, item_head in (("premium", "PREMIUM"), ("commodity", "COMMODITY")):
+            cur.execute(
+                f"""
+                WITH channels(channel, sort_order) AS (
+                    VALUES ('CORE', 1), ('FRESH', 2), ('NOW', 3)
+                ),
+                base AS (
+                    SELECT
+                        UPPER(TRIM(COALESCE(core_fresh_now::text, ''))) AS channel,
+                        NULLIF(TRIM(po_number::text), '') AS po_number,
+                        COALESCE(requested_qty, 0) AS requested_qty,
+                        COALESCE(total_order_liters, 0) AS total_order_liters,
+                        COALESCE(total_order_amt_exclusive, 0) AS total_order_amt_exclusive
+                    FROM reporting."Amazon PO"
+                    WHERE {date_sql}
+                      AND COALESCE(NULLIF(UPPER(TRIM(item_head::text)), ''), 'OTHER') = %s
+                )
+                SELECT
+                    channels.channel,
+                    COUNT(DISTINCT base.po_number) AS count_of_po,
+                    COALESCE(SUM(base.requested_qty), 0) AS unit_order,
+                    COALESCE(SUM(base.total_order_liters), 0) AS order_ltr,
+                    COALESCE(SUM(base.total_order_amt_exclusive), 0) AS order_value
+                FROM channels
+                LEFT JOIN base ON base.channel = channels.channel
+                GROUP BY channels.channel, channels.sort_order
+                ORDER BY channels.sort_order
+                """,
+                [*date_params, item_head],
+            )
+            channel_summary[label] = _rows_to_dicts(cur)
+
+        cur.execute(
+            f"""
+            SELECT
+                po_number,
+                fulfillment_center,
+                COALESCE(SUM(requested_qty), 0) AS order_qty,
+                COALESCE(SUM(total_order_liters), 0) AS order_ltr,
+                COALESCE(SUM(total_order_liters) FILTER (
+                    WHERE COALESCE(NULLIF(UPPER(TRIM(item_head::text)), ''), 'OTHER') = 'PREMIUM'
+                ), 0) AS premium_ltr,
+                COALESCE(SUM(total_order_liters) FILTER (
+                    WHERE COALESCE(NULLIF(UPPER(TRIM(item_head::text)), ''), 'OTHER') = 'COMMODITY'
+                ), 0) AS commodity_ltr
+            FROM reporting."Amazon PO"
+            WHERE {date_sql}
+            {channel_sql}
+            GROUP BY po_number, fulfillment_center
+            ORDER BY COALESCE(SUM(total_order_liters), 0) DESC, po_number ASC
+            LIMIT 100
+            """,
+            [*date_params, *channel_params],
+        )
+        po_summary = _rows_to_dicts(cur)
+
+        cur.execute(
+            f"""
+            SELECT COUNT(*)
+              FROM reporting."Amazon PO"
+             WHERE {date_sql}
+             {channel_sql}
+            """,
+            [*date_params, *channel_params],
+        )
+        detail_rows = int(cur.fetchone()[0] or 0)
+
+        cur.execute(
+            f"""
+            SELECT
+                po_number,
+                order_date,
+                expiry_date,
+                sku_code,
+                item,
+                item_head,
+                fulfillment_center,
+                core_fresh_now,
+                requested_qty,
+                accepted_qty,
+                received_qty,
+                cancelled_qty,
+                total_order_liters,
+                total_order_amt_exclusive
+            FROM reporting."Amazon PO"
+            WHERE {date_sql}
+            {channel_sql}
+            ORDER BY order_date ASC NULLS LAST, po_number ASC NULLS LAST, sku_code ASC NULLS LAST
+            LIMIT 500
+            """,
+            [*date_params, *channel_params],
+        )
+        details = _rows_to_dicts(cur)
+
+    totals = {
+        "count_of_po": sum(int(row.get("count_of_po") or 0) for row in item_head_summary),
+        "unit_order": sum(float(row.get("unit_order") or 0) for row in item_head_summary),
+        "order_ltr": sum(float(row.get("order_ltr") or 0) for row in item_head_summary),
+        "order_value": sum(float(row.get("order_value") or 0) for row in item_head_summary),
+        "detail_rows": detail_rows,
+    }
+
+    return Response(
+        {
+            "selected_date": selected_date,
+            "date_from": date_from,
+            "date_to": date_to,
+            "channel": channel,
+            "filter_options": {
+                "order_dates": order_dates,
+                "channels": [{"value": "ALL", "label": "All"}]
+                + [{"value": value, "label": value.title()} for value in channels],
+            },
+            "item_head_summary": item_head_summary,
+            "channel_summary": channel_summary,
+            "po_summary": po_summary,
+            "details": details,
+            "totals": totals,
+        }
+    )
+
+
+@api_view(["GET"])
+@permission_classes([require("platform.po.view")])
 def amazon_po_matrix(request):
     _ensure_amazon_access(request.user)
     q = request.query_params
