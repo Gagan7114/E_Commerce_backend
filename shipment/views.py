@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import math
 from datetime import date as _date, timedelta
 from decimal import Decimal
@@ -587,6 +588,79 @@ def _filler_pass(loaded, leftover_pool, capacity, primary_fc=None, mark_key='_fi
     return list(loaded) + filler_loaded, filler_unfit + wrong_fc
 
 
+def _enforce_commit_caps(loaded, not_loaded, commit_caps, key_field='appointment_id'):
+    """Trim ``loaded`` so each capped group respects its Vendor Central commit:
+    sum(planned_qty) ≤ units_cap AND sum(planned_qty/case_pack) ≤ cartons_cap.
+    Lowest-priority items are dropped first; removed items go to ``not_loaded``
+    with a clear ``unfit_reason`` so the UI can explain them.
+
+    ``commit_caps`` is ``{group_key: {'units': N, 'cartons': N}}``. Items are
+    grouped by ``key_field`` (default ``appointment_id`` for auto; ``po_number``
+    for manual). For ``po_number`` the comparison is uppercase-trimmed. Zero
+    caps mean "no cap" for that field. DOH fillers bypass the cap entirely.
+    """
+    if not commit_caps:
+        return loaded, not_loaded
+
+    norm_caps = {}
+    for k, v in commit_caps.items():
+        if key_field == 'po_number':
+            norm_caps[str(k or '').strip().upper()] = v
+        else:
+            norm_caps[str(k or '').strip()] = v
+
+    def _key(it):
+        raw = str(it.get(key_field) or '').strip()
+        return raw.upper() if key_field == 'po_number' else raw
+
+    indexed = list(enumerate(loaded))
+    indexed.sort(key=lambda pair: (
+        1 if pair[1].get('_doh_filler') else 0,
+        -(pair[1].get('priority_score') or 0),
+        (pair[1].get('days_to_expiry') or 999),
+        -(pair[1].get('accepted_qty') or 0),
+    ))
+
+    totals = {k: {'u': 0.0, 'c': 0.0} for k in norm_caps}
+    keep_flags = [True] * len(loaded)
+    extras = []
+
+    for orig_idx, it in indexed:
+        if it.get('_doh_filler'):
+            continue
+        gk = _key(it)
+        if gk not in norm_caps:
+            continue
+        cap = norm_caps[gk] or {}
+        cap_u = float(cap.get('units') or 0) or float('inf')
+        cap_c = float(cap.get('cartons') or 0) or float('inf')
+
+        pq = int(it.get('planned_qty') or 0)
+        cp = max(int(it.get('case_pack') or 1), 1)
+        c_units = pq / cp
+
+        t = totals[gk]
+        if t['u'] + pq <= cap_u and t['c'] + c_units <= cap_c:
+            t['u'] += pq
+            t['c'] += c_units
+        else:
+            keep_flags[orig_idx] = False
+            removed = dict(it)
+            removed['planned_qty'] = 0
+            removed['planned_liters'] = 0
+            removed['not_loaded'] = True
+            label = 'PO' if key_field == 'po_number' else 'appointment'
+            removed['unfit_reason'] = (
+                f'Exceeds Vendor Central commit cap for this {label} '
+                f'(cap: {int(cap.get("units") or 0)} units / '
+                f'{int(cap.get("cartons") or 0)} cartons).'
+            )
+            extras.append(removed)
+
+    new_loaded = [it for i, it in enumerate(loaded) if keep_flags[i]]
+    return new_loaded, list(not_loaded) + extras
+
+
 def _fetch_doh_filler_pool(fc, exclude_po_uppers, doh_by_asin):
     """
     Pull all PENDING in-stock POs at the given FC that ARE NOT already in the
@@ -1139,6 +1213,25 @@ class AppointmentItemsView(APIView):
         strict_param = str(request.query_params.get('priority_strict') or '').lower()
         priority_strict = strict_param in ('1', 'true', 'yes', 'on')
 
+        # Vendor Central commit caps: per-appointment units & cartons ceiling.
+        # Format: {"<appointment_id>": {"units": N, "cartons": N}}. Missing /
+        # malformed entries are ignored — the planner just runs uncapped.
+        commit_caps = {}
+        caps_raw = request.query_params.get('commit_caps_json') or ''
+        if caps_raw:
+            try:
+                parsed = json.loads(caps_raw)
+                if isinstance(parsed, dict):
+                    for k, v in parsed.items():
+                        if not isinstance(v, dict):
+                            continue
+                        units = int(v.get('units') or 0)
+                        cartons = int(v.get('cartons') or 0)
+                        if units > 0 or cartons > 0:
+                            commit_caps[str(k)] = {'units': units, 'cartons': cartons}
+            except (ValueError, TypeError):
+                pass
+
         # Maximize-fill toggle: after the priority-driven plan, top up any
         # remaining capacity with NO-DEMAND / leftover items from the same FC.
         # Default ON so trucks ship full rather than 30% loaded.
@@ -1437,6 +1530,13 @@ class AppointmentItemsView(APIView):
             planned_liters = round(sum(float(it.get('planned_liters') or 0) for it in loaded), 4)
             load_pct = round((planned_liters / capacity * 100) if capacity > 0 else 0, 2)
 
+        # Apply Vendor Central commit caps as the FINAL filter so anything
+        # that maximize_fill pulled in respects the per-appointment cap too.
+        if commit_caps:
+            loaded, not_loaded = _enforce_commit_caps(loaded, not_loaded, commit_caps)
+            planned_liters = round(sum(float(it.get('planned_liters') or 0) for it in loaded), 4)
+            load_pct = round((planned_liters / capacity * 100) if capacity > 0 else 0, 2)
+
         # If load is still thin, suggest a smaller truck size
         truck_suggestion = _suggest_smaller_truck(planned_liters, capacity, truck_size)
 
@@ -1483,6 +1583,7 @@ class AppointmentItemsView(APIView):
             'maximize_fill': maximize_fill,
             'filler_count': filler_count,
             'doh_filler_count': doh_filler_count,
+            'commit_caps': commit_caps,
             'loaded_items': loaded,
             'not_loaded_items': not_loaded,
             'priority_requested': priority,
@@ -2251,6 +2352,22 @@ class ManualPlanView(APIView):
         truck_size = request.data.get('truck_size', '15_ton')
         capacity_override = request.data.get('truck_capacity_liters')
 
+        # Vendor Central commit caps per PO (manual planner). Same shape as the
+        # auto endpoint, just keyed by PO number instead of appointment_id.
+        commit_caps = {}
+        raw_caps = request.data.get('commit_caps_per_po') or {}
+        if isinstance(raw_caps, dict):
+            for k, v in raw_caps.items():
+                if not isinstance(v, dict):
+                    continue
+                try:
+                    units = int(v.get('units') or 0)
+                    cartons = int(v.get('cartons') or 0)
+                except (TypeError, ValueError):
+                    continue
+                if units > 0 or cartons > 0:
+                    commit_caps[str(k)] = {'units': units, 'cartons': cartons}
+
         if not selected_items:
             return Response({'error': 'No items selected'}, status=400)
 
@@ -2274,10 +2391,18 @@ class ManualPlanView(APIView):
             selected_items, truck_size, capacity_override
         )
 
+        if commit_caps:
+            loaded, not_loaded = _enforce_commit_caps(
+                loaded, not_loaded, commit_caps, key_field='po_number',
+            )
+            planned_liters = round(sum(float(it.get('planned_liters') or 0) for it in loaded), 4)
+            load_pct = round((planned_liters / capacity * 100) if capacity > 0 else 0, 2)
+
         return Response({
             'loaded_items': loaded,
             'not_loaded_items': not_loaded,
             'priority_actual': priority_actual,
+            'commit_caps': commit_caps,
             'load_summary': {
                 'truck_size': truck_size,
                 'capacity': capacity,
