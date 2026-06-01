@@ -104,6 +104,9 @@ def _pack_into_capacity(items, capacity_lt):
         if accepted_qty == 0:
             item['planned_qty'] = 0
             item['planned_liters'] = 0
+            item['unfit_reason'] = (
+                'Already fully committed to another shipment — nothing left to ship.'
+            )
             not_loaded.append(item)
             continue
 
@@ -118,13 +121,35 @@ def _pack_into_capacity(items, capacity_lt):
             else:
                 item['planned_qty'] = 0
                 item['planned_liters'] = 0
+                item['unfit_reason'] = (
+                    'No per-liter data in the master sheet — planner cannot fit '
+                    'this item without knowing its volume.'
+                )
                 not_loaded.append(item)
             continue
 
         if total_liters <= remaining + 0.001:
-            item['planned_qty'] = accepted_qty
-            item['planned_liters'] = round(total_liters, 4)
-            remaining -= total_liters
+            # Full ordered qty fits. Still flag as case-pack-rounded short when
+            # ordered doesn't divide evenly into the carton — Amazon receives
+            # the full case count but the line is technically short by the
+            # residue (e.g. ordered 100, case_pack 12 → ship 96, short 4).
+            full_cartons = math.floor(accepted_qty / case_pack) * case_pack if case_pack > 0 else accepted_qty
+            if case_pack > 1 and full_cartons < accepted_qty:
+                ship_qty = full_cartons
+                ship_liters = round(ship_qty * per_liter, 4)
+                item['planned_qty'] = ship_qty
+                item['planned_liters'] = ship_liters
+                item['short_reason'] = (
+                    f'Case-pack {int(case_pack)} residue — ordered '
+                    f'{int(accepted_qty)} units, only full cartons ship '
+                    f'({int(ship_qty)} units in {int(ship_qty // case_pack)} cartons); '
+                    f'{int(accepted_qty - ship_qty)} units left as residue.'
+                )
+                remaining -= ship_liters
+            else:
+                item['planned_qty'] = accepted_qty
+                item['planned_liters'] = round(total_liters, 4)
+                remaining -= total_liters
             loaded.append(item)
         else:
             if per_liter > 0 and case_pack > 0:
@@ -133,15 +158,44 @@ def _pack_into_capacity(items, capacity_lt):
                     partial_liters = round(partial_qty * per_liter, 4)
                     item['planned_qty'] = partial_qty
                     item['planned_liters'] = partial_liters
+                    # Tell the user WHY this line ships short. Two distinct
+                    # cases: (a) one more carton would have fit but Amazon
+                    # didn't order that many → case-pack residue; (b) the
+                    # truck genuinely ran out of room before we could fit
+                    # one more carton.
+                    short_units = int(accepted_qty - partial_qty)
+                    cartons_fit = int(partial_qty // case_pack)
+                    cartons_asked = int(math.ceil(accepted_qty / case_pack))
+                    if short_units < case_pack:
+                        item['short_reason'] = (
+                            f'Case-pack {int(case_pack)} residue — ordered '
+                            f'{int(accepted_qty)} units doesn\'t divide evenly into '
+                            f'full cartons. Max shippable: {int(partial_qty)} units '
+                            f'({cartons_fit} cartons); {short_units} units left over.'
+                        )
+                    else:
+                        item['short_reason'] = (
+                            f'Truck out of capacity — only {cartons_fit} of '
+                            f'{cartons_asked} cartons fit before the truck '
+                            f'filled up. {short_units} units left for the next '
+                            f'shipment.'
+                        )
                     remaining -= partial_liters
                     loaded.append(item)
                 else:
                     item['planned_qty'] = 0
                     item['planned_liters'] = 0
+                    item['unfit_reason'] = (
+                        f'Doesn\'t fit even one carton ({int(case_pack)} '
+                        f'units) in remaining truck capacity.'
+                    )
                     not_loaded.append(item)
             else:
                 item['planned_qty'] = 0
                 item['planned_liters'] = 0
+                item['unfit_reason'] = (
+                    'No per-liter / case-pack data — cannot pack this item.'
+                )
                 not_loaded.append(item)
     used = float(capacity_lt) - remaining
     return loaded, not_loaded, used
@@ -206,6 +260,10 @@ def _auto_plan_truck(items, truck_size, capacity_override=None, priority=None, s
                 else:
                     it['planned_qty'] = 0
                     it['planned_liters'] = 0
+                    it['unfit_reason'] = (
+                        f'{k} bucket has 0% allocation in the priority slider — '
+                        'this item belongs to a bucket you didn\'t pick.'
+                    )
                     not_loaded_all.append(it)
             priority_actual[k] = {'requested_liters': 0, 'used_liters': 0}
             bucket_used[k] = 0.0
