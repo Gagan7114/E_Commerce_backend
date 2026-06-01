@@ -9,6 +9,7 @@ from rest_framework_simplejwt.tokens import RefreshToken
 
 from platforms.services.inventory_doh_alerts import (
     ALERT_TYPE,
+    DEFAULT_THRESHOLD,
     notification_to_payload,
     upsert_low_doh_notifications,
 )
@@ -109,6 +110,7 @@ def notifications(request):
     queryset = InventoryDohNotification.objects.filter(alert_type=ALERT_TYPE)
     if active_only:
         queryset = queryset.filter(resolved_at__isnull=True)
+    queryset = queryset.filter(doh__lt=DEFAULT_THRESHOLD)
     platform_slug = (request.query_params.get("platform") or "").strip().lower()
     if platform_slug:
         queryset = queryset.filter(platform_slug=platform_slug)
@@ -193,7 +195,7 @@ def inventory_doh_sku_detail(request, notification_id: int):
 @permission_classes([IsAuthenticated])
 def generate_inventory_doh_notifications(request):
     try:
-        threshold = float(request.data.get("threshold", 10))
+        threshold = float(request.data.get("threshold", DEFAULT_THRESHOLD))
     except (TypeError, ValueError):
         return Response(
             {"detail": "threshold must be a number."},

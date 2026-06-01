@@ -84,4 +84,5 @@ class InventoryDohNotification(models.Model):
         return self.resolved_at is None
 
     def __str__(self) -> str:
-        return f"{self.format} {self.sku_code} DOH {self.doh}"
+        label = self.item or self.sku_code
+        return f"{self.format} {label} DOH {self.doh}"

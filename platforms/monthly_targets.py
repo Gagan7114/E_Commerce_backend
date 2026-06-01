@@ -1114,6 +1114,8 @@ def month_targets_dashboard(request):
         by_format = {r["format"].strip().lower(): r for r in raw}
         rows = []
         for slug in ordered:
+            if item_head.upper() == "COMMODITY" and slug == "zomato":
+                continue
             p = platforms.get(slug)
             if not p:
                 continue

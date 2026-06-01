@@ -33,6 +33,7 @@ IN_SCOPE_SLUGS = {
     "citymall",
     "flipkart",
     "flipkart_grocery",
+    "amazon_mp",
 }
 SKIPPED_SLUGS = {"jiomart"}
 
@@ -53,11 +54,13 @@ SPECIAL_DASHBOARD_ROWS = (
     {
         "key": "amazon_secondary",
         "format": "AMAZON SECONDARY",
-        "platform_name": "Amazon Secondary",
+        "platform_name": "Amazon",
         "type": "sec",
         "access_slug": "amazon",
         "logo_slug": "amazon",
         "source": "amazon_sec_range_master_view",
+        "target_source": "month_targets",
+        "target_format": "AMAZON",
     },
     {
         "key": "amazon_mp",
@@ -71,11 +74,13 @@ SPECIAL_DASHBOARD_ROWS = (
     {
         "key": "flipkart_secondary",
         "format": "FLIPKART SECONDARY",
-        "platform_name": "Flipkart Secondary",
+        "platform_name": "Flipkart MP",
         "type": "sec",
         "access_slug": "flipkart",
         "logo_slug": "flipkart",
         "source": "flipkart_secondary_all",
+        "target_source": "month_targets",
+        "target_format": "FLIPKART",
     },
 )
 
@@ -109,7 +114,8 @@ def _get_platform(slug: str) -> PlatformConfig:
 
 
 def _ensure_scope(user, slug: str) -> None:
-    if not can_access_platform(user, slug):
+    access_slug = "amazon" if slug == "amazon_mp" else slug
+    if not can_access_platform(user, access_slug):
         raise PermissionDenied(f"Your account is not authorized for the '{slug}' platform.")
     if slug in SKIPPED_SLUGS or slug not in IN_SCOPE_SLUGS:
         raise ValidationError(f"Platform '{slug}' is out of scope for Primary Monthly Targets.")
@@ -117,6 +123,21 @@ def _ensure_scope(user, slug: str) -> None:
 
 def _format_for(p: PlatformConfig) -> str:
     return (p.po_filter_value or p.slug).strip().upper()
+
+
+def _platform_target_meta(slug: str) -> dict:
+    if slug == "amazon_mp":
+        return {
+            "format": "AMAZON MP",
+            "type": "sec",
+            "source": "amazon_mp_master",
+        }
+    p = _get_platform(slug)
+    return {
+        "format": _format_for(p),
+        "type": "prim",
+        "source": "master_po",
+    }
 
 
 def _format_key(value: str | None) -> str:
@@ -581,8 +602,7 @@ def _refresh_existing_row(row: dict, fmt: str | None = None) -> dict:
     return _select_row("WHERE id = %s", [row_id])
 
 
-def _refresh_platform_rows(platform: PlatformConfig, month: int, year: int) -> list[dict]:
-    fmt = _format_for(platform)
+def _refresh_format_rows(fmt: str, month: int, year: int) -> list[dict]:
     rows = _select_rows(
         """WHERE LOWER(TRIM("format")) = LOWER(TRIM(%s))
              AND month = %s AND year = %s""",
@@ -596,8 +616,8 @@ def _refresh_platform_rows(platform: PlatformConfig, month: int, year: int) -> l
 @permission_classes([require("platform.month_targets.view")])
 def primary_month_targets_list(request, slug: str):
     _ensure_scope(request.user, slug)
-    p = _get_platform(slug)
-    fmt = _format_for(p)
+    meta = _platform_target_meta(slug)
+    fmt = meta["format"]
 
     where = ['LOWER(TRIM("format")) = LOWER(TRIM(%s))']
     params: list = [fmt]
@@ -617,8 +637,8 @@ def primary_month_targets_list(request, slug: str):
     return Response({
         "data": rows,
         "format": fmt,
-        "type": "prim",
-        "source": "master_po",
+        "type": meta["type"],
+        "source": meta["source"],
     })
 
 
@@ -626,8 +646,8 @@ def primary_month_targets_list(request, slug: str):
 @permission_classes([require("platform.month_targets.edit")])
 def primary_month_targets_create(request, slug: str):
     _ensure_scope(request.user, slug)
-    p = _get_platform(slug)
-    fmt = _format_for(p)
+    meta = _platform_target_meta(slug)
+    fmt = meta["format"]
 
     body = request.data or {}
     item_head = str(body.get("item_head") or "").strip().upper()
@@ -668,7 +688,7 @@ def primary_month_targets_create(request, slug: str):
     """
     params = [
         fmt,
-        "prim",
+        meta["type"],
         item_head,
         month,
         year,
@@ -715,7 +735,8 @@ def primary_month_targets_create(request, slug: str):
 @permission_classes([require("platform.month_targets.edit")])
 def primary_month_targets_refresh_platform(request, slug: str):
     _ensure_scope(request.user, slug)
-    p = _get_platform(slug)
+    meta = _platform_target_meta(slug)
+    fmt = meta["format"]
 
     body = request.data if request.data else request.query_params
     month, year = _parse_month_year_or_current(body)
@@ -725,7 +746,7 @@ def primary_month_targets_refresh_platform(request, slug: str):
         )
 
     with transaction.atomic():
-        rows = _refresh_platform_rows(p, month, year)
+        rows = _refresh_format_rows(fmt, month, year)
 
     return Response({
         "ok": True,
@@ -733,9 +754,9 @@ def primary_month_targets_refresh_platform(request, slug: str):
         "year": year,
         "updated": len(rows),
         "rows": rows,
-        "format": _format_for(p),
-        "type": "prim",
-        "source": "master_po",
+        "format": fmt,
+        "type": meta["type"],
+        "source": meta["source"],
     })
 
 
@@ -792,8 +813,8 @@ def _insert_log(
 @permission_classes([require("platform.month_targets.edit")])
 def primary_month_targets_update(request, slug: str, row_id: int):
     _ensure_scope(request.user, slug)
-    p = _get_platform(slug)
-    fmt = _format_for(p)
+    meta = _platform_target_meta(slug)
+    fmt = meta["format"]
 
     existing = _select_row(
         """WHERE id = %s
@@ -939,6 +960,66 @@ def _select_dashboard_rows(
     return {_format_key(r.get("format")): r for r in rows}
 
 
+def _select_secondary_target_dashboard_rows(
+    formats: list[str],
+    item_head: str,
+    month: int,
+    year: int,
+) -> dict[str, dict]:
+    if not formats:
+        return {}
+    placeholder = ",".join(["LOWER(TRIM(%s))"] * len(formats))
+    sql = f"""
+        SELECT
+            id,
+            "format",
+            type,
+            item_head,
+            month,
+            year,
+            "date",
+            targets,
+            done_ltrs,
+            achieved_pct,
+            est_ltr,
+            est_ltr_pct,
+            created_at,
+            updated_at
+          FROM month_targets
+         WHERE month = %s
+           AND year = %s
+           AND UPPER(TRIM(item_head)) = UPPER(TRIM(%s))
+           AND LOWER(TRIM("format")) IN ({placeholder})
+    """
+    with connection.cursor() as cur:
+        cur.execute(sql, [month, year, item_head] + formats)
+        rows = cur.fetchall()
+
+    out: dict[str, dict] = {}
+    for row in rows:
+        data = dict(zip(
+            [
+                "id",
+                "format",
+                "type",
+                "item_head",
+                "month",
+                "year",
+                "date",
+                "targets",
+                "done_ltrs",
+                "achieved_pct",
+                "est_ltr",
+                "est_ltr_pct",
+                "created_at",
+                "updated_at",
+            ],
+            row,
+        ))
+        out[_format_key(data.get("format"))] = _json_ready(data)
+    return out
+
+
 def _json_ready(row: dict) -> dict:
     out = dict(row)
     for k, v in list(out.items()):
@@ -1022,6 +1103,34 @@ def _dashboard_row_from_source(
     return _json_ready(row)
 
 
+def _dashboard_row_from_secondary_target(defn: dict, stored: dict) -> dict:
+    row = {
+        "id": stored.get("id"),
+        "format": defn["format"],
+        "type": defn["type"],
+        "item_head": stored.get("item_head"),
+        "month": stored.get("month"),
+        "year": stored.get("year"),
+        "date": stored.get("date"),
+        "targets": stored.get("targets"),
+        "done_ltrs": stored.get("done_ltrs"),
+        "achieved_pct": stored.get("achieved_pct"),
+        "est_ltr": stored.get("est_ltr"),
+        "est_ltr_pct": stored.get("est_ltr_pct"),
+        "drr": None,
+        "require_drr": None,
+        "pending_ltr": None,
+        "dp_ltrs": None,
+        "created_at": stored.get("created_at"),
+        "updated_at": stored.get("updated_at"),
+        "slug": defn["slug"],
+        "logo_slug": defn.get("logo_slug") or defn["slug"],
+        "platform_name": defn["platform_name"],
+        "source": defn["source"],
+    }
+    return _json_ready(row)
+
+
 def _primary_empty_total() -> dict:
     return {
         "targets": 0,
@@ -1084,20 +1193,45 @@ def primary_month_targets_dashboard(request):
     source_map = _dashboard_sources(row_defs, DASHBOARD_ITEM_HEADS, month, year)
     for item_head in DASHBOARD_ITEM_HEADS:
         stored_by_format = _select_dashboard_rows(formats, item_head, month, year)
-        rows = [
-            _dashboard_row_from_source(
-                defn,
-                stored_by_format.get(_format_key(defn["format"])),
-                item_head,
-                month,
-                year,
-                source_map.get(
-                    (_format_key(defn["source_format"]), _format_key(item_head)),
-                    {"done_ltrs": Decimal(0), "latest_date": None},
-                ),
-            )
+        secondary_target_formats = [
+            defn["target_format"]
             for defn in row_defs
+            if defn.get("target_source") == "month_targets"
         ]
+        secondary_by_format = _select_secondary_target_dashboard_rows(
+            secondary_target_formats,
+            item_head,
+            month,
+            year,
+        )
+        rows = []
+        for defn in row_defs:
+            if (
+                item_head.upper() == "COMMODITY"
+                and str(defn.get("key") or defn.get("slug") or "").lower() == "zomato"
+            ):
+                continue
+
+            if defn.get("target_source") == "month_targets":
+                secondary_row = secondary_by_format.get(_format_key(defn.get("target_format")))
+                if secondary_row:
+                    rows.append(_dashboard_row_from_secondary_target(defn, secondary_row))
+                    continue
+
+            rows.append(
+                _dashboard_row_from_source(
+                    defn,
+                    stored_by_format.get(_format_key(defn["format"])),
+                    item_head,
+                    month,
+                    year,
+                    source_map.get(
+                        (_format_key(defn["source_format"]), _format_key(item_head)),
+                        {"done_ltrs": Decimal(0), "latest_date": None},
+                    ),
+                )
+            )
+
         result[item_head.lower()] = {
             "rows": rows,
             "total": _primary_grand_total(rows),

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
+from functools import lru_cache
 from typing import Iterable
 
 from django.db import IntegrityError
@@ -21,7 +22,7 @@ from platforms.views import (
 
 
 ALERT_TYPE = "INVENTORY_DOH_LOW"
-DEFAULT_THRESHOLD = 10.0
+DEFAULT_THRESHOLD = 5.0
 
 
 @dataclass(frozen=True)
@@ -65,14 +66,16 @@ def _severity(doh: float) -> str:
     return "critical" if doh < 5 else "warning"
 
 
-def _title(format_name: str, sku_code: str, doh: float) -> str:
-    return f"{format_name} SKU {sku_code} DOH {doh:.2f}"
+def _title(format_name: str, sku_code: str, item: str, doh: float) -> str:
+    label = _clean(item) or f"SKU {_clean(sku_code)}"
+    title = f"{format_name} {label} DOH {doh:.2f}"
+    return title[:255]
 
 
 def _message(format_name: str, sku_code: str, item: str, doh: float, threshold: float) -> str:
-    item_part = f" ({item})" if item else ""
+    label = _clean(item) or f"SKU {_clean(sku_code)}"
     return (
-        f"{format_name} SKU {sku_code}{item_part} has DOH {doh:.2f}, "
+        f"{format_name} {label} has DOH {doh:.2f}, "
         f"below threshold {threshold:g}."
     )
 
@@ -115,6 +118,45 @@ def _active_formats(platform_slug: str | None) -> list[str]:
         config = PLATFORM_CONFIGS.get(slug)
         return [config.inventory_format] if config else []
     return [config.inventory_format for config in PLATFORM_CONFIGS.values()] + ["AMAZON"]
+
+
+@lru_cache(maxsize=512)
+def _amazon_item_for_asin(asin: str) -> str:
+    asin = _clean(asin)
+    if not asin:
+        return ""
+    item = _clean(_scalar(
+        """
+        SELECT NULLIF(TRIM(item::text), '')
+        FROM master_sheet
+        WHERE UPPER(TRIM(format_sku_code::text)) = UPPER(TRIM(%s))
+          AND NULLIF(TRIM(item::text), '') IS NOT NULL
+        ORDER BY
+            CASE
+                WHEN REGEXP_REPLACE(LOWER(TRIM(COALESCE(format, '')::text)), '[^a-z0-9]+', '', 'g') = 'amazon'
+                    THEN 0
+                ELSE 1
+            END,
+            COALESCE(item_head, ''),
+            COALESCE(category, ''),
+            COALESCE(product_name, '')
+        LIMIT 1
+        """,
+        [asin],
+    ))
+    if item:
+        return item
+    return _clean(_scalar(
+        """
+        SELECT NULLIF(TRIM(item::text), '')
+        FROM amazon_sec_range_master_view
+        WHERE UPPER(TRIM(asin::text)) = UPPER(TRIM(%s))
+          AND NULLIF(TRIM(item::text), '') IS NOT NULL
+        ORDER BY "to_date" DESC NULLS LAST
+        LIMIT 1
+        """,
+        [asin],
+    ))
 
 
 def _platforms_to_scan(platform_slug: str | None) -> list[PlatformAlertConfig]:
@@ -298,7 +340,6 @@ def _amazon_low_doh_rows(*, threshold: float, requested_date=None) -> list[dict]
             SELECT
                 UPPER(TRIM(COALESCE(asin::text, ''))) AS asin_key,
                 MIN(NULLIF(TRIM(asin::text), '')) AS asin,
-                MIN(NULLIF(TRIM(product_title::text), '')) AS product_title,
                 MIN(NULLIF(TRIM(item_head::text), '')) AS item_head,
                 MIN(NULLIF(TRIM(category::text), '')) AS category,
                 MIN(NULLIF(TRIM(sub_category::text), '')) AS sub_category,
@@ -313,6 +354,7 @@ def _amazon_low_doh_rows(*, threshold: float, requested_date=None) -> list[dict]
         sales AS (
             SELECT
                 UPPER(TRIM(COALESCE(asin::text, ''))) AS asin_key,
+                MIN(NULLIF(TRIM(item::text), '')) AS item,
                 COALESCE(SUM(shipped_units), 0)::numeric AS units_sold,
                 COALESCE(SUM(shipped_litres), 0)::numeric AS ltr_sold
             FROM amazon_sec_range_master_view
@@ -334,8 +376,8 @@ def _amazon_low_doh_rows(*, threshold: float, requested_date=None) -> list[dict]
         )
         SELECT
             r.asin AS sku_code,
-            r.product_title AS sku_name,
-            r.product_title AS item,
+            COALESCE(s.item, '') AS sku_name,
+            COALESCE(s.item, '') AS item,
             r.item_head,
             r.category,
             r.sub_category,
@@ -369,19 +411,18 @@ def _amazon_low_doh_rows(*, threshold: float, requested_date=None) -> list[dict]
         soh_units = _num(row.get("soh_units"))
         soh_ltr = _num(row.get("soh_ltr"))
         drr_units = _safe_div(units_sold, elapsed_day)
-        if drr_units <= 0:
-            continue
         drr_ltr = _safe_div(ltr_sold, elapsed_day)
-        doh = _safe_div(soh_units, drr_units)
+        doh = (_safe_div(soh_units, drr_units) - 2) if drr_units else 0.0
         if doh >= threshold:
             continue
+        item = _clean(row.get("item")) or _amazon_item_for_asin(row.get("sku_code"))
         low_rows.append({
             "format": "AMAZON",
             "platform_slug": "amazon",
             "platform_label": "Amazon",
             "sku_code": _clean(row.get("sku_code")),
-            "sku_name": _clean(row.get("sku_name")),
-            "item": _clean(row.get("item")),
+            "sku_name": item,
+            "item": item,
             "item_head": _clean(row.get("item_head")),
             "category": _clean(row.get("category")),
             "sub_category": _clean(row.get("sub_category")),
@@ -490,7 +531,7 @@ def upsert_low_doh_notifications(
             "doh": _decimal(doh),
             "threshold": _decimal(threshold),
             "severity": _severity(doh),
-            "title": _title(format_name, sku_code, doh),
+            "title": _title(format_name, sku_code, row.get("item") or "", doh),
             "message": _message(format_name, sku_code, row.get("item") or "", doh, threshold),
             "payload": _notification_payload(row, threshold),
             "resolved_at": None,
@@ -534,16 +575,30 @@ def upsert_low_doh_notifications(
 
 
 def notification_to_payload(notification) -> dict:
+    item = notification.item
+    if _clean(notification.format).upper() == "AMAZON":
+        item = _amazon_item_for_asin(notification.sku_code) or item
     return {
         "id": notification.id,
         "type": notification.alert_type,
-        "title": notification.title,
-        "message": notification.message,
+        "title": _title(
+            notification.format,
+            notification.sku_code,
+            item,
+            _num(notification.doh),
+        ),
+        "message": _message(
+            notification.format,
+            notification.sku_code,
+            item,
+            _num(notification.doh),
+            _num(notification.threshold),
+        ),
         "format": notification.format,
         "platform_slug": notification.platform_slug,
         "sku_code": notification.sku_code,
-        "sku_name": notification.sku_name,
-        "item": notification.item,
+        "sku_name": notification.sku_name or item,
+        "item": item,
         "item_head": notification.item_head,
         "category": notification.category,
         "sub_category": notification.sub_category,
