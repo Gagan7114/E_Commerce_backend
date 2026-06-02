@@ -1280,8 +1280,8 @@ def top_skus(request):
                             WITH ml AS (
                                 SELECT DISTINCT ON (format_sku_code)
                                        format_sku_code, item_head, per_unit_value,
-                                       COALESCE(NULLIF(TRIM(product_name::text), ''),
-                                                NULLIF(TRIM(item::text), '')) AS name
+                                       COALESCE(NULLIF(TRIM(item::text), ''),
+                                                NULLIF(TRIM(product_name::text), '')) AS name
                                 FROM master_sheet
                                 WHERE format_sku_code IS NOT NULL AND format_sku_code::text <> ''
                                 ORDER BY format_sku_code
@@ -1399,8 +1399,8 @@ def top_skus(request):
                         WITH ml AS (
                             SELECT DISTINCT ON (format_sku_code)
                                    format_sku_code, item_head, per_unit_value,
-                                   COALESCE(NULLIF(TRIM(product_name::text), ''),
-                                            NULLIF(TRIM(item::text), '')) AS name
+                                   COALESCE(NULLIF(TRIM(item::text), ''),
+                                            NULLIF(TRIM(product_name::text), '')) AS name
                             FROM master_sheet
                             WHERE format_sku_code IS NOT NULL AND format_sku_code::text <> ''
                             ORDER BY format_sku_code

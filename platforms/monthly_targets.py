@@ -125,6 +125,10 @@ def _format_for(p: PlatformConfig) -> str:
     return (p.po_filter_value or p.slug).strip().upper()
 
 
+def _format_key(value) -> str:
+    return str(value or "").strip().upper()
+
+
 # ─── Month/year parsing ───
 
 _MONTH_RE = re.compile(r"^\d{4}-\d{2}$")
@@ -418,6 +422,347 @@ def _read_source(slug: str, fmt: str, item_head: str, month: int, year: int) -> 
     return _read_master_po(fmt, item_head, month, year)
 
 
+def _read_secmaster_dashboard_many(
+    formats: list[str],
+    item_heads: tuple[str, ...],
+    month: int,
+    year: int,
+) -> dict[tuple[str, str], dict]:
+    """Fast litre aggregates for the home/target dashboard hot path.
+
+    `SecMaster` is a raw UNION view with expensive master/rate joins, and the
+    existing `SecMaster_Mat` can lag behind current uploads. The home KPI cards
+    only need litres, so read the month-filtered raw platform tables directly
+    and join only the master-sheet fields needed for `item_head` and litres.
+    """
+    if not formats:
+        return {}
+    requested = {_format_key(fmt) for fmt in formats}
+    if not requested:
+        return {}
+
+    start = date(year, month, 1)
+    end = date(year + (1 if month == 12 else 0), 1 if month == 12 else month + 1, 1)
+    item_placeholder = ",".join(["UPPER(TRIM(%s))"] * len(item_heads))
+
+    parts: list[str] = []
+    params: list = []
+
+    def add_part(format_name: str, sql: str, extra_params: list) -> None:
+        if format_name not in requested:
+            return
+        parts.append(sql)
+        params.extend(extra_params)
+        params.extend(item_heads)
+
+    add_part(
+        "BLINKIT",
+        f"""
+        SELECT 'BLINKIT' AS fmt,
+               UPPER(TRIM(m.item_head::text)) AS item_head,
+               COALESCE(SUM(
+                   CASE WHEN m.is_litre = 'Y'
+                        THEN COALESCE(b.qty_sold, 0)::numeric * COALESCE(m.per_unit_value, 0)::numeric
+                        ELSE 0 END
+               ), 0) AS done_ltrs,
+               MAX(b.date) AS latest_date
+          FROM "blinkitSec" b
+          LEFT JOIN LATERAL (
+                SELECT ms.item_head, ms.per_unit_value, ms.is_litre
+                  FROM master_sheet ms
+                 WHERE UPPER(TRIM(ms.format_sku_code::text)) = UPPER(TRIM(b.item_id::text))
+                   AND regexp_replace(lower(TRIM(ms.format::text)), '[^a-z0-9]+', '', 'g') = 'blinkit'
+                 ORDER BY ms.product_name, ms.item, ms.per_unit
+                 LIMIT 1
+          ) m ON true
+         WHERE b.date >= %s AND b.date < %s
+           AND UPPER(TRIM(m.item_head::text)) IN ({item_placeholder})
+         GROUP BY UPPER(TRIM(m.item_head::text))
+        """,
+        [start, end],
+    )
+    add_part(
+        "SWIGGY",
+        f"""
+        SELECT 'SWIGGY' AS fmt,
+               UPPER(TRIM(m.item_head::text)) AS item_head,
+               COALESCE(SUM(
+                   CASE WHEN m.is_litre = 'Y'
+                        THEN COALESCE(s."UNITS_SOLD", 0)::numeric * COALESCE(m.per_unit_value, 0)::numeric
+                        ELSE 0 END
+               ), 0) AS done_ltrs,
+               MAX(s."ORDERED_DATE") AS latest_date
+          FROM "swiggySec" s
+          LEFT JOIN LATERAL (
+                SELECT ms.item_head, ms.per_unit_value, ms.is_litre
+                  FROM master_sheet ms
+                 WHERE UPPER(TRIM(ms.format_sku_code::text)) = UPPER(TRIM(s."ITEM_CODE"::text))
+                   AND regexp_replace(lower(TRIM(ms.format::text)), '[^a-z0-9]+', '', 'g') = 'swiggy'
+                 ORDER BY ms.product_name, ms.item, ms.per_unit
+                 LIMIT 1
+          ) m ON true
+         WHERE s."ORDERED_DATE" >= %s AND s."ORDERED_DATE" < %s
+           AND UPPER(TRIM(m.item_head::text)) IN ({item_placeholder})
+         GROUP BY UPPER(TRIM(m.item_head::text))
+        """,
+        [start, end],
+    )
+    add_part(
+        "ZEPTO",
+        f"""
+        SELECT 'ZEPTO' AS fmt,
+               UPPER(TRIM(m.item_head::text)) AS item_head,
+               COALESCE(SUM(
+                   CASE WHEN m.is_litre = 'Y'
+                        THEN COALESCE(z."Sales (Qty) - Units", 0)::numeric * COALESCE(m.per_unit_value, 0)::numeric
+                        ELSE 0 END
+               ), 0) AS done_ltrs,
+               MAX(z."Date") AS latest_date
+          FROM "zeptoSec" z
+          LEFT JOIN LATERAL (
+                SELECT ms.item_head, ms.per_unit_value, ms.is_litre
+                  FROM master_sheet ms
+                 WHERE UPPER(TRIM(ms.format_sku_code::text)) = UPPER(TRIM(z."SKU Number"::text))
+                   AND regexp_replace(lower(TRIM(ms.format::text)), '[^a-z0-9]+', '', 'g') = 'zepto'
+                 ORDER BY ms.product_name, ms.item, ms.per_unit
+                 LIMIT 1
+          ) m ON true
+         WHERE z."Date" >= %s AND z."Date" < %s
+           AND UPPER(TRIM(m.item_head::text)) IN ({item_placeholder})
+         GROUP BY UPPER(TRIM(m.item_head::text))
+        """,
+        [start, end],
+    )
+    add_part(
+        "BIG BASKET",
+        f"""
+        SELECT 'BIG BASKET' AS fmt,
+               UPPER(TRIM(m.item_head::text)) AS item_head,
+               COALESCE(SUM(
+                   CASE WHEN m.is_litre = 'Y'
+                        THEN COALESCE(bb.total_quantity, 0)::numeric * COALESCE(m.per_unit_value, 0)::numeric
+                        ELSE 0 END
+               ), 0) AS done_ltrs,
+               MAX(bb.date_range) AS latest_date
+          FROM "bigbasketSec" bb
+          LEFT JOIN LATERAL (
+                SELECT ms.item_head, ms.per_unit_value, ms.is_litre
+                  FROM master_sheet ms
+                 WHERE UPPER(TRIM(ms.format_sku_code::text)) = UPPER(TRIM(bb.source_sku_id::text))
+                   AND regexp_replace(lower(TRIM(ms.format::text)), '[^a-z0-9]+', '', 'g') = 'bigbasket'
+                 ORDER BY ms.product_name, ms.item, ms.per_unit
+                 LIMIT 1
+          ) m ON true
+         WHERE bb.date_range >= %s AND bb.date_range < %s
+           AND UPPER(TRIM(m.item_head::text)) IN ({item_placeholder})
+         GROUP BY UPPER(TRIM(m.item_head::text))
+        """,
+        [start, end],
+    )
+    add_part(
+        "FLIPKART",
+        f"""
+        SELECT 'FLIPKART' AS fmt,
+               UPPER(TRIM(m.item_head::text)) AS item_head,
+               COALESCE(SUM(
+                   CASE WHEN m.is_litre = 'Y'
+                        THEN COALESCE(fk."Final Sale Units", 0)::numeric * COALESCE(m.per_unit_value, 0)::numeric
+                        ELSE 0 END
+               ), 0) AS done_ltrs,
+               MAX(fk."Order Date") AS latest_date
+          FROM "flipkartSec" fk
+          LEFT JOIN LATERAL (
+                SELECT ms.item_head, ms.per_unit_value, ms.is_litre
+                  FROM master_sheet ms
+                 WHERE ms.format = 'FLIPKART'
+                   AND UPPER(TRIM(ms.format_sku_code::text)) = UPPER(TRIM(fk."Product Id"::text))
+                 ORDER BY ms.product_name, ms.item, ms.per_unit
+                 LIMIT 1
+          ) m ON true
+         WHERE fk."Order Date" >= %s AND fk."Order Date" < %s
+           AND UPPER(TRIM(m.item_head::text)) IN ({item_placeholder})
+         GROUP BY UPPER(TRIM(m.item_head::text))
+        """,
+        [start, end],
+    )
+
+    if not parts:
+        return {}
+
+    sql = " UNION ALL ".join(parts)
+    with connection.cursor() as cur:
+        cur.execute(sql, params)
+        rows = cur.fetchall()
+    return {
+        (_format_key(fmt), _format_key(item_head)): {
+            "done_ltrs": Decimal(done_ltrs or 0),
+            "done_value": None,
+            "latest_date": latest_date,
+        }
+        for fmt, item_head, done_ltrs, latest_date in rows
+    }
+
+
+def _read_master_po_dashboard_many(
+    formats: list[str],
+    item_heads: tuple[str, ...],
+    month: int,
+    year: int,
+) -> dict[tuple[str, str], dict]:
+    if not formats:
+        return {}
+    month_name = _MONTH_NAMES[month]
+    format_placeholder = ",".join(["LOWER(TRIM(%s))"] * len(formats))
+    item_placeholder = ",".join(["UPPER(TRIM(%s))"] * len(item_heads))
+    sql = f"""
+        SELECT
+            UPPER(TRIM("format"::text))    AS fmt,
+            UPPER(TRIM("item_head"::text)) AS item_head,
+            COALESCE(SUM("total_delivered_liters"), 0)        AS done_ltrs,
+            COALESCE(SUM("total_delivered_amt_exclusive"), 0) AS done_value,
+            MAX("delivery_date")                              AS latest_date
+        FROM "master_po"
+        WHERE LOWER(TRIM("format"::text)) IN ({format_placeholder})
+          AND UPPER(TRIM("item_head"::text)) IN ({item_placeholder})
+          AND UPPER(TRIM("status"::text)) = 'COMPLETED'
+          AND UPPER(TRIM("delivery_month"::text)) = %s
+          AND "delivered_year" = %s
+        GROUP BY UPPER(TRIM("format"::text)), UPPER(TRIM("item_head"::text))
+    """
+    with connection.cursor() as cur:
+        cur.execute(sql, list(formats) + list(item_heads) + [month_name, year])
+        rows = cur.fetchall()
+    return {
+        (_format_key(fmt), _format_key(item_head)): {
+            "done_ltrs": Decimal(done_ltrs or 0),
+            "done_value": Decimal(done_value or 0),
+            "latest_date": latest_date,
+        }
+        for fmt, item_head, done_ltrs, done_value, latest_date in rows
+    }
+
+
+def _read_flipkart_grocery_dashboard_many(
+    item_heads: tuple[str, ...],
+    month: int,
+    year: int,
+) -> dict[tuple[str, str], dict]:
+    item_placeholder = ",".join(["UPPER(TRIM(%s))"] * len(item_heads))
+    sql = f"""
+        SELECT
+            UPPER(TRIM("item_head"::text)) AS item_head,
+            COALESCE(SUM("ltr_sold"), 0)   AS done_ltrs,
+            MAX("real_date")               AS latest_date
+        FROM "flipkart_grocery_master"
+        WHERE "month" = %s
+          AND "year" = %s
+          AND UPPER(TRIM("item_head"::text)) IN ({item_placeholder})
+        GROUP BY UPPER(TRIM("item_head"::text))
+    """
+    with connection.cursor() as cur:
+        cur.execute(sql, [month, year] + list(item_heads))
+        rows = cur.fetchall()
+    return {
+        ("FLIPKART GROCERY", _format_key(item_head)): {
+            "done_ltrs": Decimal(done_ltrs or 0),
+            "done_value": None,
+            "latest_date": latest_date,
+        }
+        for item_head, done_ltrs, latest_date in rows
+    }
+
+
+def _read_amazon_dashboard_many(
+    item_heads: tuple[str, ...],
+    month: int,
+    year: int,
+) -> dict[tuple[str, str], dict]:
+    month_day_suffix = f"%-{_MONTH_NAMES[month]}"
+    item_placeholder = ",".join(["UPPER(TRIM(%s))"] * len(item_heads))
+    sql = f"""
+        WITH filtered AS MATERIALIZED (
+            SELECT
+                UPPER(TRIM("item_head"::text)) AS item_head,
+                "shipped_litres",
+                "calculated_shipped_revenue",
+                NULLIF(split_part("month_day"::text, '-', 1), '')::int AS day_num
+            FROM "amazon_sec_range_master_view"
+            WHERE UPPER(TRIM("item_head"::text)) IN ({item_placeholder})
+              AND UPPER(TRIM("month_day"::text)) LIKE %s
+              AND "year" = %s
+        ),
+        latest AS (
+            SELECT item_head, MAX(day_num) AS max_day
+            FROM filtered
+            GROUP BY item_head
+        )
+        SELECT
+            f.item_head,
+            COALESCE(SUM(f."shipped_litres"), 0) AS done_ltrs,
+            COALESCE(SUM(f."calculated_shipped_revenue"), 0) AS done_value,
+            l.max_day
+        FROM filtered f
+        JOIN latest l
+          ON l.item_head = f.item_head
+         AND l.max_day = f.day_num
+        GROUP BY f.item_head, l.max_day
+    """
+    with connection.cursor() as cur:
+        cur.execute(sql, list(item_heads) + [month_day_suffix, year])
+        rows = cur.fetchall()
+
+    out: dict[tuple[str, str], dict] = {}
+    for item_head, done_ltrs, done_value, max_day in rows:
+        try:
+            latest_date = date(year, month, int(max_day)) if max_day else None
+        except (TypeError, ValueError):
+            latest_date = None
+        out[("AMAZON", _format_key(item_head))] = {
+            "done_ltrs": Decimal(done_ltrs or 0),
+            "done_value": Decimal(done_value or 0),
+            "latest_date": latest_date,
+        }
+    return out
+
+
+def _dashboard_source_map(
+    ordered_slugs: list[str] | tuple[str, ...],
+    platforms: dict[str, PlatformConfig],
+    item_heads: tuple[str, ...],
+    month: int,
+    year: int,
+) -> dict[tuple[str, str], dict]:
+    source_map: dict[tuple[str, str], dict] = {}
+
+    secmaster_formats = [
+        _format_for(platforms[slug])
+        for slug in ordered_slugs
+        if slug in SECMASTER_SLUGS and slug in platforms
+    ]
+    source_map.update(
+        _read_secmaster_dashboard_many(secmaster_formats, item_heads, month, year)
+    )
+
+    master_formats = [
+        _format_for(platforms[slug])
+        for slug in ordered_slugs
+        if slug in MASTER_PO_SLUGS and slug in platforms
+    ]
+    source_map.update(
+        _read_master_po_dashboard_many(master_formats, item_heads, month, year)
+    )
+
+    if any(slug in FLIPKART_GROCERY_SLUGS for slug in ordered_slugs):
+        source_map.update(
+            _read_flipkart_grocery_dashboard_many(item_heads, month, year)
+        )
+
+    if any(slug in AMAZON_SLUGS for slug in ordered_slugs):
+        source_map.update(_read_amazon_dashboard_many(item_heads, month, year))
+
+    return source_map
+
+
 def _read_platform_latest_date(slug: str, fmt: str, month: int, year: int) -> date | None:
     """Return the same platform-wide max date shown on the secondary dashboard.
 
@@ -556,15 +901,18 @@ _ROW_COLS = [
 ]
 
 
-def _row_to_dict(row: tuple) -> dict:
-    d = dict(zip(_ROW_COLS, row))
+def _json_ready(row: dict) -> dict:
     # JSON-serializable coercions.
-    for k, v in list(d.items()):
+    for k, v in list(row.items()):
         if isinstance(v, Decimal):
-            d[k] = float(v)
+            row[k] = float(v)
         elif isinstance(v, (date, datetime)):
-            d[k] = v.isoformat()
-    return d
+            row[k] = v.isoformat()
+    return row
+
+
+def _row_to_dict(row: tuple) -> dict:
+    return _json_ready(dict(zip(_ROW_COLS, row)))
 
 
 def _select_row(where_sql: str, params: list) -> dict | None:
@@ -675,6 +1023,67 @@ def _refresh_dashboard_rows(
                 continue
             refreshed_rows.extend(_refresh_platform_rows(slug, platform, month, year))
     return refreshed_rows
+
+
+def _source_backed_dashboard_row(
+    slug: str,
+    platform: PlatformConfig,
+    item_head: str,
+    month: int,
+    year: int,
+    source: dict | None = None,
+    stored: dict | None = None,
+) -> dict:
+    """Dashboard row with live display litres but no hot-path DB update."""
+    fmt = _format_for(platform)
+    source = source or {
+        "done_ltrs": Decimal(0),
+        "done_value": None,
+        "latest_date": None,
+    }
+    stored_done_value = Decimal(str((stored or {}).get("done_value") or 0))
+    done_value = source.get("done_value")
+    if done_value is None:
+        done_value = stored_done_value
+
+    derived = _compute_derived(
+        targets=Decimal(str((stored or {}).get("targets") or 0)),
+        done_ltrs=source["done_ltrs"],
+        done_value=done_value,
+        latest_date=source["latest_date"],
+        last_month=Decimal(str((stored or {}).get("last_month") or 0)),
+        month=month,
+        year=year,
+    )
+
+    if stored:
+        row = dict(stored)
+        row.update(derived)
+        row["slug"] = slug
+        row["platform_name"] = platform.name
+        return _json_ready(row)
+
+    return _json_ready({
+        "id": None,
+        "slug": slug,
+        "platform_name": platform.name,
+        "format": fmt,
+        "type": platform.sales_type or "B2B",
+        "item_head": item_head,
+        "month": month,
+        "year": year,
+        "date": derived["date"],
+        "targets": None,
+        "done_ltrs": derived["done_ltrs"],
+        "done_value": derived["done_value"],
+        "achieved_pct": None,
+        "est_ltr": derived["est_ltr"],
+        "est_value": derived["est_value"],
+        "est_ltr_pct": None,
+        "last_month": None,
+        "growth": None,
+        "growth_pct": None,
+    })
 
 
 @api_view(["POST"])
@@ -1129,10 +1538,16 @@ def month_targets_dashboard(request):
                          "commodity": {"rows": [], "total": _empty_total()},
                          "month": month, "year": year})
 
-    # The dashboard displays derived values stored in `month_targets`. Uploads
-    # can change the source tables after those target rows were created, so
-    # recompute visible rows before reading them for the response.
-    _refresh_dashboard_rows(ordered, platforms, month, year)
+    # Home dashboard loads must stay fast. Use the indexed/materialized source
+    # reads for displayed litres, while explicit refresh endpoints remain the
+    # place that writes recalculated values back into month_targets.
+    source_map = _dashboard_source_map(
+        ordered,
+        platforms,
+        DASHBOARD_ITEM_HEADS,
+        month,
+        year,
+    )
 
     result = {}
     for item_head in DASHBOARD_ITEM_HEADS:
@@ -1158,24 +1573,33 @@ def month_targets_dashboard(request):
             p = platforms.get(slug)
             if not p:
                 continue
-            fmt = _format_for(p).lower()
-            row = by_format.get(fmt)
+            fmt = _format_for(p)
+            fmt_key = _format_key(fmt)
+            row = by_format.get(fmt.lower())
+            source = source_map.get((fmt_key, _format_key(item_head)))
             if row:
-                row["slug"] = slug
-                row["platform_name"] = p.name
-                rows.append(row)
+                rows.append(
+                    _source_backed_dashboard_row(
+                        slug,
+                        p,
+                        item_head,
+                        month,
+                        year,
+                        source,
+                        row,
+                    )
+                )
             else:
-                # Placeholder row so the UI can still show the platform with
-                # a "No target set" hint.
-                rows.append({
-                    "id": None, "slug": slug, "platform_name": p.name,
-                    "format": _format_for(p), "type": p.sales_type or "B2B",
-                    "item_head": item_head, "month": month, "year": year,
-                    "date": None, "targets": None,
-                    "done_ltrs": None, "done_value": None, "achieved_pct": None,
-                    "est_ltr": None, "est_value": None, "est_ltr_pct": None,
-                    "last_month": None, "growth": None, "growth_pct": None,
-                })
+                rows.append(
+                    _source_backed_dashboard_row(
+                        slug,
+                        p,
+                        item_head,
+                        month,
+                        year,
+                        source,
+                    )
+                )
 
         result[item_head.lower()] = {
             "rows": rows,
