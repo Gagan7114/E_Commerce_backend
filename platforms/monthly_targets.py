@@ -659,6 +659,24 @@ def _refresh_platform_rows(slug: str, platform: PlatformConfig, month: int, year
     return [_refresh_existing_row(slug, row, fmt) for row in rows]
 
 
+def _refresh_dashboard_rows(
+    ordered_slugs: list[str] | tuple[str, ...],
+    platforms: dict[str, PlatformConfig],
+    month: int,
+    year: int,
+) -> list[dict]:
+    """Refresh all visible target rows before a dashboard response is built."""
+    refreshed_rows: list[dict] = []
+    with transaction.atomic():
+        for slug in ordered_slugs:
+            _source_for(slug)
+            platform = platforms.get(slug)
+            if not platform:
+                continue
+            refreshed_rows.extend(_refresh_platform_rows(slug, platform, month, year))
+    return refreshed_rows
+
+
 @api_view(["POST"])
 @permission_classes([require("platform.month_targets.edit")])
 def month_targets_refresh_all(request):
@@ -686,17 +704,15 @@ def month_targets_refresh_all(request):
         p.slug: p for p in PlatformConfig.objects.filter(slug__in=ordered_slugs)
     }
 
-    refreshed_rows: list[dict] = []
+    refreshed_rows = _refresh_dashboard_rows(ordered_slugs, platforms, month, year)
     platform_counts: dict[str, int] = {}
-    with transaction.atomic():
+    for row in refreshed_rows:
+        row_format = str(row.get("format") or "").strip().lower()
         for slug in ordered_slugs:
-            _source_for(slug)
             platform = platforms.get(slug)
-            if not platform:
-                continue
-            rows = _refresh_platform_rows(slug, platform, month, year)
-            refreshed_rows.extend(rows)
-            platform_counts[slug] = len(rows)
+            if platform and row_format == _format_for(platform).strip().lower():
+                platform_counts[slug] = platform_counts.get(slug, 0) + 1
+                break
 
     return Response({
         "ok": True,
@@ -1112,6 +1128,11 @@ def month_targets_dashboard(request):
         return Response({"premium": {"rows": [], "total": _empty_total()},
                          "commodity": {"rows": [], "total": _empty_total()},
                          "month": month, "year": year})
+
+    # The dashboard displays derived values stored in `month_targets`. Uploads
+    # can change the source tables after those target rows were created, so
+    # recompute visible rows before reading them for the response.
+    _refresh_dashboard_rows(ordered, platforms, month, year)
 
     result = {}
     for item_head in DASHBOARD_ITEM_HEADS:
