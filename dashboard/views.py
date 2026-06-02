@@ -1123,9 +1123,9 @@ def top_skus(request):
     Same source semantics as /category-breakdown. Powers the home "Top Movers"
     leaderboard: current-month top-N SKUs (name + item head + litres) plus each
     SKU's previous-period litres so the UI can show % change and risers/fallers.
-    Honours the platform filter. When compare_days is 7/30/60, the current
-    period is the trailing N days ending at the selected month end (or today for
-    the current month), compared with the previous N-day window."""
+    Honours the platform filter. compare_months selects a 1/3/6/12-month
+    window ending at the selected month end (or today for the current month),
+    compared with the previous same-length month window."""
     today = date.today()
     try:
         month_num = int(request.GET.get("month") or today.month)
@@ -1143,11 +1143,15 @@ def top_skus(request):
         limit = 10
     limit = max(1, min(limit, 50))
     try:
-        compare_days = int(request.GET.get("compare_days") or 0)
+        compare_months = int(request.GET.get("compare_months") or 0)
     except (TypeError, ValueError):
-        compare_days = 0
-    if compare_days not in (7, 30, 60):
-        compare_days = 0
+        compare_months = 0
+    if compare_months not in (1, 3, 6, 12):
+        try:
+            compare_days = int(request.GET.get("compare_days") or 0)
+        except (TypeError, ValueError):
+            compare_days = 0
+        compare_months = {30: 1, 90: 3, 180: 6, 365: 12}.get(compare_days, 0)
 
     source = "secondary" if (request.GET.get("source") or "").strip().lower() == "secondary" else "primary"
     platform = (request.GET.get("platform") or "").strip().lower() or None
@@ -1188,6 +1192,10 @@ def top_skus(request):
         except Exception as e:  # noqa: BLE001
             errors.append({"source": label, "error": str(e)})
 
+    def _month_start_months_before(dt, months_before):
+        month_index = (dt.year * 12 + dt.month - 1) - months_before
+        return date(month_index // 12, month_index % 12 + 1, 1)
+
     def _period_windows():
         last_day = calendar.monthrange(year, month_num)[1]
         selected_end = date(year, month_num, last_day)
@@ -1195,12 +1203,18 @@ def top_skus(request):
         selected_month_start = date(year, month_num, 1)
         if selected_month_start >= current_month_start:
             selected_end = min(selected_end, today)
-        current_start = selected_end - timedelta(days=compare_days - 1)
+        current_start = _month_start_months_before(
+            selected_end,
+            compare_months - 1,
+        )
         previous_end = current_start - timedelta(days=1)
-        previous_start = previous_end - timedelta(days=compare_days - 1)
+        previous_start = _month_start_months_before(
+            previous_end,
+            compare_months - 1,
+        )
         return current_start, selected_end, previous_start, previous_end
 
-    if compare_days:
+    if compare_months:
         current_start, current_end, previous_start, previous_end = _period_windows()
         acc_days = {"current": {}, "previous": {}}
 
@@ -1285,27 +1299,31 @@ def top_skus(request):
 
         cur_map = acc_days["current"]
         prev_map = acc_days["previous"]
+        def build_sku_delta_rows(rows):
+            out = []
+            for s in rows:
+                prev = prev_map.get(s["name"].upper())
+                prev_ltrs = round(prev["ltrs"], 2) if prev else 0.0
+                ltrs = round(s["ltrs"], 2)
+                if prev_ltrs > 0:
+                    delta_pct = round((ltrs - prev_ltrs) / prev_ltrs * 100, 1)
+                else:
+                    delta_pct = None
+                out.append({
+                    "name": s["name"],
+                    "head": s["head"],
+                    "ltrs": ltrs,
+                    "prev_ltrs": prev_ltrs,
+                    "delta_pct": delta_pct,
+                    "is_new": prev is None,
+                })
+            return out
+
         ranked = sorted(cur_map.values(), key=lambda s: s["ltrs"], reverse=True)[:limit]
+        skus = build_sku_delta_rows(ranked)
+        all_skus = build_sku_delta_rows(cur_map.values())
 
-        skus = []
-        for s in ranked:
-            prev = prev_map.get(s["name"].upper())
-            prev_ltrs = round(prev["ltrs"], 2) if prev else 0.0
-            ltrs = round(s["ltrs"], 2)
-            if prev_ltrs > 0:
-                delta_pct = round((ltrs - prev_ltrs) / prev_ltrs * 100, 1)
-            else:
-                delta_pct = None
-            skus.append({
-                "name": s["name"],
-                "head": s["head"],
-                "ltrs": ltrs,
-                "prev_ltrs": prev_ltrs,
-                "delta_pct": delta_pct,
-                "is_new": prev is None,
-            })
-
-        movers = [s for s in skus if s["delta_pct"] is not None]
+        movers = [s for s in all_skus if s["delta_pct"] is not None]
         risers = [s for s in movers if s["delta_pct"] > 0]
         fallers = [s for s in movers if s["delta_pct"] < 0]
         top_riser = max(risers, key=lambda s: s["delta_pct"], default=None)
@@ -1313,7 +1331,7 @@ def top_skus(request):
         return Response({
             "source": source, "platform": platform,
             "month": month_num, "year": year,
-            "compare_days": compare_days,
+            "compare_months": compare_months,
             "window": {
                 "current_start": current_start.isoformat(),
                 "current_end": current_end.isoformat(),
@@ -1409,34 +1427,39 @@ def top_skus(request):
 
     cur_map = acc[(month_num, year)]
     prev_map = acc[(prev_month, prev_year)]
-    ranked = sorted(cur_map.values(), key=lambda s: s["ltrs"], reverse=True)[:limit]
+    def build_sku_delta_rows(rows):
+        out = []
+        for s in rows:
+            prev = prev_map.get(s["name"].upper())
+            prev_ltrs = round(prev["ltrs"], 2) if prev else 0.0
+            ltrs = round(s["ltrs"], 2)
+            if prev_ltrs > 0:
+                delta_pct = round((ltrs - prev_ltrs) / prev_ltrs * 100, 1)
+            else:
+                delta_pct = None  # no prior baseline -> "NEW"
+            out.append({
+                "name": s["name"],
+                "head": s["head"],
+                "ltrs": ltrs,
+                "prev_ltrs": prev_ltrs,
+                "delta_pct": delta_pct,
+                "is_new": prev is None,
+            })
+        return out
 
-    skus = []
-    for s in ranked:
-        prev = prev_map.get(s["name"].upper())
-        prev_ltrs = round(prev["ltrs"], 2) if prev else 0.0
-        ltrs = round(s["ltrs"], 2)
-        if prev_ltrs > 0:
-            delta_pct = round((ltrs - prev_ltrs) / prev_ltrs * 100, 1)
-        else:
-            delta_pct = None  # no prior baseline → "NEW"
-        skus.append({
-            "name": s["name"],
-            "head": s["head"],
-            "ltrs": ltrs,
-            "prev_ltrs": prev_ltrs,
-            "delta_pct": delta_pct,
-            "is_new": prev is None,
-        })
+    ranked = sorted(cur_map.values(), key=lambda s: s["ltrs"], reverse=True)[:limit]
+    skus = build_sku_delta_rows(ranked)
+    all_skus = build_sku_delta_rows(cur_map.values())
 
     # A riser must actually have grown (> 0) and a faller must actually have
-    # shrunk (< 0). Without the sign guard, an all-rising month would report the
-    # slowest riser as the "biggest faller".
-    movers = [s for s in skus if s["delta_pct"] is not None]
+    # shrunk (< 0). Use all current SKUs for these callouts so the drop card is
+    # not hidden just because the dropping SKU is outside the top-N list.
+    movers = [s for s in all_skus if s["delta_pct"] is not None]
     risers = [s for s in movers if s["delta_pct"] > 0]
     fallers = [s for s in movers if s["delta_pct"] < 0]
     top_riser = max(risers, key=lambda s: s["delta_pct"], default=None)
     top_faller = min(fallers, key=lambda s: s["delta_pct"], default=None)
+
     return Response({
         "source": source, "platform": platform,
         "month": month_num, "year": year,
