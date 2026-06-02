@@ -1,0 +1,25 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git -C \"d:/Backend/E_Commerce_backend\" pull --rebase origin main)",
+      "Bash(git -C \"D:/OneDrive/Documents/Frontend/khushwindermaan051-Frontend\" stash push -u -m \"local-settings-stash\" -- .claude/settings.json)",
+      "Bash(git -C \"D:/OneDrive/Documents/Frontend/khushwindermaan051-Frontend\" pull --rebase origin main)",
+      "Bash(git -C \"D:/OneDrive/Documents/Frontend/khushwindermaan051-Frontend\" diff --check)",
+      "Bash(grep -n *)",
+      "Read(//d/OneDrive/Documents/Frontend/khushwindermaan051-Frontend/src/**)",
+      "Bash(git -C \"d:/Backend/E_Commerce_backend\" push origin main)",
+      "Bash(git -C \"d:/Backend/E_Commerce_backend\" stash drop)",
+      "Bash(git -C \"d:/Backend/E_Commerce_backend\" status -sb)",
+      "Bash(git -C \"D:/OneDrive/Documents/Frontend/khushwindermaan051-Frontend\" status -sb)",
+      "Bash(gh run *)",
+      "PowerShell(gh run list -R khushwindermaan051/Frontend --limit 3 --json databaseId,conclusion,name,headSha)",
+      "PowerShell(try { \\(Invoke-RestMethod -Uri \"https://api.github.com/repos/khushwindermaan051/Frontend/actions/runs?per_page=2\" -Headers @{ 'Accept' = 'application/vnd.github+json' }\\).workflow_runs | Select-Object id, name, conclusion, head_sha, status | Format-List } catch { $_.Exception.Message })",
+      "Bash(git -C \"D:/OneDrive/Documents/Frontend/khushwindermaan051-Frontend\" add src/App.css)",
+      "Bash(git -C D:/OneDrive/Documents/Frontend/khushwindermaan051-Frontend commit -m 'Fix CSS build: close .ads-modal-search input block *)",
+      "Bash(git -C \"D:/OneDrive/Documents/Frontend/khushwindermaan051-Frontend\" push origin main)"
+    ],
+    "additionalDirectories": [
+      "D:\\OneDrive\\Documents\\Frontend\\khushwindermaan051-Frontend\\src"
+    ]
+  }
+}

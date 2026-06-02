@@ -1,0 +1,371 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Shipment Planner — how it works</title>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+  <style>
+    :root {
+      --ink: #0f172a;
+      --mute: #64748b;
+      --line: #e2e8f0;
+      --bg: #fafbff;
+      --accent: #2563eb;
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; padding: 0; background: var(--bg); color: var(--ink); }
+    body {
+      font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
+      padding: 32px 36px 96px;
+      max-width: 1280px;
+      margin: 0 auto;
+    }
+    header {
+      border-bottom: 1px solid var(--line);
+      padding-bottom: 18px;
+      margin-bottom: 24px;
+    }
+    h1 {
+      font-size: 28px;
+      font-weight: 800;
+      letter-spacing: -0.015em;
+      margin: 0 0 4px;
+      color: var(--ink);
+    }
+    header p {
+      margin: 0;
+      color: var(--mute);
+      font-size: 14px;
+    }
+    nav {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      margin: 14px 0 0;
+    }
+    nav a {
+      font-size: 13px;
+      color: var(--accent);
+      text-decoration: none;
+      padding: 4px 10px;
+      border: 1px solid #bfdbfe;
+      border-radius: 999px;
+      background: #eff6ff;
+      transition: background 160ms ease, transform 160ms ease;
+    }
+    nav a:hover { background: #dbeafe; transform: translateY(-1px); }
+    section {
+      background: #fff;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      padding: 22px 24px 26px;
+      margin-bottom: 22px;
+      box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
+    }
+    section h2 {
+      font-size: 19px;
+      font-weight: 700;
+      margin: 0 0 6px;
+      color: var(--ink);
+      letter-spacing: -0.005em;
+    }
+    section .sub {
+      color: var(--mute);
+      font-size: 13.5px;
+      margin: 0 0 18px;
+      line-height: 1.55;
+    }
+    .mermaid {
+      background: #fff;
+      padding: 8px 0;
+      overflow-x: auto;
+    }
+    footer {
+      color: var(--mute);
+      font-size: 12.5px;
+      text-align: center;
+      margin-top: 28px;
+    }
+    kbd {
+      background: #f1f5f9;
+      border: 1px solid #cbd5e1;
+      border-bottom-width: 2px;
+      border-radius: 4px;
+      padding: 1px 6px;
+      font-family: "SF Mono", Menlo, Consolas, monospace;
+      font-size: 12px;
+    }
+    @media print {
+      body { padding: 12px; background: #fff; }
+      section { box-shadow: none; page-break-inside: avoid; }
+      nav { display: none; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Shipment Planner — how it works</h1>
+    <p>Plain-English flow charts for the whole system. Press <kbd>Ctrl</kbd>+<kbd>P</kbd> to save as PDF or print.</p>
+    <nav>
+      <a href="#overview">① The big picture</a>
+      <a href="#auto">② Auto planner</a>
+      <a href="#manual">③ Manual planner</a>
+    </nav>
+  </header>
+
+  <section id="overview">
+    <h2>① The big picture</h2>
+    <p class="sub">
+      Where the data comes from, where it lives, what the planner does with it, and where the
+      finished truck plan goes.
+    </p>
+    <pre class="mermaid">
+flowchart TB
+  subgraph SRC["WHERE THE DATA COMES FROM"]
+    direction LR
+    AmzVC["Amazon<br/>(orders + appointments)"]
+    XLS["Excel and CSV files<br/>uploaded by your team"]
+    MS["Product master sheet<br/>(case size, weight,<br/>category)"]
+    INV["Stock-on-hand<br/>(how much is in<br/>the warehouse)"]
+    SAL["Sales data<br/>(what is selling<br/>fast or slow)"]
+  end
+
+  subgraph INGEST["STEP 1 - LOADING THE DATA"]
+    direction LR
+    UP["Files are read<br/>and saved"]
+    DEDUP["Duplicates removed,<br/>cleaned up"]
+    UP --> DEDUP
+  end
+
+  subgraph DB["STEP 2 - THE DATABASE (one source of truth)"]
+    direction LR
+    APPT["Appointments<br/>(what needs to ship<br/>and when)"]
+    APO["Purchase orders<br/>(what Amazon wants,<br/>quantity, warehouse)"]
+    SP["Saved truck plans"]
+    SPI["Items on each plan"]
+    AUD["History log<br/>(every edit anyone<br/>has made)"]
+  end
+
+  subgraph BE["STEP 3 - THE PLANNER BRAIN"]
+    direction LR
+    AIV["AUTO planner<br/>(starts from an<br/>appointment)"]
+    MPV["MANUAL planner<br/>(starts from orders<br/>you pick)"]
+    SHIPV["Save / submit /<br/>approve / dispatch"]
+    AIV -. shares logic .- MPV
+  end
+
+  subgraph CORE["WHAT THE BRAIN ACTUALLY DOES"]
+    direction TB
+    PACK["Fits items into<br/>the truck by case size<br/>and litres"]
+    FILL["Tops up empty space<br/>with same-warehouse<br/>items"]
+    CAP["Keeps the load<br/>within Amazon's<br/>commitment"]
+    SUG["Suggests a smaller<br/>truck if mostly empty"]
+    PACK --> FILL --> CAP --> SUG
+  end
+
+  subgraph FE["STEP 4 - WHAT THE USER SEES"]
+    direction TB
+    MODE{"Auto or Manual?"}
+    AUTO["Auto wizard:<br/>Pick date - Pick appointment -<br/>Settings - Review - Done"]
+    MAN["Manual wizard:<br/>Pick orders - Settings -<br/>Review - Done"]
+    MODE --> AUTO
+    MODE --> MAN
+  end
+
+  subgraph REV["STEP 5 - APPROVAL"]
+    direction LR
+    DRAFT["Save Draft"]
+    SUBMIT["Send for approval"]
+    APPROVE["Manager approves"]
+    DISPATCH["Truck dispatched"]
+    DRAFT --> SUBMIT --> APPROVE --> DISPATCH
+  end
+
+  AmzVC --> XLS --> INGEST
+  INGEST --> APPT
+  XLS --> APO
+  MS --> APO
+  INV --> APO
+  SAL --> APO
+
+  APPT --> AIV
+  APO --> AIV
+  APO --> MPV
+  INV --> AIV
+  INV --> MPV
+  SAL --> AIV
+  SAL --> MPV
+  SP --> SHIPV
+  SPI --> SHIPV
+
+  AIV --> CORE
+  MPV --> CORE
+  CORE --> AIV
+  CORE --> MPV
+
+  AIV --> AUTO
+  MPV --> MAN
+  AUTO --> REV
+  MAN --> REV
+  REV --> SHIPV
+  SHIPV --> SP
+  SHIPV --> SPI
+  SHIPV --> AUD
+
+  style SRC fill:#eff6ff,stroke:#60a5fa
+  style INGEST fill:#fdf4ff,stroke:#d946ef
+  style DB fill:#ecfdf5,stroke:#34d399
+  style BE fill:#fff7ed,stroke:#f97316
+  style CORE fill:#fef3c7,stroke:#f59e0b
+  style FE fill:#f1f5f9,stroke:#64748b
+  style REV fill:#fce7f3,stroke:#ec4899
+    </pre>
+  </section>
+
+  <section id="auto">
+    <h2>② Auto planner — step by step</h2>
+    <p class="sub">
+      Pick a date, pick an appointment, tell the system what you committed to Amazon, and it
+      builds the truck for you. Five steps from start to dispatch.
+    </p>
+    <pre class="mermaid">
+flowchart TD
+  Start(["User opens<br/>New Shipment"]) --> Mode["Picks Auto Planner"]
+
+  Mode --> Step1["STEP 1 - Pick a date"]
+  Step1 --> API1["System loads dates that<br/>have appointments waiting"]
+
+  Step1 --> Step2["STEP 2 - Pick an appointment"]
+  Step2 --> API2["System loads appointments<br/>for that date with their orders"]
+  Step2 --> API2b["Also loads other orders<br/>at the same warehouse<br/>(extras you can add in)"]
+
+  Step2 --> PickPOs["User picks one or<br/>more appointments,<br/>unchecks unwanted orders,<br/>or adds extras"]
+
+  PickPOs --> Step3["STEP 3 - Set things up"]
+  Step3 --> Commit["Popup asks: how many<br/>units and cartons did<br/>you commit to Amazon?<br/>(saved for next time)"]
+  Commit --> CommitOpts{"User decides:<br/>Strict ?<br/>Skip ?<br/>Use only units or cartons ?"}
+  CommitOpts --> Cfg["Pick truck size<br/>+ Choose how to split load<br/>(Premium / Commodity / Other)<br/>+ Top up empty space ?"]
+
+  Cfg --> Generate(["Click Generate Plan"])
+  Generate --> Pool["System gathers eligible items<br/>(matching warehouse, in stock,<br/>not already on another plan)"]
+  Pool --> Score["Each item scored by urgency<br/>(low stock = high priority)"]
+  Score --> Pack["Brain fits as many items as<br/>possible into the truck<br/>(full cartons only)"]
+  Pack --> Fillers{"Top up turned on ?"}
+  Fillers -- yes --> Same["Adds more items from<br/>the same appointment"]
+  Fillers -- yes --> DOH["Adds urgent items from<br/>other orders at the<br/>same warehouse"]
+  Same --> Caps["Removes anything over<br/>Amazon's commitment cap"]
+  DOH --> Caps
+  Fillers -- no --> Caps
+  Caps --> Suggest["If truck is mostly empty,<br/>suggest a smaller one"]
+  Suggest --> Resp["Sends finished plan back:<br/>what loaded, what didnt,<br/>why short, totals"]
+
+  Resp --> Step4["STEP 4 - Review the plan"]
+  Step4 --> Edit["User can edit shipped qty,<br/>remove rows,<br/>switch truck size,<br/>refresh plan"]
+  Edit --> Save(["Click Save Draft"])
+  Save --> StrictGate{"Strict mode on ?<br/>Plan matches commitment ?"}
+  StrictGate -- yes / matches --> Persist["Plan is saved to<br/>the database"]
+  StrictGate -- mismatch --> Block["Error: numbers dont match -<br/>fix qty or turn strict off"]
+  Block --> Edit
+
+  Persist --> Step5["STEP 5 - Send for approval"]
+  Step5 --> Approver["Plan is now pending approval"]
+  Approver --> Approve["Manager approves"]
+  Approve --> Dispatch["Team marks the truck dispatched"]
+  Dispatch --> Done(["Shipment dispatched"])
+
+  style Start fill:#dbeafe,stroke:#1d4ed8
+  style Done fill:#d1fae5,stroke:#059669
+  style Generate fill:#fef3c7,stroke:#f59e0b
+  style Save fill:#fef3c7,stroke:#f59e0b
+  style Block fill:#fee2e2,stroke:#dc2626
+  style Pool fill:#f1f5f9
+  style Pack fill:#f1f5f9
+  style Caps fill:#f1f5f9
+  style Same fill:#f1f5f9
+  style DOH fill:#f1f5f9
+    </pre>
+  </section>
+
+  <section id="manual">
+    <h2>③ Manual planner — step by step</h2>
+    <p class="sub">
+      No appointment needed. Pick the exact orders and items you want to ship, give your
+      commitments per order, and the same planner brain works out the truck.
+    </p>
+    <pre class="mermaid">
+flowchart TD
+  Start(["User opens<br/>New Shipment"]) --> Mode["Picks Manual"]
+
+  Mode --> Load["System loads every<br/>pending purchase order<br/>across all warehouses"]
+  Load --> Lookup["Checks what is already<br/>on other plans so we<br/>dont double count"]
+  Lookup --> Net["Shows the real remaining<br/>quantity for each item"]
+  Net --> Filters["User filters by order,<br/>item name, warehouse,<br/>category, or searches"]
+
+  Filters --> Pick["User clicks orders or<br/>individual items to add<br/>them to the basket"]
+  Pick --> FC{"All picks from the<br/>same warehouse ?"}
+  FC -- no --> Warn["Error banner:<br/>pick from one warehouse only"]
+  Warn --> Pick
+  FC -- yes --> Cfg["User picks truck size"]
+
+  Cfg --> Generate(["Click Generate Plan"])
+  Generate --> CommitGate{"Any picked order<br/>without a commitment ?"}
+  CommitGate -- yes --> Modal["Popup asks for units and<br/>cartons for each order"]
+  Modal --> SaveModal["User fills in or hits Skip"]
+  SaveModal --> Generate
+  CommitGate -- no --> RunBrain["System sends items to<br/>the planner brain"]
+
+  RunBrain --> Score["Each item scored by urgency"]
+  Score --> Sort["Sorted by score, expiry,<br/>quantity"]
+  Sort --> Pack["Brain fits items into<br/>the truck (full cartons only)"]
+  Pack --> Caps["Removes anything over the<br/>commitment cap (per order)"]
+  Caps --> Resp["Sends finished plan back"]
+
+  Resp --> Nav["Takes user to Review page"]
+  Nav --> Review["User can edit quantity,<br/>remove rows,<br/>change item or code"]
+  Review --> Persist(["Click Save Draft"])
+  Persist --> Saved["Plan is saved to<br/>the database"]
+
+  Saved --> Submit["Send for approval"]
+  Submit --> Approve["Manager approves"]
+  Approve --> Dispatch["Team marks the truck dispatched"]
+  Dispatch --> Done(["Shipment dispatched"])
+
+  style Start fill:#dbeafe,stroke:#1d4ed8
+  style Done fill:#d1fae5,stroke:#059669
+  style Generate fill:#fef3c7,stroke:#f59e0b
+  style Persist fill:#fef3c7,stroke:#f59e0b
+  style Warn fill:#fee2e2,stroke:#dc2626
+  style Pack fill:#f1f5f9
+  style Caps fill:#f1f5f9
+  style Sort fill:#f1f5f9
+    </pre>
+  </section>
+
+  <footer>
+    Tip: <kbd>Ctrl</kbd>+<kbd>P</kbd> &rarr; "Save as PDF" gives you all three diagrams on one printable file.
+  </footer>
+
+  <script>
+    mermaid.initialize({
+      startOnLoad: true,
+      theme: 'default',
+      flowchart: {
+        curve: 'basis',
+        htmlLabels: true,
+        padding: 14,
+        nodeSpacing: 36,
+        rankSpacing: 48,
+      },
+      themeVariables: {
+        fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif',
+        fontSize: '14px',
+        primaryColor: '#eff6ff',
+        primaryBorderColor: '#60a5fa',
+        primaryTextColor: '#0f172a',
+        lineColor: '#94a3b8',
+      },
+    });
+  </script>
+</body>
+</html>

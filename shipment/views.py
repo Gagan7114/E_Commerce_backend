@@ -487,6 +487,27 @@ class AppointmentDatesView(APIView):
         dates = [r[0].isoformat() for r in rows if r[0] and r[1] > 0]
         counts = {r[0].isoformat(): r[1] for r in rows if r[0]}
         cancelled = {r[0].isoformat(): r[2] for r in rows if r[0] and r[2] > 0}
+        channels = {}
+
+        with connection.cursor() as cur:
+            cur.execute("""
+                SELECT DATE(a.appointment_time) AS appt_date,
+                       UPPER(COALESCE(NULLIF(TRIM(fcm.channel::text), ''), 'UNMAPPED')) AS channel,
+                       COUNT(DISTINCT a.appointment_id) AS appointment_count
+                FROM reporting."appointment" a
+                LEFT JOIN public.fc_city_state_channel_master fcm
+                  ON UPPER(TRIM(fcm.fc::text)) = UPPER(TRIM(a.destination_fc::text))
+                WHERE a.status = 'Confirmed'
+                  AND a.appointment_time IS NOT NULL
+                GROUP BY DATE(a.appointment_time),
+                         UPPER(COALESCE(NULLIF(TRIM(fcm.channel::text), ''), 'UNMAPPED'))
+                ORDER BY appt_date, channel
+            """)
+            for appt_date, channel, channel_count in cur.fetchall():
+                if not appt_date or not channel:
+                    continue
+                date_key = appt_date.isoformat()
+                channels.setdefault(date_key, {})[channel] = channel_count
 
         # Per-date count of appointments already in a non-rejected shipment.
         # Powers the "X planned" mark on the upcoming-dates tiles so planners
@@ -530,6 +551,7 @@ class AppointmentDatesView(APIView):
             'dates': dates,
             'counts': counts,
             'cancelled': cancelled,
+            'channels': channels,
             'planned': planned,
         })
 
@@ -991,6 +1013,7 @@ class AppointmentListView(APIView):
                     ad.status,
                     ad.appointment_time,
                     ad.destination_fc,
+                    UPPER(COALESCE(NULLIF(TRIM(fcm.channel::text), ''), 'UNMAPPED')) AS channel,
                     ad.pro,
                     ad.pos,
                     COALESCE(ac.total_po,        0) AS po_count,
@@ -1002,6 +1025,8 @@ class AppointmentListView(APIView):
                     COALESCE(ac.locked_po,       0) AS locked_count
                 FROM appt_dedup ad
                 LEFT JOIN appt_counts ac USING (appointment_id)
+                LEFT JOIN public.fc_city_state_channel_master fcm
+                    ON UPPER(TRIM(fcm.fc::text)) = UPPER(TRIM(ad.destination_fc::text))
                 ORDER BY ad.appointment_time, ad.appointment_id
             """, [date_str])
             rows = _row_to_dict(cur, cur.fetchall())
@@ -1034,36 +1059,6 @@ class AppointmentListView(APIView):
                         regexp_split_to_array(COALESCE(ad.pos, ''), '\s*[,;]\s*')
                     ) AS pv
                     WHERE NULLIF(TRIM(pv), '') IS NOT NULL
-                ),
-                appt_po_set AS (
-                    -- Set of POs already in the appointment, per appointment.
-                    SELECT DISTINCT appointment_id, po_upper FROM appt_po_pairs
-                ),
-                extra_po_pairs AS (
-                    -- Same-FC PENDING + in-stock POs that AREN'T on the appointment;
-                    -- these become the "EXTRA" pool a planner can swap/add.
-                    SELECT
-                        ad.appointment_id,
-                        ad.destination_fc,
-                        UPPER(TRIM(p.po_number)) AS po_upper,
-                        FALSE AS in_appointment
-                    FROM appt_dedup ad
-                    JOIN reporting."Amazon PO" p
-                        ON p.fulfillment_center = ad.destination_fc
-                       AND p.status = 'Confirmed'
-                       AND p.po_status = 'PENDING'
-                       AND p.availability_status = 'AC - Accepted: In stock'
-                       AND COALESCE(p.accepted_qty, 0) > 0
-                    LEFT JOIN appt_po_set s
-                        ON s.appointment_id = ad.appointment_id
-                       AND s.po_upper = UPPER(TRIM(p.po_number))
-                    WHERE s.po_upper IS NULL
-                    GROUP BY ad.appointment_id, ad.destination_fc, UPPER(TRIM(p.po_number))
-                ),
-                all_po_pairs AS (
-                    SELECT * FROM appt_po_pairs
-                    UNION ALL
-                    SELECT * FROM extra_po_pairs
                 ),
                 latest_inv AS (
                     SELECT
@@ -1117,7 +1112,7 @@ class AppointmentListView(APIView):
                         AND COALESCE(p.accepted_qty, 0) > 0
                         AND lk.po_upper IS NULL
                     ) AS is_eligible
-                FROM all_po_pairs app
+                FROM appt_po_pairs app
                 LEFT JOIN reporting."Amazon PO" p
                     ON UPPER(TRIM(p.po_number)) = app.po_upper
                 LEFT JOIN latest_inv li
