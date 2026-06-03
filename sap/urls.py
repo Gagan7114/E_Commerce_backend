@@ -18,6 +18,11 @@ urlpatterns = [
         views.inventory_warehouse_comparison,
         name="sap-inventory-warehouse-comparison",
     ),
+    path(
+        "inventory-finished-goods",
+        views.inventory_finished_goods,
+        name="sap-inventory-finished-goods",
+    ),
     path("sales-invoices", views.sales_invoices, name="sap-sales-invoices"),
     path("sales-invoices/<str:card_code>", views.customer_sales_invoices, name="sap-customer-sales-invoices"),
     path("sales-invoice-lines/<int:doc_entry>", views.sales_invoice_lines, name="sap-sales-invoice-lines"),

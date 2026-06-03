@@ -870,6 +870,92 @@ def inventory_warehouse_comparison(request):
     })
 
 
+# ─── /inventory-finished-goods ───
+# Pivot view for the JM Inventory Dashboard: rows are FINISHED-group items
+# (sub_group / variety / item code / name) and columns are the fixed warehouse
+# code list below. Cell = OnHand for that item × warehouse. Includes a per-row
+# Grand Total. Reads mart or oil schema via ?source=.
+FG_WAREHOUSE_CODES: tuple[str, ...] = (
+    "BH-FGM", "DL-MP", "DL-EC", "DL-GR", "DL-FG", "BH-JM",
+    "FBF-HR", "KT-FG", "DL-INT", "KT-FBF", "PB-FG", "BH-GR", "BH-FG",
+)
+FG_GROUP_NAME = "FINISHED"
+
+
+@api_view(["GET"])
+@permission_classes([require("sap.view")])
+def inventory_finished_goods(request):
+    source, schema = resolve_schema(request.query_params.get("source"))
+    placeholders = ",".join(["?"] * len(FG_WAREHOUSE_CODES))
+    params: list = [FG_GROUP_NAME, *FG_WAREHOUSE_CODES]
+
+    rows = _run(
+        f"""
+        SELECT
+            T0."ItemCode",
+            T0."ItemName",
+            T0."U_Sub_Group" AS "SubGroup",
+            T0."U_Variety"   AS "Variety",
+            T1."WhsCode",
+            COALESCE(SUM(T1."OnHand"), 0) AS "OnHand"
+        FROM OITM T0
+        INNER JOIN OITW T1 ON T1."ItemCode" = T0."ItemCode"
+        LEFT  JOIN OITB T3 ON T3."ItmsGrpCod" = T0."ItmsGrpCod"
+        WHERE UPPER(T3."ItmsGrpNam") = ?
+          AND T1."WhsCode" IN ({placeholders})
+        GROUP BY T0."ItemCode", T0."ItemName", T0."U_Sub_Group",
+                 T0."U_Variety", T1."WhsCode"
+        """,
+        params,
+        schema=schema,
+    )
+
+    # Pivot to one row per item with a warehouses dict + grand_total.
+    pivot: dict[str, dict] = {}
+    for r in rows:
+        code = r["ItemCode"]
+        entry = pivot.get(code)
+        if entry is None:
+            entry = {
+                "ItemCode": code,
+                "ItemName": r.get("ItemName") or "",
+                "SubGroup": r.get("SubGroup") or "",
+                "Variety": r.get("Variety") or "",
+                "warehouses": {w: 0 for w in FG_WAREHOUSE_CODES},
+                "grand_total": 0,
+            }
+            pivot[code] = entry
+        qty = float(r.get("OnHand") or 0)
+        entry["warehouses"][r["WhsCode"]] = qty
+        entry["grand_total"] += qty
+
+    items = sorted(
+        pivot.values(),
+        key=lambda it: (
+            (it.get("SubGroup") or "").upper(),
+            (it.get("Variety") or "").upper(),
+            it["ItemCode"],
+        ),
+    )
+
+    column_totals = {w: 0.0 for w in FG_WAREHOUSE_CODES}
+    grand_total = 0.0
+    for it in items:
+        for w, v in it["warehouses"].items():
+            column_totals[w] += v
+        grand_total += it["grand_total"]
+
+    return Response({
+        "source": source,
+        "sources": sorted(HANA_SCHEMAS),
+        "warehouses": list(FG_WAREHOUSE_CODES),
+        "group": FG_GROUP_NAME,
+        "items": items,
+        "column_totals": column_totals,
+        "grand_total": grand_total,
+    })
+
+
 # ─── /sales-invoices ───
 @api_view(["GET"])
 @permission_classes([require("sap.invoice.view")])
