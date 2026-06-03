@@ -9,6 +9,7 @@ urlpatterns = [
     path('po-items/', views.POListView.as_view(), name='po-items'),
     path('asin-catalog/', views.AsinCatalogView.as_view(), name='asin-catalog'),
     path('all-appointments/', views.AllAppointmentsView.as_view(), name='all-appointments'),
+    path('appointment-commits/import/', views.AppointmentCommitImportView.as_view(), name='appointment-commits-import'),
     path('shipments/', views.ShipmentListCreateView.as_view(), name='shipment-list-create'),
     path('shipments/stats/', views.ShipmentStatsView.as_view(), name='shipment-stats'),
     path('shipments/pending-approvals/', views.ShipmentPendingApprovalsView.as_view(), name='shipment-pending-approvals'),

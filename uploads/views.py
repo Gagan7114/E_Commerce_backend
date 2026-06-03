@@ -59,6 +59,9 @@ UPLOAD_ALLOWED_TABLES = {
     "blinkit_brandfund",
     # Coupons (Amazon)
     "amazon_coupon",
+    # Vendor Central per-appointment commit (Carton/Unit count scraped from
+    # Amazon appointment detail pages; upsert keyed on appointment_id).
+    "appointment_commit",
 }
 
 BATCH_SIZE = 1000
