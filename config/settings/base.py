@@ -79,6 +79,22 @@ DATABASES = {
         "PASSWORD": env("POSTGRES_PASSWORD", default="ecms"),
         "HOST": env("POSTGRES_HOST", default="127.0.0.1"),
         "PORT": env("POSTGRES_PORT", default="5432"),
+        # Reuse a connection across requests instead of opening one per request.
+        # Big latency win on every API call; safe with WSGI + per-worker pooling.
+        "CONN_MAX_AGE": env.int("DJANGO_DB_CONN_MAX_AGE", default=600),
+        "CONN_HEALTH_CHECKS": True,
+    },
+}
+
+# Explicit local-memory cache so `from django.core.cache import cache` is
+# deterministic across workers (Django's default is per-process LocMemCache;
+# we name it so it can be swapped for Redis in prod via env later).
+CACHES = {
+    "default": {
+        "BACKEND": "django.core.cache.backends.locmem.LocMemCache",
+        "LOCATION": "ecms-default",
+        "TIMEOUT": 300,
+        "OPTIONS": {"MAX_ENTRIES": 5000},
     },
 }
 

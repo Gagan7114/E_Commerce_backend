@@ -11,6 +11,7 @@ from rest_framework.exceptions import PermissionDenied, ValidationError
 from rest_framework.response import Response
 
 from accounts.permissions import can_access_platform, require
+from config.perf_cache import cached_get
 
 from .models import PlatformConfig
 from .primary_po_columns import order_primary_master_po_row
@@ -121,6 +122,7 @@ _STATS_CACHE_TTL = 60  # seconds
 
 @api_view(["GET"])
 @permission_classes([require("platform.stats.view")])
+@cached_get(timeout=60, prefix="plat.stats")
 def platform_stats(request, slug: str):
     _ensure_scope(request.user, slug)
 
@@ -1474,11 +1476,20 @@ def pendency_dashboard(request, slug: str):
             f"Pendency dashboard is not yet enabled for platform '{slug}'."
         )
 
-    where_parts = ['UPPER(TRIM("format"::text)) = %s']
-    params: list = [fmt]
-
     raw_year = (request.query_params.get("year") or "").strip()
     raw_po_month = (request.query_params.get("po_month") or "").strip()
+
+    # Short-lived cache: pendency data only changes when POs are uploaded.
+    # 60s collapses repeated polling / tab-switching into one DB hit while
+    # keeping the response close to live. Cache key includes the user's
+    # filter inputs so each filter combo is cached independently.
+    _pendency_cache_key = f"pendency:{slug}:{raw_year}:{raw_po_month.upper()}"
+    _cached_payload = cache.get(_pendency_cache_key)
+    if _cached_payload is not None:
+        return Response(_cached_payload)
+
+    where_parts = ['UPPER(TRIM("format"::text)) = %s']
+    params: list = [fmt]
     resolved_month: str | None = None
     resolved_year: int | None = None
     defaulted_to_latest = False
@@ -1674,7 +1685,7 @@ def pendency_dashboard(request, slug: str):
         params,
     )
 
-    return Response({
+    _payload = {
         "platform": slug,
         "format": fmt,
         "po_month": resolved_month,
@@ -1694,11 +1705,14 @@ def pendency_dashboard(request, slug: str):
         "by_warehouse": by_warehouse,
         "by_distributor": by_distributor,
         "by_po": by_po,
-    })
+    }
+    cache.set(_pendency_cache_key, _payload, timeout=60)
+    return Response(_payload)
 
 
 @api_view(["GET"])
 @permission_classes([require("platform.stats.view")])
+@cached_get(timeout=60, prefix="plat.primary")
 def primary_dashboard(request, slug: str):
     _ensure_scope(request.user, slug)
     if slug == "amazon":
@@ -2206,6 +2220,7 @@ def _primary_dashboard_payload(
 
 @api_view(["GET"])
 @permission_classes([require("platform.po.view")])
+@cached_get(timeout=60, prefix="plat.primary_total")
 def primary_overview_total(request):
     """Fast aggregate used by the home dashboard Primary card."""
     raw_month = str(request.query_params.get("month") or date.today().month).strip()
@@ -2411,6 +2426,7 @@ def _secmaster_inventory_date_expr(slug: str) -> str:
 
 @api_view(["GET"])
 @permission_classes([require("platform.inventory.view")])
+@cached_get(timeout=60, prefix="plat.soh_doh")
 def blinkit_soh_doh_dashboard(request, slug: str):
     _ensure_scope(request.user, slug)
     if slug == "amazon":
@@ -3122,6 +3138,7 @@ def _amazon_soh_doh_dashboard(request):
 
 @api_view(["GET"])
 @permission_classes([require("platform.stats.view")])
+@cached_get(timeout=60, prefix="plat.amazon_price")
 def amazon_price_dashboard(request, slug: str):
     _ensure_scope(request.user, slug)
     if slug != "amazon":
@@ -3506,6 +3523,7 @@ _AMAZON_METRIC_SPECS = [
 
 @api_view(["GET"])
 @permission_classes([require("platform.stats.view")])
+@cached_get(timeout=60, prefix="plat.amazon_ads")
 def amazon_ads_dashboard(request, slug: str):
     _ensure_scope(request.user, slug)
     if slug != "amazon":
@@ -3594,6 +3612,7 @@ _QC_DEFAULT_VISIBLE_COLUMNS = [
 
 @api_view(["GET"])
 @permission_classes([require("platform.stats.view")])
+@cached_get(timeout=60, prefix="plat.swiggy_ads")
 def swiggy_ads_dashboard(request, slug: str):
     _ensure_scope(request.user, slug)
     if slug != "swiggy":
@@ -3621,6 +3640,7 @@ def swiggy_ads_dashboard(request, slug: str):
 
 @api_view(["GET"])
 @permission_classes([require("platform.stats.view")])
+@cached_get(timeout=60, prefix="plat.zepto_ads")
 def zepto_ads_dashboard(request, slug: str):
     _ensure_scope(request.user, slug)
     if slug != "zepto":
@@ -3647,6 +3667,7 @@ def zepto_ads_dashboard(request, slug: str):
 
 @api_view(["GET"])
 @permission_classes([require("platform.stats.view")])
+@cached_get(timeout=60, prefix="plat.bb_ads")
 def bigbasket_ads_dashboard(request, slug: str):
     _ensure_scope(request.user, slug)
     if slug != "bigbasket":
@@ -3673,6 +3694,7 @@ def bigbasket_ads_dashboard(request, slug: str):
 
 @api_view(["GET"])
 @permission_classes([require("platform.stats.view")])
+@cached_get(timeout=60, prefix="plat.blinkit_ads")
 def blinkit_ads_dashboard(request, slug: str):
     _ensure_scope(request.user, slug)
     if slug != "blinkit":
@@ -3740,6 +3762,7 @@ _FLIPKART_METRIC_SPECS = [
 
 @api_view(["GET"])
 @permission_classes([require("platform.stats.view")])
+@cached_get(timeout=60, prefix="plat.fk_ads")
 def flipkart_ads_dashboard(request, slug: str):
     _ensure_scope(request.user, slug)
     if slug != "flipkart":
@@ -3868,6 +3891,7 @@ def _brandfund_dashboard_payload(*, source: str, title: str, request) -> dict:
 
 @api_view(["GET"])
 @permission_classes([require("platform.stats.view")])
+@cached_get(timeout=60, prefix="plat.blinkit_bf")
 def blinkit_brandfund_dashboard(request, slug: str):
     _ensure_scope(request.user, slug)
     if slug != "blinkit":
@@ -3881,6 +3905,7 @@ def blinkit_brandfund_dashboard(request, slug: str):
 
 @api_view(["GET"])
 @permission_classes([require("platform.stats.view")])
+@cached_get(timeout=60, prefix="plat.swiggy_bf")
 def swiggy_brandfund_dashboard(request, slug: str):
     _ensure_scope(request.user, slug)
     if slug != "swiggy":
@@ -3894,6 +3919,7 @@ def swiggy_brandfund_dashboard(request, slug: str):
 
 @api_view(["GET"])
 @permission_classes([require("platform.stats.view")])
+@cached_get(timeout=60, prefix="plat.zepto_bf")
 def zepto_brandfund_dashboard(request, slug: str):
     _ensure_scope(request.user, slug)
     if slug != "zepto":
@@ -5246,6 +5272,7 @@ def _top_ltr_items_from_table(
 
 @api_view(["GET"])
 @permission_classes([require("platform.secondary.view")])
+@cached_get(timeout=60, prefix="plat.fk_sec")
 def flipkart_grocery_sec_dashboard(request, slug: str):
     _ensure_scope(request.user, slug)
     if slug == "blinkit":
@@ -6653,6 +6680,7 @@ def _amazon_mp_dashboard_response(request):
 
 @api_view(["GET"])
 @permission_classes([require("platform.secondary.view")])
+@cached_get(timeout=60, prefix="plat.amazon_mp")
 def amazon_mp_dashboard(request, slug: str):
     _ensure_scope(request.user, slug)
     if slug != "amazon":
@@ -7021,6 +7049,7 @@ def _flipkart_sec_dashboard_response(request):
 
 @api_view(["GET"])
 @permission_classes([require("platform.secondary.view")])
+@cached_get(timeout=60, prefix="plat.amazon_cmp")
 def amazon_comparison_dashboard(request, slug: str):
     _ensure_scope(request.user, slug)
     if slug != "amazon":
@@ -7030,6 +7059,7 @@ def amazon_comparison_dashboard(request, slug: str):
 
 @api_view(["GET"])
 @permission_classes([require("platform.secondary.view")])
+@cached_get(timeout=60, prefix="plat.fk_sec_monthly")
 def flipkart_secondary_monthly_dashboard(request, slug: str):
     _ensure_scope(request.user, slug)
     if slug == "amazon":
@@ -7794,6 +7824,7 @@ def _zepto_sec_dashboard_response(request):
 
 @api_view(["GET"])
 @permission_classes([require("platform.secondary.view")])
+@cached_get(timeout=60, prefix="plat.sku_analysis")
 def sku_analysis_dashboard(request, slug: str):
     _ensure_scope(request.user, slug)
     if slug == "zepto":
@@ -8227,6 +8258,7 @@ def _zepto_sku_analysis_dashboard_response(request):
 
 @api_view(["GET"])
 @permission_classes([require("platform.inventory.view")])
+@cached_get(timeout=60, prefix="plat.blinkit_drr")
 def blinkit_drr_dashboard(request):
     _ensure_scope(request.user, "blinkit")
     return _blinkit_drr_dashboard_response(request)
@@ -8234,6 +8266,7 @@ def blinkit_drr_dashboard(request):
 
 @api_view(["GET"])
 @permission_classes([require("platform.inventory.view")])
+@cached_get(timeout=60, prefix="plat.zepto_drr")
 def zepto_drr_dashboard(request):
     _ensure_scope(request.user, "zepto")
     return _zepto_drr_dashboard_response(request)
@@ -8241,6 +8274,7 @@ def zepto_drr_dashboard(request):
 
 @api_view(["GET"])
 @permission_classes([require("platform.inventory.view")])
+@cached_get(timeout=60, prefix="plat.swiggy_drr")
 def swiggy_drr_dashboard(request):
     _ensure_scope(request.user, "swiggy")
     return _swiggy_drr_dashboard_response(request)
@@ -8248,6 +8282,7 @@ def swiggy_drr_dashboard(request):
 
 @api_view(["GET"])
 @permission_classes([require("platform.inventory.view")])
+@cached_get(timeout=60, prefix="plat.bb_drr")
 def bigbasket_drr_dashboard(request):
     _ensure_scope(request.user, "bigbasket")
     return _bigbasket_drr_dashboard_response(request)
@@ -8255,6 +8290,7 @@ def bigbasket_drr_dashboard(request):
 
 @api_view(["GET"])
 @permission_classes([require("platform.secondary.view")])
+@cached_get(timeout=60, prefix="plat.fk_drr")
 def flipkart_grocery_drr_dashboard(request, slug: str):
     _ensure_scope(request.user, slug)
     if slug == "amazon":
@@ -9195,6 +9231,7 @@ def _flipkart_mp_drr_dashboard_response(request):
 
 @api_view(["GET"])
 @permission_classes([require("platform.secondary.view")])
+@cached_get(timeout=60, prefix="plat.fk_mom")
 def flipkart_grocery_month_on_month_sale(request, slug: str):
     _ensure_scope(request.user, slug)
     if slug == "bigbasket":

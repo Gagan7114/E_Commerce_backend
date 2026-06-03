@@ -1,4 +1,5 @@
 from django.contrib.auth import get_user_model
+from django.core.cache import cache
 from django.shortcuts import get_object_or_404
 from rest_framework import status
 from rest_framework.decorators import api_view, permission_classes
@@ -121,12 +122,23 @@ def notifications(request):
         limit = min(max(int(request.query_params.get("limit") or 50), 1), 200)
     except (TypeError, ValueError):
         limit = 50
+
+    # Short-lived cache: this endpoint is polled on every page mount and the
+    # underlying snapshot only changes when upserts run. 20s keeps the UI fresh
+    # while collapsing burst traffic to a single DB roundtrip.
+    cache_key = f"notif:doh:{int(active_only)}:{platform_slug}:{format_name}:{limit}"
+    cached = cache.get(cache_key)
+    if cached is not None:
+        return Response(cached)
+
     page = list(queryset.order_by("is_read", "doh", "-last_seen_at")[:limit])
-    return Response({
+    payload = {
         "notifications": [notification_to_payload(item) for item in page],
         "unread_count": queryset.filter(is_read=False).count(),
         "count": queryset.count(),
-    })
+    }
+    cache.set(cache_key, payload, timeout=20)
+    return Response(payload)
 
 
 @api_view(["POST"])
@@ -137,6 +149,7 @@ def mark_all_read(request):
         resolved_at__isnull=True,
         is_read=False,
     ).update(is_read=True)
+    # 20s notif cache TTL will refresh shortly; no need to invalidate broadly.
     return Response({"status": "ok", "updated": updated})
 
 
