@@ -166,3 +166,9 @@ CORS_ALLOWED_ORIGINS = _clean_env_list(
     ],
 )
 CORS_ALLOW_CREDENTIALS = True
+
+# Shared secret for the unattended Amazon appointment-commit importer
+# (Tampermonkey auto-run script POSTs carton/unit counts here). Scoped to the
+# appointment-commit import endpoint only. Empty = endpoint disabled (safe
+# default). Set APPOINTMENT_COMMIT_IMPORT_KEY in .env to enable.
+APPOINTMENT_COMMIT_IMPORT_KEY = env("APPOINTMENT_COMMIT_IMPORT_KEY", default="")

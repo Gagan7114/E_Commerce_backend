@@ -1,13 +1,15 @@
 from __future__ import annotations
 
+import hmac
 import json
 import math
 from datetime import date as _date, timedelta
 from decimal import Decimal
 
+from django.conf import settings
 from django.db import connection, transaction
 from rest_framework import status
-from rest_framework.permissions import IsAuthenticated
+from rest_framework.permissions import IsAuthenticated, AllowAny
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
@@ -98,7 +100,6 @@ def _pack_into_capacity(items, capacity_lt):
     for item in items:
         total_liters = float(item.get('total_accepted_liters') or 0)
         per_liter    = float(item.get('per_liter') or 0)
-        case_pack    = float(item.get('case_pack') or 1)
         accepted_qty = float(item.get('accepted_qty') or 0)
 
         if accepted_qty == 0:
@@ -129,72 +130,39 @@ def _pack_into_capacity(items, capacity_lt):
             continue
 
         if total_liters <= remaining + 0.001:
-            # Full ordered qty fits. Still flag as case-pack-rounded short when
-            # ordered doesn't divide evenly into the carton — Amazon receives
-            # the full case count but the line is technically short by the
-            # residue (e.g. ordered 100, case_pack 12 → ship 96, short 4).
-            full_cartons = math.floor(accepted_qty / case_pack) * case_pack if case_pack > 0 else accepted_qty
-            if case_pack > 1 and full_cartons < accepted_qty:
-                ship_qty = full_cartons
-                ship_liters = round(ship_qty * per_liter, 4)
-                item['planned_qty'] = ship_qty
-                item['planned_liters'] = ship_liters
-                item['short_reason'] = (
-                    f'Case-pack {int(case_pack)} residue — ordered '
-                    f'{int(accepted_qty)} units, only full cartons ship '
-                    f'({int(ship_qty)} units in {int(ship_qty // case_pack)} cartons); '
-                    f'{int(accepted_qty - ship_qty)} units left as residue.'
-                )
-                remaining -= ship_liters
-            else:
-                item['planned_qty'] = accepted_qty
-                item['planned_liters'] = round(total_liters, 4)
-                remaining -= total_liters
+            # Full ordered qty fits — ship everything (cartons not counted).
+            item['planned_qty'] = accepted_qty
+            item['planned_liters'] = round(total_liters, 4)
+            remaining -= total_liters
             loaded.append(item)
         else:
-            if per_liter > 0 and case_pack > 0:
-                partial_qty = math.floor((remaining / per_liter) / case_pack) * case_pack
+            if per_liter > 0:
+                partial_qty = math.floor(remaining / per_liter)
                 if partial_qty > 0:
                     partial_liters = round(partial_qty * per_liter, 4)
                     item['planned_qty'] = partial_qty
                     item['planned_liters'] = partial_liters
-                    # Tell the user WHY this line ships short. Two distinct
-                    # cases: (a) one more carton would have fit but Amazon
-                    # didn't order that many → case-pack residue; (b) the
-                    # truck genuinely ran out of room before we could fit
-                    # one more carton.
                     short_units = int(accepted_qty - partial_qty)
-                    cartons_fit = int(partial_qty // case_pack)
-                    cartons_asked = int(math.ceil(accepted_qty / case_pack))
-                    if short_units < case_pack:
-                        item['short_reason'] = (
-                            f'Case-pack {int(case_pack)} residue — ordered '
-                            f'{int(accepted_qty)} units doesn\'t divide evenly into '
-                            f'full cartons. Max shippable: {int(partial_qty)} units '
-                            f'({cartons_fit} cartons); {short_units} units left over.'
-                        )
-                    else:
-                        item['short_reason'] = (
-                            f'Truck out of capacity — only {cartons_fit} of '
-                            f'{cartons_asked} cartons fit before the truck '
-                            f'filled up. {short_units} units left for the next '
-                            f'shipment.'
-                        )
+                    item['short_reason'] = (
+                        f'Truck out of capacity — only {int(partial_qty)} of '
+                        f'{int(accepted_qty)} units fit before the truck '
+                        f'filled up. {short_units} units left for the next '
+                        f'shipment.'
+                    )
                     remaining -= partial_liters
                     loaded.append(item)
                 else:
                     item['planned_qty'] = 0
                     item['planned_liters'] = 0
                     item['unfit_reason'] = (
-                        f'Doesn\'t fit even one carton ({int(case_pack)} '
-                        f'units) in remaining truck capacity.'
+                        'Truck is full — no remaining capacity for this item.'
                     )
                     not_loaded.append(item)
             else:
                 item['planned_qty'] = 0
                 item['planned_liters'] = 0
                 item['unfit_reason'] = (
-                    'No per-liter / case-pack data — cannot pack this item.'
+                    'No per-liter data — cannot pack this item.'
                 )
                 not_loaded.append(item)
     used = float(capacity_lt) - remaining
@@ -1016,6 +984,8 @@ class AppointmentListView(APIView):
                     UPPER(COALESCE(NULLIF(TRIM(fcm.channel::text), ''), 'UNMAPPED')) AS channel,
                     ad.pro,
                     ad.pos,
+                    acm.carton_count AS amazon_carton_count,
+                    acm.unit_count   AS amazon_unit_count,
                     COALESCE(ac.total_po,        0) AS po_count,
                     COALESCE(ac.eligible_po,     0) AS eligible_po_count,
                     COALESCE(ac.no_fc_match_po,  0) AS no_fc_match_count,
@@ -1025,6 +995,7 @@ class AppointmentListView(APIView):
                     COALESCE(ac.locked_po,       0) AS locked_count
                 FROM appt_dedup ad
                 LEFT JOIN appt_counts ac USING (appointment_id)
+                LEFT JOIN public.appointment_commit acm USING (appointment_id)
                 LEFT JOIN public.fc_city_state_channel_master fcm
                     ON UPPER(TRIM(fcm.fc::text)) = UPPER(TRIM(ad.destination_fc::text))
                 ORDER BY ad.appointment_time, ad.appointment_id
@@ -1990,14 +1961,12 @@ class ShipmentItemUpdateView(APIView):
         if 'new_qty' in data:
             new_qty = float(data['new_qty'])
             # Can't ship more than ordered (accepted); the difference is the
-            # short-supply qty shown to planners. Clamp before case-pack rounding.
+            # short-supply qty shown to planners. Cartons are not counted, so
+            # the entered quantity ships as-is (clamped to the ordered qty).
             ordered = float(item.accepted_qty or 0)
             if ordered > 0:
                 new_qty = min(new_qty, ordered)
             new_qty = max(new_qty, 0)
-            case_pack = float(item.case_pack or 1)
-            if case_pack > 0:
-                new_qty = math.floor(new_qty / case_pack) * case_pack
             item.planned_qty = new_qty
             item.planned_liters = round(new_qty * float(item.per_liter or 0), 4)
 
@@ -2333,22 +2302,24 @@ class AllAppointmentsView(APIView):
         page_size = 9999 if no_paginate else min(100, int(request.query_params.get('page_size', 50)))
         offset = 0 if no_paginate else (page - 1) * page_size
 
-        where = ["appointment_time IS NOT NULL"]
+        # Qualify with the `a` alias so the appointment_commit LEFT JOIN below
+        # (which also has appointment_id / destination_fc) stays unambiguous.
+        where = ["a.appointment_time IS NOT NULL"]
         params = []
         if status:
-            where.append("LOWER(status) LIKE LOWER(%s)")
+            where.append("LOWER(a.status) LIKE LOWER(%s)")
             params.append(f'%{status}%')
         if fc:
-            where.append("LOWER(destination_fc) LIKE LOWER(%s)")
+            where.append("LOWER(a.destination_fc) LIKE LOWER(%s)")
             params.append(f'%{fc}%')
         if appt_id:
-            where.append("LOWER(appointment_id) LIKE LOWER(%s)")
+            where.append("LOWER(a.appointment_id) LIKE LOWER(%s)")
             params.append(f'%{appt_id}%')
         if date_from:
-            where.append("DATE(appointment_time) >= %s")
+            where.append("DATE(a.appointment_time) >= %s")
             params.append(date_from)
         if date_to:
-            where.append("DATE(appointment_time) <= %s")
+            where.append("DATE(a.appointment_time) <= %s")
             params.append(date_to)
 
         where_sql = ' AND '.join(where)
@@ -2356,8 +2327,8 @@ class AllAppointmentsView(APIView):
         with connection.cursor() as cur:
             cur.execute(f"""
                 SELECT COUNT(*) FROM (
-                    SELECT DISTINCT appointment_id
-                    FROM reporting."appointment"
+                    SELECT DISTINCT a.appointment_id
+                    FROM reporting."appointment" a
                     WHERE {where_sql}
                 ) _distinct
             """, params)
@@ -2366,23 +2337,29 @@ class AllAppointmentsView(APIView):
             # The ingest stores one row per (appointment_id, PO). Aggregate
             # back to one row per appointment_id by stitching the POs with
             # STRING_AGG, so the View page shows the full PO list per row.
+            # LEFT JOIN appointment_commit to surface Amazon's scraped carton /
+            # unit counts (one row per appointment_id) for verification.
             cur.execute(f"""
-                SELECT appointment_id,
-                       MAX(status)            AS status,
-                       MAX(appointment_time)  AS appointment_time,
-                       MAX(creation_date)     AS creation_date,
-                       MAX(destination_fc)    AS destination_fc,
-                       MAX(pro)               AS pro,
+                SELECT a.appointment_id,
+                       MAX(a.status)            AS status,
+                       MAX(a.appointment_time)  AS appointment_time,
+                       MAX(a.creation_date)     AS creation_date,
+                       MAX(a.destination_fc)    AS destination_fc,
+                       MAX(a.pro)               AS pro,
                        STRING_AGG(
-                           DISTINCT NULLIF(TRIM(COALESCE(pos,'')),''),
+                           DISTINCT NULLIF(TRIM(COALESCE(a.pos,'')),''),
                            ', '
-                           ORDER BY NULLIF(TRIM(COALESCE(pos,'')),'')
+                           ORDER BY NULLIF(TRIM(COALESCE(a.pos,'')),'')
                        ) AS pos,
-                       COUNT(DISTINCT NULLIF(TRIM(COALESCE(pos,'')),'')) AS po_count
-                FROM reporting."appointment"
+                       COUNT(DISTINCT NULLIF(TRIM(COALESCE(a.pos,'')),'')) AS po_count,
+                       MAX(acm.carton_count)    AS amazon_carton_count,
+                       MAX(acm.unit_count)      AS amazon_unit_count
+                FROM reporting."appointment" a
+                LEFT JOIN public.appointment_commit acm
+                       ON acm.appointment_id = a.appointment_id
                 WHERE {where_sql}
-                GROUP BY appointment_id
-                ORDER BY MAX(appointment_time) DESC NULLS LAST
+                GROUP BY a.appointment_id
+                ORDER BY MAX(a.appointment_time) DESC NULLS LAST
                 LIMIT %s OFFSET %s
             """, params + [page_size, offset])
             rows = _row_to_dict(cur, cur.fetchall())
@@ -2393,6 +2370,95 @@ class AllAppointmentsView(APIView):
             'page': page,
             'page_size': page_size,
             'total_pages': math.ceil(total / page_size) if page_size else 1,
+        })
+
+
+class AppointmentCommitImportView(APIView):
+    """Unattended importer for Amazon Vendor Central carton/unit commitments.
+
+    Authenticated by a shared-secret header (``X-Import-Key``) instead of a user
+    JWT, so the Tampermonkey auto-run script can POST from vendorcentral.in
+    without the app login. Scoped to ONLY upsert public.appointment_commit — it
+    cannot touch any other table (unlike the generic /api/upload/batch).
+
+    No CORS change is needed: the userscript uses GM_xmlhttpRequest, which is
+    not subject to the browser's same-origin policy.
+
+    Body: { "rows": [ {appointment_id, destination_fc, carton_count, unit_count}, … ] }
+    """
+    authentication_classes = []          # no session auth → no CSRF; key check below
+    permission_classes = [AllowAny]
+
+    @staticmethod
+    def _pos_int(value):
+        try:
+            n = int(round(float(value)))
+        except (TypeError, ValueError):
+            return None
+        return n if n > 0 else None
+
+    def post(self, request):
+        expected = (getattr(settings, "APPOINTMENT_COMMIT_IMPORT_KEY", "") or "").strip()
+        if not expected:
+            return Response({"detail": "Import endpoint is disabled (no key configured)."}, status=503)
+        provided = (request.headers.get("X-Import-Key") or "").strip()
+        if not provided or not hmac.compare_digest(provided, expected):
+            return Response({"detail": "Invalid or missing import key."}, status=401)
+
+        payload = request.data or {}
+        rows_in = payload.get("rows") if isinstance(payload, dict) else payload
+        if not isinstance(rows_in, list):
+            rows_in = []
+
+        cleaned = []
+        for r in rows_in:
+            if not isinstance(r, dict):
+                continue
+            aid = str(r.get("appointment_id") or "").strip()
+            if not aid:
+                continue
+            fc = str(r.get("destination_fc") or "").strip() or None
+            carton = self._pos_int(r.get("carton_count"))
+            unit = self._pos_int(r.get("unit_count"))
+            if carton is None and unit is None:
+                continue
+            cleaned.append((aid, fc, carton, unit))
+
+        if not cleaned:
+            return Response({"imported": 0, "updated": 0, "received": len(rows_in), "detail": "No usable rows."})
+
+        created = 0
+        updated = 0
+        with connection.cursor() as cur:
+            for aid, fc, carton, unit in cleaned:
+                # COALESCE keeps any existing value when a re-import omits a
+                # field, so partial scrapes never wipe good data.
+                cur.execute(
+                    """
+                    INSERT INTO public.appointment_commit
+                        (appointment_id, destination_fc, carton_count, unit_count, source, updated_at)
+                    VALUES (%s, %s, %s, %s, 'amazon', now())
+                    ON CONFLICT (appointment_id) DO UPDATE SET
+                        destination_fc = COALESCE(EXCLUDED.destination_fc, public.appointment_commit.destination_fc),
+                        carton_count   = COALESCE(EXCLUDED.carton_count, public.appointment_commit.carton_count),
+                        unit_count     = COALESCE(EXCLUDED.unit_count, public.appointment_commit.unit_count),
+                        source         = 'amazon',
+                        updated_at     = now()
+                    RETURNING (xmax::text = '0') AS inserted
+                    """,
+                    [aid, fc, carton, unit],
+                )
+                row = cur.fetchone()
+                if row and row[0]:
+                    created += 1
+                else:
+                    updated += 1
+
+        return Response({
+            "imported": created,
+            "updated": updated,
+            "stored": created + updated,
+            "received": len(rows_in),
         })
 
 
