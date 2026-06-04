@@ -3280,8 +3280,10 @@ def _ads_build_where(request, *, allow_date: bool = True):
       * `where_sql` / `params`         — full filter (year + month + date)
       * `trend_where_sql` / `trend_params` — same filter without `date`
 
-    The trend chart uses the no-date version so picking a single date doesn't
-    collapse the trend to a single point.
+    The trend chart uses the trend version: a specific date narrows the trend
+    to everything UP TO that date (inclusive), so the line still spans multiple
+    days and visibly changes as the user moves the date — rather than
+    collapsing to a single point.
 
     Returns (where_sql, params, trend_where_sql, trend_params, filters_dict).
     """
@@ -3301,12 +3303,12 @@ def _ads_build_where(request, *, allow_date: bool = True):
         base_clauses.append("month = %s")
         base_params.append(month_param)
 
-    # Trend version stops here — no date narrowing.
+    # Trend version starts from the base (year/month) clauses; a specific date
+    # is added below as an UPPER BOUND so the trend spans up to that date.
     trend_clauses = list(base_clauses)
     trend_params = list(base_params)
-    trend_where_sql = ("WHERE " + " AND ".join(trend_clauses)) if trend_clauses else ""
 
-    # Full version adds the date narrowing if present.
+    # Full version (summary / breakdown) narrows to the EXACT date if present.
     full_clauses = list(base_clauses)
     full_params = list(base_params)
     if allow_date and date_param:
@@ -3314,6 +3316,11 @@ def _ads_build_where(request, *, allow_date: bool = True):
             raise ValidationError(f"Invalid date value: {date_param!r} (expected YYYY-MM-DD)")
         full_clauses.append("date = %s::date")
         full_params.append(date_param)
+        # Trend follows the date as an inclusive upper bound (up-to-that-date).
+        trend_clauses.append("date <= %s::date")
+        trend_params.append(date_param)
+
+    trend_where_sql = ("WHERE " + " AND ".join(trend_clauses)) if trend_clauses else ""
     where_sql = ("WHERE " + " AND ".join(full_clauses)) if full_clauses else ""
 
     return where_sql, full_params, trend_where_sql, trend_params, {
@@ -3383,9 +3390,9 @@ def _ads_dashboard_payload(
     # render BOTH the dual-axis spend-vs-revenue chart AND a tiny sparkline
     # inside each KPI card without a second round-trip.
     #
-    # IMPORTANT: trend deliberately ignores the `date` filter so picking a
-    # single date in the UI doesn't collapse the trend to a single point.
-    # Year / month filters still apply.
+    # Trend follows the date filter as an inclusive UPPER BOUND (up-to-that-date)
+    # via `trend_where_sql`, so picking a date shrinks/grows the line instead of
+    # collapsing it to a single point. Year / month filters still apply.
     spend_spec = next(s for s in metric_specs if s["key"] == spend_metric)
     revenue_spec = next(s for s in metric_specs if s["key"] == revenue_metric)
     trend_metric_select_sql = ", ".join(
