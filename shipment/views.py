@@ -859,34 +859,62 @@ def _suggest_smaller_truck(planned_liters, current_capacity, current_truck_size)
     }
 
 
+def _record_po_flips(flips):
+    """Upsert detected FC flips into public.po_fc_flip (audit log).
+
+    `flips` is an iterable of (po_number, from_fc, to_fc). A flip is when a PO
+    is on an appointment whose FC differs from the PO's Amazon-PO-sheet FC —
+    i.e. the team intentionally moved (flipped) the PO to the sister FC.
+    """
+    rows = [
+        (str(po or '').strip().upper(), str(frm or '').strip().upper(), str(to or '').strip().upper())
+        for (po, frm, to) in (flips or [])
+    ]
+    rows = [r for r in rows if r[0] and r[1] and r[2] and r[1] != r[2]]
+    if not rows:
+        return
+    try:
+        with connection.cursor() as cur:
+            cur.executemany("""
+                INSERT INTO public.po_fc_flip (po_number, from_fc, to_fc, first_seen, last_seen)
+                VALUES (%s, %s, %s, now(), now())
+                ON CONFLICT (po_number, from_fc, to_fc)
+                DO UPDATE SET last_seen = now()
+            """, rows)
+    except Exception:
+        # Never let flip bookkeeping break planning.
+        pass
+
+
 def _row_eligibility_reason(row):
     """
     Per-(PO, ASIN) reason string for the eligibility detail drawer.
-    Order matters: list the most-actionable blocker first. FC mismatch is
-    checked BEFORE other blockers because it dominates — if the PO's row is
-    at the wrong FC, the other flags are aggregated over an empty set or
-    over rows from a different warehouse and don't represent the truth.
+
+    A "flip" (PO booked on an appointment at a different FC than its PO-sheet FC)
+    is treated as VALID — the team intentionally moved the PO to that FC — so it
+    no longer blocks eligibility; we just tag it "Flipped <from> → <to>".
     """
+    actual = (row.get('actual_fc') or '').strip()
+    expected = (row.get('expected_fc') or '').strip()
+    flip = f"Flipped {actual} → {expected or '?'}" if (row.get('is_fc_mismatch') and actual) else ''
+
     if row.get('is_eligible'):
-        return 'OK · ready to ship'
-    if row.get('is_fc_mismatch'):
-        actual = (row.get('actual_fc') or '').strip()
-        expected = (row.get('expected_fc') or '').strip()
-        if actual:
-            return f"FC mismatch · PO is at {actual}, appointment is at {expected or '?'}"
-        return f"FC mismatch · no PO row at {expected or '?'}"
+        return f"{flip} · ready to ship" if flip else 'OK · ready to ship'
+
     if row.get('is_locked'):
         sid = row.get('locked_shipment_id')
-        return f'Locked in shipment #{sid}' if sid else 'Locked in another shipment'
-    if not row.get('is_pending'):
+        base = f'Locked in shipment #{sid}' if sid else 'Locked in another shipment'
+    elif not row.get('is_pending'):
         po_status = (row.get('po_status') or '').strip() or 'unknown'
-        return f'PO closed/dispatched (po_status={po_status})'
-    if not row.get('is_in_stock'):
+        base = f'PO closed/dispatched (po_status={po_status})'
+    elif not row.get('is_in_stock'):
         avail = (row.get('availability_status') or '').strip() or 'unknown'
-        return f'Out of stock (availability={avail})'
-    if not row.get('has_qty'):
-        return 'Zero accepted qty'
-    return 'Unknown reason'
+        base = f'Out of stock (availability={avail})'
+    elif not row.get('has_qty'):
+        base = 'Zero accepted qty'
+    else:
+        base = 'Unknown reason'
+    return f"{flip} · {base}" if flip else base
 
 
 class AppointmentListView(APIView):
@@ -953,7 +981,8 @@ class AppointmentListView(APIView):
                     FROM appt_po_pairs app
                     LEFT JOIN reporting."Amazon PO" p
                         ON UPPER(TRIM(p.po_number)) = app.po_upper
-                       AND p.fulfillment_center = app.destination_fc
+                        -- No FC filter: a PO on this appointment at another FC is a
+                        -- flip (intentionally moved), so it still counts as matched.
                     GROUP BY app.appointment_id, app.po_upper
                 ),
                 appt_counts AS (
@@ -1076,8 +1105,9 @@ class AppointmentListView(APIView):
                     (lk.po_upper IS NOT NULL)                                                  AS is_locked,
                     lk.locked_shipment_id,
                     (
-                        p.fulfillment_center = app.destination_fc
-                        AND p.status = 'Confirmed'
+                        -- FC match is NOT required: a PO on this appointment at a
+                        -- different FC is a "flip" (intentionally moved), still valid.
+                        p.status = 'Confirmed'
                         AND p.po_status = 'PENDING'
                         AND p.availability_status = 'AC - Accepted: In stock'
                         AND COALESCE(p.accepted_qty, 0) > 0
@@ -1105,6 +1135,10 @@ class AppointmentListView(APIView):
             if appt_id is None:
                 continue
             d['reason'] = _row_eligibility_reason(d)
+            # Surface the flip explicitly (from/to FC) for the UI tag.
+            d['is_flipped'] = bool(d.get('is_fc_mismatch'))
+            d['flipped_from'] = (d.get('actual_fc') or '').strip() if d['is_flipped'] else None
+            d['flipped_to'] = (d.get('expected_fc') or '').strip() if d['is_flipped'] else None
             accepted = float(d.get('accepted_qty') or 0)
             soh = float(d.get('soh_unit') or 0)
             d['shortfall_unit'] = max(0.0, accepted - soh)
@@ -1446,7 +1480,13 @@ class AppointmentItemsView(APIView):
                 FROM appt_pos ap
                 JOIN reporting."Amazon PO" p
                     ON UPPER(TRIM(p.po_number)) = ap.po_number
-                    AND p.fulfillment_center = %s
+                    -- PO at the appointment's FC (normal) OR a PO genuinely on the
+                    -- appointment but at another FC (a "flip" — intentionally moved
+                    -- to this FC). Planner-added extras still require an FC match.
+                    AND (
+                        p.fulfillment_center = %s
+                        OR EXISTS (SELECT 1 FROM appt_po_map m2 WHERE m2.po_number = ap.po_number)
+                    )
                 LEFT JOIN appt_po_map m
                     ON m.po_number = ap.po_number
                 LEFT JOIN committed c
@@ -1463,6 +1503,8 @@ class AppointmentItemsView(APIView):
 
         # Attach LIVE DOH/DRR/SOH (matches SOH/DOH dashboard exactly)
         doh_by_asin, doh_meta = _live_doh_by_asin()
+        appt_fc_up = str(primary_fc_value or '').strip().upper()
+        flips_seen = []
         for r in raw:
             asin_up = str(r.get('asin') or '').upper().strip()
             live = doh_by_asin.get(asin_up, {})
@@ -1471,6 +1513,20 @@ class AppointmentItemsView(APIView):
             r['drr_unit'] = live.get('drr_unit', 0) or 0
             r['drr_ltr']  = live.get('drr_ltr', 0) or 0
             r['doh']      = live.get('doh', 0) or 0
+            # Flip detection: PO's actual (sheet) FC differs from the appointment FC
+            # it's being shipped on. Tag it and ship it to the appointment's FC.
+            actual_fc = str(r.get('fulfillment_center') or '').strip()
+            if actual_fc and actual_fc.upper() != appt_fc_up:
+                r['is_flipped'] = True
+                r['flipped_from'] = actual_fc
+                r['flipped_to'] = primary_fc_value
+                r['destination_fc'] = primary_fc_value  # ships to the appointment's FC
+                flips_seen.append((r.get('po_number'), actual_fc, primary_fc_value))
+            else:
+                r['is_flipped'] = False
+                r['flipped_from'] = None
+                r['flipped_to'] = None
+        _record_po_flips(flips_seen)
 
         if not raw:
             return Response({
@@ -1724,6 +1780,9 @@ class ShipmentListCreateView(APIView):
         # the primary). Frontend sends both; backend uses them to populate
         # the new `additional_appointment_ids` + `appointments_meta` fields.
         appointments_meta = data.get('appointments_meta') or []
+        commitment_snapshot = data.get('commitment_snapshot') or []
+        if not isinstance(commitment_snapshot, list):
+            commitment_snapshot = []
         additional_ids = data.get('additional_appointment_ids') or ''
         if isinstance(additional_ids, list):
             additional_ids = ','.join(str(x) for x in additional_ids if x)
@@ -1798,6 +1857,7 @@ class ShipmentListCreateView(APIView):
                 pro=(appointment or {}).get('pro', ''),
                 additional_appointment_ids=additional_ids,
                 appointments_meta=appointments_meta,
+                commitment_snapshot=commitment_snapshot,
                 truck_size=truck_size,
                 truck_capacity_liters=load_summary.get('capacity'),
                 planned_liters=load_summary.get('planned_liters'),
@@ -2582,6 +2642,47 @@ class AppointmentCommitManualImportView(APIView):
             'received': len(rows_in),
             'last_update': last_update,
         })
+
+
+class SetFcChannelView(APIView):
+    """Manually map a fulfillment center to a sales channel (one channel per FC).
+
+    Persisted in public.fc_city_state_channel_master so an unmapped ('Other')
+    FC only needs to be assigned once — every current and future appointment at
+    that FC then inherits the channel automatically (no re-asking).
+    """
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        body = request.data or {}
+        fc = str(body.get('fc') or '').strip()
+        channel = str(body.get('channel') or '').strip().upper()
+        if not fc:
+            return Response({'detail': 'fc is required.'}, status=400)
+
+        with connection.cursor() as cur:
+            cur.execute("""
+                SELECT DISTINCT UPPER(TRIM(channel))
+                FROM public.fc_city_state_channel_master
+                WHERE channel IS NOT NULL AND TRIM(channel) <> ''
+            """)
+            allowed = {r[0] for r in cur.fetchall()}
+            if channel not in allowed:
+                return Response(
+                    {'detail': f'Unknown channel "{channel}". Allowed: {sorted(allowed)}'},
+                    status=400,
+                )
+            # One row per FC: update if it exists, else insert.
+            cur.execute(
+                "UPDATE public.fc_city_state_channel_master SET channel = %s WHERE UPPER(TRIM(fc)) = UPPER(TRIM(%s))",
+                [channel, fc],
+            )
+            if cur.rowcount == 0:
+                cur.execute(
+                    "INSERT INTO public.fc_city_state_channel_master (fc, channel) VALUES (%s, %s)",
+                    [fc, channel],
+                )
+        return Response({'ok': True, 'fc': fc.upper(), 'channel': channel})
 
 
 class ManualPlanView(APIView):

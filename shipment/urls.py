@@ -11,6 +11,7 @@ urlpatterns = [
     path('all-appointments/', views.AllAppointmentsView.as_view(), name='all-appointments'),
     path('appointment-commits/', views.AppointmentCommitListView.as_view(), name='appointment-commits-list'),
     path('appointment-commits/manual-import/', views.AppointmentCommitManualImportView.as_view(), name='appointment-commits-manual-import'),
+    path('fc-channel/', views.SetFcChannelView.as_view(), name='fc-channel-set'),
     path('appointment-commits/import/', views.AppointmentCommitImportView.as_view(), name='appointment-commits-import'),
     path('shipments/', views.ShipmentListCreateView.as_view(), name='shipment-list-create'),
     path('shipments/stats/', views.ShipmentStatsView.as_view(), name='shipment-stats'),

@@ -44,6 +44,11 @@ class Shipment(models.Model):
     # (majority by loaded liters) and these two fields carry the rest.
     additional_appointment_ids = models.TextField(blank=True, default='')
     appointments_meta = models.JSONField(default=list, blank=True)
+    # Frozen snapshot of the Amazon Vendor Central commitment vs what was loaded,
+    # per appointment, captured at save time so Review/Print/Draft always show the
+    # same numbers. Shape: [{appointment_id, destination_fc, committed_units,
+    # committed_cartons, filled_units, filled_cartons}]
+    commitment_snapshot = models.JSONField(default=list, blank=True)
     truck_size = models.CharField(max_length=16, blank=True)
     truck_capacity_liters = models.DecimalField(max_digits=14, decimal_places=4, null=True)
     planned_liters = models.DecimalField(max_digits=14, decimal_places=4, null=True)
