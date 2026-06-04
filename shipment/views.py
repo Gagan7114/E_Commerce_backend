@@ -2470,12 +2470,118 @@ class AppointmentCommitListView(APIView):
                        carton_count,
                        unit_count,
                        source,
-                       updated_at
+                       updated_at,
+                       updated_by
                 FROM public.appointment_commit
                 ORDER BY updated_at DESC NULLS LAST, appointment_id
             """)
             rows = _row_to_dict(cur, cur.fetchall())
-        return Response({'results': [_serialize_row(r) for r in rows], 'count': len(rows)})
+            cur.execute("""
+                SELECT updated_at, updated_by
+                FROM public.appointment_commit
+                WHERE updated_at IS NOT NULL
+                ORDER BY updated_at DESC
+                LIMIT 1
+            """)
+            lr = cur.fetchone()
+        last_update = (
+            {'at': lr[0].isoformat() if lr[0] else None, 'by': lr[1]}
+            if lr else None
+        )
+        return Response({
+            'results': [_serialize_row(r) for r in rows],
+            'count': len(rows),
+            'last_update': last_update,
+        })
+
+
+class AppointmentCommitManualImportView(APIView):
+    """Logged-in (paste-flow) importer for Vendor Central carton/unit data.
+
+    Upserts public.appointment_commit AND stamps updated_at + updated_by with
+    the current user, so the VC page can show "Last updated <when> by <who>"
+    and warn on same-day re-runs (Amazon ToS exposure). Distinct from the
+    key-authed AppointmentCommitImportView used by the unattended script.
+    """
+    permission_classes = [IsAuthenticated]
+
+    @staticmethod
+    def _pos_int(value):
+        try:
+            n = int(round(float(value)))
+        except (TypeError, ValueError):
+            return None
+        return n if n > 0 else None
+
+    def post(self, request):
+        u = request.user
+        who = (
+            (getattr(u, 'get_full_name', lambda: '')() or '').strip()
+            or getattr(u, 'email', '') or getattr(u, 'username', '') or str(u)
+        ).strip() or 'unknown'
+
+        payload = request.data or {}
+        rows_in = payload.get('rows') if isinstance(payload, dict) else payload
+        if not isinstance(rows_in, list):
+            rows_in = []
+
+        cleaned = []
+        for r in rows_in:
+            if not isinstance(r, dict):
+                continue
+            aid = str(r.get('appointment_id') or '').strip()
+            if not aid:
+                continue
+            fc = str(r.get('destination_fc') or '').strip() or None
+            carton = self._pos_int(r.get('carton_count'))
+            unit = self._pos_int(r.get('unit_count'))
+            if carton is None and unit is None:
+                continue
+            cleaned.append((aid, fc, carton, unit, who))
+
+        created = 0
+        updated = 0
+        lr = None
+        if cleaned:
+            with connection.cursor() as cur:
+                for aid, fc, carton, unit, who in cleaned:
+                    cur.execute(
+                        """
+                        INSERT INTO public.appointment_commit
+                            (appointment_id, destination_fc, carton_count, unit_count, source, updated_at, updated_by)
+                        VALUES (%s, %s, %s, %s, 'amazon', now(), %s)
+                        ON CONFLICT (appointment_id) DO UPDATE SET
+                            destination_fc = COALESCE(EXCLUDED.destination_fc, public.appointment_commit.destination_fc),
+                            carton_count   = COALESCE(EXCLUDED.carton_count, public.appointment_commit.carton_count),
+                            unit_count     = COALESCE(EXCLUDED.unit_count, public.appointment_commit.unit_count),
+                            source         = 'amazon',
+                            updated_at     = now(),
+                            updated_by     = EXCLUDED.updated_by
+                        RETURNING (xmax::text = '0') AS inserted
+                        """,
+                        [aid, fc, carton, unit, who],
+                    )
+                    row = cur.fetchone()
+                    if row and row[0]:
+                        created += 1
+                    else:
+                        updated += 1
+                cur.execute("""
+                    SELECT updated_at, updated_by FROM public.appointment_commit
+                    WHERE updated_at IS NOT NULL ORDER BY updated_at DESC LIMIT 1
+                """)
+                lr = cur.fetchone()
+
+        last_update = (
+            {'at': lr[0].isoformat() if lr[0] else None, 'by': lr[1]} if lr else None
+        )
+        return Response({
+            'imported': created,
+            'updated': updated,
+            'stored': created + updated,
+            'received': len(rows_in),
+            'last_update': last_update,
+        })
 
 
 class ManualPlanView(APIView):
