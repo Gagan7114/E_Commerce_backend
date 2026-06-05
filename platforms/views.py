@@ -1448,12 +1448,14 @@ def pendency_dashboard(request, slug: str):
 
     raw_year = (request.query_params.get("year") or "").strip()
     raw_po_month = (request.query_params.get("po_month") or "").strip()
+    raw_from = (request.query_params.get("from_date") or "").strip()
+    raw_to = (request.query_params.get("to_date") or "").strip()
 
     # Short-lived cache: pendency data only changes when POs are uploaded.
     # 60s collapses repeated polling / tab-switching into one DB hit while
     # keeping the response close to live. Cache key includes the user's
     # filter inputs so each filter combo is cached independently.
-    _pendency_cache_key = f"pendency:{slug}:{raw_year}:{raw_po_month.upper()}"
+    _pendency_cache_key = f"pendency:{slug}:{raw_year}:{raw_po_month.upper()}:{raw_from}:{raw_to}"
     _cached_payload = cache.get(_pendency_cache_key)
     if _cached_payload is not None:
         return Response(_cached_payload)
@@ -1464,7 +1466,12 @@ def pendency_dashboard(request, slug: str):
     resolved_year: int | None = None
     defaulted_to_latest = False
 
-    if not raw_year and not raw_po_month:
+    has_date_range = bool(
+        re.fullmatch(r"\d{4}-\d{2}-\d{2}", raw_from)
+        and re.fullmatch(r"\d{4}-\d{2}-\d{2}", raw_to)
+    )
+
+    if not raw_year and not raw_po_month and not has_date_range:
         latest = _dict_rows(
             '''
             SELECT
@@ -1499,17 +1506,32 @@ def pendency_dashboard(request, slug: str):
     if raw_year and raw_year.isdigit():
         resolved_year = int(raw_year)
 
-    if resolved_month:
-        where_parts.append('UPPER(TRIM("po_month"::text)) = %s')
-        params.append(resolved_month)
-    if resolved_year is not None:
-        where_parts.append('"po_year" = %s')
-        params.append(resolved_year)
+    # A user-selected date range drives the filter on its own (across any
+    # month); the month/year filter only applies when no range is given.
+    if not has_date_range:
+        if resolved_month:
+            where_parts.append('UPPER(TRIM("po_month"::text)) = %s')
+            params.append(resolved_month)
+        if resolved_year is not None:
+            where_parts.append('"po_year" = %s')
+            params.append(resolved_year)
 
     base_where = "WHERE " + " AND ".join(where_parts)
     # Match Primary Dashboard semantics: only OPEN POs, pending = max(order - delivered, 0).
     pending_filter = " AND UPPER(TRIM(\"open_close\"::text)) = 'OPEN'"
-    full_where = base_where + pending_filter
+    # User-selected PO-date range (both YYYY-MM-DD) filters POs whose po_date
+    # falls between the two dates.
+    date_range_filter = ""
+    if has_date_range:
+        date_range_filter = (
+            " AND (CASE "
+            "WHEN TRIM(\"po_date\"::text) ~ '^[0-9]{2}-[0-9]{2}-[0-9]{4}$' "
+            "THEN TO_DATE(TRIM(\"po_date\"::text), 'DD-MM-YYYY') "
+            "WHEN TRIM(\"po_date\"::text) ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$' "
+            "THEN TRIM(\"po_date\"::text)::date END) BETWEEN %s AND %s"
+        )
+        params.extend([raw_from, raw_to])
+    full_where = base_where + pending_filter + date_range_filter
 
     pending_units_expr = (
         'COALESCE(SUM(GREATEST('
@@ -1541,7 +1563,18 @@ def pendency_dashboard(request, slug: str):
                     END
                 ),
                 'DD-MM-YYYY'
-            ) AS max_po_date
+            ) AS max_po_date,
+            TO_CHAR(
+                MIN(
+                    CASE
+                        WHEN TRIM("po_date"::text) ~ '^[0-9]{{2}}-[0-9]{{2}}-[0-9]{{4}}$'
+                            THEN TO_DATE(TRIM("po_date"::text), 'DD-MM-YYYY')
+                        WHEN TRIM("po_date"::text) ~ '^[0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}$'
+                            THEN TRIM("po_date"::text)::date
+                    END
+                ),
+                'DD-MM-YYYY'
+            ) AS min_po_date
         FROM "master_po"
         {full_where}
         ''',
@@ -1555,6 +1588,7 @@ def pendency_dashboard(request, slug: str):
         "open_pos": 0,
         "rows": 0,
         "max_po_date": None,
+        "min_po_date": None,
     }
 
     metric_cols = f'''
@@ -1624,6 +1658,7 @@ def pendency_dashboard(request, slug: str):
         f'''
         SELECT
             COALESCE(NULLIF(TRIM("po_number"::text), ''), 'UNMAPPED') AS po_number,
+            MAX(NULLIF(TRIM("vendor_new"::text), '')) AS distributor,
             TO_CHAR(
                 MAX(
                     CASE
@@ -1670,6 +1705,7 @@ def pendency_dashboard(request, slug: str):
             "rows": int(totals.get("rows") or 0),
         },
         "max_po_date": totals.get("max_po_date"),
+        "min_po_date": totals.get("min_po_date"),
         "by_city": by_city,
         "by_sku": by_sku,
         "by_warehouse": by_warehouse,
