@@ -2362,22 +2362,24 @@ class AllAppointmentsView(APIView):
         page_size = 9999 if no_paginate else min(100, int(request.query_params.get('page_size', 50)))
         offset = 0 if no_paginate else (page - 1) * page_size
 
-        where = ["appointment_time IS NOT NULL"]
+        # Qualify with the `a` alias so the appointment_commit LEFT JOIN (which
+        # also has appointment_id / destination_fc) stays unambiguous.
+        where = ["a.appointment_time IS NOT NULL"]
         params = []
         if status:
-            where.append("LOWER(status) LIKE LOWER(%s)")
+            where.append("LOWER(a.status) LIKE LOWER(%s)")
             params.append(f'%{status}%')
         if fc:
-            where.append("LOWER(destination_fc) LIKE LOWER(%s)")
+            where.append("LOWER(a.destination_fc) LIKE LOWER(%s)")
             params.append(f'%{fc}%')
         if appt_id:
-            where.append("LOWER(appointment_id) LIKE LOWER(%s)")
+            where.append("LOWER(a.appointment_id) LIKE LOWER(%s)")
             params.append(f'%{appt_id}%')
         if date_from:
-            where.append("DATE(appointment_time) >= %s")
+            where.append("DATE(a.appointment_time) >= %s")
             params.append(date_from)
         if date_to:
-            where.append("DATE(appointment_time) <= %s")
+            where.append("DATE(a.appointment_time) <= %s")
             params.append(date_to)
 
         where_sql = ' AND '.join(where)
@@ -2385,8 +2387,8 @@ class AllAppointmentsView(APIView):
         with connection.cursor() as cur:
             cur.execute(f"""
                 SELECT COUNT(*) FROM (
-                    SELECT DISTINCT appointment_id
-                    FROM reporting."appointment"
+                    SELECT DISTINCT a.appointment_id
+                    FROM reporting."appointment" a
                     WHERE {where_sql}
                 ) _distinct
             """, params)
@@ -2394,27 +2396,43 @@ class AllAppointmentsView(APIView):
 
             # The ingest stores one row per (appointment_id, PO). Aggregate
             # back to one row per appointment_id by stitching the POs with
-            # STRING_AGG, so the View page shows the full PO list per row.
+            # STRING_AGG. LEFT JOIN appointment_commit to surface the Amazon
+            # carton/unit counts on the same combined page.
             cur.execute(f"""
-                SELECT appointment_id,
-                       MAX(status)            AS status,
-                       MAX(appointment_time)  AS appointment_time,
-                       MAX(creation_date)     AS creation_date,
-                       MAX(destination_fc)    AS destination_fc,
-                       MAX(pro)               AS pro,
+                SELECT a.appointment_id,
+                       MAX(a.status)            AS status,
+                       MAX(a.appointment_time)  AS appointment_time,
+                       MAX(a.creation_date)     AS creation_date,
+                       MAX(a.destination_fc)    AS destination_fc,
+                       MAX(a.pro)               AS pro,
                        STRING_AGG(
-                           DISTINCT NULLIF(TRIM(COALESCE(pos,'')),''),
+                           DISTINCT NULLIF(TRIM(COALESCE(a.pos,'')),''),
                            ', '
-                           ORDER BY NULLIF(TRIM(COALESCE(pos,'')),'')
+                           ORDER BY NULLIF(TRIM(COALESCE(a.pos,'')),'')
                        ) AS pos,
-                       COUNT(DISTINCT NULLIF(TRIM(COALESCE(pos,'')),'')) AS po_count
-                FROM reporting."appointment"
+                       COUNT(DISTINCT NULLIF(TRIM(COALESCE(a.pos,'')),'')) AS po_count,
+                       MAX(acm.carton_count)    AS amazon_carton_count,
+                       MAX(acm.unit_count)      AS amazon_unit_count
+                FROM reporting."appointment" a
+                LEFT JOIN public.appointment_commit acm
+                       ON acm.appointment_id = a.appointment_id
                 WHERE {where_sql}
-                GROUP BY appointment_id
-                ORDER BY MAX(appointment_time) DESC NULLS LAST
+                GROUP BY a.appointment_id
+                ORDER BY MAX(a.appointment_time) DESC NULLS LAST
                 LIMIT %s OFFSET %s
             """, params + [page_size, offset])
             rows = _row_to_dict(cur, cur.fetchall())
+
+            cur.execute("""
+                SELECT updated_at, updated_by
+                FROM public.appointment_commit
+                WHERE updated_at IS NOT NULL
+                ORDER BY updated_at DESC LIMIT 1
+            """)
+            lr = cur.fetchone()
+        last_update = (
+            {'at': lr[0].isoformat() if lr[0] else None, 'by': lr[1]} if lr else None
+        )
 
         return Response({
             'results': [_serialize_row(r) for r in rows],
@@ -2422,6 +2440,7 @@ class AllAppointmentsView(APIView):
             'page': page,
             'page_size': page_size,
             'total_pages': math.ceil(total / page_size) if page_size else 1,
+            'last_update': last_update,
         })
 
 
