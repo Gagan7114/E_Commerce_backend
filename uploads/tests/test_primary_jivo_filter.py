@@ -4,6 +4,7 @@ from django.test import SimpleTestCase
 
 from uploads.views import (
     PRIMARY_PO_JIVO_ONLY_TABLES,
+    _default_blank_status_to_pending,
     _filter_primary_jivo_rows,
     _row_mentions_jivo,
 )
@@ -38,3 +39,28 @@ class PrimaryJivoFilterTests(SimpleTestCase):
         kept, skipped = _filter_primary_jivo_rows(rows)
         self.assertEqual([r["sku_code"] for r in kept], ["A", "C"])
         self.assertEqual([r["sku_code"] for r in skipped], ["B", "D", "E"])
+
+
+class BlankStatusToPendingTests(SimpleTestCase):
+    """Blank PO status must default to PENDING (not the view's EXPIRED default)."""
+
+    def test_blank_status_becomes_pending(self):
+        rows = [
+            {"sku_code": "A", "status": None},
+            {"sku_code": "B", "status": ""},
+            {"sku_code": "C", "status": "   "},
+            {"sku_code": "D"},  # status key missing entirely
+        ]
+        n = _default_blank_status_to_pending(rows)
+        self.assertEqual(n, 4)
+        self.assertTrue(all(r["status"] == "PENDING" for r in rows))
+
+    def test_existing_status_is_left_untouched(self):
+        rows = [
+            {"sku_code": "A", "status": "EXPIRED"},
+            {"sku_code": "B", "status": "COMPLETED"},
+            {"sku_code": "C", "status": "PENDING"},
+        ]
+        n = _default_blank_status_to_pending(rows)
+        self.assertEqual(n, 0)
+        self.assertEqual([r["status"] for r in rows], ["EXPIRED", "COMPLETED", "PENDING"])

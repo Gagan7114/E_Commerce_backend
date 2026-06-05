@@ -786,6 +786,40 @@ def _read_amazon_mp_dashboard_many(
     return out
 
 
+def _read_amazon_mp_primary_target(item_head: str, month: int, year: int) -> dict | None:
+    """Amazon MP keeps a SINGLE target shared by the Primary and Secondary
+    sheets — it is stored only in `primary_month_targets` (set via Prim
+    Targets). The Secondary `month_targets` table has no Amazon MP row, so the
+    Sec sheet showed "No target". Return a stored-row-shaped dict carrying that
+    shared target so the Secondary dashboard surfaces the same number the user
+    set on Prim Targets. Returns None when no target has been set yet."""
+    with connection.cursor() as cur:
+        cur.execute(
+            """
+            SELECT targets FROM primary_month_targets
+             WHERE UPPER(TRIM("format")) = UPPER(TRIM(%s))
+               AND UPPER(TRIM(item_head)) = UPPER(TRIM(%s))
+               AND month = %s AND year = %s
+             ORDER BY updated_at DESC NULLS LAST
+             LIMIT 1
+            """,
+            [AMAZON_MP_FORMAT, item_head, month, year],
+        )
+        r = cur.fetchone()
+    if not r or r[0] is None:
+        return None
+    return {
+        "format": AMAZON_MP_FORMAT,
+        "type": "sec",
+        "item_head": item_head,
+        "month": month,
+        "year": year,
+        "targets": Decimal(str(r[0])),
+        "done_value": Decimal(0),
+        "last_month": Decimal(0),
+    }
+
+
 def _dashboard_source_map(
     ordered_slugs: list[str] | tuple[str, ...],
     platforms: dict[str, PlatformConfig],
@@ -1647,6 +1681,12 @@ def month_targets_dashboard(request):
             fmt_key = _format_key(fmt)
             row = by_format.get(fmt.lower())
             source = source_map.get((fmt_key, _format_key(item_head)))
+            # Amazon MP shares one target across the Primary and Secondary
+            # sheets, stored only in primary_month_targets. If there is no
+            # Secondary row, fall back to that shared Primary target so the MP
+            # row shows the same number the user set on Prim Targets.
+            if not row and slug == "amazon_mp":
+                row = _read_amazon_mp_primary_target(item_head, month, year)
             if row:
                 rows.append(
                     _source_backed_dashboard_row(

@@ -1375,6 +1375,23 @@ def _filter_primary_jivo_rows(data: list[dict]) -> tuple[list[dict], list[dict]]
     return kept, skipped
 
 
+def _default_blank_status_to_pending(data: list[dict]) -> int:
+    """A blank/missing PO status means the PO is still pending, not expired.
+
+    The master_po view defaults an empty status to EXPIRED, which then books the
+    whole undelivered order as 'missed'. Stamping PENDING on ingest keeps such
+    POs OPEN until they actually expire (mirrors the source sheet). Only
+    blank-status rows are touched; existing statuses are left as-is. Returns the
+    number of rows defaulted.
+    """
+    count = 0
+    for row in data:
+        if not str(row.get("status") or "").strip():
+            row["status"] = "PENDING"
+            count += 1
+    return count
+
+
 def _validate_primary_upload_format(table: str, data: list[dict], expected_format: str | None):
     if table not in PRIMARY_UPLOAD_TABLES or not expected_format:
         return None
@@ -1755,6 +1772,7 @@ def _batch_upload(body, *, forced_table: str | None = None):
     # Primary PO tables only accept Jivo-branded SKUs; drop any non-Jivo rows
     # (other brands accidentally included in a platform PO export).
     skipped_non_jivo = 0
+    defaulted_pending_status = 0
     if table in PRIMARY_PO_JIVO_ONLY_TABLES:
         data, non_jivo_rows = _filter_primary_jivo_rows(data)
         skipped_non_jivo = len(non_jivo_rows)
@@ -1772,6 +1790,15 @@ def _batch_upload(body, *, forced_table: str | None = None):
                 "skipped_non_jivo": skipped_non_jivo,
                 "error": None,
             })
+        # A blank PO status means pending, not expired. Default it to PENDING so
+        # the master_po view does not fall back to its EXPIRED default and
+        # over-count the order as missed.
+        defaulted_pending_status = _default_blank_status_to_pending(data)
+        if defaulted_pending_status:
+            logger.info(
+                "Defaulted %s blank-status row(s) to PENDING on %s upload",
+                defaulted_pending_status, table,
+            )
 
     if upsert and table in UPLOAD_FORCED_UNIQUE_KEYS:
         unique_key = UPLOAD_FORCED_UNIQUE_KEYS[table]
@@ -1970,6 +1997,7 @@ def _batch_upload(body, *, forced_table: str | None = None):
         "platform_updated": platform_updated,
         "platform_skipped": platform_skipped,
         "skipped_non_jivo": skipped_non_jivo,
+        "defaulted_pending_status": defaulted_pending_status,
         "duplicates": updated + skipped,
         "failed": failed,
         "error": last_error,

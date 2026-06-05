@@ -84,6 +84,16 @@ SPECIAL_DASHBOARD_ROWS = (
     },
 )
 
+# Per-platform slugs whose Primary-sheet target is the SAME single target set on
+# the Secondary sheet (stored in month_targets) — one target, shown on both
+# sheets. Maps slug -> (month_targets format, primary done source_format). The
+# all-platforms dashboard already honours target_source for these; this lets the
+# per-platform list endpoint surface the same shared target instead of an empty
+# primary_month_targets row.
+_PRIMARY_TARGET_FROM_SECONDARY = {
+    "amazon": ("AMAZON", "AMAZON SECONDARY"),
+}
+
 _MONTH_RE = re.compile(r"^\d{4}-\d{2}$")
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}")
 _MONTH_NAMES = [
@@ -619,6 +629,24 @@ def primary_month_targets_list(request, slug: str):
     meta = _platform_target_meta(slug)
     fmt = meta["format"]
 
+    # Platforms whose target is the single shared value set on the Secondary
+    # sheet (e.g. Amazon) read it from month_targets, so the Primary per-platform
+    # page shows the same number instead of an empty primary_month_targets row.
+    sec_map = _PRIMARY_TARGET_FROM_SECONDARY.get(slug)
+    if sec_map:
+        sec_fmt, source_format = sec_map
+        m, y = _parse_month_year_or_current({
+            "month": request.query_params.get("month"),
+            "year": request.query_params.get("year"),
+        })
+        rows = _list_secondary_sourced_targets(slug, sec_fmt, source_format, m, y)
+        return Response({
+            "data": rows,
+            "format": fmt,
+            "type": meta["type"],
+            "source": meta["source"],
+        })
+
     where = ['LOWER(TRIM("format")) = LOWER(TRIM(%s))']
     params: list = [fmt]
 
@@ -1100,23 +1128,30 @@ def _dashboard_row_from_source(
 
 
 def _dashboard_row_from_secondary_target(defn: dict, stored: dict) -> dict:
+    # The TARGET is the single shared value from the saved Secondary
+    # (month_targets) row, but DONE and all derived figures are recomputed from
+    # the LIVE source — so the Primary sheet matches the Secondary sheet and
+    # auto-updates (e.g. after re-tagging item_head in master_sheet) instead of
+    # echoing the frozen month_targets snapshot.
+    item_head = stored.get("item_head")
+    month = stored.get("month")
+    year = stored.get("year")
+    source = _read_primary_target_source(defn["source_format"], item_head, month, year)
+    derived = _compute_derived(
+        targets=Decimal(str(stored.get("targets") or 0)),
+        done_ltrs=source["done_ltrs"],
+        latest_date=source["latest_date"],
+        month=month,
+        year=year,
+    )
     row = {
         "id": stored.get("id"),
         "format": defn["format"],
         "type": defn["type"],
-        "item_head": stored.get("item_head"),
-        "month": stored.get("month"),
-        "year": stored.get("year"),
-        "date": stored.get("date"),
+        "item_head": item_head,
+        "month": month,
+        "year": year,
         "targets": stored.get("targets"),
-        "done_ltrs": stored.get("done_ltrs"),
-        "achieved_pct": stored.get("achieved_pct"),
-        "est_ltr": stored.get("est_ltr"),
-        "est_ltr_pct": stored.get("est_ltr_pct"),
-        "drr": None,
-        "require_drr": None,
-        "pending_ltr": None,
-        "dp_ltrs": None,
         "created_at": stored.get("created_at"),
         "updated_at": stored.get("updated_at"),
         "slug": defn["slug"],
@@ -1124,7 +1159,48 @@ def _dashboard_row_from_secondary_target(defn: dict, stored: dict) -> dict:
         "platform_name": defn["platform_name"],
         "source": defn["source"],
     }
+    row.update(derived)
     return _json_ready(row)
+
+
+def _list_secondary_sourced_targets(
+    slug: str,
+    sec_fmt: str,
+    source_format: str,
+    month: int,
+    year: int,
+) -> list[dict]:
+    """Per-platform Primary list rows for a platform whose target is the single
+    shared value set on the Secondary sheet (month_targets). Reads that target
+    and recomputes Primary done/derived (DRR, pending, dp …) from the live
+    primary source, so the same number shows on both sheets."""
+    rows: list[dict] = []
+    for item_head in _item_heads_for(slug):
+        stored = _select_secondary_target_dashboard_rows(
+            [sec_fmt], item_head, month, year
+        ).get(_format_key(sec_fmt))
+        if not stored or stored.get("targets") is None:
+            continue
+        source = _read_primary_target_source(source_format, item_head, month, year)
+        derived = _compute_derived(
+            targets=Decimal(str(stored["targets"])),
+            done_ltrs=source["done_ltrs"],
+            latest_date=source["latest_date"],
+            month=month,
+            year=year,
+        )
+        row = {
+            "id": None,
+            "format": sec_fmt,
+            "type": "sec",
+            "item_head": item_head,
+            "month": month,
+            "year": year,
+            "targets": Decimal(str(stored["targets"])),
+        }
+        row.update(derived)
+        rows.append(_json_ready(row))
+    return rows
 
 
 def _primary_empty_total() -> dict:
