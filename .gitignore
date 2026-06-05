@@ -20,3 +20,7 @@ media/
 .vscode/
 .idea/
 *.log
+
+# Local-only data comparison scripts & deleted-row backups (keep off GitHub)
+_compare_*.py
+backup_deleted_*.json
