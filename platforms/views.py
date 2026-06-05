@@ -299,8 +299,8 @@ _PRIMARY_DASHBOARD_FORMATS = {
     "zomato": "ZOMATO",
 }
 _PRIMARY_DASHBOARD_DONE_VALUE_COLUMNS = {
-    ("bigbasket", "DEL MONTH"): "total_delivered_amt_exclusive",
-    ("bigbasket", "PO MONTH"): "total_delivered_amt_exclusive",
+    ("bigbasket", "DEL MONTH"): "total_deliver_amt_inclusive",
+    ("bigbasket", "PO MONTH"): "total_deliver_amt_inclusive",
     ("blinkit", "DEL MONTH"): "total_delivered_amt_exclusive",
     ("blinkit", "PO MONTH"): "total_delivered_amt_exclusive",
     ("citymall", "DEL MONTH"): "total_delivered_amt_exclusive",
@@ -436,31 +436,23 @@ def _primary_master_po_order_minus_deliver_kpi_total(
     rows = _dict_rows(
         f"""
         SELECT
-            COALESCE(SUM(COALESCE(total_order_amt_exclusive, 0)), 0) AS order_value,
+            COALESCE(SUM(COALESCE(total_order_amt_inclusive, 0)), 0) AS order_value,
             COALESCE(SUM(COALESCE(total_order_liters, 0)), 0) AS order_ltrs,
             COALESCE(SUM(COALESCE(order_qty, 0)), 0) AS order_qty,
             0 AS projection_value,
             0 AS projection_ltrs,
             0 AS projection_qty,
-            COALESCE(SUM(COALESCE(total_delivered_amt_exclusive, 0)), 0) AS done_value,
+            COALESCE(SUM(COALESCE(total_deliver_amt_inclusive, 0)), 0) AS done_value,
             COALESCE(SUM(COALESCE(total_delivered_liters, 0)), 0) AS done_ltrs,
             COALESCE(SUM(COALESCE(delivered_qty, 0)), 0) AS done_qty,
-            COALESCE(SUM(CASE
-                WHEN UPPER(TRIM(COALESCE(open_close::text, ''))) = 'OPEN'
-                THEN COALESCE(total_order_amt_exclusive, 0)
-                ELSE 0 END), 0) AS pending_value,
-            COALESCE(SUM(CASE
-                WHEN UPPER(TRIM(COALESCE(open_close::text, ''))) = 'OPEN'
-                THEN COALESCE(total_order_liters, 0)
-                ELSE 0 END), 0) AS pending_ltrs,
-            COALESCE(SUM(CASE
-                WHEN UPPER(TRIM(COALESCE(open_close::text, ''))) = 'OPEN'
-                THEN COALESCE(order_qty, 0)
-                ELSE 0 END), 0) AS pending_qty,
-            COALESCE(SUM(CASE
-                WHEN UPPER(TRIM(COALESCE(open_close::text, ''))) = 'OPEN'
-                THEN COALESCE(total_order_liters, 0)
-                ELSE 0 END), 0) AS missed_ltrs,
+            -- Pending = short-delivered ("missed") balance. The open_close
+            -- column is empty for every row, so the old open_close='OPEN'
+            -- filter always yielded 0. missed_qty x basic_rate / missed_ltrs /
+            -- missed_qty match the source DB exactly.
+            COALESCE(SUM(COALESCE(missed_qty, 0) * COALESCE(basic_rate, 0)), 0) AS pending_value,
+            COALESCE(SUM(COALESCE(missed_ltrs, 0)), 0) AS pending_ltrs,
+            COALESCE(SUM(COALESCE(missed_qty, 0)), 0) AS pending_qty,
+            COALESCE(SUM(COALESCE(missed_ltrs, 0)), 0) AS missed_ltrs,
             MAX({period_col}) AS projection_max_date
         FROM public.master_po
         WHERE REGEXP_REPLACE(LOWER(TRIM(format::text)), '[^a-z0-9]+', '', 'g') = %s
@@ -548,7 +540,7 @@ def _bigbasket_primary_dashboard_response(request, slug: str):
         {filtered_cte}
         SELECT
             COALESCE(NULLIF(UPPER(TRIM("item_head"::text)), ''), 'OTHER') AS item_head,
-            COALESCE(SUM("total_order_amt_exclusive"), 0) AS order_value,
+            COALESCE(SUM("total_order_amt_inclusive"), 0) AS order_value,
             COALESCE(SUM("total_order_liters"), 0) AS order_ltrs,
             COALESCE(SUM("order_qty"), 0) AS order_qty,
             0 AS projection_ltrs,
@@ -561,15 +553,9 @@ def _bigbasket_primary_dashboard_response(request, slug: str):
             COALESCE(SUM(CASE WHEN in_selected_period
                 AND UPPER(TRIM("po_status"::text)) = 'COMPLETED'
                 THEN "delivered_qty" ELSE 0 END), 0) AS done_qty,
-            COALESCE(SUM(CASE WHEN in_selected_period
-                AND {pending_status}
-                THEN "total_order_amt_exclusive" ELSE 0 END), 0) AS pending_value,
-            COALESCE(SUM(CASE WHEN in_selected_period
-                AND {pending_status}
-                THEN "total_order_liters" ELSE 0 END), 0) AS pending_ltrs,
-            COALESCE(SUM(CASE WHEN in_selected_period
-                AND {pending_status}
-                THEN "order_qty" ELSE 0 END), 0) AS pending_qty,
+            COALESCE(SUM(COALESCE("missed_qty", 0) * COALESCE("basic_rate", 0)), 0) AS pending_value,
+            COALESCE(SUM(COALESCE("missed_ltrs", 0)), 0) AS pending_ltrs,
+            COALESCE(SUM(COALESCE("missed_qty", 0)), 0) AS pending_qty,
             COALESCE(SUM(CASE WHEN in_selected_period
                 AND UPPER(TRIM("po_status"::text)) = 'EXPIRED'
                 THEN "total_order_amt_exclusive" ELSE 0 END), 0) AS expired_value,
@@ -603,7 +589,7 @@ def _bigbasket_primary_dashboard_response(request, slug: str):
             SELECT
                 COALESCE(NULLIF(UPPER(TRIM("item_head"::text)), ''), 'OTHER') AS item_head,
                 COALESCE(NULLIF(UPPER(TRIM("item"::text)), ''), 'UNMAPPED') AS item,
-                COALESCE(SUM("total_order_amt_exclusive"), 0) AS order_value,
+                COALESCE(SUM("total_order_amt_inclusive"), 0) AS order_value,
                 COALESCE(SUM("total_order_liters"), 0) AS order_ltrs,
                 COALESCE(SUM("order_qty"), 0) AS order_qty,
                 0 AS projection_ltrs,
@@ -616,15 +602,9 @@ def _bigbasket_primary_dashboard_response(request, slug: str):
                 COALESCE(SUM(CASE WHEN in_selected_period
                     AND UPPER(TRIM("po_status"::text)) = 'COMPLETED'
                     THEN "delivered_qty" ELSE 0 END), 0) AS done_qty,
-                COALESCE(SUM(CASE WHEN in_selected_period
-                    AND {pending_status}
-                    THEN "total_order_amt_exclusive" ELSE 0 END), 0) AS pending_value,
-                COALESCE(SUM(CASE WHEN in_selected_period
-                    AND {pending_status}
-                    THEN "total_order_liters" ELSE 0 END), 0) AS pending_ltrs,
-                COALESCE(SUM(CASE WHEN in_selected_period
-                    AND {pending_status}
-                    THEN "order_qty" ELSE 0 END), 0) AS pending_qty,
+                COALESCE(SUM(COALESCE("missed_qty", 0) * COALESCE("basic_rate", 0)), 0) AS pending_value,
+                COALESCE(SUM(COALESCE("missed_ltrs", 0)), 0) AS pending_ltrs,
+                COALESCE(SUM(COALESCE("missed_qty", 0)), 0) AS pending_qty,
                 COALESCE(SUM(CASE WHEN in_selected_period
                     AND UPPER(TRIM("po_status"::text)) = 'EXPIRED'
                     THEN "total_order_amt_exclusive" ELSE 0 END), 0) AS expired_value,
@@ -661,7 +641,7 @@ def _bigbasket_primary_dashboard_response(request, slug: str):
                 COALESCE(NULLIF(UPPER(TRIM("category"::text)), ''), 'OTHER') AS category,
                 COALESCE(NULLIF(UPPER(TRIM("sub_category"::text)), ''), 'OTHER') AS sub_category,
                 COALESCE(NULLIF(UPPER(TRIM("per_liter"::text)), ''), '-') AS per_ltr,
-                COALESCE(SUM("total_order_amt_exclusive"), 0) AS order_value,
+                COALESCE(SUM("total_order_amt_inclusive"), 0) AS order_value,
                 COALESCE(SUM("total_order_liters"), 0) AS order_ltrs,
                 COALESCE(SUM("order_qty"), 0) AS order_qty,
                 0 AS projection_ltrs,
@@ -674,15 +654,9 @@ def _bigbasket_primary_dashboard_response(request, slug: str):
                 COALESCE(SUM(CASE WHEN in_selected_period
                     AND UPPER(TRIM("po_status"::text)) = 'COMPLETED'
                     THEN "delivered_qty" ELSE 0 END), 0) AS done_qty,
-                COALESCE(SUM(CASE WHEN in_selected_period
-                    AND {pending_status}
-                    THEN "total_order_amt_exclusive" ELSE 0 END), 0) AS pending_value,
-                COALESCE(SUM(CASE WHEN in_selected_period
-                    AND {pending_status}
-                    THEN "total_order_liters" ELSE 0 END), 0) AS pending_ltrs,
-                COALESCE(SUM(CASE WHEN in_selected_period
-                    AND {pending_status}
-                    THEN "order_qty" ELSE 0 END), 0) AS pending_qty,
+                COALESCE(SUM(COALESCE("missed_qty", 0) * COALESCE("basic_rate", 0)), 0) AS pending_value,
+                COALESCE(SUM(COALESCE("missed_ltrs", 0)), 0) AS pending_ltrs,
+                COALESCE(SUM(COALESCE("missed_qty", 0)), 0) AS pending_qty,
                 COALESCE(SUM(CASE WHEN in_selected_period
                     AND UPPER(TRIM("po_status"::text)) = 'EXPIRED'
                     THEN "total_order_amt_exclusive" ELSE 0 END), 0) AS expired_value,
@@ -719,7 +693,7 @@ def _bigbasket_primary_dashboard_response(request, slug: str):
                     NULLIF(UPPER(TRIM("vendor_name"::text)), ''),
                     'UNMAPPED'
                 ) AS vendor,
-                COALESCE("total_order_amt_exclusive", 0) AS order_value_row,
+                COALESCE("total_order_amt_inclusive", 0) AS order_value_row,
                 COALESCE(CASE WHEN UPPER(TRIM("po_status"::text)) = 'COMPLETED'
                     THEN "{done_value_col}" ELSE 0 END, 0) AS delivered_value_row,
                 COALESCE("total_order_liters", 0) AS order_ltrs_row,
@@ -728,12 +702,9 @@ def _bigbasket_primary_dashboard_response(request, slug: str):
                 COALESCE("order_qty", 0) AS order_qty_row,
                 COALESCE(CASE WHEN UPPER(TRIM("po_status"::text)) = 'COMPLETED'
                     THEN "delivered_qty" ELSE 0 END, 0) AS delivered_qty_row,
-                COALESCE(CASE WHEN {pending_status}
-                    THEN "total_order_amt_exclusive" ELSE 0 END, 0) AS pending_value_row,
-                COALESCE(CASE WHEN {pending_status}
-                    THEN "total_order_liters" ELSE 0 END, 0) AS pending_ltrs_row,
-                COALESCE(CASE WHEN {pending_status}
-                    THEN "order_qty" ELSE 0 END, 0) AS pending_qty_row,
+                COALESCE("missed_qty", 0) * COALESCE("basic_rate", 0) AS pending_value_row,
+                COALESCE("missed_ltrs", 0) AS pending_ltrs_row,
+                COALESCE("missed_qty", 0) AS pending_qty_row,
                 CASE
                     WHEN NULLIF(TRIM("lead_time"::text), '') ~ '^-?[0-9]+(\\.[0-9]+)?$'
                     THEN "lead_time"::numeric
@@ -883,14 +854,14 @@ _PRIMARY_METRIC_SQL = """
     COALESCE(SUM(COALESCE(metric_delivered_value, 0)), 0) AS done_value,
     COALESCE(SUM(COALESCE(metric_delivered_liters, 0)), 0) AS done_ltrs,
     COALESCE(SUM(COALESCE(metric_delivered_qty, 0)), 0) AS done_qty,
-    COALESCE(SUM(CASE WHEN open_close_key = 'OPEN'
-        THEN COALESCE(metric_order_liters, 0) ELSE 0 END), 0) AS missed_ltrs,
-    COALESCE(SUM(CASE WHEN open_close_key = 'OPEN'
-        THEN COALESCE(metric_order_value, 0) ELSE 0 END), 0) AS pending_value,
-    COALESCE(SUM(CASE WHEN open_close_key = 'OPEN'
-        THEN COALESCE(metric_order_liters, 0) ELSE 0 END), 0) AS pending_ltrs,
-    COALESCE(SUM(CASE WHEN open_close_key = 'OPEN'
-        THEN COALESCE(metric_order_qty, 0) ELSE 0 END), 0) AS pending_qty,
+    -- Pending = the short-delivered ("missed") balance, not an open_close
+    -- filter (the open_close column is empty/CLOSED for every row, which made
+    -- Pending read 0). metric_pending_* = missed_ltrs / missed_qty /
+    -- (missed_qty x basic_rate) and matches the source DB exactly.
+    COALESCE(SUM(COALESCE(metric_pending_liters, 0)), 0) AS missed_ltrs,
+    COALESCE(SUM(COALESCE(metric_pending_value, 0)), 0) AS pending_value,
+    COALESCE(SUM(COALESCE(metric_pending_liters, 0)), 0) AS pending_ltrs,
+    COALESCE(SUM(COALESCE(metric_pending_qty, 0)), 0) AS pending_qty,
     COALESCE(SUM(CASE WHEN status_key = 'EXPIRED'
         THEN COALESCE(metric_order_value, 0) ELSE 0 END), 0) AS expired_value,
     COALESCE(SUM(CASE WHEN status_key = 'EXPIRED'
@@ -912,12 +883,9 @@ _PRIMARY_TREND_METRIC_SQL = """
     COALESCE(SUM(COALESCE(metric_delivered_value, 0)), 0) AS done_value,
     COALESCE(SUM(COALESCE(metric_delivered_liters, 0)), 0) AS done_ltrs,
     COALESCE(SUM(COALESCE(metric_delivered_qty, 0)), 0) AS done_qty,
-    COALESCE(SUM(CASE WHEN open_close_key = 'OPEN'
-        THEN COALESCE(metric_order_value, 0) ELSE 0 END), 0) AS pending_value,
-    COALESCE(SUM(CASE WHEN open_close_key = 'OPEN'
-        THEN COALESCE(metric_order_liters, 0) ELSE 0 END), 0) AS pending_ltrs,
-    COALESCE(SUM(CASE WHEN open_close_key = 'OPEN'
-        THEN COALESCE(metric_order_qty, 0) ELSE 0 END), 0) AS pending_qty,
+    COALESCE(SUM(COALESCE(metric_pending_value, 0)), 0) AS pending_value,
+    COALESCE(SUM(COALESCE(metric_pending_liters, 0)), 0) AS pending_ltrs,
+    COALESCE(SUM(COALESCE(metric_pending_qty, 0)), 0) AS pending_qty,
     COALESCE(SUM(COALESCE(metric_order_value, 0)), 0) AS order_value,
     COALESCE(SUM(COALESCE(metric_order_liters, 0)), 0) AS order_ltrs,
     COALESCE(SUM(COALESCE(metric_order_qty, 0)), 0) AS order_qty
@@ -4911,10 +4879,12 @@ normalized AS (
         END AS per_ltr_key,
         -- Direct mapping per user spec: each KPI card reads exactly one
         -- canonical column from master_po — no qty x rate fallbacks.
+        -- Value cards use the tax/margin-INCLUSIVE amounts (these match the
+        -- source DB; the *_exclusive columns under-report Order/Deliver value).
         COALESCE(total_order_liters, 0) AS metric_order_liters,
         COALESCE(total_delivered_liters, 0) AS metric_delivered_liters,
-        COALESCE(total_order_amt_exclusive, 0) AS metric_order_value,
-        COALESCE(total_delivered_amt_exclusive, 0) AS metric_delivered_value,
+        COALESCE(total_order_amt_inclusive, 0) AS metric_order_value,
+        COALESCE(total_deliver_amt_inclusive, 0) AS metric_delivered_value,
         COALESCE(order_qty, 0) AS metric_order_qty,
         COALESCE(delivered_qty, 0) AS metric_delivered_qty,
         0 AS metric_projection_value,

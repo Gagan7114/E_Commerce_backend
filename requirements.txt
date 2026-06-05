@@ -9,3 +9,5 @@ hdbcli==2.23.27
 openpyxl>=3.1.5,<3.2
 gunicorn==23.0.0
 firebase-admin>=6.5.0,<7
+gspread>=6.1.0,<7
+google-auth>=2.35.0,<3

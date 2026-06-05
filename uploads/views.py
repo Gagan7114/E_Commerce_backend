@@ -140,6 +140,12 @@ PRIMARY_UPLOAD_TABLES = {
     "total_po_zbs_grn_update",
 }
 
+# Primary PO insert tables that must only contain Jivo-branded SKUs. Rows whose
+# sku_name does not mention "jivo" are dropped on upload (e.g. a third-party
+# item accidentally attached to a Jivo PO export). Amazon primary POs use a
+# separate uploader/table (amazon_po) and are intentionally not covered here.
+PRIMARY_PO_JIVO_ONLY_TABLES = frozenset({"total_po", "total_po_zbs"})
+
 UPLOAD_DATE_DELETE_TABLES = {
     "amazon_ads": "date",
     "blinkit_ads": "date",
@@ -1349,6 +1355,26 @@ def _normalize_platform_format(value) -> str:
     return re.sub(r"[^a-z0-9]+", "", str(value or "").strip().lower())
 
 
+def _row_mentions_jivo(row: dict) -> bool:
+    """True when a primary-PO row's SKU name mentions the Jivo brand."""
+    return "jivo" in str(row.get("sku_name") or "").lower()
+
+
+def _filter_primary_jivo_rows(data: list[dict]) -> tuple[list[dict], list[dict]]:
+    """Split primary-PO rows by brand: keep Jivo SKUs, drop everything else.
+
+    Platform PO exports occasionally include third-party items (e.g. another
+    brand's SKU mistakenly attached to a Jivo PO). Only Jivo-branded SKUs belong
+    in the primary PO tables, so non-Jivo rows are skipped on upload. Applies to
+    every platform's primary uploader except Amazon (separate uploader/table).
+    """
+    kept: list[dict] = []
+    skipped: list[dict] = []
+    for row in data:
+        (kept if _row_mentions_jivo(row) else skipped).append(row)
+    return kept, skipped
+
+
 def _validate_primary_upload_format(table: str, data: list[dict], expected_format: str | None):
     if table not in PRIMARY_UPLOAD_TABLES or not expected_format:
         return None
@@ -1726,6 +1752,27 @@ def _batch_upload(body, *, forced_table: str | None = None):
     if table == "total_po_zbs_grn_update":
         return _update_total_po_grn_dates(data, target_table="total_po_zbs")
 
+    # Primary PO tables only accept Jivo-branded SKUs; drop any non-Jivo rows
+    # (other brands accidentally included in a platform PO export).
+    skipped_non_jivo = 0
+    if table in PRIMARY_PO_JIVO_ONLY_TABLES:
+        data, non_jivo_rows = _filter_primary_jivo_rows(data)
+        skipped_non_jivo = len(non_jivo_rows)
+        if skipped_non_jivo:
+            logger.info(
+                "Skipped %s non-Jivo row(s) on %s upload", skipped_non_jivo, table
+            )
+        if not data:
+            return Response({
+                "success": 0,
+                "created": 0,
+                "updated": 0,
+                "skipped": 0,
+                "failed": 0,
+                "skipped_non_jivo": skipped_non_jivo,
+                "error": None,
+            })
+
     if upsert and table in UPLOAD_FORCED_UNIQUE_KEYS:
         unique_key = UPLOAD_FORCED_UNIQUE_KEYS[table]
 
@@ -1922,6 +1969,7 @@ def _batch_upload(body, *, forced_table: str | None = None):
         "platform_created": platform_created,
         "platform_updated": platform_updated,
         "platform_skipped": platform_skipped,
+        "skipped_non_jivo": skipped_non_jivo,
         "duplicates": updated + skipped,
         "failed": failed,
         "error": last_error,

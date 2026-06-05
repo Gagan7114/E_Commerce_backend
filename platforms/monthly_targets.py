@@ -20,6 +20,7 @@ import calendar
 import re
 from datetime import date, datetime
 from decimal import Decimal
+from types import SimpleNamespace
 
 from django.db import connection, transaction
 from django.db.utils import IntegrityError
@@ -81,6 +82,20 @@ IN_SCOPE_SLUGS = (
 # IN_SCOPE_SLUGS. De-duplication via tuple(dict.fromkeys(...)) keeps the
 # expression idempotent if the order ever changes.
 DASHBOARD_DISPLAY_SLUGS = tuple(dict.fromkeys(("amazon",) + IN_SCOPE_SLUGS))
+
+# Amazon MP is a secondary-sales channel whose data lives in `amazon_mp_master`
+# and which has NO PlatformConfig row of its own — exactly like the Primary
+# dashboard, which surfaces it via SPECIAL_DASHBOARD_ROWS. We render it as a
+# synthetic dashboard row gated by Amazon access. Deliberately kept OUT of
+# IN_SCOPE_SLUGS so the set/refresh write paths stay untouched; it is display +
+# live-source only.
+AMAZON_MP_FORMAT = "AMAZON MP"
+_AMAZON_MP_PLATFORM = SimpleNamespace(
+    slug="amazon_mp",
+    name="Amazon MP",
+    po_filter_value=AMAZON_MP_FORMAT,
+    sales_type="sec",
+)
 
 DASHBOARD_ITEM_HEADS = ("PREMIUM", "COMMODITY")
 DEFAULT_ITEM_HEADS = ("PREMIUM", "COMMODITY")
@@ -725,6 +740,52 @@ def _read_amazon_dashboard_many(
     return out
 
 
+def _read_amazon_mp_dashboard_many(
+    item_heads: tuple[str, ...],
+    month: int,
+    year: int,
+) -> dict[tuple[str, str], dict]:
+    """Live done_ltrs for Amazon MP, read from `amazon_mp_master` — the same
+    source the Primary dashboard uses. Amazon MP carries no revenue column, so
+    `done_value` is reported as 0. Keyed to the AMAZON MP synthetic format."""
+    month_name = _MONTH_NAMES[month]
+    item_placeholder = ",".join(["UPPER(TRIM(%s))"] * len(item_heads))
+    sql = """
+        SELECT
+            UPPER(TRIM("item_head"::text)) AS item_head,
+            COALESCE(SUM("delivered_ltr"), 0) AS done_ltrs,
+            MAX(
+                CASE
+                    WHEN "shipment_date" ~ '^[0-9]{2}/[0-9]{2}/[0-9]{2}'
+                        THEN to_timestamp("shipment_date", 'DD/MM/YY HH24:MI')::date
+                    WHEN "shipment_date" ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}'
+                        THEN "shipment_date"::date
+                    WHEN "shipment_date" ~ '^[0-9]{2}-[0-9]{2}-[0-9]{4}'
+                        THEN to_date("shipment_date", 'DD-MM-YYYY')
+                    ELSE NULL
+                END
+            ) AS latest_date
+        FROM "amazon_mp_master"
+        WHERE UPPER(TRIM("item_head"::text)) IN (__ITEMS__)
+          AND UPPER(TRIM("shipment_month"::text)) = %s
+          AND "shipment_year" = %s
+        GROUP BY UPPER(TRIM("item_head"::text))
+    """.replace("__ITEMS__", item_placeholder)
+    with connection.cursor() as cur:
+        cur.execute(sql, list(item_heads) + [month_name, year])
+        rows = cur.fetchall()
+
+    fmt_key = _format_key(AMAZON_MP_FORMAT)
+    out: dict[tuple[str, str], dict] = {}
+    for item_head, done_ltrs, latest_date in rows:
+        out[(fmt_key, _format_key(item_head))] = {
+            "done_ltrs": Decimal(done_ltrs or 0),
+            "done_value": Decimal(0),
+            "latest_date": latest_date,
+        }
+    return out
+
+
 def _dashboard_source_map(
     ordered_slugs: list[str] | tuple[str, ...],
     platforms: dict[str, PlatformConfig],
@@ -759,6 +820,9 @@ def _dashboard_source_map(
 
     if any(slug in AMAZON_SLUGS for slug in ordered_slugs):
         source_map.update(_read_amazon_dashboard_many(item_heads, month, year))
+
+    if "amazon_mp" in ordered_slugs:
+        source_map.update(_read_amazon_mp_dashboard_many(item_heads, month, year))
 
     return source_map
 
@@ -1529,6 +1593,12 @@ def month_targets_dashboard(request):
     # Preserve the sheet's display order.
     ordered = [s for s in DASHBOARD_DISPLAY_SLUGS if s in allowed_slugs]
     platforms = {p.slug: p for p in PlatformConfig.objects.filter(slug__in=ordered)}
+
+    # Amazon MP rides on Amazon access — it has no PlatformConfig of its own,
+    # so inject the synthetic row right after Amazon (mirrors the Primary sheet).
+    if "amazon" in allowed_slugs and "amazon" in ordered:
+        platforms["amazon_mp"] = _AMAZON_MP_PLATFORM
+        ordered.insert(ordered.index("amazon") + 1, "amazon_mp")
 
     # One query per SKU-group. Using LOWER/TRIM on format so the row joins
     # regardless of stored casing.
