@@ -2412,7 +2412,19 @@ class AllAppointmentsView(APIView):
                        ) AS pos,
                        COUNT(DISTINCT NULLIF(TRIM(COALESCE(a.pos,'')),'')) AS po_count,
                        MAX(acm.carton_count)    AS amazon_carton_count,
-                       MAX(acm.unit_count)      AS amazon_unit_count
+                       MAX(acm.unit_count)      AS amazon_unit_count,
+                       -- Estimated carton count from this appointment's PO line
+                       -- items: sum of (accepted_qty / case_pack) per SKU. Used
+                       -- only when Amazon VC has no carton count for the appt.
+                       (
+                           SELECT ROUND(SUM(p.accepted_qty::numeric / GREATEST(p.case_pack, 1)))
+                           FROM reporting."Amazon PO" p
+                           WHERE UPPER(TRIM(p.po_number)) IN (
+                               SELECT UPPER(TRIM(NULLIF(a2.pos, '')))
+                               FROM reporting."appointment" a2
+                               WHERE a2.appointment_id = a.appointment_id
+                           )
+                       ) AS calc_carton_count
                 FROM reporting."appointment" a
                 LEFT JOIN public.appointment_commit acm
                        ON acm.appointment_id = a.appointment_id
@@ -2433,6 +2445,24 @@ class AllAppointmentsView(APIView):
         last_update = (
             {'at': lr[0].isoformat() if lr[0] else None, 'by': lr[1]} if lr else None
         )
+
+        # Carton count: when Amazon VC has no carton count for an appointment,
+        # estimate it from the appointment's PO line items
+        # (sum of accepted_qty / case_pack). Units are never calculated. Flagged
+        # with carton_is_calc so the UI can mark it as an estimate.
+        for r in rows:
+            cc = r.get('amazon_carton_count')
+            calc_raw = r.pop('calc_carton_count', None)
+            calc = None
+            if cc is None and calc_raw is not None:
+                try:
+                    calc = int(round(float(calc_raw)))
+                    if calc <= 0:
+                        calc = None
+                except (TypeError, ValueError):
+                    calc = None
+            r['amazon_carton_count_calc'] = calc
+            r['carton_is_calc'] = calc is not None
 
         return Response({
             'results': [_serialize_row(r) for r in rows],
