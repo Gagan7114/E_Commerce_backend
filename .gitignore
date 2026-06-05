@@ -8,6 +8,11 @@ env/
 .env
 .env.*
 *.env
+
+# Secret credential files (service accounts, etc.)
+secrets/
+*credentials*.json
+*service*account*.json
 db.sqlite3
 staticfiles/
 uploaded_files/

@@ -112,6 +112,17 @@ FIREBASE_CREDENTIALS_FILE = env("FIREBASE_CREDENTIALS_FILE", default="")
 FIREBASE_NOTIFICATIONS_ENABLED = env.bool("FIREBASE_NOTIFICATIONS_ENABLED", default=False)
 FIREBASE_DOH_TOPIC = env("FIREBASE_DOH_TOPIC", default="inventory_doh_alerts")
 
+# Google Sheets (read-only) integration. The credentials file is a service
+# account JSON key; share the target spreadsheet with its client_email as Viewer.
+GOOGLE_SHEETS_CREDENTIALS_FILE = env(
+    "GOOGLE_SHEETS_CREDENTIALS_FILE",
+    default=str(BASE_DIR / "secrets" / "google_sheets_credentials.json"),
+)
+GOOGLE_SHEETS_SPREADSHEET_ID = env(
+    "GOOGLE_SHEETS_SPREADSHEET_ID",
+    default="10-P_ZBVGaIKz87PTByk8rMb_c1J0VT0mfZo_84qwjQU",
+)
+
 DATABASE_ROUTERS = ["sap.router.SAPReadOnlyRouter"]
 
 AUTH_USER_MODEL = "accounts.User"
