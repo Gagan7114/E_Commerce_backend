@@ -29,6 +29,10 @@ LOCKED_STATUSES = ('approved', 'dispatched', 'in_transit', 'delivered')
 # Priority helpers
 # ---------------------------------------------------------------------------
 
+# Vendor Central commit caps may be exceeded by up to this factor (10% over).
+CAP_TOLERANCE = 1.10
+
+
 def _compute_priority(drr_unit, soh_unit, doh, days_to_expiry, po_status):
     drr = float(drr_unit or 0)
     soh = float(soh_unit or 0)
@@ -637,8 +641,9 @@ def _filler_pass(loaded, leftover_pool, capacity, primary_fc=None, mark_key='_fi
 
 
 def _enforce_commit_caps(loaded, not_loaded, commit_caps, key_field='appointment_id'):
-    """Trim ``loaded`` so each capped group respects its Vendor Central commit:
-    sum(planned_qty) ≤ units_cap AND sum(planned_qty/case_pack) ≤ cartons_cap.
+    """Trim ``loaded`` so each capped group respects its Vendor Central commit,
+    allowing up to CAP_TOLERANCE (10%) over:
+    sum(planned_qty) ≤ units_cap×1.1 AND sum(planned_qty/case_pack) ≤ cartons_cap×1.1.
     Lowest-priority items are dropped first; removed items go to ``not_loaded``
     with a clear ``unfit_reason`` so the UI can explain them.
 
@@ -680,8 +685,9 @@ def _enforce_commit_caps(loaded, not_loaded, commit_caps, key_field='appointment
         if gk not in norm_caps:
             continue
         cap = norm_caps[gk] or {}
-        cap_u = float(cap.get('units') or 0) or float('inf')
-        cap_c = float(cap.get('cartons') or 0) or float('inf')
+        # Allow up to 10% over the Vendor Central commit (units AND cartons).
+        cap_u = (float(cap.get('units') or 0) * CAP_TOLERANCE) or float('inf')
+        cap_c = (float(cap.get('cartons') or 0) * CAP_TOLERANCE) or float('inf')
 
         pq = int(it.get('planned_qty') or 0)
         cp = max(int(it.get('case_pack') or 1), 1)
@@ -701,7 +707,7 @@ def _enforce_commit_caps(loaded, not_loaded, commit_caps, key_field='appointment
             removed['unfit_reason'] = (
                 f'Exceeds Vendor Central commit cap for this {label} '
                 f'(cap: {int(cap.get("units") or 0)} units / '
-                f'{int(cap.get("cartons") or 0)} cartons).'
+                f'{int(cap.get("cartons") or 0)} cartons, +10% allowed).'
             )
             extras.append(removed)
 
@@ -1562,8 +1568,14 @@ class AppointmentItemsView(APIView):
             -(x.get('accepted_qty') or 0),
         ))
 
+        # Appointment POs come FIRST and in full: pack the appointment's own POs
+        # (highest priority_score first) straight into the truck, limited only by
+        # physical capacity — the priority slider does NOT restrict or reduce the
+        # appointment's own POs. The Vendor Central units/cartons cap (with +10%
+        # tolerance) is still applied at the end. Leftover capacity is then filled
+        # by the maximize-fill / DOH-filler waterfall below.
         loaded, not_loaded, capacity, planned_liters, load_pct, priority_actual = _auto_plan_truck(
-            items, truck_size, capacity_override, priority=priority, strict=priority_strict,
+            items, truck_size, capacity_override, priority=None,
         )
 
         # Maximize-fill — three-stage waterfall:
