@@ -1,12 +1,15 @@
-"""Compare MASTER PO Google Sheet (CSV side) vs DB master_po (DB side) for MAY 2026."""
-import os, re, django
+"""Compare MASTER PO Google Sheet (CSV side) vs DB master_po (DB side).
+
+Usage: python _compare_master_po.py [MONTH] [YEAR]   (defaults: MAY 2026)
+"""
+import os, re, sys, django
 os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'config.settings.dev')
 django.setup()
 from django.db import connection
 from accounts import google_sheets as gs
 
-YEAR = 2026
-MONTH = 'MAY'
+MONTH = (sys.argv[1] if len(sys.argv) > 1 else 'MAY').strip().upper()
+YEAR = int(sys.argv[2]) if len(sys.argv) > 2 else 2026
 
 PLATFORMS = [
     ("BIG BASKET", "bigbasket"),

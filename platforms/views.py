@@ -1427,7 +1427,9 @@ _PENDENCY_DASHBOARD_FORMATS = {
     "zepto": "ZEPTO",
     "swiggy": "SWIGGY",
     "blinkit": "BLINKIT",
-    "bigbasket": "BIGBASKET",
+    # master_po stores this as "BIG BASKET" (with a space); the pendency query
+    # matches `format` exactly, so the value here must match the data verbatim.
+    "bigbasket": "BIG BASKET",
     "flipkart_grocery": "FLIPKART GROCERY",
     "citymall": "CITY MALL",
     "zomato": "ZOMATO",
