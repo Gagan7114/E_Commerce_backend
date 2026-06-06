@@ -83,6 +83,17 @@ DATABASES = {
         # Big latency win on every API call; safe with WSGI + per-worker pooling.
         "CONN_MAX_AGE": env.int("DJANGO_DB_CONN_MAX_AGE", default=600),
         "CONN_HEALTH_CHECKS": True,
+        # Per-connection work_mem. The dashboard's master_po view runs several
+        # large sorts/dedupes over ~41k rows; at Postgres' 4MB default they
+        # spill to disk ("Sort Method: external merge Disk" in EXPLAIN), which
+        # is slow. Giving each query more sort memory keeps those sorts in RAM.
+        # This is read-only tuning: it changes no data, no query, and no result
+        # — only how much memory a single sort/hash step may use. Tune or revert
+        # per environment with DJANGO_DB_WORK_MEM (e.g. "32MB", or "4MB" to
+        # restore the Postgres default).
+        "OPTIONS": {
+            "options": f"-c work_mem={env('DJANGO_DB_WORK_MEM', default='64MB')}",
+        },
     },
 }
 
@@ -106,6 +117,9 @@ HANA = {
     "user": env("HANA_USER", default=""),
     "password": env("HANA_PASSWORD", default=""),
     "schema": env("HANA_SCHEMA", default=""),
+    # Fail fast when HANA is unreachable (VPN down / host blocked) instead of
+    # hanging on the OS default (~20-30s) and freezing every SAP-backed widget.
+    "connect_timeout_ms": env.int("HANA_CONNECT_TIMEOUT_MS", default=5000),
 }
 
 FIREBASE_CREDENTIALS_FILE = env("FIREBASE_CREDENTIALS_FILE", default="")

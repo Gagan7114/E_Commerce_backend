@@ -44,6 +44,9 @@ def hana_connection(schema: str | None = None) -> Iterator[Any]:
         password=cfg["password"],
         currentSchema=(schema or cfg["schema"] or None),
         autocommit=False,
+        # Give up quickly if HANA is unreachable so a down VPN/host fails fast
+        # (raises a connect error) instead of freezing the request for ~30s.
+        connectTimeout=cfg.get("connect_timeout_ms", 5000),
     )
     try:
         yield conn

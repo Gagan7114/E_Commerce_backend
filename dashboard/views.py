@@ -69,11 +69,43 @@ def _table_exists(table: str) -> bool:
 
 
 def _count(table: str) -> int:
+    """Row count for a stat card.
+
+    Fast path: for ordinary/partitioned tables and materialized views, use the
+    `reltuples` estimate Postgres maintains in pg_class via ANALYZE/autovacuum.
+    That is O(1) instead of a full COUNT(*) scan over the whole table.
+
+    Safe fallback: for plain VIEWs (reltuples is not maintained for them) or a
+    table that has never been analyzed (reltuples < 0, or 0 which is ambiguous),
+    fall back to an exact COUNT(*) so the number is never silently wrong. Many
+    ALLOWED_TABLES entries are views, so this fallback matters.
+    """
     try:
         with connection.cursor() as cur:
-            cur.execute(f"SELECT COUNT(*) FROM {_quoted(table)}")
+            cur.execute(
+                """
+                SELECT c.relkind, c.reltuples::bigint
+                FROM pg_class c
+                JOIN pg_namespace n ON n.oid = c.relnamespace
+                WHERE n.nspname = current_schema()
+                  AND c.relname = %s
+                LIMIT 1
+                """,
+                [table],
+            )
             row = cur.fetchone()
-            return int(row[0]) if row else 0
+            if row is not None:
+                relkind, estimate = row[0], row[1]
+                # 'r' table, 'p' partitioned table, 'm' materialized view all
+                # keep a usable estimate. Only trust it when > 0 (a 0/negative
+                # estimate means empty or never-analyzed -> verify exactly).
+                if relkind in ("r", "p", "m") and estimate and estimate > 0:
+                    return int(estimate)
+            # View, missing stats, or never analyzed -> exact (and for empty
+            # tables COUNT(*) is itself instant).
+            cur.execute(f"SELECT COUNT(*) FROM {_quoted(table)}")
+            exact = cur.fetchone()
+            return int(exact[0]) if exact else 0
     except Exception:
         return 0
 
@@ -342,10 +374,36 @@ def expiry_alerts(request, table_name: str):
 
 
 # ─── /inventory-charts ───
+def _inv_num_sql(col: str) -> str:
+    """SQL that coerces a (possibly text) quantity column to an integer,
+    mirroring the old Python ``int(value or 0)``: NULL / non-numeric -> 0,
+    floats floored. Works whether the column is numeric or text."""
+    txt = f'btrim("{col}"::text)'
+    return (
+        f"CASE WHEN {txt} ~ '^-?[0-9]+(\\.[0-9]+)?$' "
+        f"THEN floor({txt}::numeric) ELSE 0 END"
+    )
+
+
+def _inv_is_code_sql(col: str) -> str:
+    """SQL mirror of the old Python ``_is_code``: empty, or <=12 chars and
+    purely alphanumeric -> treated as a code rather than a real product name."""
+    txt = f'btrim("{col}"::text)'
+    return f"({txt} = '' OR ({txt} ~ '^[A-Za-z0-9]+$' AND length({txt}) <= 12))"
+
+
 @api_view(["GET"])
 @permission_classes([require("dashboard.view")])
 @cached_get(timeout=120, prefix="dash.inventory_charts")
 def inventory_charts(request):
+    """Inventory totals, city split, and top products per platform.
+
+    All aggregation runs in SQL (COUNT / SUM / GROUP BY), so each platform
+    returns only a few summary rows instead of up to 5,000 raw rows pulled into
+    Python. This is far faster AND more correct: the previous version summed
+    only the first 5,000 rows (``LIMIT 5000``), so totals were silently
+    truncated on any table larger than that.
+    """
     platform_totals = []
     city_totals: dict[str, int] = defaultdict(int)
     top_products = []
@@ -360,41 +418,83 @@ def inventory_charts(request):
 
         total_qty = 0
         sku_count = 0
-        rows: list[dict] = []
+        num_sql = _inv_num_sql(qty_col)
 
         try:
-            select_cols = [qty_col, name_col]
-            if id_col:
-                select_cols.append(id_col)
-            if city_col:
-                select_cols.append(city_col)
-            cols_sql = ", ".join(f'"{c}"' for c in select_cols)
             qt = _quoted(table)
             with connection.cursor() as cur:
-                cur.execute(f"SELECT COUNT(*) FROM {qt}")
-                sku_count = int(cur.fetchone()[0] or 0)
-                cur.execute(f"SELECT {cols_sql} FROM {qt} LIMIT 5000")
-                rows = [dict(zip(select_cols, r)) for r in cur.fetchall()]
+                # 1) Whole-table total + SKU count (no row cap).
+                cur.execute(f"SELECT COUNT(*), COALESCE(SUM({num_sql}), 0) FROM {qt}")
+                row = cur.fetchone()
+                sku_count = int(row[0] or 0)
+                total_qty = int(row[1] or 0)
+
+                # 2) Top 5 products by quantity.
+                if id_col:
+                    # Amazon: aggregate by id, then label with a non-code title
+                    # for that id (fall back to any title, then the id itself).
+                    code_sql = _inv_is_code_sql(name_col)
+                    cur.execute(
+                        f"""
+                        WITH agg AS (
+                            SELECT "{id_col}"::text AS id,
+                                   COALESCE(SUM({num_sql}), 0) AS qty,
+                                   MAX(CASE WHEN NOT {code_sql}
+                                            THEN "{name_col}"::text END) AS good_name,
+                                   MAX("{name_col}"::text) AS any_name
+                            FROM {qt}
+                            GROUP BY "{id_col}"::text
+                        )
+                        SELECT COALESCE(good_name, any_name, id) AS product, qty
+                        FROM agg
+                        WHERE qty > 0
+                        ORDER BY qty DESC
+                        LIMIT 5
+                        """
+                    )
+                else:
+                    cur.execute(
+                        f"""
+                        SELECT "{name_col}"::text AS product,
+                               COALESCE(SUM({num_sql}), 0) AS qty
+                        FROM {qt}
+                        WHERE "{name_col}" IS NOT NULL
+                          AND btrim("{name_col}"::text) <> ''
+                        GROUP BY "{name_col}"::text
+                        HAVING COALESCE(SUM({num_sql}), 0) > 0
+                        ORDER BY qty DESC
+                        LIMIT 5
+                        """
+                    )
+                for prod, qty in cur.fetchall():
+                    top_products.append({
+                        "product": (str(prod) if prod else "")[:80],
+                        "qty": int(qty or 0),
+                        "platform": platform,
+                        "color": color,
+                    })
+
+                # 3) City distribution (only platforms that carry a city column).
+                if city_col:
+                    cur.execute(
+                        f"""
+                        SELECT UPPER(btrim("{city_col}"::text)) AS city,
+                               COALESCE(SUM({num_sql}), 0) AS qty
+                        FROM {qt}
+                        WHERE "{city_col}" IS NOT NULL
+                          AND btrim("{city_col}"::text) <> ''
+                        GROUP BY 1
+                        HAVING COALESCE(SUM({num_sql}), 0) > 0
+                        """
+                    )
+                    for city, qty in cur.fetchall():
+                        if city:
+                            city_totals[str(city)] += int(qty or 0)
         except Exception:
             platform_totals.append({
                 "platform": platform, "total_qty": 0, "sku_count": 0, "color": color,
             })
             continue
-
-        name_lookup: dict = {}
-        if id_col:
-            for r in rows:
-                rid = r.get(id_col)
-                rname = r.get(name_col)
-                if rid and rname and not _is_code(rname):
-                    name_lookup[rid] = rname
-
-        for r in rows:
-            q = r.get(qty_col)
-            try:
-                total_qty += int(q or 0)
-            except (TypeError, ValueError):
-                pass
 
         platform_totals.append({
             "platform": platform,
@@ -402,38 +502,6 @@ def inventory_charts(request):
             "sku_count": sku_count,
             "color": color,
         })
-
-        if city_col:
-            for r in rows:
-                city = r.get(city_col)
-                try:
-                    qty = int(r.get(qty_col) or 0)
-                except (TypeError, ValueError):
-                    qty = 0
-                if city and qty > 0:
-                    city_totals[str(city).upper().strip()] += qty
-
-        product_map: dict[str, int] = defaultdict(int)
-        for r in rows:
-            name = r.get(name_col)
-            try:
-                qty = int(r.get(qty_col) or 0)
-            except (TypeError, ValueError):
-                qty = 0
-            if not name or qty <= 0:
-                continue
-            if _is_code(name) and id_col:
-                rid = r.get(id_col) or name
-                name = name_lookup.get(rid, name)
-            product_map[str(name)] += qty
-
-        for name, qty in sorted(product_map.items(), key=lambda x: -x[1])[:5]:
-            top_products.append({
-                "product": name[:80],
-                "qty": qty,
-                "platform": platform,
-                "color": color,
-            })
 
     platform_totals.sort(key=lambda x: -x["total_qty"])
     city_list = sorted(
