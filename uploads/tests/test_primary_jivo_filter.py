@@ -11,7 +11,7 @@ from uploads.views import (
 
 
 class PrimaryJivoFilterTests(SimpleTestCase):
-    """Primary PO uploads must keep only Jivo-branded SKUs (Amazon excluded)."""
+    """Primary PO uploads must keep only own-brand SKUs — Jivo or Sano (Amazon excluded)."""
 
     def test_only_total_po_tables_are_jivo_filtered(self):
         # The non-Amazon primary PO insert tables, and nothing else.
@@ -22,7 +22,12 @@ class PrimaryJivoFilterTests(SimpleTestCase):
         self.assertTrue(_row_mentions_jivo({"sku_name": "JIVO Olive Oil"}))
         self.assertTrue(_row_mentions_jivo({"sku_name": "premium jivo cold pressed"}))
 
-    def test_row_without_jivo_is_rejected(self):
+    def test_sano_brand_is_accepted(self):
+        self.assertTrue(_row_mentions_jivo({"sku_name": "Sano - Pomace Olive Oil, 5 L"}))
+        self.assertTrue(_row_mentions_jivo({"sku_name": "SANO Pomace Olive Oil, 1 L"}))
+        self.assertTrue(_row_mentions_jivo({"sku_name": "premium sano olive"}))
+
+    def test_row_without_known_brand_is_rejected(self):
         self.assertFalse(_row_mentions_jivo({"sku_name": "Morton Pure Ghee 100 ml"}))
         self.assertFalse(_row_mentions_jivo({"sku_name": ""}))
         self.assertFalse(_row_mentions_jivo({"sku_name": None}))
@@ -35,9 +40,10 @@ class PrimaryJivoFilterTests(SimpleTestCase):
             {"sku_code": "C", "sku_name": "JIVO Olive Oil"},
             {"sku_code": "D", "sku_name": ""},
             {"sku_code": "E", "sku_name": None},
+            {"sku_code": "F", "sku_name": "Sano - Pomace Olive Oil, 5 L"},
         ]
         kept, skipped = _filter_primary_jivo_rows(rows)
-        self.assertEqual([r["sku_code"] for r in kept], ["A", "C"])
+        self.assertEqual([r["sku_code"] for r in kept], ["A", "C", "F"])
         self.assertEqual([r["sku_code"] for r in skipped], ["B", "D", "E"])
 
 

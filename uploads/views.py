@@ -140,11 +140,14 @@ PRIMARY_UPLOAD_TABLES = {
     "total_po_zbs_grn_update",
 }
 
-# Primary PO insert tables that must only contain Jivo-branded SKUs. Rows whose
-# sku_name does not mention "jivo" are dropped on upload (e.g. a third-party
-# item accidentally attached to a Jivo PO export). Amazon primary POs use a
-# separate uploader/table (amazon_po) and are intentionally not covered here.
+# Primary PO insert tables that must only contain our own-brand SKUs. Rows whose
+# sku_name mentions none of the accepted brands are dropped on upload (e.g. a
+# third-party item accidentally attached to a PO export). Amazon primary POs use
+# a separate uploader/table (amazon_po) and are intentionally not covered here.
 PRIMARY_PO_JIVO_ONLY_TABLES = frozenset({"total_po", "total_po_zbs"})
+# Brands accepted into the primary PO tables, matched case-insensitively as a
+# substring of sku_name (e.g. "Jivo - Canola Refined Oil", "Sano - Pomace Olive Oil").
+PRIMARY_PO_ACCEPTED_BRANDS = ("jivo", "sano")
 
 UPLOAD_DATE_DELETE_TABLES = {
     "amazon_ads": "date",
@@ -176,6 +179,15 @@ def _clear_upload_dependent_cache() -> None:
         cache.clear()
     except Exception:  # noqa: BLE001 - cache invalidation should not fail uploads
         logger.exception("Failed to clear cache after upload write")
+    # Primary-PO / master_sheet uploads feed the master_po materialized view
+    # (master_po_mv). Refresh it so the dashboard never serves stale rows. This
+    # is best-effort and no-ops if migration 0040 isn't applied; a refresh
+    # failure must never fail the upload.
+    try:
+        from platforms.master_po_refresh import refresh_master_po_mv
+        refresh_master_po_mv()
+    except Exception:  # noqa: BLE001 - refresh must never break an upload
+        logger.exception("Failed to refresh master_po_mv after upload")
 
 
 def _quote_ident(name: str) -> str:
@@ -1356,17 +1368,20 @@ def _normalize_platform_format(value) -> str:
 
 
 def _row_mentions_jivo(row: dict) -> bool:
-    """True when a primary-PO row's SKU name mentions the Jivo brand."""
-    return "jivo" in str(row.get("sku_name") or "").lower()
+    """True when a primary-PO row's SKU name mentions an accepted own-brand
+    (Jivo or Sano — see PRIMARY_PO_ACCEPTED_BRANDS)."""
+    name = str(row.get("sku_name") or "").lower()
+    return any(brand in name for brand in PRIMARY_PO_ACCEPTED_BRANDS)
 
 
 def _filter_primary_jivo_rows(data: list[dict]) -> tuple[list[dict], list[dict]]:
-    """Split primary-PO rows by brand: keep Jivo SKUs, drop everything else.
+    """Split primary-PO rows by brand: keep our own-brand SKUs, drop everything else.
 
     Platform PO exports occasionally include third-party items (e.g. another
-    brand's SKU mistakenly attached to a Jivo PO). Only Jivo-branded SKUs belong
-    in the primary PO tables, so non-Jivo rows are skipped on upload. Applies to
-    every platform's primary uploader except Amazon (separate uploader/table).
+    brand's SKU mistakenly attached to the PO). Only own-brand SKUs (Jivo or
+    Sano) belong in the primary PO tables, so other-brand rows are skipped on
+    upload. Applies to every platform's primary uploader except Amazon
+    (separate uploader/table).
     """
     kept: list[dict] = []
     skipped: list[dict] = []
@@ -1769,8 +1784,8 @@ def _batch_upload(body, *, forced_table: str | None = None):
     if table == "total_po_zbs_grn_update":
         return _update_total_po_grn_dates(data, target_table="total_po_zbs")
 
-    # Primary PO tables only accept Jivo-branded SKUs; drop any non-Jivo rows
-    # (other brands accidentally included in a platform PO export).
+    # Primary PO tables only accept our own-brand SKUs (Jivo or Sano); drop any
+    # other-brand rows accidentally included in a platform PO export.
     skipped_non_jivo = 0
     defaulted_pending_status = 0
     if table in PRIMARY_PO_JIVO_ONLY_TABLES:
