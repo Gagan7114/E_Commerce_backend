@@ -3376,3 +3376,67 @@ class PoShortSupplyView(APIView):
             'count': len(results),
             'total_short_units': round(total_short_units, 4),
         })
+
+
+class SapInventoryView(APIView):
+    """Live SAP HANA finished-goods stock for the BH-FGM (Sonipat) warehouse,
+    surfaced inside the Shipment Planner. Read-only; queried live each request
+    from the JIVO_MART_HANADB schema (OITM × OITW × OWHS × OITB)."""
+    permission_classes = [IsAuthenticated]
+
+    WHS_CODE = 'BH-FGM'
+
+    def get(self, request):
+        # Imported lazily so the rest of the shipment app never hard-depends on
+        # the HANA driver (hdbcli) being installed.
+        from sap.service import select, resolve_schema
+
+        _source, schema = resolve_schema('mart')
+        sql = '''
+            SELECT
+                T0."ItemCode",
+                T0."ItemName",
+                T3."ItmsGrpNam"  AS "GroupName",
+                T0."SalUnitMsr"  AS "UOM",
+                T0."validFor"    AS "Active",
+                T0."LastPurPrc"  AS "LastPurchasePrice",
+                T1."WhsCode",
+                T2."WhsName",
+                T2."City",
+                T1."OnHand",
+                T1."IsCommited" AS "Committed",
+                T1."OnHand" - T1."IsCommited" AS "Available",
+                T1."OnOrder",
+                T1."MinStock",
+                T1."MaxStock",
+                T1."OnHand" * T0."LastPurPrc" AS "StockValue"
+            FROM OITM T0
+            INNER JOIN OITW T1 ON T1."ItemCode"   = T0."ItemCode"
+            LEFT  JOIN OWHS T2 ON T2."WhsCode"     = T1."WhsCode"
+            LEFT  JOIN OITB T3 ON T3."ItmsGrpCod"  = T0."ItmsGrpCod"
+            WHERE T1."WhsCode" = ?
+            ORDER BY T0."ItemName"
+        '''
+        try:
+            rows = select(sql, [self.WHS_CODE], schema=schema)
+        except Exception as e:  # HANA unreachable / VPN down / driver missing
+            return Response(
+                {'error': f'Could not reach SAP HANA: {e}', 'results': [], 'summary': {}},
+                status=502,
+            )
+
+        total_units = sum(float(r.get('OnHand') or 0) for r in rows)
+        total_value = sum(float(r.get('StockValue') or 0) for r in rows)
+        zero_stock = sum(1 for r in rows if float(r.get('OnHand') or 0) == 0)
+        return Response({
+            'warehouse': self.WHS_CODE,
+            'schema': schema,
+            'results': rows,
+            'count': len(rows),
+            'summary': {
+                'total_skus': len(rows),
+                'total_units_on_hand': round(total_units, 3),
+                'total_stock_value': round(total_value, 2),
+                'items_at_zero_stock': zero_stock,
+            },
+        })
