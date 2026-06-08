@@ -1780,6 +1780,42 @@ class AppointmentItemsView(APIView):
         # If load is still thin, suggest a smaller truck size
         truck_suggestion = _suggest_smaller_truck(planned_liters, capacity, truck_size)
 
+        # Multi-truck: how many trucks the appointment's OWN available-stock demand
+        # needs (ignores DOH fillers — those only top off truck 1). Walks the
+        # stock-capped demand in priority order, filling trucks of `capacity`;
+        # an item's liters may split across trucks. Purely informational here.
+        trucks_breakdown = []
+        if capacity > 0:
+            t_units = 0.0
+            t_liters = 0.0
+            remaining_cap = float(capacity)
+            for it in items:  # already priority-sorted
+                pl = float(it.get('per_liter') or 0)
+                units = float(it.get('accepted_qty') or 0)
+                sc = it.get('stock_cap')
+                if sc is not None:
+                    units = min(units, max(0.0, float(sc)))
+                if units <= 0:
+                    continue
+                if pl <= 0:
+                    t_units += units  # zero-volume rides any truck free
+                    continue
+                liters = units * pl
+                while liters > 1e-6:
+                    if remaining_cap <= 1e-6:
+                        trucks_breakdown.append({'liters': round(t_liters, 1), 'units': int(round(t_units))})
+                        t_units = 0.0
+                        t_liters = 0.0
+                        remaining_cap = float(capacity)
+                    take = min(liters, remaining_cap)
+                    t_liters += take
+                    t_units += take / pl
+                    remaining_cap -= take
+                    liters -= take
+            if t_liters > 1e-6 or t_units > 0:
+                trucks_breakdown.append({'liters': round(t_liters, 1), 'units': int(round(t_units))})
+        trucks_needed = max(1, len(trucks_breakdown))
+
         # Multi-appointment: compute the majority by loaded liters so the
         # saved shipment can store the right primary appointment_id, and
         # build per-appointment counts so the UI can show "appt A 3500L,
@@ -1835,6 +1871,8 @@ class AppointmentItemsView(APIView):
                 'load_percentage': load_pct,
             },
             'truck_suggestion': truck_suggestion,
+            'trucks_needed': trucks_needed,
+            'trucks_breakdown': trucks_breakdown,
         })
 
 
