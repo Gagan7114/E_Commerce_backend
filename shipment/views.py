@@ -3428,9 +3428,8 @@ class SapInventoryView(APIView):
             )
 
         # Enrich each item from public.master_sheet, keyed by SAP item code
-        # (master_sheet.sku_sap_code = SAP "ItemCode"). One SAP item maps to many
-        # channel rows; per_unit is identical across them, format_sku_code differs
-        # per channel — prefer the Amazon listing (this is the Amazon planner).
+        # (master_sheet.sku_sap_code = SAP "ItemCode"). Only the AMAZON listing is
+        # used — this is the Amazon planner; items with no Amazon row map to nothing.
         codes = list({(r.get('ItemCode') or '').strip().upper() for r in rows if r.get('ItemCode')})
         master = {}
         if codes:
@@ -3438,16 +3437,16 @@ class SapInventoryView(APIView):
                 cur.execute("""
                     SELECT UPPER(TRIM(sku_sap_code)) AS code,
                            MAX(per_unit) AS per_unit,
-                           MAX(format_sku_code) FILTER (WHERE UPPER(format) = 'AMAZON') AS amazon_code,
-                           MAX(format_sku_code) AS any_code
+                           MAX(format_sku_code) AS format_sku_code
                     FROM public.master_sheet
-                    WHERE UPPER(TRIM(sku_sap_code)) = ANY(%s)
+                    WHERE UPPER(format) = 'AMAZON'
+                      AND UPPER(TRIM(sku_sap_code)) = ANY(%s)
                     GROUP BY UPPER(TRIM(sku_sap_code))
                 """, [codes])
-                for code, per_unit, amazon_code, any_code in cur.fetchall():
+                for code, per_unit, fmt_code in cur.fetchall():
                     master[code] = {
                         'per_unit': per_unit,
-                        'format_sku_code': amazon_code or any_code,
+                        'format_sku_code': fmt_code,
                     }
         for r in rows:
             m = master.get((r.get('ItemCode') or '').strip().upper()) or {}
