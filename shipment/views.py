@@ -3376,3 +3376,96 @@ class PoShortSupplyView(APIView):
             'count': len(results),
             'total_short_units': round(total_short_units, 4),
         })
+
+
+class SapInventoryView(APIView):
+    """Live SAP HANA finished-goods stock for the BH-FGM (Sonipat) warehouse,
+    surfaced inside the Shipment Planner. Read-only; queried live each request
+    from the JIVO_MART_HANADB schema (OITM × OITW × OWHS × OITB)."""
+    permission_classes = [IsAuthenticated]
+
+    WHS_CODE = 'BH-FGM'
+
+    def get(self, request):
+        # Imported lazily so the rest of the shipment app never hard-depends on
+        # the HANA driver (hdbcli) being installed.
+        from sap.service import select, resolve_schema
+
+        _source, schema = resolve_schema('mart')
+        sql = '''
+            SELECT
+                T0."ItemCode",
+                T0."ItemName",
+                T3."ItmsGrpNam"  AS "GroupName",
+                T0."SalUnitMsr"  AS "UOM",
+                T0."validFor"    AS "Active",
+                T0."LastPurPrc"  AS "LastPurchasePrice",
+                T1."WhsCode",
+                T2."WhsName",
+                T2."City",
+                T1."OnHand",
+                T1."IsCommited" AS "Committed",
+                T1."OnHand" - T1."IsCommited" AS "Available",
+                T1."OnOrder",
+                T1."MinStock",
+                T1."MaxStock",
+                T1."OnHand" * T0."LastPurPrc" AS "StockValue"
+            FROM OITM T0
+            INNER JOIN OITW T1 ON T1."ItemCode"   = T0."ItemCode"
+            LEFT  JOIN OWHS T2 ON T2."WhsCode"     = T1."WhsCode"
+            LEFT  JOIN OITB T3 ON T3."ItmsGrpCod"  = T0."ItmsGrpCod"
+            WHERE T1."WhsCode" = ?
+              AND T0."validFor" = 'Y'
+              AND T3."ItmsGrpNam" = 'FINISHED'
+            ORDER BY T0."ItemName"
+        '''
+        try:
+            rows = select(sql, [self.WHS_CODE], schema=schema)
+        except Exception as e:  # HANA unreachable / VPN down / driver missing
+            return Response(
+                {'error': f'Could not reach SAP HANA: {e}', 'results': [], 'summary': {}},
+                status=502,
+            )
+
+        # Enrich each item from public.master_sheet, keyed by SAP item code
+        # (master_sheet.sku_sap_code = SAP "ItemCode"). One SAP item maps to many
+        # channel rows; per_unit is identical across them, format_sku_code differs
+        # per channel — prefer the Amazon listing (this is the Amazon planner).
+        codes = list({(r.get('ItemCode') or '').strip().upper() for r in rows if r.get('ItemCode')})
+        master = {}
+        if codes:
+            with connection.cursor() as cur:
+                cur.execute("""
+                    SELECT UPPER(TRIM(sku_sap_code)) AS code,
+                           MAX(per_unit) AS per_unit,
+                           MAX(format_sku_code) FILTER (WHERE UPPER(format) = 'AMAZON') AS amazon_code,
+                           MAX(format_sku_code) AS any_code
+                    FROM public.master_sheet
+                    WHERE UPPER(TRIM(sku_sap_code)) = ANY(%s)
+                    GROUP BY UPPER(TRIM(sku_sap_code))
+                """, [codes])
+                for code, per_unit, amazon_code, any_code in cur.fetchall():
+                    master[code] = {
+                        'per_unit': per_unit,
+                        'format_sku_code': amazon_code or any_code,
+                    }
+        for r in rows:
+            m = master.get((r.get('ItemCode') or '').strip().upper()) or {}
+            r['per_unit'] = m.get('per_unit')
+            r['format_sku_code'] = m.get('format_sku_code')
+
+        total_units = sum(float(r.get('OnHand') or 0) for r in rows)
+        total_value = sum(float(r.get('StockValue') or 0) for r in rows)
+        zero_stock = sum(1 for r in rows if float(r.get('OnHand') or 0) == 0)
+        return Response({
+            'warehouse': self.WHS_CODE,
+            'schema': schema,
+            'results': rows,
+            'count': len(rows),
+            'summary': {
+                'total_skus': len(rows),
+                'total_units_on_hand': round(total_units, 3),
+                'total_stock_value': round(total_value, 2),
+                'items_at_zero_stock': zero_stock,
+            },
+        })
