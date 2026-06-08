@@ -3415,6 +3415,8 @@ class SapInventoryView(APIView):
             LEFT  JOIN OWHS T2 ON T2."WhsCode"     = T1."WhsCode"
             LEFT  JOIN OITB T3 ON T3."ItmsGrpCod"  = T0."ItmsGrpCod"
             WHERE T1."WhsCode" = ?
+              AND T0."validFor" = 'Y'
+              AND T3."ItmsGrpNam" = 'FINISHED'
             ORDER BY T0."ItemName"
         '''
         try:
