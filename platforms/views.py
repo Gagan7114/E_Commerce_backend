@@ -1596,6 +1596,7 @@ def pendency_dashboard(request, slug: str):
         {pending_ltrs_expr} AS pending_ltrs,
         COALESCE(SUM("order_qty"), 0) AS open_units,
         COALESCE(SUM("total_order_liters"), 0) AS open_ltrs,
+        COALESCE(SUM("total_order_amt_exclusive"), 0) AS order_value,
         COUNT(DISTINCT "po_number") AS open_pos
     '''
     order_clause = "ORDER BY pending_ltrs DESC, pending_units DESC"
@@ -2145,7 +2146,10 @@ def _primary_dashboard_payload(
             COALESCE(a.done_qty, 0) AS done_qty,
             COALESCE(a.pending_value, 0) AS pending_value,
             COALESCE(a.pending_ltrs, 0) AS pending_ltrs,
-            COALESCE(a.pending_qty, 0) AS pending_qty
+            COALESCE(a.pending_qty, 0) AS pending_qty,
+            COALESCE(a.order_value, 0) AS order_value,
+            COALESCE(a.order_ltrs, 0) AS order_ltrs,
+            COALESCE(a.order_qty, 0) AS order_qty
         FROM trend_days d
         LEFT JOIN agg a ON a.period = d.period
         ORDER BY d.period
@@ -3816,13 +3820,15 @@ def flipkart_ads_dashboard(request, slug: str):
 #     "summary": {"total_brand_fund": <number>},
 #     "item_rows":        [{dimension, total}, ...],   # grouped by `item`
 #     "subcategory_rows": [{dimension, total}, ...],   # grouped by `sub_category`
+#     "trend_axes": {"spend": {label, format}},        # single-line chart axis
+#     "trend_rows": [{date, spend}, ...],              # brand fund spent per day
 #     "max_date": <iso date>,
 #     "filter_options": {years, months, dates},
 #     "filters": {year, month, date},
 #   }
 
 def _brandfund_dashboard_payload(*, source: str, title: str, request) -> dict:
-    where_sql, params, _trend_where, _trend_params, filters = _ads_build_where(
+    where_sql, params, trend_where_sql, trend_params, filters = _ads_build_where(
         request, allow_date=True,
     )
 
@@ -3860,6 +3866,26 @@ def _brandfund_dashboard_payload(*, source: str, title: str, request) -> dict:
     item_rows = _grouped("item")
     subcategory_rows = _grouped("sub_category")
 
+    # 2b) Day-by-day trend — total brand fund spent per date (single line).
+    #     Mirrors the ADS dashboards: the date filter acts as an inclusive UPPER
+    #     BOUND (up-to-that-date) via `trend_where_sql`, so picking a date shows
+    #     the series up to that day instead of collapsing it to a single point.
+    #     Year / month filters still apply.
+    trend_rows = _dict_rows(
+        f"""
+        SELECT date,
+               COALESCE(SUM(brand_fund_spent), 0) AS spend
+        FROM {source}
+        {trend_where_sql}
+        GROUP BY date
+        ORDER BY date
+        """,
+        trend_params,
+    )
+    for r in trend_rows:
+        if hasattr(r.get("date"), "isoformat"):
+            r["date"] = r["date"].isoformat()
+
     # 3) Filter options — global (ignore current filters so dropdowns always
     #    show every available choice).
     years = [
@@ -3896,6 +3922,8 @@ def _brandfund_dashboard_payload(*, source: str, title: str, request) -> dict:
         "summary": summary,
         "item_rows": item_rows,
         "subcategory_rows": subcategory_rows,
+        "trend_axes": {"spend": {"label": "Brand Fund Spent", "format": "inr"}},
+        "trend_rows": trend_rows,
         "max_date": max_date,
         "filter_options": {"years": years, "months": months, "dates": dates},
         "filters": filters,
