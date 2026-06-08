@@ -3427,6 +3427,33 @@ class SapInventoryView(APIView):
                 status=502,
             )
 
+        # Enrich each item from public.master_sheet, keyed by SAP item code
+        # (master_sheet.sku_sap_code = SAP "ItemCode"). One SAP item maps to many
+        # channel rows; per_unit is identical across them, format_sku_code differs
+        # per channel — prefer the Amazon listing (this is the Amazon planner).
+        codes = list({(r.get('ItemCode') or '').strip().upper() for r in rows if r.get('ItemCode')})
+        master = {}
+        if codes:
+            with connection.cursor() as cur:
+                cur.execute("""
+                    SELECT UPPER(TRIM(sku_sap_code)) AS code,
+                           MAX(per_unit) AS per_unit,
+                           MAX(format_sku_code) FILTER (WHERE UPPER(format) = 'AMAZON') AS amazon_code,
+                           MAX(format_sku_code) AS any_code
+                    FROM public.master_sheet
+                    WHERE UPPER(TRIM(sku_sap_code)) = ANY(%s)
+                    GROUP BY UPPER(TRIM(sku_sap_code))
+                """, [codes])
+                for code, per_unit, amazon_code, any_code in cur.fetchall():
+                    master[code] = {
+                        'per_unit': per_unit,
+                        'format_sku_code': amazon_code or any_code,
+                    }
+        for r in rows:
+            m = master.get((r.get('ItemCode') or '').strip().upper()) or {}
+            r['per_unit'] = m.get('per_unit')
+            r['format_sku_code'] = m.get('format_sku_code')
+
         total_units = sum(float(r.get('OnHand') or 0) for r in rows)
         total_value = sum(float(r.get('StockValue') or 0) for r in rows)
         zero_stock = sum(1 for r in rows if float(r.get('OnHand') or 0) == 0)
