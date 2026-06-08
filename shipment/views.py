@@ -730,34 +730,35 @@ def _enforce_commit_caps(loaded, not_loaded, commit_caps, key_field='appointment
 
 
 # ── Live BH-FGM warehouse stock, bridged to Amazon ASINs ─────────────────────
-_STOCK_CACHE = {'at': 0.0, 'map': {}}
+_STOCK_CACHE = {'at': 0.0, 'detail': {}}
 _STOCK_TTL = 60  # seconds — avoids hitting HANA on every plan / 30s auto-refresh
 
 
-def _bh_fgm_stock_map():
-    """ASIN (upper) → live OnHand units at the BH-FGM (Sonipat) warehouse.
+def _bh_fgm_stock_detail():
+    """ASIN (upper) → {'onhand': units in BH-FGM now, 'onorder': units inbound}.
 
     Bridge: master_sheet (Amazon listing) maps format_sku_code (ASIN) →
-    sku_sap_code; SAP OITW gives OnHand per SAP code at BH-FGM. SAP pieces are
-    the same unit as Amazon sellable units (verified). Cached ~60s. Returns the
-    last good map (or {}) if HANA is unreachable so planning never breaks.
+    sku_sap_code; SAP OITW gives OnHand / OnOrder per SAP code at BH-FGM. SAP
+    pieces are the same unit as Amazon sellable units (verified). Cached ~60s.
+    Returns the last good map (or {}) if HANA is unreachable so planning never
+    breaks.
     """
     now = time.time()
-    if _STOCK_CACHE['map'] and (now - _STOCK_CACHE['at'] < _STOCK_TTL):
-        return _STOCK_CACHE['map']
+    if _STOCK_CACHE['detail'] and (now - _STOCK_CACHE['at'] < _STOCK_TTL):
+        return _STOCK_CACHE['detail']
     try:
         from sap.service import select, resolve_schema
         _src, schema = resolve_schema('mart')
         oh_rows = select(
-            'SELECT "ItemCode", "OnHand" FROM OITW WHERE "WhsCode" = ?',
+            'SELECT "ItemCode", "OnHand", "OnOrder" FROM OITW WHERE "WhsCode" = ?',
             ['BH-FGM'], schema=schema,
         )
-        onhand = {
-            str(r['ItemCode']).strip().upper(): float(r['OnHand'] or 0)
+        sap_stock = {
+            str(r['ItemCode']).strip().upper(): (float(r['OnHand'] or 0), float(r['OnOrder'] or 0))
             for r in oh_rows
         }
     except Exception:
-        return _STOCK_CACHE['map'] or {}
+        return _STOCK_CACHE['detail'] or {}
 
     asin_map = {}
     with connection.cursor() as cur:
@@ -770,41 +771,67 @@ def _bh_fgm_stock_map():
               AND sku_sap_code   IS NOT NULL
         """)
         for asin, sap in cur.fetchall():
-            oh = onhand.get(sap)
-            if oh is not None:
-                # If two SAP codes map to one ASIN, keep the larger stock.
-                asin_map[asin] = max(asin_map.get(asin, 0.0), oh)
+            s = sap_stock.get(sap)
+            if s is not None:
+                cur_d = asin_map.get(asin)
+                # If two SAP codes map to one ASIN, keep the larger on-hand.
+                if cur_d is None or s[0] > cur_d['onhand']:
+                    asin_map[asin] = {'onhand': s[0], 'onorder': s[1]}
 
     _STOCK_CACHE['at'] = now
-    _STOCK_CACHE['map'] = asin_map
+    _STOCK_CACHE['detail'] = asin_map
     return asin_map
 
 
-def _apply_stock_caps(items, stock_total, stock_remaining, respect):
-    """Tag each item with `sap_stock` (BH-FGM OnHand for its ASIN). When
-    ``respect`` is True, set ``stock_cap`` = units still available for that ASIN
-    so the packer plans no more than that. ``accepted_qty`` (the ordered amount)
-    is left untouched, so Ordered/Short still read correctly. Stock is consumed
-    in the order items appear (priority order) so one ASIN across rows shares one
-    pool. Unmapped ASINs (no stock data) are never capped. Mutates ``items``.
+def _reserved_stock_by_asin():
+    """ASIN (upper) → units already reserved by ACTIVE shipments not yet
+    dispatched (draft / pending_approval / approved). Those units are spoken for,
+    so a new plan shouldn't claim them again. Dispatched/delivered shipments have
+    physically left the warehouse and are assumed reflected in SAP OnHand."""
+    reserved = {}
+    with connection.cursor() as cur:
+        cur.execute("""
+            SELECT UPPER(TRIM(si.asin)) AS asin, SUM(COALESCE(si.planned_qty, 0)) AS qty
+            FROM sp_items si
+            JOIN sp_shipments s ON s.id = si.shipment_id
+            WHERE si.not_loaded = FALSE
+              AND si.asin IS NOT NULL
+              AND s.status IN ('draft', 'pending_approval', 'approved')
+            GROUP BY UPPER(TRIM(si.asin))
+        """)
+        for asin, qty in cur.fetchall():
+            reserved[asin] = float(qty or 0)
+    return reserved
+
+
+def _apply_stock_caps(items, avail_total, avail_remaining, respect, detail, reserved):
+    """Tag each item with live stock figures (on-hand, reserved-elsewhere,
+    available, incoming on-order). When ``respect``, set ``stock_cap`` = units
+    still AVAILABLE (on-hand − reserved) for that ASIN so the packer plans no
+    more than that. ``accepted_qty`` is left untouched so Ordered/Short stay
+    correct. Stock is consumed in item order (priority) so one ASIN across rows
+    shares one pool. Unmapped ASINs are never capped. Mutates ``items``.
     """
     for it in items:
         asin = str(it.get('asin') or '').strip().upper()
-        total = stock_total.get(asin)
-        it['sap_stock'] = total  # None if unmapped → UI shows "—"
-        if not respect or total is None:
+        d = detail.get(asin)
+        it['sap_stock'] = d['onhand'] if d else None          # physical on hand
+        it['sap_on_order'] = d['onorder'] if d else None       # inbound
+        it['sap_reserved'] = (reserved.get(asin, 0.0) if d else None)
+        it['sap_available'] = (avail_total.get(asin) if d else None)  # on-hand − reserved
+        if not respect or d is None:
             continue
-        avail = stock_remaining.get(asin, 0.0)
+        avail = avail_remaining.get(asin, 0.0)
         orderable = float(it.get('accepted_qty') or 0)
         it['stock_cap'] = avail
         # Reserve what this row could ship so later rows of the same ASIN see less.
-        stock_remaining[asin] = max(0.0, avail - min(orderable, max(0.0, avail)))
+        avail_remaining[asin] = max(0.0, avail - min(orderable, max(0.0, avail)))
         if avail < orderable - 1e-6:
             it['stock_limited'] = True
             short = int(round(orderable - max(0.0, avail)))
             it['stock_unfit'] = (
-                'Out of stock at BH-FGM (0 available).' if avail <= 0
-                else f'Limited to {int(round(avail))} by BH-FGM stock ({short} short).'
+                'No free stock at BH-FGM (0 available).' if avail <= 0
+                else f'Limited to {int(round(avail))} available at BH-FGM ({short} short).'
             )
 
 
@@ -1666,13 +1693,16 @@ class AppointmentItemsView(APIView):
             -(x.get('accepted_qty') or 0),
         ))
 
-        # Live warehouse stock: tag every item with its BH-FGM OnHand and (when
-        # respect_stock) cap the orderable qty to what's physically in stock,
-        # consumed in priority order. stock_remaining is shared with the DOH
+        # Live warehouse stock: tag every item with BH-FGM on-hand / reserved /
+        # available / incoming, and (when respect_stock) cap the orderable qty to
+        # what's AVAILABLE (on-hand − reserved by other active shipments),
+        # consumed in priority order. avail_remaining is shared with the DOH
         # fillers below so one ASIN's stock isn't double-counted.
-        stock_total = _bh_fgm_stock_map()
-        stock_remaining = dict(stock_total)
-        _apply_stock_caps(items, stock_total, stock_remaining, respect_stock)
+        stock_detail = _bh_fgm_stock_detail()
+        reserved = _reserved_stock_by_asin()
+        avail_total = {a: max(0.0, d['onhand'] - reserved.get(a, 0.0)) for a, d in stock_detail.items()}
+        avail_remaining = dict(avail_total)
+        _apply_stock_caps(items, avail_total, avail_remaining, respect_stock, stock_detail, reserved)
 
         # Appointment POs come FIRST and in full: pack the appointment's own POs
         # (highest priority_score first) straight into the truck, limited only by
@@ -1713,7 +1743,7 @@ class AppointmentItemsView(APIView):
                 })
                 doh_pool = _fetch_doh_filler_pool(primary_fc, appt_po_uppers, doh_by_asin)
                 # Cap fillers by the same live stock (shared remaining pool).
-                _apply_stock_caps(doh_pool, stock_total, stock_remaining, respect_stock)
+                _apply_stock_caps(doh_pool, avail_total, avail_remaining, respect_stock, stock_detail, reserved)
                 if doh_pool:
                     loaded, _doh_unfit = _filler_pass(
                         loaded, doh_pool, capacity,
@@ -2468,10 +2498,21 @@ class POListView(APIView):
             """, params + [page_size, offset])
             rows = _row_to_dict(cur, cur.fetchall())
 
-        # Tag each PO line with live BH-FGM stock (informational here — no cap).
-        stock = _bh_fgm_stock_map()
+        # Tag each PO line with live BH-FGM stock (informational here — no cap):
+        # on-hand, reserved by active shipments, available (on-hand − reserved),
+        # and inbound on-order.
+        stock_detail = _bh_fgm_stock_detail()
+        reserved = _reserved_stock_by_asin()
         for r in rows:
-            r['sap_stock'] = stock.get(str(r.get('asin') or '').strip().upper())
+            a = str(r.get('asin') or '').strip().upper()
+            d = stock_detail.get(a)
+            if d:
+                r['sap_stock'] = d['onhand']
+                r['sap_on_order'] = d['onorder']
+                r['sap_reserved'] = reserved.get(a, 0.0)
+                r['sap_available'] = max(0.0, d['onhand'] - reserved.get(a, 0.0))
+            else:
+                r['sap_stock'] = r['sap_on_order'] = r['sap_reserved'] = r['sap_available'] = None
 
         return Response({
             'results': [_serialize_row(r) for r in rows],
