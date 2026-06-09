@@ -3,6 +3,7 @@ from __future__ import annotations
 import hmac
 import json
 import math
+import time
 from datetime import date as _date, timedelta
 from decimal import Decimal
 
@@ -102,9 +103,14 @@ def _pack_into_capacity(items, capacity_lt):
     remaining = float(capacity_lt)
     loaded, not_loaded = [], []
     for item in items:
-        total_liters = float(item.get('total_accepted_liters') or 0)
         per_liter    = float(item.get('per_liter') or 0)
         accepted_qty = float(item.get('accepted_qty') or 0)
+        # Effective shippable units = ordered, capped by live stock when set.
+        # accepted_qty itself is never changed (Ordered/Short stay correct).
+        sc = item.get('stock_cap')
+        cap_units = accepted_qty if sc is None else min(accepted_qty, max(0.0, float(sc)))
+        total_liters = (round(cap_units * per_liter, 4) if sc is not None
+                        else float(item.get('total_accepted_liters') or 0))
 
         if accepted_qty == 0:
             item['planned_qty'] = 0
@@ -115,12 +121,20 @@ def _pack_into_capacity(items, capacity_lt):
             not_loaded.append(item)
             continue
 
+        if sc is not None and cap_units <= 0:
+            # No live stock for this SKU — can't ship it.
+            item['planned_qty'] = 0
+            item['planned_liters'] = 0
+            item['unfit_reason'] = item.get('stock_unfit') or 'Out of stock at BH-FGM.'
+            not_loaded.append(item)
+            continue
+
         if total_liters == 0:
             # Zero-volume items (e.g. no per-litre value in the master sheet)
             # normally can't be packed. Exception: OTHER-bucket items still ship
             # at full qty — they consume no truck capacity, so they always fit.
             if _item_head_bucket(item) == 'OTHER':
-                item['planned_qty'] = accepted_qty
+                item['planned_qty'] = cap_units
                 item['planned_liters'] = 0
                 loaded.append(item)
             else:
@@ -134,8 +148,8 @@ def _pack_into_capacity(items, capacity_lt):
             continue
 
         if total_liters <= remaining + 0.001:
-            # Full ordered qty fits — ship everything (cartons not counted).
-            item['planned_qty'] = accepted_qty
+            # All shippable (in-stock) units fit — ship them.
+            item['planned_qty'] = cap_units
             item['planned_liters'] = round(total_liters, 4)
             remaining -= total_liters
             loaded.append(item)
@@ -713,6 +727,112 @@ def _enforce_commit_caps(loaded, not_loaded, commit_caps, key_field='appointment
 
     new_loaded = [it for i, it in enumerate(loaded) if keep_flags[i]]
     return new_loaded, list(not_loaded) + extras
+
+
+# ── Live BH-FGM warehouse stock, bridged to Amazon ASINs ─────────────────────
+_STOCK_CACHE = {'at': 0.0, 'detail': {}}
+_STOCK_TTL = 60  # seconds — avoids hitting HANA on every plan / 30s auto-refresh
+
+
+def _bh_fgm_stock_detail():
+    """ASIN (upper) → {'onhand': units in BH-FGM now, 'onorder': units inbound}.
+
+    Bridge: master_sheet (Amazon listing) maps format_sku_code (ASIN) →
+    sku_sap_code; SAP OITW gives OnHand / OnOrder per SAP code at BH-FGM. SAP
+    pieces are the same unit as Amazon sellable units (verified). Cached ~60s.
+    Returns the last good map (or {}) if HANA is unreachable so planning never
+    breaks.
+    """
+    now = time.time()
+    if _STOCK_CACHE['detail'] and (now - _STOCK_CACHE['at'] < _STOCK_TTL):
+        return _STOCK_CACHE['detail']
+    try:
+        from sap.service import select, resolve_schema
+        _src, schema = resolve_schema('mart')
+        oh_rows = select(
+            'SELECT "ItemCode", "OnHand", "OnOrder" FROM OITW WHERE "WhsCode" = ?',
+            ['BH-FGM'], schema=schema,
+        )
+        sap_stock = {
+            str(r['ItemCode']).strip().upper(): (float(r['OnHand'] or 0), float(r['OnOrder'] or 0))
+            for r in oh_rows
+        }
+    except Exception:
+        return _STOCK_CACHE['detail'] or {}
+
+    asin_map = {}
+    with connection.cursor() as cur:
+        cur.execute("""
+            SELECT UPPER(TRIM(format_sku_code)) AS asin,
+                   UPPER(TRIM(sku_sap_code))    AS sap
+            FROM public.master_sheet
+            WHERE UPPER(format) = 'AMAZON'
+              AND format_sku_code IS NOT NULL
+              AND sku_sap_code   IS NOT NULL
+        """)
+        for asin, sap in cur.fetchall():
+            s = sap_stock.get(sap)
+            if s is not None:
+                cur_d = asin_map.get(asin)
+                # If two SAP codes map to one ASIN, keep the larger on-hand.
+                if cur_d is None or s[0] > cur_d['onhand']:
+                    asin_map[asin] = {'onhand': s[0], 'onorder': s[1]}
+
+    _STOCK_CACHE['at'] = now
+    _STOCK_CACHE['detail'] = asin_map
+    return asin_map
+
+
+def _reserved_stock_by_asin():
+    """ASIN (upper) → units already reserved by ACTIVE shipments not yet
+    dispatched (draft / pending_approval / approved). Those units are spoken for,
+    so a new plan shouldn't claim them again. Dispatched/delivered shipments have
+    physically left the warehouse and are assumed reflected in SAP OnHand."""
+    reserved = {}
+    with connection.cursor() as cur:
+        cur.execute("""
+            SELECT UPPER(TRIM(si.asin)) AS asin, SUM(COALESCE(si.planned_qty, 0)) AS qty
+            FROM sp_items si
+            JOIN sp_shipments s ON s.id = si.shipment_id
+            WHERE si.not_loaded = FALSE
+              AND si.asin IS NOT NULL
+              AND s.status IN ('draft', 'pending_approval', 'approved')
+            GROUP BY UPPER(TRIM(si.asin))
+        """)
+        for asin, qty in cur.fetchall():
+            reserved[asin] = float(qty or 0)
+    return reserved
+
+
+def _apply_stock_caps(items, avail_total, avail_remaining, respect, detail, reserved):
+    """Tag each item with live stock figures (on-hand, reserved-elsewhere,
+    available, incoming on-order). When ``respect``, set ``stock_cap`` = units
+    still AVAILABLE (on-hand − reserved) for that ASIN so the packer plans no
+    more than that. ``accepted_qty`` is left untouched so Ordered/Short stay
+    correct. Stock is consumed in item order (priority) so one ASIN across rows
+    shares one pool. Unmapped ASINs are never capped. Mutates ``items``.
+    """
+    for it in items:
+        asin = str(it.get('asin') or '').strip().upper()
+        d = detail.get(asin)
+        it['sap_stock'] = d['onhand'] if d else None          # physical on hand
+        it['sap_on_order'] = d['onorder'] if d else None       # inbound
+        it['sap_reserved'] = (reserved.get(asin, 0.0) if d else None)
+        it['sap_available'] = (avail_total.get(asin) if d else None)  # on-hand − reserved
+        if not respect or d is None:
+            continue
+        avail = avail_remaining.get(asin, 0.0)
+        orderable = float(it.get('accepted_qty') or 0)
+        it['stock_cap'] = avail
+        # Reserve what this row could ship so later rows of the same ASIN see less.
+        avail_remaining[asin] = max(0.0, avail - min(orderable, max(0.0, avail)))
+        if avail < orderable - 1e-6:
+            it['stock_limited'] = True
+            short = int(round(orderable - max(0.0, avail)))
+            it['stock_unfit'] = (
+                'No free stock at BH-FGM (0 available).' if avail <= 0
+                else f'Limited to {int(round(avail))} available at BH-FGM ({short} short).'
+            )
 
 
 def _fetch_doh_filler_pool(fc, exclude_po_uppers, doh_by_asin):
@@ -1302,6 +1422,11 @@ class AppointmentItemsView(APIView):
         fill_param = str(request.query_params.get('maximize_fill') or '1').lower()
         maximize_fill = fill_param in ('1', 'true', 'yes', 'on')
 
+        # Respect live BH-FGM warehouse stock (default ON): cap planned qty by
+        # what's physically available. Off = plan against PO qty only.
+        stock_param = str(request.query_params.get('respect_stock') or '1').lower()
+        respect_stock = stock_param in ('1', 'true', 'yes', 'on')
+
         # Multi-appointment support: the URL still carries one appointment_id
         # (the primary entry point) but the caller can pass additional IDs via
         # the `appointment_ids` query param (comma-separated). All appointments
@@ -1568,6 +1693,17 @@ class AppointmentItemsView(APIView):
             -(x.get('accepted_qty') or 0),
         ))
 
+        # Live warehouse stock: tag every item with BH-FGM on-hand / reserved /
+        # available / incoming, and (when respect_stock) cap the orderable qty to
+        # what's AVAILABLE (on-hand − reserved by other active shipments),
+        # consumed in priority order. avail_remaining is shared with the DOH
+        # fillers below so one ASIN's stock isn't double-counted.
+        stock_detail = _bh_fgm_stock_detail()
+        reserved = _reserved_stock_by_asin()
+        avail_total = {a: max(0.0, d['onhand'] - reserved.get(a, 0.0)) for a, d in stock_detail.items()}
+        avail_remaining = dict(avail_total)
+        _apply_stock_caps(items, avail_total, avail_remaining, respect_stock, stock_detail, reserved)
+
         # Appointment POs come FIRST and in full: pack the appointment's own POs
         # (highest priority_score first) straight into the truck, limited only by
         # physical capacity — the priority slider does NOT restrict or reduce the
@@ -1606,6 +1742,8 @@ class AppointmentItemsView(APIView):
                     if it.get('po_number')
                 })
                 doh_pool = _fetch_doh_filler_pool(primary_fc, appt_po_uppers, doh_by_asin)
+                # Cap fillers by the same live stock (shared remaining pool).
+                _apply_stock_caps(doh_pool, avail_total, avail_remaining, respect_stock, stock_detail, reserved)
                 if doh_pool:
                     loaded, _doh_unfit = _filler_pass(
                         loaded, doh_pool, capacity,
@@ -1629,8 +1767,54 @@ class AppointmentItemsView(APIView):
             planned_liters = round(sum(float(it.get('planned_liters') or 0) for it in loaded), 4)
             load_pct = round((planned_liters / capacity * 100) if capacity > 0 else 0, 2)
 
+        # Surface the stock reason: out-of-stock items get it as their not-loaded
+        # reason; partially-stocked items get it as their short reason.
+        if respect_stock:
+            for it in not_loaded:
+                if it.get('stock_unfit') and float(it.get('planned_qty') or 0) <= 0:
+                    it['unfit_reason'] = it['stock_unfit']
+            for it in loaded:
+                if it.get('stock_limited') and it.get('stock_unfit') and not it.get('short_reason'):
+                    it['short_reason'] = it['stock_unfit']
+
         # If load is still thin, suggest a smaller truck size
         truck_suggestion = _suggest_smaller_truck(planned_liters, capacity, truck_size)
+
+        # Multi-truck: how many trucks the appointment's OWN available-stock demand
+        # needs (ignores DOH fillers — those only top off truck 1). Walks the
+        # stock-capped demand in priority order, filling trucks of `capacity`;
+        # an item's liters may split across trucks. Purely informational here.
+        trucks_breakdown = []
+        if capacity > 0:
+            t_units = 0.0
+            t_liters = 0.0
+            remaining_cap = float(capacity)
+            for it in items:  # already priority-sorted
+                pl = float(it.get('per_liter') or 0)
+                units = float(it.get('accepted_qty') or 0)
+                sc = it.get('stock_cap')
+                if sc is not None:
+                    units = min(units, max(0.0, float(sc)))
+                if units <= 0:
+                    continue
+                if pl <= 0:
+                    t_units += units  # zero-volume rides any truck free
+                    continue
+                liters = units * pl
+                while liters > 1e-6:
+                    if remaining_cap <= 1e-6:
+                        trucks_breakdown.append({'liters': round(t_liters, 1), 'units': int(round(t_units))})
+                        t_units = 0.0
+                        t_liters = 0.0
+                        remaining_cap = float(capacity)
+                    take = min(liters, remaining_cap)
+                    t_liters += take
+                    t_units += take / pl
+                    remaining_cap -= take
+                    liters -= take
+            if t_liters > 1e-6 or t_units > 0:
+                trucks_breakdown.append({'liters': round(t_liters, 1), 'units': int(round(t_units))})
+        trucks_needed = max(1, len(trucks_breakdown))
 
         # Multi-appointment: compute the majority by loaded liters so the
         # saved shipment can store the right primary appointment_id, and
@@ -1687,6 +1871,8 @@ class AppointmentItemsView(APIView):
                 'load_percentage': load_pct,
             },
             'truck_suggestion': truck_suggestion,
+            'trucks_needed': trucks_needed,
+            'trucks_breakdown': trucks_breakdown,
         })
 
 
@@ -2349,6 +2535,22 @@ class POListView(APIView):
                 LIMIT %s OFFSET %s
             """, params + [page_size, offset])
             rows = _row_to_dict(cur, cur.fetchall())
+
+        # Tag each PO line with live BH-FGM stock (informational here — no cap):
+        # on-hand, reserved by active shipments, available (on-hand − reserved),
+        # and inbound on-order.
+        stock_detail = _bh_fgm_stock_detail()
+        reserved = _reserved_stock_by_asin()
+        for r in rows:
+            a = str(r.get('asin') or '').strip().upper()
+            d = stock_detail.get(a)
+            if d:
+                r['sap_stock'] = d['onhand']
+                r['sap_on_order'] = d['onorder']
+                r['sap_reserved'] = reserved.get(a, 0.0)
+                r['sap_available'] = max(0.0, d['onhand'] - reserved.get(a, 0.0))
+            else:
+                r['sap_stock'] = r['sap_on_order'] = r['sap_reserved'] = r['sap_available'] = None
 
         return Response({
             'results': [_serialize_row(r) for r in rows],
