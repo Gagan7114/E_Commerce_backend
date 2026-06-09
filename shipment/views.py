@@ -716,22 +716,43 @@ def _enforce_commit_caps(loaded, not_loaded, commit_caps, key_field='appointment
         c_units = pq / cp
 
         t = totals[gk]
+        label = 'PO' if key_field == 'po_number' else 'appointment'
         if t['u'] + pq <= cap_u and t['c'] + c_units <= cap_c:
             t['u'] += pq
             t['c'] += c_units
         else:
-            keep_flags[orig_idx] = False
-            removed = dict(it)
-            removed['planned_qty'] = 0
-            removed['planned_liters'] = 0
-            removed['not_loaded'] = True
-            label = 'PO' if key_field == 'po_number' else 'appointment'
-            removed['unfit_reason'] = (
-                f'Exceeds Vendor Central commit cap for this {label} '
-                f'(cap: {int(cap.get("units") or 0)} units / '
-                f'{int(cap.get("cartons") or 0)} cartons, +10% allowed).'
-            )
-            extras.append(removed)
+            # Item would breach the cap. Rather than dropping it whole, fill it
+            # PARTIALLY up to whatever headroom is left (units AND cartons) so
+            # the commit is respected exactly, and short-supply the remainder.
+            # (A partial of an item that already fit the truck can't overflow it.)
+            ru = max(0.0, cap_u - t['u'])                  # units headroom
+            rc_units = max(0.0, cap_c - t['c']) * cp        # carton headroom, in units
+            allow = int(min(pq, ru, rc_units))
+            if allow > 0:
+                per_liter = float(it.get('per_liter') or 0)
+                it['planned_qty'] = allow
+                it['planned_liters'] = round(allow * per_liter, 4)
+                it['short_reason'] = (
+                    f'Capped at Vendor Central commit for this {label} '
+                    f'(cap: {int(cap.get("units") or 0)} units / '
+                    f'{int(cap.get("cartons") or 0)} cartons, +10% allowed) — '
+                    f'rest short-supplied.'
+                )
+                t['u'] += allow
+                t['c'] += allow / cp
+                # keep_flags[orig_idx] stays True — item remains loaded (partial)
+            else:
+                keep_flags[orig_idx] = False
+                removed = dict(it)
+                removed['planned_qty'] = 0
+                removed['planned_liters'] = 0
+                removed['not_loaded'] = True
+                removed['unfit_reason'] = (
+                    f'Exceeds Vendor Central commit cap for this {label} '
+                    f'(cap: {int(cap.get("units") or 0)} units / '
+                    f'{int(cap.get("cartons") or 0)} cartons, +10% allowed).'
+                )
+                extras.append(removed)
 
     new_loaded = [it for i, it in enumerate(loaded) if keep_flags[i]]
     return new_loaded, list(not_loaded) + extras
