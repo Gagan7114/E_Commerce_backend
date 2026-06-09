@@ -5324,6 +5324,193 @@ def _top_ltr_items_from_table(
     )
 
 
+# Format-slug filter shared by every SecMaster-backed platform.
+_SECMASTER_FORMAT_WHERE = (
+    " AND REGEXP_REPLACE(LOWER(TRIM(\"format\"::text)), '[^a-z0-9]+', '', 'g') = %s"
+)
+
+_SEC_TREND_FIELDS = (
+    "order_value", "order_ltr", "order_units",
+    "shipped_value", "shipped_ltr", "shipped_units",
+    "return_value", "return_ltr", "return_units",
+)
+
+
+def _build_sec_keyed_trend(
+    *,
+    table,
+    date_col,
+    month,
+    year,
+    max_date,
+    days_in_month,
+    value_expr,
+    ltr_expr,
+    qty_expr,
+    where_sql="",
+    where_params=None,
+    order_value_expr=None,
+    order_ltr_expr=None,
+    order_units_expr=None,
+    return_value_expr=None,
+    return_ltr_expr=None,
+    return_units_expr=None,
+):
+    """Per-item-head trend (day / month / year) keyed by {all, premium, commodity}.
+
+    Mirrors the Amazon-secondary `visual_dashboard.trend` shape so the dashboard's
+    All / Premium / Commodity toggle (and the Excel export) work for every
+    secondary platform. The whole platform's history is aggregated by date and
+    item head in SQL, then bucketed in Python: the Day view uses the selected
+    month, Month uses the selected year, Year spans every year present.
+
+    Platforms whose source has only delivered metrics pass just the shipped
+    expressions; Order/Return then come back as 0 and the chart hides those lines.
+    """
+    where_params = list(where_params or [])
+    has_order = order_value_expr is not None
+    has_return = return_value_expr is not None
+
+    def _z(expr):
+        return f"COALESCE(SUM({expr}), 0)"
+
+    cols = [
+        f"{date_col}::date AS d",
+        'UPPER(TRIM("item_head"::text)) AS item_head',
+        f"{_z(value_expr)} AS shipped_value",
+        f"{_z(ltr_expr)} AS shipped_ltr",
+        f"{_z(qty_expr)} AS shipped_units",
+    ]
+    if has_order:
+        cols += [
+            f"{_z(order_value_expr)} AS order_value",
+            f"{_z(order_ltr_expr or '0')} AS order_ltr",
+            f"{_z(order_units_expr or '0')} AS order_units",
+        ]
+    if has_return:
+        cols += [
+            f"{_z(return_value_expr)} AS return_value",
+            f"{_z(return_ltr_expr or '0')} AS return_ltr",
+            f"{_z(return_units_expr or '0')} AS return_units",
+        ]
+
+    rows = _dict_rows(
+        f"""
+        SELECT {", ".join(cols)}
+        FROM "{table}"
+        WHERE {date_col} IS NOT NULL{where_sql}
+        GROUP BY {date_col}::date, UPPER(TRIM("item_head"::text))
+        """,
+        where_params,
+    )
+
+    def _empty():
+        return {field: 0.0 for field in _SEC_TREND_FIELDS}
+
+    def _bundle(agg):
+        return {
+            "values": {
+                "order": agg["order_value"],
+                "deliver": agg["shipped_value"],
+                "return": agg["return_value"],
+            },
+            "ltrs": {
+                "order": agg["order_ltr"],
+                "deliver": agg["shipped_ltr"],
+                "return": agg["return_ltr"],
+            },
+            "quantity": {
+                "order": agg["order_units"],
+                "deliver": agg["shipped_units"],
+                "return": agg["return_units"],
+            },
+        }
+
+    def _matches(row_head, item_head):
+        if item_head == "all":
+            return True
+        return _norm_sec_key(row_head) == item_head.upper()
+
+    heads = ("all", "premium", "commodity")
+    dated = [row for row in rows if row.get("d")]
+    latest_month = max(
+        (row["d"].month for row in dated if row["d"].year == year),
+        default=month,
+    )
+    years_present = sorted({row["d"].year for row in dated}) or [year]
+    year_start, year_end = years_present[0], years_present[-1]
+
+    def _accumulate(predicate, item_head, key_fn):
+        buckets = {}
+        for row in dated:
+            if not predicate(row["d"]):
+                continue
+            if not _matches(row.get("item_head"), item_head):
+                continue
+            agg = buckets.setdefault(key_fn(row["d"]), _empty())
+            for field in _SEC_TREND_FIELDS:
+                agg[field] += _num(row.get(field))
+        return buckets
+
+    def day_series(item_head):
+        buckets = _accumulate(
+            lambda d: d.year == year and d.month == month,
+            item_head,
+            lambda d: d.day,
+        )
+        out = []
+        for day in range(1, days_in_month + 1):
+            current = date(year, month, day)
+            agg = (
+                buckets.get(day, _empty())
+                if (max_date and current <= max_date)
+                else _empty()
+            )
+            out.append({
+                "date": current.isoformat(),
+                "period": current.isoformat(),
+                "label": f"{day:02d}",
+                "day": day,
+                **_bundle(agg),
+            })
+        return out
+
+    def month_series(item_head):
+        buckets = _accumulate(
+            lambda d: d.year == year,
+            item_head,
+            lambda d: d.month,
+        )
+        out = []
+        for month_number in range(1, latest_month + 1):
+            month_period = date(year, month_number, 1)
+            out.append({
+                "period": month_period.isoformat(),
+                "label": month_period.strftime("%b").upper(),
+                "month": month_number,
+                **_bundle(buckets.get(month_number, _empty())),
+            })
+        return out
+
+    def year_series(item_head):
+        buckets = _accumulate(lambda d: True, item_head, lambda d: d.year)
+        out = []
+        for period_year in range(year_start, year_end + 1):
+            out.append({
+                "period": str(period_year),
+                "label": str(period_year),
+                "year": period_year,
+                **_bundle(buckets.get(period_year, _empty())),
+            })
+        return out
+
+    return {
+        "day": {head: day_series(head) for head in heads},
+        "month": {head: month_series(head) for head in heads},
+        "year": {head: year_series(head) for head in heads},
+    }
+
+
 @api_view(["GET"])
 @permission_classes([require("platform.secondary.view")])
 @cached_get(timeout=60, prefix="plat.fk_sec")
@@ -5444,8 +5631,21 @@ def flipkart_grocery_sec_dashboard(request, slug: str):
         date_params=date_params,
     )
 
+    sec_trend = _build_sec_keyed_trend(
+        table="flipkart_grocery_master",
+        date_col='"real_date"',
+        month=month,
+        year=year,
+        max_date=max_date,
+        days_in_month=monthrange(year, month)[1],
+        value_expr='"sale_amt_exclusive"',
+        ltr_expr='"ltr_sold"',
+        qty_expr='"qty"',
+    )
+
     return Response({
         "source": "flipkart_grocery_master",
+        "sec_trend": sec_trend,
         "detail_rows_fixed": True,
         "defaulted_to_latest": defaulted_to_latest,
         "month": month,
@@ -6418,10 +6618,31 @@ def _amazon_sec_dashboard_response(request):
         for item_head in ("all", "premium", "commodity")
     }
 
+    # Trend (day / month / year) is built per item-head — "all", "premium" and
+    # "commodity" — so the dashboard can filter the trend lines the same way the
+    # Top-SKU and sub-category charts already do. The "all" series sums every
+    # item head per period and reproduces the previous item-head-agnostic trend
+    # exactly. rows_for_item_head("all") returns every row; "premium"/"commodity"
+    # keep only matching item heads.
+    def _sum_trend_by_period(raw_rows, period_key, item_head):
+        by_period = {}
+        for row in rows_for_item_head(raw_rows, item_head):
+            key = row.get(period_key)
+            agg = by_period.get(key)
+            if agg is None:
+                agg = {field: 0.0 for field in metric_fields}
+                by_period[key] = agg
+            for field in metric_fields:
+                agg[field] += _num(row.get(field))
+        return by_period
+
+    _ITEM_HEAD_KEYS = ("all", "premium", "commodity")
+
     daily_raw = _dict_rows(
         """
         SELECT
             "to_date"::date AS sale_date,
+            UPPER(TRIM("item_head"::text)) AS item_head,
             COALESCE(SUM("ordered_revenue"), 0) AS order_value,
             COALESCE(SUM("ordered_litres"), 0) AS order_ltr,
             COALESCE(SUM("ordered_units"), 0) AS order_units,
@@ -6435,28 +6656,38 @@ def _amazon_sec_dashboard_response(request):
         WHERE UPPER(TRIM("month"::text)) = %s
           AND "year" = %s
           AND "to_date" IS NOT NULL
-        GROUP BY "to_date"::date
+        GROUP BY "to_date"::date, UPPER(TRIM("item_head"::text))
         ORDER BY "to_date"::date
         """,
         [month_name, year],
     )
-    daily_by_date = {row["sale_date"]: row for row in daily_raw}
-    trend_rows = []
-    for day in range(1, days_in_month + 1):
-        current_date = date(year, month, day)
-        row = daily_by_date.get(current_date, {}) if max_date and current_date <= max_date else {}
-        trend_rows.append({
-            "date": current_date.isoformat(),
-            "period": current_date.isoformat(),
-            "label": f"{day:02d}",
-            "day": day,
-            **visual_metric_bundle(row),
-        })
+
+    def build_daily_trend(item_head):
+        by_date = _sum_trend_by_period(daily_raw, "sale_date", item_head)
+        rows = []
+        for day in range(1, days_in_month + 1):
+            current_date = date(year, month, day)
+            row = (
+                by_date.get(current_date, {})
+                if max_date and current_date <= max_date
+                else {}
+            )
+            rows.append({
+                "date": current_date.isoformat(),
+                "period": current_date.isoformat(),
+                "label": f"{day:02d}",
+                "day": day,
+                **visual_metric_bundle(row),
+            })
+        return rows
+
+    trend_day = {ih: build_daily_trend(ih) for ih in _ITEM_HEAD_KEYS}
 
     monthly_raw = _dict_rows(
         """
         SELECT
             DATE_TRUNC('month', "to_date")::date AS period,
+            UPPER(TRIM("item_head"::text)) AS item_head,
             COALESCE(SUM("ordered_revenue"), 0) AS order_value,
             COALESCE(SUM("ordered_litres"), 0) AS order_ltr,
             COALESCE(SUM("ordered_units"), 0) AS order_units,
@@ -6469,28 +6700,35 @@ def _amazon_sec_dashboard_response(request):
         FROM "amazon_sec_daily_master_view"
         WHERE "to_date" IS NOT NULL
           AND EXTRACT(YEAR FROM "to_date")::integer = %s
-        GROUP BY DATE_TRUNC('month', "to_date")::date
+        GROUP BY DATE_TRUNC('month', "to_date")::date, UPPER(TRIM("item_head"::text))
         ORDER BY DATE_TRUNC('month', "to_date")::date
         """,
         [year],
     )
-    monthly_by_period = {row["period"]: row for row in monthly_raw}
-    latest_month_period = max(monthly_by_period.keys(), default=date(year, month, 1))
-    monthly_trend_rows = []
-    for month_number in range(1, latest_month_period.month + 1):
-        month_period = date(year, month_number, 1)
-        row = monthly_by_period.get(month_period, {})
-        monthly_trend_rows.append({
-            "period": month_period.isoformat(),
-            "label": month_period.strftime("%b").upper(),
-            "month": month_number,
-            **visual_metric_bundle(row),
-        })
+    monthly_periods = {row["period"] for row in monthly_raw if row.get("period")}
+    latest_month_period = max(monthly_periods, default=date(year, month, 1))
+
+    def build_monthly_trend(item_head):
+        by_period = _sum_trend_by_period(monthly_raw, "period", item_head)
+        rows = []
+        for month_number in range(1, latest_month_period.month + 1):
+            month_period = date(year, month_number, 1)
+            row = by_period.get(month_period, {})
+            rows.append({
+                "period": month_period.isoformat(),
+                "label": month_period.strftime("%b").upper(),
+                "month": month_number,
+                **visual_metric_bundle(row),
+            })
+        return rows
+
+    trend_month = {ih: build_monthly_trend(ih) for ih in _ITEM_HEAD_KEYS}
 
     yearly_raw = _dict_rows(
         """
         SELECT
             EXTRACT(YEAR FROM "to_date")::integer AS period_year,
+            UPPER(TRIM("item_head"::text)) AS item_head,
             COALESCE(SUM("ordered_revenue"), 0) AS order_value,
             COALESCE(SUM("ordered_litres"), 0) AS order_ltr,
             COALESCE(SUM("ordered_units"), 0) AS order_units,
@@ -6502,34 +6740,52 @@ def _amazon_sec_dashboard_response(request):
             COALESCE(SUM("return_units"), 0) AS return_units
         FROM "amazon_sec_daily_master_view"
         WHERE "to_date" IS NOT NULL
-        GROUP BY EXTRACT(YEAR FROM "to_date")::integer
+        GROUP BY EXTRACT(YEAR FROM "to_date")::integer, UPPER(TRIM("item_head"::text))
         ORDER BY EXTRACT(YEAR FROM "to_date")::integer
         """,
         [],
     )
-    yearly_by_period = {int(row["period_year"]): row for row in yearly_raw if row.get("period_year")}
-    if yearly_by_period:
-        year_start = min(yearly_by_period)
-        year_end = max(yearly_by_period)
+    yearly_years = {
+        int(row["period_year"]) for row in yearly_raw if row.get("period_year")
+    }
+    if yearly_years:
+        year_start = min(yearly_years)
+        year_end = max(yearly_years)
     else:
         year_start = year_end = year
-    yearly_trend_rows = []
-    for period_year in range(year_start, year_end + 1):
-        row = yearly_by_period.get(period_year, {})
-        yearly_trend_rows.append({
-            "period": str(period_year),
-            "label": str(period_year),
-            "year": period_year,
-            **visual_metric_bundle(row),
-        })
+
+    def build_yearly_trend(item_head):
+        by_year = {}
+        for row in rows_for_item_head(yearly_raw, item_head):
+            key = int(row["period_year"]) if row.get("period_year") else None
+            if key is None:
+                continue
+            agg = by_year.get(key)
+            if agg is None:
+                agg = {field: 0.0 for field in metric_fields}
+                by_year[key] = agg
+            for field in metric_fields:
+                agg[field] += _num(row.get(field))
+        rows = []
+        for period_year in range(year_start, year_end + 1):
+            row = by_year.get(period_year, {})
+            rows.append({
+                "period": str(period_year),
+                "label": str(period_year),
+                "year": period_year,
+                **visual_metric_bundle(row),
+            })
+        return rows
+
+    trend_year = {ih: build_yearly_trend(ih) for ih in _ITEM_HEAD_KEYS}
 
     visual_dashboard = {
         "show_by_options": ["values", "ltrs", "quantity"],
         "cards": visual_metric_bundle(visual_total),
         "trend": {
-            "day": trend_rows,
-            "month": monthly_trend_rows,
-            "year": yearly_trend_rows,
+            "day": trend_day,
+            "month": trend_month,
+            "year": trend_year,
         },
         "item_head_split": item_head_split,
         "top_10_sku": top_10_sku,
@@ -6871,9 +7127,24 @@ def _bigbasket_sec_dashboard_response(request):
         date_params,
     )
 
+    sec_trend = _build_sec_keyed_trend(
+        table="SecMaster",
+        date_col='"date"',
+        month=month,
+        year=year,
+        max_date=max_date,
+        days_in_month=days_in_month,
+        value_expr='"sales_amt_exc"',
+        ltr_expr='"ltr_sold"',
+        qty_expr='"quantity"',
+        where_sql=_SECMASTER_FORMAT_WHERE,
+        where_params=["bigbasket"],
+    )
+
     return Response({
         "source": "SecMaster",
         "format": "BIG BASKET",
+        "sec_trend": sec_trend,
         "detail_rows_fixed": True,
         "defaulted_to_latest": defaulted_to_latest,
         "month": month,
@@ -7056,9 +7327,30 @@ def _flipkart_sec_dashboard_response(request):
         date_params=date_params,
     )
 
+    # Flipkart's source carries Order + Deliver + Return, so all three trend
+    # lines are populated (unlike the SecMaster / grocery platforms).
+    sec_trend = _build_sec_keyed_trend(
+        table="flipkart_secondary_all",
+        date_col='"Order Date"',
+        month=month,
+        year=year,
+        max_date=max_date,
+        days_in_month=days_in_month,
+        value_expr='"Final Sale Amount"',
+        ltr_expr='"ltr_sold"',
+        qty_expr='"Final Sale Units"',
+        order_value_expr='"GMV"',
+        order_ltr_expr='"ltr_ordered"',
+        order_units_expr='0',
+        return_value_expr='"Return Amount"',
+        return_ltr_expr='"return_ltr"',
+        return_units_expr='"Return Units"',
+    )
+
     return Response({
         "source": "flipkart_secondary_all",
         "format": "FLIPKART",
+        "sec_trend": sec_trend,
         "detail_rows_fixed": True,
         "defaulted_to_latest": defaulted_to_latest,
         "month": month,
@@ -7434,9 +7726,24 @@ def _blinkit_sec_dashboard_response(request):
     monthly_trend = []
     yearly_trend = []
 
+    sec_trend = _build_sec_keyed_trend(
+        table="SecMaster",
+        date_col='"date"',
+        month=month,
+        year=year,
+        max_date=max_date,
+        days_in_month=days_in_month,
+        value_expr='"sales_amt_exc"',
+        ltr_expr='"ltr_sold"',
+        qty_expr='"quantity"',
+        where_sql=_SECMASTER_FORMAT_WHERE,
+        where_params=["blinkit"],
+    )
+
     payload = {
         "source": "SecMaster",
         "format": "BLINKIT",
+        "sec_trend": sec_trend,
         "detail_rows_fixed": True,
         "defaulted_to_latest": defaulted_to_latest,
         "month": month,
@@ -7852,9 +8159,24 @@ def _zepto_sec_dashboard_response(request):
         date_params,
     )
 
+    sec_trend = _build_sec_keyed_trend(
+        table="SecMaster",
+        date_col='"date"',
+        month=month,
+        year=year,
+        max_date=max_date,
+        days_in_month=days_in_month,
+        value_expr='"sales_amt_exc"',
+        ltr_expr='"ltr_sold"',
+        qty_expr='"quantity"',
+        where_sql=_SECMASTER_FORMAT_WHERE,
+        where_params=["zepto"],
+    )
+
     return Response({
         "source": "SecMaster",
         "format": "ZEPTO",
+        "sec_trend": sec_trend,
         "detail_rows_fixed": True,
         "defaulted_to_latest": defaulted_to_latest,
         "month": month,
