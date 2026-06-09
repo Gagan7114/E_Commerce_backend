@@ -896,6 +896,7 @@ def _fetch_doh_filler_pool(fc, exclude_po_uppers, doh_by_asin):
                 p.accepted_qty,
                 p.case_pack,
                 p.per_liter,
+                p.cost_price,
                 p.total_accepted_liters,
                 p.days_to_expiry,
                 p.expiry_date,
@@ -1616,6 +1617,7 @@ class AppointmentItemsView(APIView):
                     COALESCE(c.committed_qty, 0) AS committed_qty,
                     p.case_pack,
                     p.per_liter,
+                    p.cost_price,
                     -- Liters for the leftover so the packer fills against remaining.
                     round((p.accepted_qty - COALESCE(c.committed_qty, 0)) * COALESCE(p.per_liter, 0), 4) AS total_accepted_liters,
                     p.days_to_expiry,
