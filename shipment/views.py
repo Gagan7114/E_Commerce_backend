@@ -664,7 +664,9 @@ def _enforce_commit_caps(loaded, not_loaded, commit_caps, key_field='appointment
     ``commit_caps`` is ``{group_key: {'units': N, 'cartons': N}}``. Items are
     grouped by ``key_field`` (default ``appointment_id`` for auto; ``po_number``
     for manual). For ``po_number`` the comparison is uppercase-trimmed. Zero
-    caps mean "no cap" for that field. DOH fillers bypass the cap entirely.
+    caps mean "no cap" for that field. DOH fillers (which have no appointment of
+    their own) are counted toward the single appointment's cap, so the truck
+    total — fillers included — respects the Vendor Central commit ×1.1.
     """
     if not commit_caps:
         return loaded, not_loaded
@@ -691,13 +693,19 @@ def _enforce_commit_caps(loaded, not_loaded, commit_caps, key_field='appointment
     totals = {k: {'u': 0.0, 'c': 0.0} for k in norm_caps}
     keep_flags = [True] * len(loaded)
     extras = []
+    # DOH fillers have no appointment of their own; with exactly one cap they're
+    # attributed to it so the truck total (fillers included) respects the commit.
+    # The sort above keeps appointment items first and drops fillers first when
+    # the cap is reached. With multiple caps we can't attribute, so they pass.
+    single_cap_key = next(iter(norm_caps)) if len(norm_caps) == 1 else None
 
     for orig_idx, it in indexed:
-        if it.get('_doh_filler'):
-            continue
         gk = _key(it)
         if gk not in norm_caps:
-            continue
+            if it.get('_doh_filler') and single_cap_key is not None:
+                gk = single_cap_key
+            else:
+                continue
         cap = norm_caps[gk] or {}
         # Allow up to 10% over the Vendor Central commit (units AND cartons).
         cap_u = (float(cap.get('units') or 0) * CAP_TOLERANCE) or float('inf')
