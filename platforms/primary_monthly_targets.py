@@ -210,7 +210,9 @@ def _read_master_po(fmt: str, item_head: str, month: int, year: int) -> dict:
     sql = """
         SELECT
             COALESCE(SUM(COALESCE("total_delivered_liters", 0)), 0) AS done_ltrs,
-            MAX("delivery_date")                                    AS latest_date
+            -- Latest delivery date, ignoring future-dated POs (scheduled but not
+            -- yet "today"); matches the Primary Dashboard's max date.
+            MAX("delivery_date") FILTER (WHERE "delivery_date" <= CURRENT_DATE) AS latest_date
         FROM "master_po"
         WHERE LOWER(TRIM("format"::text))         = LOWER(TRIM(%s))
           AND UPPER(TRIM("item_head"::text))      = UPPER(TRIM(%s))
@@ -224,6 +226,23 @@ def _read_master_po(fmt: str, item_head: str, month: int, year: int) -> dict:
         "done_ltrs": Decimal(row[0] or 0),
         "latest_date": row[1],
     }
+
+
+def _read_amazon_primary_max_date(month: int, year: int) -> date | None:
+    """Latest Amazon PRIMARY (Amazon PO) order date for the month, capped at today
+    — mirrors the Amazon Primary Dashboard's max date. The Amazon prim-target row
+    surfaces THIS date even though its Done Ltrs come from Amazon secondary."""
+    sql = """
+        SELECT MAX("order_date"::date)
+        FROM reporting."Amazon PO"
+        WHERE po_month::integer = %s
+          AND "year"::integer    = %s
+          AND "order_date"::date <= CURRENT_DATE
+    """
+    with connection.cursor() as cur:
+        cur.execute(sql, [month, year])
+        row = cur.fetchone()
+    return row[0] if row and row[0] else None
 
 
 def _read_amazon_secondary(item_head: str, month: int, year: int) -> dict:
@@ -257,7 +276,9 @@ def _read_amazon_secondary(item_head: str, month: int, year: int) -> dict:
         latest_date = None
     return {
         "done_ltrs": Decimal(row[0] or 0) if row else Decimal(0),
-        "latest_date": latest_date,
+        # Date follows the Amazon PRIMARY dashboard (product decision); falls back
+        # to the secondary snapshot date when primary has no data for the month.
+        "latest_date": _read_amazon_primary_max_date(month, year) or latest_date,
     }
 
 
@@ -333,7 +354,7 @@ def _read_master_po_many(formats: list[str], item_heads: tuple[str, ...], month:
             UPPER(TRIM("format"::text))    AS fmt,
             UPPER(TRIM("item_head"::text)) AS item_head,
             COALESCE(SUM(COALESCE("total_delivered_liters", 0)), 0) AS done_ltrs,
-            MAX("delivery_date") AS latest_date
+            MAX("delivery_date") FILTER (WHERE "delivery_date" <= CURRENT_DATE) AS latest_date
         FROM "master_po"
         WHERE LOWER(TRIM("format"::text)) IN ({format_placeholder})
           AND UPPER(TRIM("item_head"::text)) IN ({item_placeholder})
@@ -386,6 +407,9 @@ def _read_amazon_secondary_many(item_heads: tuple[str, ...], month: int, year: i
         cur.execute(sql, list(item_heads) + [month_day_suffix, year])
         rows = cur.fetchall()
 
+    # Date follows the Amazon PRIMARY dashboard (product decision); computed once
+    # for the month and applied to every item head (Done Ltrs stay secondary).
+    primary_max = _read_amazon_primary_max_date(month, year)
     result: dict[tuple[str, str], dict] = {}
     for item_head, done_ltrs, max_day in rows:
         try:
@@ -394,7 +418,7 @@ def _read_amazon_secondary_many(item_heads: tuple[str, ...], month: int, year: i
             latest_date = None
         result[("AMAZON SECONDARY", _format_key(item_head))] = {
             "done_ltrs": Decimal(done_ltrs or 0),
-            "latest_date": latest_date,
+            "latest_date": primary_max or latest_date,
         }
     return result
 
