@@ -3546,12 +3546,23 @@ def amazon_ads_dashboard(request, slug: str):
     if slug != "amazon":
         raise ValidationError("Amazon Ads Dashboard is available only for Amazon.")
 
+    # Dimension switch — re-groups the whole sheet by Portfolio / Campaign / ASIN.
+    # (ASIN lives in advertised_product_id; advertised_product_sku mixes ASINs and
+    # free-text SKUs, so the product id is the reliable ASIN column.)
+    dimension = str(request.query_params.get("dimension") or "portfolio").strip().lower()
+    dim_map = {
+        "portfolio": ("portfolio_name", "Portfolios"),
+        "campaign": ("campaign_name", "Campaigns"),
+        "asin": ("advertised_product_id", "ASINs"),
+    }
+    dimension_key, dimension_label = dim_map.get(dimension, dim_map["portfolio"])
+
     where_sql, params, trend_where_sql, trend_params, filters = _ads_build_where(request, allow_date=True)
     return Response(_ads_dashboard_payload(
         source="amazon_ads_master",
         title="AMS ADS Dashboard",
-        dimension_key="portfolio_name",
-        dimension_label="Portfolios",
+        dimension_key=dimension_key,
+        dimension_label=dimension_label,
         dimension_unmapped="(Unassigned)",
         metric_specs=_AMAZON_METRIC_SPECS,
         default_metric_keys=["total_cost", "sales", "roas", "acos"],
