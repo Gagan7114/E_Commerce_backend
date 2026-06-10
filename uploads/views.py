@@ -184,10 +184,17 @@ def _clear_upload_dependent_cache() -> None:
     # is best-effort and no-ops if migration 0040 isn't applied; a refresh
     # failure must never fail the upload.
     try:
-        from platforms.master_po_refresh import refresh_master_po_mv
+        from platforms.master_po_refresh import (
+            refresh_amazon_mp_master,
+            refresh_master_po_mv,
+        )
         refresh_master_po_mv()
+        # amazon_mp_master (matview, migration 0041) is fed by amazon_mp +
+        # master_sheet; refresh it too so Amazon MP / targets stay current. It's
+        # tiny (~4k rows) so an unconditional refresh after any upload is cheap.
+        refresh_amazon_mp_master()
     except Exception:  # noqa: BLE001 - refresh must never break an upload
-        logger.exception("Failed to refresh master_po_mv after upload")
+        logger.exception("Failed to refresh dashboard matviews after upload")
 
 
 def _quote_ident(name: str) -> str:
@@ -1686,6 +1693,23 @@ def _update_total_po_grn_dates(data: list[dict], target_table: str = "total_po")
                     ]
                     if not has_sku and "delivered_qty" in update_columns:
                         update_columns.remove("delivered_qty")
+                    # A PO-level GRN file (no SKU column) can still post
+                    # delivered_qty when the PO has exactly ONE SKU row in the
+                    # table — the PO-level GRN qty is unambiguously that row's
+                    # delivered qty. With multiple SKUs we can't split it safely,
+                    # so it stays skipped (date/status only, as before).
+                    if (
+                        not has_sku
+                        and "delivered_qty" not in update_columns
+                        and "delivered_qty" in allowed_update_columns
+                        and str(row_for_update.get("delivered_qty") or "").strip() != ""
+                    ):
+                        cur.execute(
+                            f"SELECT COUNT(*) FROM {quoted_target_table} AS t WHERE {po_where}",
+                            list(po_where_values),
+                        )
+                        if (cur.fetchone() or [0])[0] == 1:
+                            update_columns.append("delivered_qty")
                     if not update_columns:
                         if row_updated:
                             updated += row_updated
@@ -1732,6 +1756,57 @@ def _update_total_po_grn_dates(data: list[dict], target_table: str = "total_po")
             "error": last_error,
         }
     )
+
+
+def _propagate_swiggy_po_grn_dates(po_numbers: list[str]) -> int:
+    """Swiggy-only: fill the delivery date + status on a PO's undelivered SKU rows.
+
+    A Swiggy PO often has several SKUs. When the PO is (partially) delivered, the
+    Swiggy primary export carries a delivery date only on the delivered SKU lines
+    and leaves it blank on the rest, so those rows land in total_po_zbs with a
+    NULL grn_date even though the PO itself is matched/delivered. The user wants
+    every SKU of a matched PO to read consistently, so we copy the PO's delivery
+    date (its latest grn_date) onto any NULL-grn_date sibling rows, and backfill a
+    blank status from the PO's delivered rows. Only fills holes (COALESCE) — never
+    overwrites an existing date/status — and only for POs that have at least one
+    delivered row. Scoped to format='SWIGGY'. Best-effort; never raises.
+
+    Returns the number of rows updated.
+    """
+    pons = sorted(
+        {str(p or "").strip().lower() for p in po_numbers if str(p or "").strip()}
+    )
+    if not pons:
+        return 0
+    try:
+        with connection.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE total_po_zbs AS t
+                SET grn_date = COALESCE(t.grn_date, po.max_grn),
+                    status   = COALESCE(NULLIF(TRIM(t.status::text), ''), po.rep_status)
+                FROM (
+                    SELECT LOWER(TRIM(po_number::text)) AS pon,
+                           MAX(grn_date) AS max_grn,
+                           (ARRAY_AGG(status::text ORDER BY grn_date DESC NULLS LAST)
+                              FILTER (WHERE NULLIF(TRIM(status::text), '') IS NOT NULL))[1]
+                              AS rep_status
+                    FROM total_po_zbs
+                    WHERE UPPER(TRIM(format::text)) = 'SWIGGY'
+                      AND LOWER(TRIM(po_number::text)) = ANY(%s)
+                    GROUP BY LOWER(TRIM(po_number::text))
+                    HAVING MAX(grn_date) IS NOT NULL
+                ) po
+                WHERE LOWER(TRIM(t.po_number::text)) = po.pon
+                  AND UPPER(TRIM(t.format::text)) = 'SWIGGY'
+                  AND (t.grn_date IS NULL OR NULLIF(TRIM(t.status::text), '') IS NULL)
+                """,
+                [pons],
+            )
+            return cur.rowcount or 0
+    except Exception:  # noqa: BLE001 - propagation must never break an upload
+        logger.exception("Failed to propagate Swiggy PO grn_date/status")
+        return 0
 
 
 # master_po sync helpers were removed once the master_po table was retired.
@@ -2001,6 +2076,17 @@ def _batch_upload(body, *, forced_table: str | None = None):
             notification_result = {"error": str(exc)}
 
     if success:
+        # Swiggy-only: a partially-delivered PO leaves its undelivered SKU rows
+        # with a NULL delivery date. Fill those from the PO's delivered rows so
+        # every SKU of a matched PO reads consistently (see helper docstring).
+        if table == "total_po_zbs":
+            swiggy_pos = [
+                row.get("po_number")
+                for row in data
+                if str(row.get("format") or "").strip().upper() == "SWIGGY"
+            ]
+            if swiggy_pos:
+                _propagate_swiggy_po_grn_dates(swiggy_pos)
         _clear_upload_dependent_cache()
 
     return Response({
