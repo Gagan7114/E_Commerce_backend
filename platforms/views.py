@@ -67,7 +67,9 @@ def _materialize_primary_normalized(cte_sql: str) -> None:
             f"CREATE TEMP TABLE {_PRIMARY_NORMALIZED_TEMP} AS "
             f"{cte_sql} SELECT * FROM normalized"
         )
-        cur.execute(f"ANALYZE {_PRIMARY_NORMALIZED_TEMP}")
+        # No ANALYZE: this temp table is a single platform's slice (a few thousand
+        # rows) and every downstream query just seq-scans + aggregates it, so the
+        # planner gains nothing from stats. ANALYZE was costing ~1s per request.
 
 
 def _drop_primary_normalized() -> None:
@@ -2265,6 +2267,7 @@ def primary_overview_total(request):
         return Response(cached)
 
     master_format_keys = []
+    slug_format_keys = []  # (slug, format_key) — lets us split the totals per platform
     include_amazon = False
     for slug in allowed_slugs:
         if slug == "amazon":
@@ -2273,9 +2276,10 @@ def primary_overview_total(request):
         platform_format = _PRIMARY_DASHBOARD_FORMATS.get(slug)
         if not platform_format:
             continue
-        master_format_keys.append(
-            re.sub(r"[^a-z0-9]+", "", str(platform_format).strip().lower())
-        )
+        fk = re.sub(r"[^a-z0-9]+", "", str(platform_format).strip().lower())
+        if fk not in master_format_keys:
+            master_format_keys.append(fk)
+        slug_format_keys.append((slug, fk))
 
     total_ltrs = Decimal("0")
     total_value = Decimal("0")
@@ -2297,6 +2301,21 @@ def primary_overview_total(request):
         item_heads[head]["done_ltrs"] += done_ltrs
         item_heads[head]["done_value"] += done_value
 
+    by_platform = {}
+
+    def _empty_heads():
+        return {h: {"done_ltrs": Decimal("0"), "done_value": Decimal("0")}
+                for h in ("PREMIUM", "COMMODITY", "OTHER")}
+
+    def _heads_payload(heads):
+        return {
+            "item_heads": {h: {"done_ltrs": float(v["done_ltrs"]),
+                               "done_value": float(v["done_value"])}
+                           for h, v in heads.items()},
+            "done_ltrs": float(sum(v["done_ltrs"] for v in heads.values())),
+            "done_value": float(sum(v["done_value"] for v in heads.values())),
+        }
+
     if master_format_keys:
         values_sql = ", ".join(["(%s)"] * len(master_format_keys))
         delivery_expr = _prim_safe_date_expr("delivery_date", "p")
@@ -2307,6 +2326,7 @@ def primary_overview_total(request):
             ),
             base AS (
                 SELECT
+                    r.format_key,
                     p.total_delivered_liters,
                     p.total_delivered_amt_exclusive,
                     {delivery_expr} AS delivery_dt,
@@ -2324,6 +2344,7 @@ def primary_overview_total(request):
                   ON REGEXP_REPLACE(LOWER(TRIM(p.format::text)), '[^a-z0-9]+', '', 'g') = r.format_key
             )
             SELECT
+                format_key,
                 item_head,
                 COALESCE(SUM(COALESCE(total_delivered_liters, 0)), 0) AS done_ltrs,
                 COALESCE(SUM(COALESCE(total_delivered_amt_exclusive, 0)), 0) AS done_value
@@ -2331,12 +2352,21 @@ def primary_overview_total(request):
             WHERE delivery_month_key = %s
               AND EXTRACT(YEAR FROM delivery_dt)::integer = %s
               AND delivery_dt <= %s
-            GROUP BY item_head
+            GROUP BY format_key, item_head
             """,
             [*master_format_keys, month_name, year, period_end_cap],
         )
+        heads_by_fk = {}
         for row in rows:
             add_item_head_total(row)
+            head = str(row.get("item_head") or "OTHER").strip().upper()
+            if head not in ("PREMIUM", "COMMODITY", "OTHER"):
+                head = "OTHER"
+            bucket = heads_by_fk.setdefault(row.get("format_key"), _empty_heads())
+            bucket[head]["done_ltrs"] += Decimal(str(row.get("done_ltrs") or 0))
+            bucket[head]["done_value"] += Decimal(str(row.get("done_value") or 0))
+        for slug, fk in slug_format_keys:
+            by_platform[slug] = _heads_payload(heads_by_fk.get(fk, _empty_heads()))
 
     if include_amazon:
         amazon_rows = _dict_rows(
@@ -2357,8 +2387,15 @@ def primary_overview_total(request):
             """,
             [month_name, year],
         )
+        amazon_heads = _empty_heads()
         for row in amazon_rows:
             add_item_head_total(row)
+            head = str(row.get("item_head") or "OTHER").strip().upper()
+            if head not in ("PREMIUM", "COMMODITY", "OTHER"):
+                head = "OTHER"
+            amazon_heads[head]["done_ltrs"] += Decimal(str(row.get("done_ltrs") or 0))
+            amazon_heads[head]["done_value"] += Decimal(str(row.get("done_value") or 0))
+        by_platform["amazon"] = _heads_payload(amazon_heads)
 
     payload = {
         "done_ltrs": float(total_ltrs),
@@ -2370,6 +2407,7 @@ def primary_overview_total(request):
             }
             for key, value in item_heads.items()
         },
+        "by_platform": by_platform,
         "month": month,
         "month_name": month_name,
         "year": year,
