@@ -36,6 +36,7 @@ class ShipmentSerializer(serializers.ModelSerializer):
     created_by_email = serializers.SerializerMethodField()
     approved_by_email = serializers.SerializerMethodField()
     is_stale_draft = serializers.SerializerMethodField()
+    channel = serializers.SerializerMethodField()
 
     class Meta:
         model = Shipment
@@ -49,6 +50,23 @@ class ShipmentSerializer(serializers.ModelSerializer):
 
     def get_is_stale_draft(self, obj):
         return _is_stale_draft(obj)
+
+    def get_channel(self, obj):
+        """Channel (CORE/FRESH/NOW) mapped to this shipment's FC."""
+        fc = (obj.destination_fc or '').strip()
+        if not fc:
+            return None
+        try:
+            with connection.cursor() as cur:
+                cur.execute(
+                    "SELECT channel FROM public.fc_city_state_channel_master "
+                    "WHERE UPPER(TRIM(fc::text)) = UPPER(%s) LIMIT 1",
+                    [fc],
+                )
+                r = cur.fetchone()
+                return r[0] if r and r[0] else None
+        except Exception:
+            return None
 
     def to_representation(self, instance):
         """Enrich each saved item with `cost_price` (per-unit basic cost) from
