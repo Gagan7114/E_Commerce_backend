@@ -31,3 +31,29 @@ def refresh_master_po_mv() -> bool:
     except Exception:  # noqa: BLE001 - a refresh failure must not break callers
         logger.exception("Failed to refresh master_po_mv")
         return False
+
+
+def refresh_amazon_mp_master() -> bool:
+    """Refresh public.amazon_mp_master if it's a materialized view (migration
+    0041). Best-effort; never raises.
+
+    amazon_mp_master is fed by amazon_mp + master_sheet, which only change on
+    upload, so refreshing after uploads keeps it current while making every read
+    a cheap table scan instead of re-parsing shipment_date per row. Returns True
+    if a refresh ran, False if the object is absent or still a plain view (0041
+    not applied) or the refresh failed.
+    """
+    try:
+        with connection.cursor() as cur:
+            # 'm' = materialized view; a plain view ('v') has nothing to refresh.
+            cur.execute(
+                "SELECT relkind FROM pg_class WHERE relname = 'amazon_mp_master'"
+            )
+            row = cur.fetchone()
+            if not row or row[0] != "m":
+                return False
+            cur.execute("REFRESH MATERIALIZED VIEW public.amazon_mp_master")
+        return True
+    except Exception:  # noqa: BLE001 - a refresh failure must not break callers
+        logger.exception("Failed to refresh amazon_mp_master")
+        return False

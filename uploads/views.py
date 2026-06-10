@@ -184,10 +184,17 @@ def _clear_upload_dependent_cache() -> None:
     # is best-effort and no-ops if migration 0040 isn't applied; a refresh
     # failure must never fail the upload.
     try:
-        from platforms.master_po_refresh import refresh_master_po_mv
+        from platforms.master_po_refresh import (
+            refresh_amazon_mp_master,
+            refresh_master_po_mv,
+        )
         refresh_master_po_mv()
+        # amazon_mp_master (matview, migration 0041) is fed by amazon_mp +
+        # master_sheet; refresh it too so Amazon MP / targets stay current. It's
+        # tiny (~4k rows) so an unconditional refresh after any upload is cheap.
+        refresh_amazon_mp_master()
     except Exception:  # noqa: BLE001 - refresh must never break an upload
-        logger.exception("Failed to refresh master_po_mv after upload")
+        logger.exception("Failed to refresh dashboard matviews after upload")
 
 
 def _quote_ident(name: str) -> str:
@@ -1686,6 +1693,23 @@ def _update_total_po_grn_dates(data: list[dict], target_table: str = "total_po")
                     ]
                     if not has_sku and "delivered_qty" in update_columns:
                         update_columns.remove("delivered_qty")
+                    # A PO-level GRN file (no SKU column) can still post
+                    # delivered_qty when the PO has exactly ONE SKU row in the
+                    # table — the PO-level GRN qty is unambiguously that row's
+                    # delivered qty. With multiple SKUs we can't split it safely,
+                    # so it stays skipped (date/status only, as before).
+                    if (
+                        not has_sku
+                        and "delivered_qty" not in update_columns
+                        and "delivered_qty" in allowed_update_columns
+                        and str(row_for_update.get("delivered_qty") or "").strip() != ""
+                    ):
+                        cur.execute(
+                            f"SELECT COUNT(*) FROM {quoted_target_table} AS t WHERE {po_where}",
+                            list(po_where_values),
+                        )
+                        if (cur.fetchone() or [0])[0] == 1:
+                            update_columns.append("delivered_qty")
                     if not update_columns:
                         if row_updated:
                             updated += row_updated
