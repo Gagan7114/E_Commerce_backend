@@ -1,5 +1,6 @@
 from datetime import timedelta
 
+from django.db import connection
 from django.utils import timezone
 from rest_framework import serializers
 
@@ -48,6 +49,39 @@ class ShipmentSerializer(serializers.ModelSerializer):
 
     def get_is_stale_draft(self, obj):
         return _is_stale_draft(obj)
+
+    def to_representation(self, instance):
+        """Enrich each saved item with `cost_price` (per-unit basic cost) from
+        reporting."Amazon PO", so the PDF/print Basic-Rate / Landing columns work
+        for saved shipments too (sp_items doesn't store cost). One batched query
+        keyed on ASIN; exact PO match preferred, else any PO for that ASIN."""
+        data = super().to_representation(instance)
+        items = data.get('items') or []
+        asins = list({str(it.get('asin') or '').strip().upper() for it in items if it.get('asin')})
+        if not asins:
+            return data
+        ph = ','.join(['%s'] * len(asins))
+        pair_cost, asin_cost = {}, {}
+        try:
+            with connection.cursor() as cur:
+                cur.execute(
+                    f'''SELECT UPPER(TRIM(po_number)), UPPER(TRIM(asin)), MAX(cost_price)
+                        FROM reporting."Amazon PO"
+                        WHERE UPPER(TRIM(asin)) IN ({ph}) AND cost_price IS NOT NULL
+                        GROUP BY UPPER(TRIM(po_number)), UPPER(TRIM(asin))''',
+                    asins,
+                )
+                for po, asin, cp in cur.fetchall():
+                    pair_cost[(po, asin)] = cp
+                    asin_cost[asin] = cp
+        except Exception:
+            return data
+        for it in items:
+            asin = str(it.get('asin') or '').strip().upper()
+            po = str(it.get('po_number') or '').strip().upper()
+            cp = pair_cost.get((po, asin)) or asin_cost.get(asin)
+            it['cost_price'] = float(cp) if cp is not None else None
+        return data
 
 
 class ShipmentListSerializer(serializers.ModelSerializer):
