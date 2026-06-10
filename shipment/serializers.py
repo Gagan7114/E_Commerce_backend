@@ -62,18 +62,24 @@ class ShipmentSerializer(serializers.ModelSerializer):
             return data
         ph = ','.join(['%s'] * len(asins))
         pair_cost, asin_cost = {}, {}
+        pair_sku, asin_sku = {}, {}
         try:
             with connection.cursor() as cur:
                 cur.execute(
-                    f'''SELECT UPPER(TRIM(po_number)), UPPER(TRIM(asin)), MAX(cost_price)
+                    f'''SELECT UPPER(TRIM(po_number)), UPPER(TRIM(asin)),
+                               MAX(cost_price), MAX(sap_sku_code)
                         FROM reporting."Amazon PO"
-                        WHERE UPPER(TRIM(asin)) IN ({ph}) AND cost_price IS NOT NULL
+                        WHERE UPPER(TRIM(asin)) IN ({ph})
                         GROUP BY UPPER(TRIM(po_number)), UPPER(TRIM(asin))''',
                     asins,
                 )
-                for po, asin, cp in cur.fetchall():
-                    pair_cost[(po, asin)] = cp
-                    asin_cost[asin] = cp
+                for po, asin, cp, sku in cur.fetchall():
+                    if cp is not None:
+                        pair_cost[(po, asin)] = cp
+                        asin_cost[asin] = cp
+                    if sku:
+                        pair_sku[(po, asin)] = sku
+                        asin_sku[asin] = sku
         except Exception:
             return data
         for it in items:
@@ -81,6 +87,7 @@ class ShipmentSerializer(serializers.ModelSerializer):
             po = str(it.get('po_number') or '').strip().upper()
             cp = pair_cost.get((po, asin)) or asin_cost.get(asin)
             it['cost_price'] = float(cp) if cp is not None else None
+            it['sap_sku_code'] = pair_sku.get((po, asin)) or asin_sku.get(asin)
         return data
 
 
