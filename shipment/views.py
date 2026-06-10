@@ -2210,11 +2210,16 @@ class ShipmentDetailView(APIView):
         shipment = self._get_shipment(pk)
         if not shipment:
             return Response({'error': 'Not found'}, status=404)
-        # Only DRAFT and REJECTED shipments can be deleted; approved/dispatched/delivered are protected.
-        deletable_statuses = {Shipment.Status.DRAFT, Shipment.Status.REJECTED}
+        # DRAFT, PENDING_APPROVAL and REJECTED shipments can be deleted;
+        # approved/dispatched/delivered are protected.
+        deletable_statuses = {
+            Shipment.Status.DRAFT,
+            Shipment.Status.PENDING_APPROVAL,
+            Shipment.Status.REJECTED,
+        }
         if shipment.status not in deletable_statuses:
             return Response(
-                {'error': f'Only draft or rejected shipments can be deleted. This shipment is "{shipment.get_status_display()}".'},
+                {'error': f'Only draft, pending-approval or rejected shipments can be deleted. This shipment is "{shipment.get_status_display()}".'},
                 status=400,
             )
         # Only the creator (or staff) can delete.
