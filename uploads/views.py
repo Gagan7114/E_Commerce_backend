@@ -1758,6 +1758,57 @@ def _update_total_po_grn_dates(data: list[dict], target_table: str = "total_po")
     )
 
 
+def _propagate_swiggy_po_grn_dates(po_numbers: list[str]) -> int:
+    """Swiggy-only: fill the delivery date + status on a PO's undelivered SKU rows.
+
+    A Swiggy PO often has several SKUs. When the PO is (partially) delivered, the
+    Swiggy primary export carries a delivery date only on the delivered SKU lines
+    and leaves it blank on the rest, so those rows land in total_po_zbs with a
+    NULL grn_date even though the PO itself is matched/delivered. The user wants
+    every SKU of a matched PO to read consistently, so we copy the PO's delivery
+    date (its latest grn_date) onto any NULL-grn_date sibling rows, and backfill a
+    blank status from the PO's delivered rows. Only fills holes (COALESCE) — never
+    overwrites an existing date/status — and only for POs that have at least one
+    delivered row. Scoped to format='SWIGGY'. Best-effort; never raises.
+
+    Returns the number of rows updated.
+    """
+    pons = sorted(
+        {str(p or "").strip().lower() for p in po_numbers if str(p or "").strip()}
+    )
+    if not pons:
+        return 0
+    try:
+        with connection.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE total_po_zbs AS t
+                SET grn_date = COALESCE(t.grn_date, po.max_grn),
+                    status   = COALESCE(NULLIF(TRIM(t.status::text), ''), po.rep_status)
+                FROM (
+                    SELECT LOWER(TRIM(po_number::text)) AS pon,
+                           MAX(grn_date) AS max_grn,
+                           (ARRAY_AGG(status::text ORDER BY grn_date DESC NULLS LAST)
+                              FILTER (WHERE NULLIF(TRIM(status::text), '') IS NOT NULL))[1]
+                              AS rep_status
+                    FROM total_po_zbs
+                    WHERE UPPER(TRIM(format::text)) = 'SWIGGY'
+                      AND LOWER(TRIM(po_number::text)) = ANY(%s)
+                    GROUP BY LOWER(TRIM(po_number::text))
+                    HAVING MAX(grn_date) IS NOT NULL
+                ) po
+                WHERE LOWER(TRIM(t.po_number::text)) = po.pon
+                  AND UPPER(TRIM(t.format::text)) = 'SWIGGY'
+                  AND (t.grn_date IS NULL OR NULLIF(TRIM(t.status::text), '') IS NULL)
+                """,
+                [pons],
+            )
+            return cur.rowcount or 0
+    except Exception:  # noqa: BLE001 - propagation must never break an upload
+        logger.exception("Failed to propagate Swiggy PO grn_date/status")
+        return 0
+
+
 # master_po sync helpers were removed once the master_po table was retired.
 # Uploads now go straight to each platform's per-tenant table via the upsert
 # `INSERT ... ON CONFLICT` path in `_batch_upload`.
@@ -2025,6 +2076,17 @@ def _batch_upload(body, *, forced_table: str | None = None):
             notification_result = {"error": str(exc)}
 
     if success:
+        # Swiggy-only: a partially-delivered PO leaves its undelivered SKU rows
+        # with a NULL delivery date. Fill those from the PO's delivered rows so
+        # every SKU of a matched PO reads consistently (see helper docstring).
+        if table == "total_po_zbs":
+            swiggy_pos = [
+                row.get("po_number")
+                for row in data
+                if str(row.get("format") or "").strip().upper() == "SWIGGY"
+            ]
+            if swiggy_pos:
+                _propagate_swiggy_po_grn_dates(swiggy_pos)
         _clear_upload_dependent_cache()
 
     return Response({
