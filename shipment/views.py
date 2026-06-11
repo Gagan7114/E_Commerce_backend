@@ -3577,6 +3577,7 @@ class PoShortSupplyView(APIView):
                            MAX(si.destination_fc)   AS destination_fc,
                            MAX(si.product_name)     AS product_name,
                            MAX(si.internal_sku)     AS internal_sku,
+                           MAX(si.item)             AS item_name,
                            SUM(COALESCE(si.planned_qty, 0)) AS committed_qty,
                            -- Appointment(s) this line was committed under, so the report
                            -- can be grouped appointment-wise. Use the ITEM's appointment
@@ -3592,7 +3593,7 @@ class PoShortSupplyView(APIView):
                              UPPER(TRIM(si.po_number)),
                              UPPER(TRIM(COALESCE(si.destination_fc, '')))
                 )
-                SELECT c.po_number, c.asin, c.product_name, c.internal_sku,
+                SELECT c.po_number, c.asin, c.product_name, c.internal_sku, c.item_name,
                        c.destination_fc, c.appointment_ids, c.last_shipped_at, c.appointment_time,
                        po.accepted_qty                    AS ordered_qty,
                        c.committed_qty                    AS shipped_qty,
