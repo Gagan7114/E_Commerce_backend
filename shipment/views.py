@@ -3096,6 +3096,10 @@ class ManualPlanView(_SafeAPIView):
         selected_items = request.data.get('items', [])
         truck_size = request.data.get('truck_size', '15_ton')
         capacity_override = request.data.get('truck_capacity_liters')
+        # Respect live BH-FGM stock by default — same constraint as the auto /
+        # appointment planner, so a manual plan can't ship more than is physically
+        # available. Toggleable via respect_stock (default on).
+        respect_stock = str(request.data.get('respect_stock', True)).lower() not in ('0', 'false', 'no', 'off')
 
         # Vendor Central commit caps per PO (manual planner). Same shape as the
         # auto endpoint, just keyed by PO number instead of appointment_id.
@@ -3132,6 +3136,17 @@ class ManualPlanView(_SafeAPIView):
             -(float(x.get('accepted_qty') or 0)),
         ))
 
+        # Live warehouse stock cap — identical to the appointment / auto planner.
+        # Tags each item with on-hand / reserved / available / incoming and, when
+        # respect_stock, caps the shippable qty to what's AVAILABLE (on-hand −
+        # reserved by other active shipments). Out-of-stock items drop to
+        # not_loaded; partials are short-supplied — exactly the same rules as auto.
+        stock_detail = _bh_fgm_stock_detail()
+        reserved = _reserved_stock_by_asin()
+        avail_total = {a: max(0.0, d['onhand'] - reserved.get(a, 0.0)) for a, d in stock_detail.items()}
+        avail_remaining = dict(avail_total)
+        _apply_stock_caps(selected_items, avail_total, avail_remaining, respect_stock, stock_detail, reserved)
+
         loaded, not_loaded, capacity, planned_liters, load_pct, priority_actual = _auto_plan_truck(
             selected_items, truck_size, capacity_override
         )
@@ -3148,6 +3163,7 @@ class ManualPlanView(_SafeAPIView):
             'not_loaded_items': not_loaded,
             'priority_actual': priority_actual,
             'commit_caps': commit_caps,
+            'respect_stock': respect_stock,
             'load_summary': {
                 'truck_size': truck_size,
                 'capacity': capacity,
