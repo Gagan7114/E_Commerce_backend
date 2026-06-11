@@ -7,9 +7,14 @@ import time
 from datetime import date as _date, timedelta
 from decimal import Decimal
 
+import logging
+
 from django.conf import settings
-from django.db import connection, transaction
+from django.core.exceptions import PermissionDenied
+from django.db import connection, transaction, DatabaseError
+from django.http import Http404
 from rest_framework import status
+from rest_framework.exceptions import APIException
 from rest_framework.permissions import IsAuthenticated, AllowAny
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -24,6 +29,46 @@ from .serializers import (
 
 TRUCK_CAPACITIES = {'10_ton': 10000.0, '15_ton': 15000.0}
 LOCKED_STATUSES = ('approved', 'dispatched', 'in_transit', 'delivered')
+
+logger = logging.getLogger(__name__)
+
+
+def _safe_int(value, default, *, lo=None, hi=None):
+    """Parse a query-param int without 500-ing on garbage; clamp to [lo, hi]."""
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return default
+    if lo is not None:
+        n = max(lo, n)
+    if hi is not None:
+        n = min(hi, n)
+    return n
+
+
+# Base view that turns an unexpected (non-DRF) error into a clean JSON response
+# instead of a raw 500 stack trace. DRF's own exceptions (validation, auth, 404)
+# still render normally. Aliasing APIView keeps the class swap below from
+# rewriting this definition. Scoped to the shipment app — global behaviour
+# is unchanged (other apps still use the plain APIView).
+_BaseAPIView = APIView
+
+
+class _SafeAPIView(_BaseAPIView):
+    def handle_exception(self, exc):
+        if isinstance(exc, (APIException, Http404, PermissionDenied)):
+            return super().handle_exception(exc)
+        if isinstance(exc, DatabaseError):
+            logger.exception('shipment: database error in %s', self.__class__.__name__)
+            return Response(
+                {'error': 'A database error occurred. Please try again in a moment.'},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+        logger.exception('shipment: unhandled error in %s', self.__class__.__name__)
+        return Response(
+            {'error': 'Something went wrong while processing your request.'},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -454,7 +499,7 @@ def _live_doh_by_asin():
 # Appointment endpoints
 # ---------------------------------------------------------------------------
 
-class AppointmentDatesView(APIView):
+class AppointmentDatesView(_SafeAPIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
@@ -1073,7 +1118,7 @@ def _row_eligibility_reason(row):
     return f"{flip} · {base}" if flip else base
 
 
-class AppointmentListView(APIView):
+class AppointmentListView(_SafeAPIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
@@ -1398,7 +1443,7 @@ class AppointmentListView(APIView):
         return Response(out)
 
 
-class AppointmentItemsView(APIView):
+class AppointmentItemsView(_SafeAPIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request, appointment_id):
@@ -1907,7 +1952,7 @@ class AppointmentItemsView(APIView):
         })
 
 
-class AppointmentExtraPosView(APIView):
+class AppointmentExtraPosView(_SafeAPIView):
     """
     Lists same-FC PENDING + in-stock POs that AREN'T on the appointment(s).
     Powers the PO picker that lets a planner add "extra" POs alongside (or in
@@ -1986,7 +2031,7 @@ class AppointmentExtraPosView(APIView):
 # Shipment CRUD
 # ---------------------------------------------------------------------------
 
-class ShipmentListCreateView(APIView):
+class ShipmentListCreateView(_SafeAPIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
@@ -2166,7 +2211,7 @@ class ShipmentListCreateView(APIView):
         return Response(serializer.data, status=201)
 
 
-class ShipmentDetailView(APIView):
+class ShipmentDetailView(_SafeAPIView):
     permission_classes = [IsAuthenticated]
 
     def _get_shipment(self, pk):
@@ -2230,7 +2275,7 @@ class ShipmentDetailView(APIView):
         return Response({'deleted': True, 'shipment_id': sid}, status=200)
 
 
-class ShipmentItemUpdateView(APIView):
+class ShipmentItemUpdateView(_SafeAPIView):
     permission_classes = [IsAuthenticated]
 
     def patch(self, request, pk, item_id):
@@ -2253,7 +2298,10 @@ class ShipmentItemUpdateView(APIView):
         old_qty = item.planned_qty
 
         if 'new_qty' in data:
-            new_qty = float(data['new_qty'])
+            try:
+                new_qty = float(data['new_qty'])
+            except (TypeError, ValueError):
+                return Response({'error': 'new_qty must be a number.'}, status=400)
             # Can't ship more than ordered (accepted); the difference is the
             # short-supply qty shown to planners. Cartons are not counted, so
             # the entered quantity ships as-is (clamped to the ordered qty).
@@ -2309,7 +2357,7 @@ def _recalc_shipment_totals(shipment):
 # Shipment workflow actions
 # ---------------------------------------------------------------------------
 
-class ShipmentSubmitView(APIView):
+class ShipmentSubmitView(_SafeAPIView):
     permission_classes = [IsAuthenticated]
 
     def post(self, request, pk):
@@ -2330,7 +2378,7 @@ class ShipmentSubmitView(APIView):
         return Response(ShipmentListSerializer(shipment).data)
 
 
-class ShipmentApproveView(APIView):
+class ShipmentApproveView(_SafeAPIView):
     permission_classes = [IsAuthenticated]
 
     def post(self, request, pk):
@@ -2355,7 +2403,7 @@ class ShipmentApproveView(APIView):
         return Response(ShipmentListSerializer(shipment).data)
 
 
-class ShipmentRejectView(APIView):
+class ShipmentRejectView(_SafeAPIView):
     permission_classes = [IsAuthenticated]
 
     def post(self, request, pk):
@@ -2377,7 +2425,7 @@ class ShipmentRejectView(APIView):
         return Response(ShipmentListSerializer(shipment).data)
 
 
-class ShipmentDispatchView(APIView):
+class ShipmentDispatchView(_SafeAPIView):
     permission_classes = [IsAuthenticated]
 
     def post(self, request, pk):
@@ -2452,7 +2500,7 @@ def _check_qty_conflicts(shipment):
     return conflicts
 
 
-class ShipmentStatsView(APIView):
+class ShipmentStatsView(_SafeAPIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
@@ -2472,7 +2520,7 @@ class ShipmentStatsView(APIView):
         return Response(stats)
 
 
-class AsinCatalogView(APIView):
+class AsinCatalogView(_SafeAPIView):
     """Returns distinct ASIN → per_liter + DOH data for PO List calculations."""
     permission_classes = [IsAuthenticated]
 
@@ -2507,7 +2555,7 @@ class AsinCatalogView(APIView):
         return Response(catalog)
 
 
-class POListView(APIView):
+class POListView(_SafeAPIView):
     """Paginated list of POs from reporting."Amazon PO"."""
     permission_classes = [IsAuthenticated]
 
@@ -2518,8 +2566,8 @@ class POListView(APIView):
         fc = request.query_params.get('fc', '').strip()
         asin = request.query_params.get('asin', '').strip()
         no_paginate = request.query_params.get('no_paginate', '').lower() == 'true'
-        page = max(1, int(request.query_params.get('page', 1)))
-        page_size = 9999 if no_paginate else min(5000, int(request.query_params.get('page_size', 50)))
+        page = _safe_int(request.query_params.get('page'), 1, lo=1)
+        page_size = 9999 if no_paginate else _safe_int(request.query_params.get('page_size'), 50, lo=1, hi=5000)
         offset = 0 if no_paginate else (page - 1) * page_size
 
         where = ["1=1"]
@@ -2597,7 +2645,7 @@ class POListView(APIView):
         })
 
 
-class AllAppointmentsView(APIView):
+class AllAppointmentsView(_SafeAPIView):
     """All appointments from reporting.appointment with filters."""
     permission_classes = [IsAuthenticated]
 
@@ -2608,8 +2656,8 @@ class AllAppointmentsView(APIView):
         date_from = request.query_params.get('date_from', '').strip()
         date_to = request.query_params.get('date_to', '').strip()
         no_paginate = request.query_params.get('no_paginate', '').lower() == 'true'
-        page = max(1, int(request.query_params.get('page', 1)))
-        page_size = 9999 if no_paginate else min(100, int(request.query_params.get('page_size', 50)))
+        page = _safe_int(request.query_params.get('page'), 1, lo=1)
+        page_size = 9999 if no_paginate else _safe_int(request.query_params.get('page_size'), 50, lo=1, hi=100)
         offset = 0 if no_paginate else (page - 1) * page_size
 
         # Qualify with the `a` alias so the appointment_commit LEFT JOIN (which
@@ -2724,7 +2772,7 @@ class AllAppointmentsView(APIView):
         })
 
 
-class AppointmentCommitImportView(APIView):
+class AppointmentCommitImportView(_SafeAPIView):
     """Unattended importer for Amazon Vendor Central carton/unit commitments.
 
     Authenticated by a shared-secret header (``X-Import-Key``) instead of a user
@@ -2813,7 +2861,7 @@ class AppointmentCommitImportView(APIView):
         })
 
 
-class AppointmentCommitListView(APIView):
+class AppointmentCommitListView(_SafeAPIView):
     """Read-only list of Amazon Vendor Central carton/unit commitments
     (the public.appointment_commit table) for the standalone
     'Cartons/Unit Count VC' page. Deliberately kept separate from the
@@ -2854,7 +2902,7 @@ class AppointmentCommitListView(APIView):
         })
 
 
-class AppointmentCommitManualImportView(APIView):
+class AppointmentCommitManualImportView(_SafeAPIView):
     """Logged-in (paste-flow) importer for Vendor Central carton/unit data.
 
     Upserts public.appointment_commit AND stamps updated_at + updated_by with
@@ -2943,7 +2991,7 @@ class AppointmentCommitManualImportView(APIView):
         })
 
 
-class SetFcChannelView(APIView):
+class SetFcChannelView(_SafeAPIView):
     """Manually map a fulfillment center to a sales channel (one channel per FC).
 
     Persisted in public.fc_city_state_channel_master so an unmapped ('Other')
@@ -2984,7 +3032,7 @@ class SetFcChannelView(APIView):
         return Response({'ok': True, 'fc': fc.upper(), 'channel': channel})
 
 
-class ManualPlanView(APIView):
+class ManualPlanView(_SafeAPIView):
     """Preview a plan from manually selected PO items (no DB writes — Save as Draft persists it)."""
     permission_classes = [IsAuthenticated]
 
@@ -3068,7 +3116,7 @@ def _doh_bucket(doh, drr):
     return 'LOW', f'DOH {d:.1f} — well stocked'
 
 
-class DOHAutoFillView(APIView):
+class DOHAutoFillView(_SafeAPIView):
     """
     Auto-fill a truck using LIVE DOH from amazon_master_inventory + amazon_sec_range_master_view
     (same source as the SOH/DOH dashboard so numbers match exactly).
@@ -3459,7 +3507,7 @@ class DOHAutoFillView(APIView):
         })
 
 
-class ShipmentPendingApprovalsView(APIView):
+class ShipmentPendingApprovalsView(_SafeAPIView):
     """Returns full detail (including items) for all pending-approval shipments."""
     permission_classes = [IsAuthenticated]
 
@@ -3470,7 +3518,7 @@ class ShipmentPendingApprovalsView(APIView):
         return Response(ShipmentSerializer(qs, many=True).data)
 
 
-class PoShipmentLookupView(APIView):
+class PoShipmentLookupView(_SafeAPIView):
     """
     Live map of (asin, po_number) -> list of shipments that contain that line.
 
@@ -3554,7 +3602,7 @@ class PoShipmentLookupView(APIView):
         return Response(result)
 
 
-class PoShortSupplyView(APIView):
+class PoShortSupplyView(_SafeAPIView):
     """
     Global short-supply report: per PO+ASIN line that has been shipped less than
     ordered. shipped = SUM(planned_qty) across non-rejected shipments (same
@@ -3623,7 +3671,7 @@ class PoShortSupplyView(APIView):
         })
 
 
-class SapInventoryView(APIView):
+class SapInventoryView(_SafeAPIView):
     """Live SAP HANA finished-goods stock for the BH-FGM (Sonipat) warehouse,
     surfaced inside the Shipment Planner. Read-only; queried live each request
     from the JIVO_MART_HANADB schema (OITM × OITW × OWHS × OITB)."""
@@ -3633,10 +3681,16 @@ class SapInventoryView(APIView):
 
     def get(self, request):
         # Imported lazily so the rest of the shipment app never hard-depends on
-        # the HANA driver (hdbcli) being installed.
-        from sap.service import select, resolve_schema
-
-        _source, schema = resolve_schema('mart')
+        # the HANA driver (hdbcli) being installed. Both the import and the
+        # schema resolution can fail (driver missing / SAP config) — guard them.
+        try:
+            from sap.service import select, resolve_schema
+            _source, schema = resolve_schema('mart')
+        except Exception as e:
+            return Response(
+                {'error': f'Could not reach SAP HANA: {e}', 'results': [], 'summary': {}},
+                status=502,
+            )
         sql = '''
             SELECT
                 T0."ItemCode",
