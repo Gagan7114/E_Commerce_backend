@@ -3577,7 +3577,12 @@ class PoShortSupplyView(APIView):
                            MAX(si.destination_fc)   AS destination_fc,
                            MAX(si.product_name)     AS product_name,
                            MAX(si.internal_sku)     AS internal_sku,
-                           SUM(COALESCE(si.planned_qty, 0)) AS committed_qty
+                           SUM(COALESCE(si.planned_qty, 0)) AS committed_qty,
+                           -- Appointment(s) this line was committed under, so the report
+                           -- can be grouped appointment-wise. Use the ITEM's appointment
+                           -- (precise for combined trucks); empty => DOH/no-appointment.
+                           STRING_AGG(DISTINCT NULLIF(TRIM(si.appointment_id), ''), ', ') AS appointment_ids,
+                           MAX(s.created_at)        AS last_shipped_at
                     FROM sp_items si
                     JOIN sp_shipments s ON s.id = si.shipment_id
                     WHERE si.not_loaded = FALSE
@@ -3587,7 +3592,7 @@ class PoShortSupplyView(APIView):
                              UPPER(TRIM(COALESCE(si.destination_fc, '')))
                 )
                 SELECT c.po_number, c.asin, c.product_name, c.internal_sku,
-                       c.destination_fc,
+                       c.destination_fc, c.appointment_ids, c.last_shipped_at,
                        po.accepted_qty                    AS ordered_qty,
                        c.committed_qty                    AS shipped_qty,
                        (po.accepted_qty - c.committed_qty) AS short_qty
