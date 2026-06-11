@@ -15,7 +15,7 @@ from django.db import connection, transaction, DatabaseError
 from django.http import Http404
 from rest_framework import status
 from rest_framework.exceptions import APIException
-from rest_framework.permissions import IsAuthenticated, AllowAny
+from rest_framework.permissions import IsAuthenticated, AllowAny, BasePermission
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
@@ -29,6 +29,12 @@ from .serializers import (
 
 TRUCK_CAPACITIES = {'10_ton': 10000.0, '15_ton': 15000.0}
 LOCKED_STATUSES = ('approved', 'dispatched', 'in_transit', 'delivered')
+
+# Fixed key for the Postgres transaction-scoped advisory lock that serializes the
+# shipment claim+create critical section. Without it, two planners can both pass
+# the "is this PO line still free?" check and then both insert the same rows
+# (a phantom race a plain re-check cannot prevent) → over-commitment.
+SHIPMENT_CLAIM_LOCK = 738214
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +74,23 @@ class _SafeAPIView(_BaseAPIView):
         return Response(
             {'error': 'Something went wrong while processing your request.'},
             status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
+
+
+class IsShipmentManager(BasePermission):
+    """Manager-only actions (approve / reject / dispatch). A user qualifies if
+    they are a superuser, Django staff, OR belong to the 'shipment_managers'
+    group — so a proper role can be granted without handing out staff/admin."""
+    message = 'Manager access required to approve, reject, or dispatch shipments.'
+
+    def has_permission(self, request, view):
+        u = getattr(request, 'user', None)
+        return bool(
+            u and u.is_authenticated and (
+                u.is_superuser
+                or u.is_staff
+                or u.groups.filter(name='shipment_managers').exists()
+            )
         )
 
 
@@ -404,7 +427,26 @@ def _rolling_window_date_keys(effective_date, days=DRR_WINDOW_DAYS):
     return keys
 
 
+_DOH_CACHE = {'at': 0.0, 'data': None}
+_DOH_TTL = 120  # seconds — DOH/DRR change ~daily; avoid recomputing this heavy
+#                 rolling-window query on every plan / 30s auto-refresh.
+
+
 def _live_doh_by_asin():
+    """Cached wrapper (TTL _DOH_TTL) over the heavy DOH/DRR computation below.
+    The numbers only change daily, so recomputing on every appointment-items /
+    auto-plan / 30s poll is wasteful. Call sites are unchanged."""
+    now = time.time()
+    cached = _DOH_CACHE['data']
+    if cached is not None and (now - _DOH_CACHE['at'] < _DOH_TTL):
+        return cached
+    result = _compute_live_doh_by_asin()
+    _DOH_CACHE['at'] = now
+    _DOH_CACHE['data'] = result
+    return result
+
+
+def _compute_live_doh_by_asin():
     """
     Returns (by_asin, meta).
 
@@ -1628,6 +1670,11 @@ class AppointmentItemsView(_SafeAPIView):
                       AND NULLIF(TRIM(pv), '') IS NOT NULL
                 ),
                 committed AS (
+                    -- NOTE: this is PO-fulfilment "committed" (units already put on
+                    -- ANY non-rejected shipment, incl. dispatched/delivered — those
+                    -- units are gone from the order). It is DISTINCT from physical
+                    -- stock reservation in _reserved_stock_by_asin(), which counts
+                    -- only not-yet-dispatched shipments. Don't merge the two.
                     -- Quantity already committed to non-rejected shipments per
                     -- (ASIN, PO, FC). The remainder (accepted - committed) is what's
                     -- still shippable, so a partially-shipped line reappears with
@@ -2077,53 +2124,61 @@ class ShipmentListCreateView(_SafeAPIView):
                 else Shipment.PlanningMode.MANUAL
             )
 
-        # Lock re-check at draft time. Between the moment the plan was generated
-        # and this Save call, another planner may have claimed some of the same
-        # ASIN+PO rows. Fail fast with details so the UI can guide the user
-        # rather than surfacing the conflict later at Submit time.
-        if loaded_items:
-            pair_keys = {
-                (
-                    str(it.get('asin') or '').strip().upper(),
-                    str(it.get('po_number') or '').strip().upper(),
-                )
-                for it in loaded_items
-                if it.get('asin') and it.get('po_number')
-            }
-            if pair_keys:
-                from django.db.models import Q
-                conflict_q = Q()
-                for asin_up, po_up in pair_keys:
-                    conflict_q |= Q(asin__iexact=asin_up, po_number__iexact=po_up)
-                claimed = (
-                    ShipmentItem.objects
-                    .filter(not_loaded=False)
-                    .filter(conflict_q)
-                    .exclude(shipment__status=Shipment.Status.REJECTED)
-                    .select_related('shipment')
-                    .values(
-                        'asin', 'po_number',
-                        'shipment_id', 'shipment__status',
-                        'shipment__appointment_id', 'shipment__destination_fc',
-                    )
-                )
-                conflicts = list(claimed)
-                if conflicts:
-                    # De-dup per (asin, po) so the message is concise
-                    return Response(
-                        {
-                            'error': 'Some items are already in another active shipment',
-                            'conflicts': conflicts,
-                            'detail': (
-                                f'{len(conflicts)} row(s) were claimed by another '
-                                'shipment since this plan was generated. Refresh '
-                                'the plan and try again.'
-                            ),
-                        },
-                        status=409,
-                    )
-
+        # Serialize the claim+create critical section with a transaction-scoped
+        # advisory lock so two planners can't both pass the "is this PO+ASIN
+        # free?" check and then both insert the same rows (phantom race →
+        # over-commitment). Concurrent saves queue here; the second one re-checks
+        # below — now inside the lock — and sees the first planner's rows.
         with transaction.atomic():
+            with connection.cursor() as _lock_cur:
+                _lock_cur.execute('SELECT pg_advisory_xact_lock(%s)', [SHIPMENT_CLAIM_LOCK])
+
+            # Lock re-check at draft time. Between the moment the plan was
+            # generated and this Save call, another planner may have claimed some
+            # of the same ASIN+PO rows. Fail fast with details so the UI can
+            # guide the user rather than surfacing the conflict later at Submit.
+            if loaded_items:
+                pair_keys = {
+                    (
+                        str(it.get('asin') or '').strip().upper(),
+                        str(it.get('po_number') or '').strip().upper(),
+                    )
+                    for it in loaded_items
+                    if it.get('asin') and it.get('po_number')
+                }
+                if pair_keys:
+                    from django.db.models import Q
+                    conflict_q = Q()
+                    for asin_up, po_up in pair_keys:
+                        conflict_q |= Q(asin__iexact=asin_up, po_number__iexact=po_up)
+                    claimed = (
+                        ShipmentItem.objects
+                        .filter(not_loaded=False)
+                        .filter(conflict_q)
+                        .exclude(shipment__status=Shipment.Status.REJECTED)
+                        .select_related('shipment')
+                        .values(
+                            'asin', 'po_number',
+                            'shipment_id', 'shipment__status',
+                            'shipment__appointment_id', 'shipment__destination_fc',
+                        )
+                    )
+                    conflicts = list(claimed)
+                    if conflicts:
+                        # De-dup per (asin, po) so the message is concise
+                        return Response(
+                            {
+                                'error': 'Some items are already in another active shipment',
+                                'conflicts': conflicts,
+                                'detail': (
+                                    f'{len(conflicts)} row(s) were claimed by another '
+                                    'shipment since this plan was generated. Refresh '
+                                    'the plan and try again.'
+                                ),
+                            },
+                            status=409,
+                        )
+
             shipment = Shipment.objects.create(
                 appointment_id=appointment_id or '',
                 appointment_time=appointment.get('appointment_time') if appointment else None,
@@ -2271,6 +2326,13 @@ class ShipmentDetailView(_SafeAPIView):
         if shipment.created_by_id and shipment.created_by_id != request.user.id and not request.user.is_staff:
             return Response({'error': 'Only the creator or staff can delete this shipment.'}, status=403)
         sid = shipment.id
+        # Durable audit trail: the ShipmentAuditLog FK cascades on delete, so a
+        # DB row would vanish with the shipment — log to the server instead.
+        logger.info(
+            'shipment delete: id=%s status=%s appointment=%s fc=%s by user_id=%s (%s)',
+            sid, shipment.status, shipment.appointment_id, shipment.destination_fc,
+            getattr(request.user, 'id', None), getattr(request.user, 'username', ''),
+        )
         shipment.delete()  # cascades to items + audit_logs via FK
         return Response({'deleted': True, 'shipment_id': sid}, status=200)
 
@@ -2379,12 +2441,9 @@ class ShipmentSubmitView(_SafeAPIView):
 
 
 class ShipmentApproveView(_SafeAPIView):
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, IsShipmentManager]
 
     def post(self, request, pk):
-        if not (request.user.is_staff or request.user.is_superuser):
-            return Response({'error': 'Manager access required'}, status=403)
-
         try:
             shipment = Shipment.objects.get(pk=pk)
         except Shipment.DoesNotExist:
@@ -2404,12 +2463,9 @@ class ShipmentApproveView(_SafeAPIView):
 
 
 class ShipmentRejectView(_SafeAPIView):
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, IsShipmentManager]
 
     def post(self, request, pk):
-        if not (request.user.is_staff or request.user.is_superuser):
-            return Response({'error': 'Manager access required'}, status=403)
-
         try:
             shipment = Shipment.objects.get(pk=pk)
         except Shipment.DoesNotExist:
@@ -2426,7 +2482,7 @@ class ShipmentRejectView(_SafeAPIView):
 
 
 class ShipmentDispatchView(_SafeAPIView):
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, IsShipmentManager]
 
     def post(self, request, pk):
         try:
@@ -3671,6 +3727,11 @@ class PoShortSupplyView(_SafeAPIView):
         })
 
 
+_SAP_INV_CACHE = {'at': 0.0, 'data': None}
+_SAP_INV_TTL = 60  # seconds — full-warehouse SAP read; the inventory page
+#                    auto-refreshes, so cache to avoid a live HANA hit each time.
+
+
 class SapInventoryView(_SafeAPIView):
     """Live SAP HANA finished-goods stock for the BH-FGM (Sonipat) warehouse,
     surfaced inside the Shipment Planner. Read-only; queried live each request
@@ -3680,6 +3741,10 @@ class SapInventoryView(_SafeAPIView):
     WHS_CODE = 'BH-FGM'
 
     def get(self, request):
+        now = time.time()
+        cached = _SAP_INV_CACHE['data']
+        if cached is not None and (now - _SAP_INV_CACHE['at'] < _SAP_INV_TTL):
+            return Response(cached)
         # Imported lazily so the rest of the shipment app never hard-depends on
         # the HANA driver (hdbcli) being installed. Both the import and the
         # schema resolution can fail (driver missing / SAP config) — guard them.
@@ -3755,7 +3820,7 @@ class SapInventoryView(_SafeAPIView):
         total_units = sum(float(r.get('OnHand') or 0) for r in rows)
         total_value = sum(float(r.get('StockValue') or 0) for r in rows)
         zero_stock = sum(1 for r in rows if float(r.get('OnHand') or 0) == 0)
-        return Response({
+        payload = {
             'warehouse': self.WHS_CODE,
             'schema': schema,
             'results': rows,
@@ -3766,4 +3831,7 @@ class SapInventoryView(_SafeAPIView):
                 'total_stock_value': round(total_value, 2),
                 'items_at_zero_stock': zero_stock,
             },
-        })
+        }
+        _SAP_INV_CACHE['at'] = now
+        _SAP_INV_CACHE['data'] = payload
+        return Response(payload)
