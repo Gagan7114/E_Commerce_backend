@@ -3582,7 +3582,8 @@ class PoShortSupplyView(APIView):
                            -- can be grouped appointment-wise. Use the ITEM's appointment
                            -- (precise for combined trucks); empty => DOH/no-appointment.
                            STRING_AGG(DISTINCT NULLIF(TRIM(si.appointment_id), ''), ', ') AS appointment_ids,
-                           MAX(s.created_at)        AS last_shipped_at
+                           MAX(s.created_at)        AS last_shipped_at,
+                           MAX(s.appointment_time)  AS appointment_time
                     FROM sp_items si
                     JOIN sp_shipments s ON s.id = si.shipment_id
                     WHERE si.not_loaded = FALSE
@@ -3592,7 +3593,7 @@ class PoShortSupplyView(APIView):
                              UPPER(TRIM(COALESCE(si.destination_fc, '')))
                 )
                 SELECT c.po_number, c.asin, c.product_name, c.internal_sku,
-                       c.destination_fc, c.appointment_ids, c.last_shipped_at,
+                       c.destination_fc, c.appointment_ids, c.last_shipped_at, c.appointment_time,
                        po.accepted_qty                    AS ordered_qty,
                        c.committed_qty                    AS shipped_qty,
                        (po.accepted_qty - c.committed_qty) AS short_qty
