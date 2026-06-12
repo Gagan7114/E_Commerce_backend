@@ -1453,14 +1453,12 @@ def pendency_dashboard(request, slug: str):
     raw_from = (request.query_params.get("from_date") or "").strip()
     raw_to = (request.query_params.get("to_date") or "").strip()
 
-    # Short-lived cache: pendency data only changes when POs are uploaded.
-    # 60s collapses repeated polling / tab-switching into one DB hit while
-    # keeping the response close to live. Cache key includes the user's
-    # filter inputs so each filter combo is cached independently.
-    _pendency_cache_key = f"pendency:{slug}:{raw_year}:{raw_po_month.upper()}:{raw_from}:{raw_to}"
-    _cached_payload = cache.get(_pendency_cache_key)
-    if _cached_payload is not None:
-        return Response(_cached_payload)
+    # No response cache here: the pendency dashboard must reflect uploads
+    # immediately. It reads the master_po_mv materialized view (refreshed on
+    # every upload), so the query is already fast. A cached payload could be
+    # served stale by a worker that didn't handle the upload (the cache is a
+    # per-process LocMemCache, so cache.clear() on upload only clears one
+    # worker) — which is exactly what made pendency look "not refreshed".
 
     where_parts = ['UPPER(TRIM("format"::text)) = %s']
     params: list = [fmt]
@@ -1715,7 +1713,6 @@ def pendency_dashboard(request, slug: str):
         "by_distributor": by_distributor,
         "by_po": by_po,
     }
-    cache.set(_pendency_cache_key, _payload, timeout=60)
     return Response(_payload)
 
 
