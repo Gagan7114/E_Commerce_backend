@@ -3715,6 +3715,7 @@ class PoShortSupplyView(_SafeAPIView):
                 )
                 SELECT c.po_number, c.asin, c.product_name, c.internal_sku, c.item_name,
                        c.destination_fc, c.appointment_ids, c.last_shipped_at, c.appointment_time,
+                       ch.channel                         AS channel,
                        po.accepted_qty                    AS ordered_qty,
                        c.committed_qty                    AS shipped_qty,
                        (po.accepted_qty - c.committed_qty) AS short_qty
@@ -3728,6 +3729,10 @@ class PoShortSupplyView(_SafeAPIView):
                     ORDER BY p.accepted_qty DESC NULLS LAST
                     LIMIT 1
                 ) po ON TRUE
+                -- Channel (CORE/FRESH/NOW) for this line's FC, same mapping the
+                -- shipment serializer uses; LEFT JOIN so an unmapped FC just yields NULL.
+                LEFT JOIN public.fc_city_state_channel_master ch
+                       ON UPPER(TRIM(ch.fc::text)) = c.fc_key
                 WHERE c.committed_qty > 0
                   AND (po.accepted_qty - c.committed_qty) > 0
                 ORDER BY (po.accepted_qty - c.committed_qty) DESC
@@ -3760,6 +3765,7 @@ class SapInventoryView(_SafeAPIView):
         now = time.time()
         cached = _SAP_INV_CACHE['data']
         if cached is not None and (now - _SAP_INV_CACHE['at'] < _SAP_INV_TTL):
+            self._overlay_reserved(cached.get('results') or [])
             return Response(cached)
         # Imported lazily so the rest of the shipment app never hard-depends on
         # the HANA driver (hdbcli) being installed. Both the import and the
@@ -3850,4 +3856,21 @@ class SapInventoryView(_SafeAPIView):
         }
         _SAP_INV_CACHE['at'] = now
         _SAP_INV_CACHE['data'] = payload
+        self._overlay_reserved(payload['results'])
         return Response(payload)
+
+    @staticmethod
+    def _overlay_reserved(rows):
+        """Attach the planner's LIVE reservation to each SAP row: ``planned_reserved``
+        = units already spoken for by ACTIVE Amazon plans (draft / pending_approval /
+        approved) for that ASIN, and ``free_to_plan`` = On Hand − planned_reserved
+        (what the planner actually treats as available). Computed fresh on every
+        request — NOT part of the 60s SAP cache — so a load shows here the instant
+        it's planned. SAP's own OnHand / Committed / Available are left untouched.
+        Keyed by the row's ASIN (format_sku_code); non-Amazon rows reserve nothing."""
+        reserved = _reserved_stock_by_asin()
+        for r in rows:
+            asin = str(r.get('format_sku_code') or '').strip().upper()
+            res = reserved.get(asin, 0.0) if asin else 0.0
+            r['planned_reserved'] = res
+            r['free_to_plan'] = float(r.get('OnHand') or 0) - res
