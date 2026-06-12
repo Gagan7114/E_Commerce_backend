@@ -17,6 +17,7 @@ urlpatterns = [
     path("category-litres", views.category_litres, name="dashboard-category-litres"),
     path("category-breakdown", views.category_breakdown, name="dashboard-category-breakdown"),
     path("category-trend", views.category_trend, name="dashboard-category-trend"),
+    path("secondary-yoy-growth", views.secondary_yoy_growth, name="dashboard-secondary-yoy-growth"),
     path("fulfilment-health", views.fulfilment_health, name="dashboard-fulfilment-health"),
     path("top-skus", views.top_skus, name="dashboard-top-skus"),
     path("platform-expiry-alerts", views.platform_expiry_alerts, name="dashboard-platform-expiry-alerts"),

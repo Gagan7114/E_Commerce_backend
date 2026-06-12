@@ -1056,7 +1056,466 @@ def category_trend(request):
     })
 
 
-# ─── /fulfilment-health ───
+# --- /secondary-yoy-growth ---
+# Secondary YOY comparison for the Home page. This intentionally excludes
+# JioMart and B2B primary-style channels (Zomato/CityMall). Swiggy is sourced
+# from SecMaster here, even though its detailed platform dashboard uses swiggySec.
+_SECONDARY_YOY_PLATFORMS = (
+    ("amazon", "Amazon"),
+    ("amazon_mp", "Amazon MP"),
+    ("blinkit", "Blinkit"),
+    ("swiggy", "Swiggy"),
+    ("zepto", "Zepto"),
+    ("bigbasket", "BigBasket"),
+    ("flipkart", "Flipkart"),
+    ("flipkart_grocery", "Flipkart Grocery"),
+)
+
+_SECONDARY_YOY_SECM_FORMATS = {
+    "blinkit": "blinkit",
+    "swiggy": "swiggy",
+    "zepto": "zepto",
+    "bigbasket": "bigbasket",
+}
+
+
+def _secondary_yoy_float(value):
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _secondary_yoy_date(value):
+    return value.isoformat() if hasattr(value, "isoformat") else value
+
+
+def _secondary_yoy_growth(current, previous):
+    current_num = _secondary_yoy_float(current)
+    previous_num = _secondary_yoy_float(previous)
+    if current_num is None or previous_num is None or previous_num <= 0:
+        return None
+    return round(((current_num - previous_num) / previous_num) * 100, 2)
+
+
+def _secondary_yoy_empty_cell():
+    return {
+        "actual": None,
+        "value": None,
+        "units": None,
+        "has_data": False,
+        "growth_pct": None,
+        "projection": None,
+        "elapsed_day": None,
+        "days_in_month": None,
+        "max_date": None,
+    }
+
+
+def _secondary_yoy_pick_platforms(raw_platform: str | None):
+    allowed = {slug for slug, _ in _SECONDARY_YOY_PLATFORMS}
+    platform = (raw_platform or "").strip().lower()
+    if platform and platform in allowed:
+        return [
+            (slug, name)
+            for slug, name in _SECONDARY_YOY_PLATFORMS
+            if slug == platform
+        ]
+    return list(_SECONDARY_YOY_PLATFORMS)
+
+
+def _secondary_yoy_month_year(params) -> tuple[int, int, bool, list[dict]]:
+    errors: list[dict] = []
+    today = date.today()
+    raw_month = str(params.get("month") or "").strip()
+    raw_year = str(params.get("year") or "").strip()
+
+    if re.fullmatch(r"\d{4}-\d{2}", raw_month) and not raw_year:
+        raw_year, raw_month = raw_month.split("-")
+
+    if raw_month and raw_year:
+        try:
+            month = int(raw_month)
+            year = int(raw_year)
+            if 1 <= month <= 12 and 2000 <= year <= 2100:
+                return month, year, False, errors
+        except (TypeError, ValueError):
+            pass
+
+    latest = None
+
+    def consider(label, sql, sql_params=None):
+        nonlocal latest
+        try:
+            with connection.cursor() as cur:
+                cur.execute(sql, sql_params or [])
+                row = cur.fetchone()
+            candidate = row[0] if row else None
+            if candidate and (latest is None or candidate > latest):
+                latest = candidate
+        except Exception as exc:  # noqa: BLE001
+            errors.append({"source": label, "error": str(exc)})
+
+    secmaster_date_expr = """
+        CASE
+            WHEN REGEXP_REPLACE(LOWER(TRIM("format"::text)), '[^a-z0-9]+', '', 'g') = 'zepto'
+             AND TRIM("real_date"::text) ~ '^\\d{2}-\\d{2}-\\d{4}$'
+                THEN TO_DATE(TRIM("real_date"::text), 'DD-MM-YYYY')
+            WHEN REGEXP_REPLACE(LOWER(TRIM("format"::text)), '[^a-z0-9]+', '', 'g') = 'zepto'
+             AND TRIM("real_date"::text) ~ '^\\d{4}-\\d{2}-\\d{2}$'
+                THEN TRIM("real_date"::text)::date
+            ELSE "date"
+        END
+    """
+    consider(
+        "secmaster",
+        f"""
+        SELECT MAX(({secmaster_date_expr})::date)
+        FROM "SecMaster"
+        WHERE REGEXP_REPLACE(LOWER(TRIM("format"::text)), '[^a-z0-9]+', '', 'g')
+              IN ('blinkit', 'swiggy', 'zepto', 'bigbasket')
+        """,
+    )
+    consider(
+        "amazon_sec_range_master_view",
+        'SELECT MAX("to_date"::date) FROM "amazon_sec_range_master_view"',
+    )
+    consider(
+        "amazon_mp_master",
+        """
+        SELECT MAX(
+            CASE
+                WHEN "shipment_date" ~ '^[0-9]{2}/[0-9]{2}/[0-9]{2}'
+                    THEN to_timestamp("shipment_date", 'DD/MM/YY HH24:MI')::date
+                WHEN "shipment_date" ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}'
+                    THEN "shipment_date"::date
+                WHEN "shipment_date" ~ '^[0-9]{2}-[0-9]{2}-[0-9]{4}'
+                    THEN to_date("shipment_date", 'DD-MM-YYYY')
+                ELSE NULL
+            END
+        )
+        FROM "amazon_mp_master"
+        """,
+    )
+    consider(
+        "flipkart_secondary_all",
+        'SELECT MAX("Order Date"::date) FROM "flipkart_secondary_all"',
+    )
+    consider(
+        "flipkart_grocery_master",
+        'SELECT MAX("real_date"::date) FROM "flipkart_grocery_master"',
+    )
+
+    if latest:
+        return latest.month, latest.year, True, errors
+    return today.month, today.year, True, errors
+
+
+@api_view(["GET"])
+@permission_classes([require("dashboard.view")])
+@cached_get(timeout=120, prefix="dash.secondary_yoy_growth")
+def secondary_yoy_growth(request):
+    month, anchor_year, defaulted, errors = _secondary_yoy_month_year(request.GET)
+    month_name = calendar.month_name[month].upper()
+    years = [anchor_year - 2, anchor_year - 1, anchor_year]
+    days_in_month = calendar.monthrange(anchor_year, month)[1]
+    platform_filter = (request.GET.get("platform") or "").strip().lower() or None
+    selected_platforms = _secondary_yoy_pick_platforms(platform_filter)
+    selected_slugs = {slug for slug, _ in selected_platforms}
+    cells: dict[str, dict[int, dict]] = defaultdict(dict)
+
+    def put(slug, year, actual, value, units, max_date, source):
+        if slug not in selected_slugs:
+            return
+        actual_num = _secondary_yoy_float(actual)
+        max_date_value = _secondary_yoy_date(max_date)
+        cell = {
+            "actual": actual_num,
+            "value": _secondary_yoy_float(value),
+            "units": _secondary_yoy_float(units),
+            "has_data": actual_num is not None and actual_num != 0,
+            "growth_pct": None,
+            "projection": None,
+            "elapsed_day": None,
+            "days_in_month": None,
+            "max_date": max_date_value,
+            "source": source,
+        }
+        if year == anchor_year and actual_num is not None:
+            elapsed_day = None
+            if hasattr(max_date, "day"):
+                elapsed_day = max_date.day
+            elif isinstance(max_date_value, str):
+                match = re.match(r"^\d{4}-\d{2}-(\d{2})", max_date_value)
+                if match:
+                    elapsed_day = int(match.group(1))
+            if elapsed_day:
+                cell["elapsed_day"] = elapsed_day
+                cell["days_in_month"] = days_in_month
+                cell["projection"] = round(
+                    (actual_num / elapsed_day) * days_in_month,
+                    2,
+                )
+        cells[slug][int(year)] = cell
+
+    def run(label, sql, params, handler):
+        try:
+            with connection.cursor() as cur:
+                cur.execute(sql, params)
+                rows = cur.fetchall()
+            for row in rows:
+                handler(row)
+        except Exception as exc:  # noqa: BLE001
+            errors.append({"source": label, "error": str(exc)})
+
+    if selected_slugs & set(_SECONDARY_YOY_SECM_FORMATS):
+        format_to_slug = {
+            fmt: slug for slug, fmt in _SECONDARY_YOY_SECM_FORMATS.items()
+        }
+        secmaster_date_expr = """
+            CASE
+                WHEN REGEXP_REPLACE(LOWER(TRIM("format"::text)), '[^a-z0-9]+', '', 'g') = 'zepto'
+                 AND TRIM("real_date"::text) ~ '^\\d{2}-\\d{2}-\\d{4}$'
+                    THEN TO_DATE(TRIM("real_date"::text), 'DD-MM-YYYY')
+                WHEN REGEXP_REPLACE(LOWER(TRIM("format"::text)), '[^a-z0-9]+', '', 'g') = 'zepto'
+                 AND TRIM("real_date"::text) ~ '^\\d{4}-\\d{2}-\\d{2}$'
+                    THEN TRIM("real_date"::text)::date
+                ELSE "date"
+            END
+        """
+        fmt_values = [
+            _SECONDARY_YOY_SECM_FORMATS[slug]
+            for slug in selected_slugs
+            if slug in _SECONDARY_YOY_SECM_FORMATS
+        ]
+        fmt_placeholders = ", ".join(["%s"] * len(fmt_values))
+        year_placeholders = ", ".join(["%s"] * len(years))
+        run(
+            "secmaster",
+            f"""
+            SELECT
+                REGEXP_REPLACE(LOWER(TRIM("format"::text)), '[^a-z0-9]+', '', 'g') AS fmt,
+                "year"::int AS yr,
+                COALESCE(SUM("ltr_sold"), 0) AS ltrs,
+                COALESCE(
+                    NULLIF(SUM("sales_amt_exc"), 0),
+                    NULLIF(SUM("sales_amt"), 0),
+                    SUM("amount"),
+                    0
+                ) AS value,
+                COALESCE(SUM("quantity"), 0) AS units,
+                MAX(({secmaster_date_expr})::date) AS max_date
+            FROM "SecMaster"
+            WHERE REGEXP_REPLACE(LOWER(TRIM("format"::text)), '[^a-z0-9]+', '', 'g')
+                  IN ({fmt_placeholders})
+              AND UPPER(TRIM("month"::text)) = %s
+              AND "year"::numeric IN ({year_placeholders})
+            GROUP BY 1, 2
+            """,
+            [*fmt_values, month_name, *years],
+            lambda row: put(
+                format_to_slug.get(row[0]),
+                row[1],
+                row[2],
+                row[3],
+                row[4],
+                row[5],
+                "SecMaster",
+            ),
+        )
+
+    if "amazon" in selected_slugs:
+        year_placeholders = ", ".join(["%s"] * len(years))
+        run(
+            "amazon_sec_range_master_view",
+            f"""
+            WITH base AS (
+                SELECT
+                    "year"::int AS yr,
+                    "to_date"::date AS to_date,
+                    COALESCE("shipped_litres", 0) AS ltrs,
+                    COALESCE("calculated_shipped_revenue", 0) AS value,
+                    COALESCE("shipped_units", 0) AS units
+                FROM "amazon_sec_range_master_view"
+                WHERE UPPER(TRIM("month"::text)) = %s
+                  AND "year"::int IN ({year_placeholders})
+            ),
+            latest AS (
+                SELECT yr, MAX(to_date) AS max_date
+                FROM base
+                GROUP BY yr
+            )
+            SELECT b.yr, COALESCE(SUM(b.ltrs), 0), COALESCE(SUM(b.value), 0),
+                   COALESCE(SUM(b.units), 0), l.max_date
+            FROM base b
+            JOIN latest l ON l.yr = b.yr AND l.max_date = b.to_date
+            GROUP BY b.yr, l.max_date
+            """,
+            [month_name, *years],
+            lambda row: put(
+                "amazon",
+                row[0],
+                row[1],
+                row[2],
+                row[3],
+                row[4],
+                "amazon_sec_range_master_view",
+            ),
+        )
+
+    if "amazon_mp" in selected_slugs:
+        year_placeholders = ", ".join(["%s"] * len(years))
+        run(
+            "amazon_mp_master",
+            f"""
+            SELECT
+                "shipment_year"::int AS yr,
+                COALESCE(SUM("delivered_ltr"), 0) AS ltrs,
+                NULL::numeric AS value,
+                COALESCE(SUM("quantity"), 0) AS units,
+                MAX(
+                    CASE
+                        WHEN "shipment_date" ~ '^[0-9]{{2}}/[0-9]{{2}}/[0-9]{{2}}'
+                            THEN to_timestamp("shipment_date", 'DD/MM/YY HH24:MI')::date
+                        WHEN "shipment_date" ~ '^[0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}'
+                            THEN "shipment_date"::date
+                        WHEN "shipment_date" ~ '^[0-9]{{2}}-[0-9]{{2}}-[0-9]{{4}}'
+                            THEN to_date("shipment_date", 'DD-MM-YYYY')
+                        ELSE NULL
+                    END
+                ) AS max_date
+            FROM "amazon_mp_master"
+            WHERE UPPER(TRIM("shipment_month"::text)) = %s
+              AND "shipment_year"::int IN ({year_placeholders})
+            GROUP BY "shipment_year"::int
+            """,
+            [month_name, *years],
+            lambda row: put(
+                "amazon_mp",
+                row[0],
+                row[1],
+                row[2],
+                row[3],
+                row[4],
+                "amazon_mp_master",
+            ),
+        )
+
+    if "flipkart" in selected_slugs:
+        year_placeholders = ", ".join(["%s"] * len(years))
+        run(
+            "flipkart_secondary_all",
+            f"""
+            SELECT
+                "year"::int AS yr,
+                COALESCE(SUM("ltr_sold"), 0) AS ltrs,
+                COALESCE(SUM("Final Sale Amount"), 0) AS value,
+                COALESCE(SUM("Final Sale Units"), 0) AS units,
+                MAX("Order Date"::date) AS max_date
+            FROM "flipkart_secondary_all"
+            WHERE UPPER(TRIM("month"::text)) = %s
+              AND "year"::int IN ({year_placeholders})
+            GROUP BY "year"::int
+            """,
+            [month_name, *years],
+            lambda row: put(
+                "flipkart",
+                row[0],
+                row[1],
+                row[2],
+                row[3],
+                row[4],
+                "flipkart_secondary_all",
+            ),
+        )
+
+    if "flipkart_grocery" in selected_slugs:
+        year_placeholders = ", ".join(["%s"] * len(years))
+        run(
+            "flipkart_grocery_master",
+            f"""
+            SELECT
+                "year"::int AS yr,
+                COALESCE(SUM("ltr_sold"), 0) AS ltrs,
+                COALESCE(SUM("sale_amt_exclusive"), 0) AS value,
+                COALESCE(SUM("qty"), 0) AS units,
+                MAX("real_date"::date) AS max_date
+            FROM "flipkart_grocery_master"
+            WHERE "month"::int = %s
+              AND "year"::int IN ({year_placeholders})
+            GROUP BY "year"::int
+            """,
+            [month, *years],
+            lambda row: put(
+                "flipkart_grocery",
+                row[0],
+                row[1],
+                row[2],
+                row[3],
+                row[4],
+                "flipkart_grocery_master",
+            ),
+        )
+
+    rows = []
+    total_by_year = {
+        year: {
+            "actual": None,
+            "projection": None,
+            "growth_pct": None,
+            "has_data": False,
+        }
+        for year in years
+    }
+
+    for slug, name in selected_platforms:
+        values = {}
+        for year in years:
+            cell = cells.get(slug, {}).get(year, _secondary_yoy_empty_cell()).copy()
+            if cell["actual"] is not None:
+                total_by_year[year]["actual"] = (
+                    total_by_year[year]["actual"] or 0
+                ) + cell["actual"]
+                total_by_year[year]["has_data"] = True
+            if year == anchor_year and cell.get("projection") is not None:
+                total_by_year[year]["projection"] = (
+                    total_by_year[year]["projection"] or 0
+                ) + cell["projection"]
+            values[str(year)] = cell
+        for index, year in enumerate(years):
+            if index == 0:
+                continue
+            values[str(year)]["growth_pct"] = _secondary_yoy_growth(
+                values[str(year)]["actual"],
+                values[str(years[index - 1])]["actual"],
+            )
+        rows.append({"slug": slug, "name": name, "values": values})
+
+    for index, year in enumerate(years):
+        if index == 0:
+            continue
+        total_by_year[year]["growth_pct"] = _secondary_yoy_growth(
+            total_by_year[year]["actual"],
+            total_by_year[years[index - 1]]["actual"],
+        )
+
+    return Response({
+        "source": "secondary",
+        "metric": "ltrs",
+        "anchor_month": month,
+        "anchor_month_label": calendar.month_name[month],
+        "anchor_year": anchor_year,
+        "defaulted_to_latest": defaulted,
+        "years": years,
+        "rows": rows,
+        "totals": {str(year): total_by_year[year] for year in years},
+        "errors": errors,
+    })
+
+
+# --- /fulfilment-health ---
 @api_view(["GET"])
 @permission_classes([require("dashboard.view")])
 @cached_get(timeout=120, prefix="dash.fulfilment_health")

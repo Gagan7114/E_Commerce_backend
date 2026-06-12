@@ -1453,14 +1453,12 @@ def pendency_dashboard(request, slug: str):
     raw_from = (request.query_params.get("from_date") or "").strip()
     raw_to = (request.query_params.get("to_date") or "").strip()
 
-    # Short-lived cache: pendency data only changes when POs are uploaded.
-    # 60s collapses repeated polling / tab-switching into one DB hit while
-    # keeping the response close to live. Cache key includes the user's
-    # filter inputs so each filter combo is cached independently.
-    _pendency_cache_key = f"pendency:{slug}:{raw_year}:{raw_po_month.upper()}:{raw_from}:{raw_to}"
-    _cached_payload = cache.get(_pendency_cache_key)
-    if _cached_payload is not None:
-        return Response(_cached_payload)
+    # No response cache here: the pendency dashboard must reflect uploads
+    # immediately. It reads the master_po_mv materialized view (refreshed on
+    # every upload), so the query is already fast. A cached payload could be
+    # served stale by a worker that didn't handle the upload (the cache is a
+    # per-process LocMemCache, so cache.clear() on upload only clears one
+    # worker) — which is exactly what made pendency look "not refreshed".
 
     where_parts = ['UPPER(TRIM("format"::text)) = %s']
     params: list = [fmt]
@@ -1715,7 +1713,6 @@ def pendency_dashboard(request, slug: str):
         "by_distributor": by_distributor,
         "by_po": by_po,
     }
-    cache.set(_pendency_cache_key, _payload, timeout=60)
     return Response(_payload)
 
 
@@ -9409,24 +9406,119 @@ def _amazon_drr_dashboard_response(request):
     }
     ops_col, units_col, ltr_col = metric_columns[sales_mode]
 
-    max_date = _scalar(
-        """
-        SELECT MAX("to_date"::date)
-        FROM "amazon_sec_daily_master_view"
-        WHERE UPPER(TRIM("month"::text)) = %s
-          AND "year" = %s
-        """,
-        [month_name, year],
-    )
-    elapsed_days = _sec_elapsed_day(max_date)
+    month_start = date(year, month, 1)
+    month_end = date(year, month, days_in_month)
+
+    def parse_optional_date(value, field_name: str):
+        value = str(value or "").strip()
+        if not value:
+            return None
+        try:
+            return date.fromisoformat(value)
+        except ValueError:
+            raise ValidationError(f"`{field_name}` must be a valid YYYY-MM-DD date.")
+
+    from_date = parse_optional_date(request.query_params.get("from_date"), "from_date")
+    to_date = parse_optional_date(request.query_params.get("to_date"), "to_date")
+    if from_date and to_date and from_date > to_date:
+        raise ValidationError("`from_date` cannot be later than `to_date`.")
 
     item_head_filter = ""
     daily_params = [month_name, year]
     if item_head != "ALL":
         item_head_filter = 'AND UPPER(TRIM("item_head"::text)) = %s'
         daily_params.append(item_head)
+    overall_params = list(daily_params)
+
+    date_filter = ""
+    if from_date:
+        date_filter += ' AND "to_date"::date >= %s'
+        daily_params.append(from_date)
+    if to_date:
+        date_filter += ' AND "to_date"::date <= %s'
+        daily_params.append(to_date)
+
+    max_date = _scalar(
+        f"""
+        SELECT MAX("to_date"::date)
+        FROM "amazon_sec_daily_master_view"
+        WHERE UPPER(TRIM("month"::text)) = %s
+          AND "year" = %s
+          {item_head_filter}
+          {date_filter}
+        """,
+        daily_params,
+    )
+    has_date_range = bool(from_date or to_date)
+    daily_start = max(from_date or month_start, month_start)
+    if has_date_range:
+        daily_end = min(to_date or max_date or month_end, month_end)
+    else:
+        daily_end = month_end
+    if max_date and daily_start <= max_date:
+        elapsed_days = (max_date - daily_start).days + 1
+    else:
+        elapsed_days = 0
 
     daily_raw = _dict_rows(
+        f"""
+        SELECT
+            "to_date"::date AS sale_date,
+            COALESCE(SUM("{ops_col}"), 0) AS ops,
+            COALESCE(SUM("{units_col}"), 0) AS units,
+            COALESCE(SUM("{ltr_col}"), 0) AS ltr
+        FROM "amazon_sec_daily_master_view"
+        WHERE UPPER(TRIM("month"::text)) = %s
+          AND "year" = %s
+          AND "to_date" IS NOT NULL
+          {item_head_filter}
+          {date_filter}
+        GROUP BY "to_date"::date
+        ORDER BY "to_date"::date
+        """,
+        daily_params,
+    )
+    daily_by_date = {row["sale_date"]: row for row in daily_raw}
+
+    daily = []
+    total_ops = 0.0
+    total_units = 0.0
+    total_ltr = 0.0
+    daily_dates = []
+    if daily_start <= daily_end:
+        daily_dates = [
+            daily_start + timedelta(days=offset)
+            for offset in range((daily_end - daily_start).days + 1)
+        ]
+    for current_date in daily_dates:
+        row = daily_by_date.get(current_date, {})
+        ops = _num(row.get("ops"))
+        units = _num(row.get("units"))
+        ltr = _num(row.get("ltr"))
+        if max_date and current_date <= max_date:
+            total_ops += ops
+            total_units += units
+            total_ltr += ltr
+        daily.append({
+            "date": current_date.isoformat(),
+            "display_date": current_date.strftime("%d-%m-%Y"),
+            "day": current_date.day,
+            "ops": ops,
+            "units": units,
+            "ltr": ltr,
+        })
+
+    overall_max_date = _scalar(
+        f"""
+        SELECT MAX("to_date"::date)
+        FROM "amazon_sec_daily_master_view"
+        WHERE UPPER(TRIM("month"::text)) = %s
+          AND "year" = %s
+          {item_head_filter}
+        """,
+        overall_params,
+    )
+    overall_daily_raw = _dict_rows(
         f"""
         SELECT
             "to_date"::date AS sale_date,
@@ -9441,40 +9533,143 @@ def _amazon_drr_dashboard_response(request):
         GROUP BY "to_date"::date
         ORDER BY "to_date"::date
         """,
-        daily_params,
+        overall_params,
     )
-    daily_by_date = {row["sale_date"]: row for row in daily_raw}
-
-    daily = []
-    total_ops = 0.0
-    total_units = 0.0
-    total_ltr = 0.0
+    overall_daily_by_date = {row["sale_date"]: row for row in overall_daily_raw}
+    overall_daily = []
     for day in range(1, days_in_month + 1):
         current_date = date(year, month, day)
-        row = daily_by_date.get(current_date, {})
-        ops = _num(row.get("ops"))
-        units = _num(row.get("units"))
-        ltr = _num(row.get("ltr"))
-        if max_date and current_date <= max_date:
-            total_ops += ops
-            total_units += units
-            total_ltr += ltr
-        daily.append({
+        row = overall_daily_by_date.get(current_date, {})
+        overall_daily.append({
             "date": current_date.isoformat(),
             "display_date": current_date.strftime("%d-%m-%Y"),
             "day": day,
+            "ops": _num(row.get("ops")),
+            "units": _num(row.get("units")),
+            "ltr": _num(row.get("ltr")),
+        })
+
+    def build_amazon_drr_row(row: dict) -> dict:
+        ops = _num(row.get("ops"))
+        units = _num(row.get("units"))
+        ltr = _num(row.get("ltr"))
+        drr_ops = _safe_div(ops, elapsed_days)
+        drr_units = _safe_div(units, elapsed_days)
+        drr_ltr = _safe_div(ltr, elapsed_days)
+        enriched = dict(row)
+        enriched.update({
             "ops": ops,
             "units": units,
             "ltr": ltr,
+            "drr_ops": drr_ops,
+            "drr_units": drr_units,
+            "drr_ltr": drr_ltr,
+            "projection_ops": drr_ops * days_in_month,
+            "projection_units": drr_units * days_in_month,
+            "projection_ltr": drr_ltr * days_in_month,
         })
+        return enriched
 
-    max_date_label = max_date.strftime("%d %B %Y").upper() if max_date else f"{month_name} {year}"
+    sub_category_rows = [
+        build_amazon_drr_row(row)
+        for row in _dict_rows(
+            f"""
+            SELECT
+                COALESCE(NULLIF(UPPER(TRIM("item_head"::text)), ''), 'OTHER') AS item_head,
+                COALESCE(NULLIF(UPPER(TRIM("category"::text)), ''), 'UNMAPPED') AS category,
+                COALESCE(NULLIF(UPPER(TRIM("sub_category"::text)), ''), 'UNMAPPED') AS sub_category,
+                COALESCE(
+                    NULLIF(
+                        STRING_AGG(DISTINCT NULLIF(UPPER(TRIM("brand"::text)), ''), ' / '),
+                        ''
+                    ),
+                    '-'
+                ) AS brand,
+                COUNT(DISTINCT NULLIF(TRIM("asin"::text), '')) AS sku_count,
+                COALESCE(SUM("{ops_col}"), 0) AS ops,
+                COALESCE(SUM("{units_col}"), 0) AS units,
+                COALESCE(SUM("{ltr_col}"), 0) AS ltr
+            FROM "amazon_sec_daily_master_view"
+            WHERE UPPER(TRIM("month"::text)) = %s
+              AND "year" = %s
+              AND "to_date" IS NOT NULL
+              {item_head_filter}
+              {date_filter}
+            GROUP BY
+                COALESCE(NULLIF(UPPER(TRIM("item_head"::text)), ''), 'OTHER'),
+                COALESCE(NULLIF(UPPER(TRIM("category"::text)), ''), 'UNMAPPED'),
+                COALESCE(NULLIF(UPPER(TRIM("sub_category"::text)), ''), 'UNMAPPED')
+            ORDER BY ltr DESC, ops DESC, sub_category ASC
+            """,
+            list(daily_params),
+        )
+    ]
+
+    sku_rows = [
+        build_amazon_drr_row(row)
+        for row in _dict_rows(
+            f"""
+            SELECT
+                COALESCE(NULLIF(UPPER(TRIM("item_head"::text)), ''), 'OTHER') AS item_head,
+                COALESCE(NULLIF(UPPER(TRIM("category"::text)), ''), 'UNMAPPED') AS category,
+                COALESCE(NULLIF(UPPER(TRIM("sub_category"::text)), ''), 'UNMAPPED') AS sub_category,
+                COALESCE(NULLIF(TRIM("brand"::text), ''), '-') AS brand,
+                COALESCE(NULLIF(TRIM("per_unit"::text), ''), '-') AS per_ltr,
+                COALESCE(NULLIF(TRIM("asin"::text), ''), '-') AS sku_code,
+                COALESCE(NULLIF(TRIM("asin"::text), ''), '-') AS asin,
+                COALESCE(NULLIF(TRIM("product_title"::text), ''), 'UNMAPPED SKU') AS sku_name,
+                COALESCE(NULLIF(TRIM("item"::text), ''), '-') AS item,
+                COALESCE(SUM("{ops_col}"), 0) AS ops,
+                COALESCE(SUM("{units_col}"), 0) AS units,
+                COALESCE(SUM("{ltr_col}"), 0) AS ltr
+            FROM "amazon_sec_daily_master_view"
+            WHERE UPPER(TRIM("month"::text)) = %s
+              AND "year" = %s
+              AND "to_date" IS NOT NULL
+              {item_head_filter}
+              {date_filter}
+            GROUP BY
+                COALESCE(NULLIF(UPPER(TRIM("item_head"::text)), ''), 'OTHER'),
+                COALESCE(NULLIF(UPPER(TRIM("category"::text)), ''), 'UNMAPPED'),
+                COALESCE(NULLIF(UPPER(TRIM("sub_category"::text)), ''), 'UNMAPPED'),
+                COALESCE(NULLIF(TRIM("brand"::text), ''), '-'),
+                COALESCE(NULLIF(TRIM("per_unit"::text), ''), '-'),
+                COALESCE(NULLIF(TRIM("asin"::text), ''), '-'),
+                COALESCE(NULLIF(TRIM("product_title"::text), ''), 'UNMAPPED SKU'),
+                COALESCE(NULLIF(TRIM("item"::text), ''), '-')
+            ORDER BY ltr DESC, ops DESC, sku_name ASC
+            """,
+            list(daily_params),
+        )
+    ]
+
+    if has_date_range and daily_start <= daily_end:
+        max_date_label = (
+            f"{daily_start.strftime('%d-%m-%Y')} TO {daily_end.strftime('%d-%m-%Y')}"
+        )
+    else:
+        max_date_label = max_date.strftime("%d %B %Y").upper() if max_date else f"{month_name} {year}"
+    overall_max_date_label = (
+        overall_max_date.strftime("%d %B %Y").upper()
+        if overall_max_date
+        else f"{month_name} {year}"
+    )
+    drr_ops = _safe_div(total_ops, elapsed_days)
+    drr_units = _safe_div(total_units, elapsed_days)
+    drr_ltr = _safe_div(total_ltr, elapsed_days)
     totals = {
         "ops": total_ops,
         "units": total_units,
         "ltr": total_ltr,
-        "avg_value": _safe_div(total_ops, elapsed_days),
-        "avg_ltrs": _safe_div(total_ltr, elapsed_days),
+        "avg_value": drr_ops,
+        "avg_units": drr_units,
+        "avg_ltrs": drr_ltr,
+        "drr_ops": drr_ops,
+        "drr_units": drr_units,
+        "drr_ltr": drr_ltr,
+        "projection_ops": drr_ops * days_in_month,
+        "projection_units": drr_units * days_in_month,
+        "projection_ltr": drr_ltr * days_in_month,
     }
 
     return Response({
@@ -9485,6 +9680,10 @@ def _amazon_drr_dashboard_response(request):
         "month_name": month_name,
         "year": year,
         "max_date": max_date.isoformat() if max_date else None,
+        "from_date": from_date.isoformat() if from_date else None,
+        "to_date": to_date.isoformat() if to_date else None,
+        "date_range_start": daily_start.isoformat() if daily_start <= daily_end else None,
+        "date_range_end": daily_end.isoformat() if daily_start <= daily_end else None,
         "elapsed_days": elapsed_days,
         "days_in_month": days_in_month,
         "item_head": item_head,
@@ -9493,8 +9692,21 @@ def _amazon_drr_dashboard_response(request):
         "sales_mode": sales_mode,
         "sales_mode_options": list(_AMAZON_DRR_SALES_MODES),
         "title": f"JIVO AMAZON SALE ({max_date_label})",
+        "overall_title": f"JIVO AMAZON SALE ({overall_max_date_label})",
         "daily": daily,
-        "daily_groups": [daily[:9], daily[9:18], daily[18:27], daily[27:]],
+        "daily_groups": [
+            daily[index:index + 9]
+            for index in range(0, len(daily), 9)
+        ],
+        "overall_daily": overall_daily,
+        "overall_daily_groups": [
+            overall_daily[index:index + 9]
+            for index in range(0, len(overall_daily), 9)
+        ],
+        "rows": sku_rows,
+        "items": sku_rows,
+        "sku_rows": sku_rows,
+        "sub_category_rows": sub_category_rows,
         "totals": totals,
         "summary_note": "Uses amazon_sec_daily_master_view to match DRR rows 1-20 from AMAZON SHEET.xlsx.",
     })
