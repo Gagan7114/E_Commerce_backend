@@ -1709,8 +1709,11 @@ def top_skus(request):
     acc = {(month_num, year): {}, (prev_month, prev_year): {}}
 
     def absorb(dest, rows):
-        # rows: (name, head, ltrs)
-        for name_val, head_val, ltrs in rows:
+        # rows: (name, head, ltrs[, code]) — code is an optional 4th column the
+        # secondary queries supply so the UI can show a SKU code per row.
+        for row in rows:
+            name_val, head_val, ltrs = row[0], row[1], row[2]
+            code_val = row[3] if len(row) > 3 else None
             val = float(ltrs or 0)
             if val == 0:
                 continue
@@ -1719,11 +1722,14 @@ def top_skus(request):
             head = (str(head_val).strip().upper() if head_val else "")
             if head not in ("PREMIUM", "COMMODITY"):
                 head = "OTHER"
+            code = (str(code_val).strip() if code_val else "") or None
             slot = dest.get(key)
             if slot is None:
-                dest[key] = {"name": name, "head": head, "ltrs": val}
+                dest[key] = {"name": name, "head": head, "ltrs": val, "code": code}
             else:
                 slot["ltrs"] += val
+                if not slot.get("code") and code:
+                    slot["code"] = code
 
     def run(label, dest, sql, params):
         try:
@@ -1921,7 +1927,8 @@ def top_skus(request):
                     sql = """
                         SELECT COALESCE(NULLIF(TRIM(item::text), ''), 'Unknown') AS name,
                                UPPER(TRIM(item_head::text)) AS head,
-                               COALESCE(SUM(ltr_sold), 0) AS ltrs
+                               COALESCE(SUM(ltr_sold), 0) AS ltrs,
+                               MAX(NULLIF(TRIM(sku_code::text), '')) AS code
                         FROM "SecMaster"
                         WHERE UPPER(TRIM(month::text)) = %s AND year::numeric = %s
                           AND UPPER(TRIM(item_head::text)) IN ('PREMIUM', 'COMMODITY')
@@ -1956,7 +1963,8 @@ def top_skus(request):
                         latest AS (SELECT MAX(to_day) AS md FROM base)
                         SELECT COALESCE(ml.name, b.asin) AS name,
                                UPPER(TRIM(ml.item_head::text)) AS head,
-                               COALESCE(SUM(b.units * COALESCE(ml.per_unit_value::numeric, 0)), 0) AS ltrs
+                               COALESCE(SUM(b.units * COALESCE(ml.per_unit_value::numeric, 0)), 0) AS ltrs,
+                               MAX(b.asin) AS code
                         FROM base b
                         CROSS JOIN latest l
                         JOIN ml ON UPPER(TRIM(ml.format_sku_code::text)) = UPPER(TRIM(b.asin::text))
@@ -1980,6 +1988,7 @@ def top_skus(request):
             out.append({
                 "name": s["name"],
                 "head": s["head"],
+                "code": s.get("code"),
                 "ltrs": ltrs,
                 "prev_ltrs": prev_ltrs,
                 "delta_pct": delta_pct,
