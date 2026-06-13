@@ -2067,7 +2067,8 @@ def platform_expiry_alerts(request):
                     UPPER(TRIM(format::text))                       AS format,
                     COUNT(DISTINCT po_number)                       AS po_count,
                     COALESCE(SUM(total_order_liters), 0)            AS total_litrs,
-                    COALESCE(SUM(total_order_amt_exclusive), 0)     AS total_units
+                    COALESCE(SUM(total_order_amt_exclusive), 0)     AS total_units,
+                    COALESCE(SUM(order_qty), 0)                     AS total_order_units
                 FROM public.master_po
                 WHERE days_to_expiry IS NOT NULL
                   AND days_to_expiry >= 1
@@ -2085,6 +2086,7 @@ def platform_expiry_alerts(request):
                     "po_count": int(row[1] or 0),
                     "total_litrs": float(row[2] or 0),
                     "total_units": float(row[3] or 0),
+                    "total_order_units": float(row[4] or 0),
                 })
         except Exception as e:
             errors.append({"source": "master_po", "error": str(e)})
@@ -2108,6 +2110,7 @@ def platform_expiry_alerts(request):
                     "po_count": int(row[0] or 0),
                     "total_litrs": float(row[1] or 0),
                     "total_units": float(row[2] or 0),
+                    "total_order_units": float(row[2] or 0),
                 })
         except Exception as e:
             errors.append({"source": "amazon_po", "error": str(e)})
