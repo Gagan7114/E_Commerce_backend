@@ -2554,6 +2554,13 @@ def update_primary_manual_fields(request, table_name: str):
     except Exception as exc:
         return Response({"detail": f"Update failed: {exc}"}, status=400)
 
+    # The edited status / GRN date / delivered qty / remark feeds the master_po
+    # materialized view (master_po_mv). Refresh it now so the dashboards and
+    # pendency reflect the change immediately instead of staying stale until the
+    # next upload. Best-effort (never raises).
+    from platforms.master_po_refresh import refresh_master_po_mv
+    refresh_master_po_mv()
+
     return Response({"row": dict(zip(cols, row))})
 
 
@@ -2634,5 +2641,12 @@ def bulk_update_primary_manual_fields(request, table_name: str):
             },
             status=400,
         )
+
+    # Refresh the master_po materialized view so the edited status / GRN /
+    # delivered / remark shows up on the dashboards and pendency right away
+    # (one refresh after the whole batch). Best-effort (never raises).
+    if updated:
+        from platforms.master_po_refresh import refresh_master_po_mv
+        refresh_master_po_mv()
 
     return Response({"updated": updated, "rows": saved_rows})

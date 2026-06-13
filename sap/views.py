@@ -297,6 +297,35 @@ def sales_analysis(request):
         active,
         query,
     )
+
+    # Compact aggregate mode. KPI cards (e.g. Home "JM Primary") only need the
+    # per-item_head totals, not the raw rows. Returning those sums instead of up
+    # to `page_size` rows shrinks the payload from megabytes to a few bytes and
+    # skips the expensive filter-option build — so the card paints fast and the
+    # response is small enough for the frontend to persist for instant refresh.
+    if str(request.query_params.get("aggregate") or "").strip().lower() == "item_head":
+        groups: dict[str, dict] = {}
+        for row in filtered:
+            head = str(_row_value(row, "U_TYPE") or "").strip().upper()
+            g = groups.get(head)
+            if g is None:
+                g = {"item_head": head, "liter": 0.0, "line_total": 0.0,
+                     "quantity": 0.0, "rows": 0}
+                groups[head] = g
+            g["liter"] += _num(row.get("Liter"))
+            g["line_total"] += _num(row.get("LineTotal"))
+            g["quantity"] += _num(row.get("Quantity"))
+            g["rows"] += 1
+        return Response({
+            "aggregate": list(groups.values()),
+            "summary": _sales_analysis_summary(filtered),
+            "count": len(filtered),
+            "procedure": procedure_label,
+            "source": source,
+            "from_date": from_date,
+            "to_date": to_date,
+        })
+
     return Response({
         "data": filtered[offset:offset + page_size],
         "count": len(filtered),

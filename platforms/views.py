@@ -1488,6 +1488,8 @@ def pendency_dashboard(request, slug: str):
             FROM "master_po"
             WHERE UPPER(TRIM("format"::text)) = %s
               AND UPPER(TRIM("open_close"::text)) = 'OPEN'
+              AND UPPER(TRIM(COALESCE("po_status", "status", '')::text))
+                  NOT IN ('CANCELLED', 'CANCELED', 'CANCEL')
               AND "po_month" IS NOT NULL
               AND "po_year" IS NOT NULL
             GROUP BY 1, 2
@@ -1518,7 +1520,13 @@ def pendency_dashboard(request, slug: str):
 
     base_where = "WHERE " + " AND ".join(where_parts)
     # Match Primary Dashboard semantics: only OPEN POs, pending = max(order - delivered, 0).
-    pending_filter = " AND UPPER(TRIM(\"open_close\"::text)) = 'OPEN'"
+    # Cancelled POs are never pending/open (even with no GRN yet), so drop them —
+    # po_status is the normalized status; fall back to the raw status column.
+    pending_filter = (
+        " AND UPPER(TRIM(\"open_close\"::text)) = 'OPEN'"
+        " AND UPPER(TRIM(COALESCE(\"po_status\", \"status\", '')::text))"
+        " NOT IN ('CANCELLED', 'CANCELED', 'CANCEL')"
+    )
     # User-selected PO-date range (both YYYY-MM-DD) filters POs whose po_date
     # falls between the two dates.
     date_range_filter = ""
