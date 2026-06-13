@@ -18,6 +18,7 @@ from decimal import Decimal
 from difflib import SequenceMatcher
 import logging
 import re
+import threading
 
 from django.core.cache import cache
 from django.db import connection, transaction
@@ -173,28 +174,71 @@ INVENTORY_DOH_UPLOAD_PLATFORMS = {
 }
 
 
-def _clear_upload_dependent_cache() -> None:
-    """Uploads change dashboard source tables, so cached dashboard payloads are stale."""
-    try:
-        cache.clear()
-    except Exception:  # noqa: BLE001 - cache invalidation should not fail uploads
-        logger.exception("Failed to clear cache after upload write")
-    # Primary-PO / master_sheet uploads feed the master_po materialized view
-    # (master_po_mv). Refresh it so the dashboard never serves stale rows. This
-    # is best-effort and no-ops if migration 0040 isn't applied; a refresh
-    # failure must never fail the upload.
-    try:
+# Which uploaded tables feed each dashboard matview. An upload that doesn't
+# touch a matview's sources doesn't need to refresh it (e.g. an ads/inventory/
+# secondary upload never changes master_po_mv).
+_MASTER_PO_SOURCE_TABLES = frozenset({
+    "total_po", "total_po_zbs",
+    "total_po_grn_update", "total_po_zbs_grn_update",
+    "master_sheet",
+})
+_AMAZON_MP_SOURCE_TABLES = frozenset({"amazon_mp", "master_sheet"})
+
+# Serializes background refreshes so two near-simultaneous uploads don't run
+# REFRESH concurrently (the later one includes the earlier's rows, so the final
+# matview state is correct and no data is missed).
+_MATVIEW_REFRESH_LOCK = threading.Lock()
+
+
+def _refresh_matviews_async(do_master_po: bool, do_amazon_mp: bool) -> None:
+    """Refresh the dashboard matviews OFF the request thread so the upload
+    responds immediately. The matviews still refresh (REFRESH recomputes the
+    same rows — no data is changed or dropped); only the wait moves off the
+    upload's response. The dashboard reflects the upload a few seconds later."""
+    if not (do_master_po or do_amazon_mp):
+        return
+
+    def _worker():
+        from django.db import connection
         from platforms.master_po_refresh import (
             refresh_amazon_mp_master,
             refresh_master_po_mv,
         )
-        refresh_master_po_mv()
-        # amazon_mp_master (matview, migration 0041) is fed by amazon_mp +
-        # master_sheet; refresh it too so Amazon MP / targets stay current. It's
-        # tiny (~4k rows) so an unconditional refresh after any upload is cheap.
-        refresh_amazon_mp_master()
-    except Exception:  # noqa: BLE001 - refresh must never break an upload
-        logger.exception("Failed to refresh dashboard matviews after upload")
+        with _MATVIEW_REFRESH_LOCK:
+            try:
+                if do_master_po:
+                    refresh_master_po_mv()
+                if do_amazon_mp:
+                    refresh_amazon_mp_master()
+            except Exception:  # noqa: BLE001 - a refresh failure must not crash
+                logger.exception("Background matview refresh failed")
+            finally:
+                connection.close()  # don't leak this worker thread's connection
+
+    threading.Thread(target=_worker, name="matview-refresh", daemon=True).start()
+
+
+def _clear_upload_dependent_cache(table: str | None = None) -> None:
+    """Invalidate cached dashboard payloads + refresh the dependent matviews
+    after an upload.
+
+    The matview refresh now runs in the BACKGROUND so the upload returns
+    immediately instead of waiting ~5s for a full REFRESH, and only the matviews
+    whose source table was actually uploaded are refreshed — an unrelated upload
+    (ads / inventory / secondary) skips them entirely. `table=None` refreshes
+    both (the safe default for callers that don't pass their table). No data is
+    altered and the UI is unchanged: it's the same REFRESH, just off the
+    response path and only when relevant."""
+    try:
+        cache.clear()
+    except Exception:  # noqa: BLE001 - cache invalidation should not fail uploads
+        logger.exception("Failed to clear cache after upload write")
+    do_master_po = table is None or table in _MASTER_PO_SOURCE_TABLES
+    do_amazon_mp = table is None or table in _AMAZON_MP_SOURCE_TABLES
+    try:
+        _refresh_matviews_async(do_master_po, do_amazon_mp)
+    except Exception:  # noqa: BLE001 - scheduling must never break an upload
+        logger.exception("Failed to schedule dashboard matview refresh")
 
 
 def _quote_ident(name: str) -> str:
@@ -1744,7 +1788,7 @@ def _update_total_po_grn_dates(data: list[dict], target_table: str = "total_po")
 
     skipped += max(0, len(prepared) - success)
     if updated:
-        _clear_upload_dependent_cache()
+        _clear_upload_dependent_cache(target_table)
 
     return Response(
         {
@@ -2087,7 +2131,7 @@ def _batch_upload(body, *, forced_table: str | None = None):
             ]
             if swiggy_pos:
                 _propagate_swiggy_po_grn_dates(swiggy_pos)
-        _clear_upload_dependent_cache()
+        _clear_upload_dependent_cache(table)
 
     return Response({
         "success": success,
