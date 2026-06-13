@@ -5554,6 +5554,63 @@ def _build_sec_keyed_trend(
     }
 
 
+# Per-platform sources for the Sec Dashboard "year" filter. Mirrors the table
+# each *_sec_dashboard_response reads from, so the dropdown only offers years
+# that actually have data. SecMaster-backed platforms filter on their format.
+# slug -> tuple of (table, year_sql_expression, format_filter_or_None). The year
+# expression yields the year for each row; Swiggy derives it from ORDERED_DATE
+# since swiggySec has no year column.
+_SEC_DASHBOARD_YEAR_SOURCES = {
+    "amazon": (
+        ("amazon_sec_range_master_view", '"year"', None),
+        ("amazon_sec_daily_master_view", '"year"', None),
+    ),
+    "blinkit": (("SecMaster", '"year"', "blinkit"),),
+    "zepto": (("SecMaster", '"year"', "zepto"),),
+    "bigbasket": (("SecMaster", '"year"', "bigbasket"),),
+    "swiggy": (("swiggySec", 'EXTRACT(YEAR FROM "ORDERED_DATE")::int', None),),
+    "flipkart": (("flipkart_secondary_all", '"year"', None),),
+    "flipkart_grocery": (("flipkart_grocery_master", '"year"', None),),
+}
+
+
+@api_view(["GET"])
+@permission_classes([require("platform.secondary.view")])
+@cached_get(timeout=300, prefix="plat.sec_years")
+def sec_dashboard_years(request, slug: str):
+    """Distinct years that actually have secondary data for the platform, so the
+    Sec Dashboard year filter only lists years present in the database."""
+    slug = (slug or "").strip().lower()
+    _ensure_scope(request.user, slug)
+    sources = _SEC_DASHBOARD_YEAR_SOURCES.get(slug)
+    years: set[int] = set()
+    errors = []
+    if sources:
+        with connection.cursor() as cur:
+            for table, year_expr, fmt in sources:
+                try:
+                    if fmt:
+                        cur.execute(
+                            f'SELECT DISTINCT ({year_expr})::text FROM "{table}" '
+                            'WHERE REGEXP_REPLACE(LOWER(TRIM("format"::text)), '
+                            "'[^a-z0-9]+', '', 'g') = %s",
+                            [fmt],
+                        )
+                    else:
+                        cur.execute(
+                            f'SELECT DISTINCT ({year_expr})::text FROM "{table}"'
+                        )
+                    for (raw,) in cur.fetchall():
+                        digits = re.sub(r"\D", "", str(raw or ""))
+                        if len(digits) == 4:
+                            value = int(digits)
+                            if 2000 <= value <= 2100:
+                                years.add(value)
+                except Exception as exc:  # noqa: BLE001
+                    errors.append({"table": table, "error": str(exc)})
+    return Response({"years": sorted(years, reverse=True), "errors": errors})
+
+
 @api_view(["GET"])
 @permission_classes([require("platform.secondary.view")])
 @cached_get(timeout=60, prefix="plat.fk_sec")

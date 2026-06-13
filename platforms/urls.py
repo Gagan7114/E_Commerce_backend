@@ -65,6 +65,7 @@ urlpatterns = [
     path("<slug:slug>/zepto-brandfund-dashboard", views.zepto_brandfund_dashboard, name="platform-zepto-brandfund-dashboard"),
     path("<slug:slug>/comparison-dashboard", views.amazon_comparison_dashboard, name="platform-amazon-comparison-dashboard"),
     path("<slug:slug>/sec-dashboard", views.flipkart_grocery_sec_dashboard, name="platform-sec-dashboard"),
+    path("<slug:slug>/sec-dashboard-years", views.sec_dashboard_years, name="platform-sec-dashboard-years"),
     path("<slug:slug>/mp-dashboard", views.amazon_mp_dashboard, name="platform-amazon-mp-dashboard"),
     path("<slug:slug>/sec-monthly-dashboard", views.flipkart_secondary_monthly_dashboard, name="platform-sec-monthly-dashboard"),
     path("<slug:slug>/sku-analysis-dashboard", views.sku_analysis_dashboard, name="platform-sku-analysis-dashboard"),
