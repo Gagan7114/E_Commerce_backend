@@ -1678,7 +1678,10 @@ def top_skus(request):
         limit = int(request.GET.get("limit") or 10)
     except (TypeError, ValueError):
         limit = 10
-    limit = max(1, min(limit, 50))
+    # Cap high enough that callers wanting the full SKU list (e.g. the YoY
+    # SKU-wise drill-down) get every SKU with data, while the Top Movers
+    # leaderboard still asks for just its small N.
+    limit = max(1, min(limit, 1000))
     try:
         compare_months = int(request.GET.get("compare_months") or 0)
     except (TypeError, ValueError):
