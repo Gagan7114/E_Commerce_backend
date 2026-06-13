@@ -1709,23 +1709,33 @@ def top_skus(request):
     acc = {(month_num, year): {}, (prev_month, prev_year): {}}
 
     def absorb(dest, rows):
-        # rows: (name, head, ltrs[, code]) — code is an optional 4th column the
-        # secondary queries supply so the UI can show a SKU code per row.
+        # rows: (name, head, ltrs[, code[, brand]]) — code and brand are optional
+        # extra columns the secondary queries supply. Rows are keyed by
+        # (name, brand) so the same product under two brands (e.g. Jivo vs Sano
+        # Canola) stays as two separate rows instead of being merged.
         for row in rows:
             name_val, head_val, ltrs = row[0], row[1], row[2]
             code_val = row[3] if len(row) > 3 else None
+            brand_val = row[4] if len(row) > 4 else None
             val = float(ltrs or 0)
             if val == 0:
                 continue
             name = (str(name_val).strip() if name_val else "") or "Unknown"
-            key = name.upper()
             head = (str(head_val).strip().upper() if head_val else "")
             if head not in ("PREMIUM", "COMMODITY"):
                 head = "OTHER"
             code = (str(code_val).strip() if code_val else "") or None
+            brand = (str(brand_val).strip() if brand_val else "") or None
+            key = (name.upper(), (brand or "").upper())
             slot = dest.get(key)
             if slot is None:
-                dest[key] = {"name": name, "head": head, "ltrs": val, "code": code}
+                dest[key] = {
+                    "name": name,
+                    "head": head,
+                    "code": code,
+                    "brand": brand,
+                    "ltrs": val,
+                }
             else:
                 slot["ltrs"] += val
                 if not slot.get("code") and code:
@@ -1848,7 +1858,9 @@ def top_skus(request):
         def build_sku_delta_rows(rows):
             out = []
             for s in rows:
-                prev = prev_map.get(s["name"].upper())
+                prev = prev_map.get(
+                    (s["name"].upper(), (s.get("brand") or "").upper())
+                )
                 prev_ltrs = round(prev["ltrs"], 2) if prev else 0.0
                 ltrs = round(s["ltrs"], 2)
                 if prev_ltrs > 0:
@@ -1858,6 +1870,8 @@ def top_skus(request):
                 out.append({
                     "name": s["name"],
                     "head": s["head"],
+                    "code": s.get("code"),
+                    "brand": s.get("brand"),
                     "ltrs": ltrs,
                     "prev_ltrs": prev_ltrs,
                     "delta_pct": delta_pct,
@@ -1928,7 +1942,8 @@ def top_skus(request):
                         SELECT COALESCE(NULLIF(TRIM(item::text), ''), 'Unknown') AS name,
                                UPPER(TRIM(item_head::text)) AS head,
                                COALESCE(SUM(ltr_sold), 0) AS ltrs,
-                               MAX(NULLIF(TRIM(sku_code::text), '')) AS code
+                               MAX(NULLIF(TRIM(sku_code::text), '')) AS code,
+                               NULLIF(TRIM(brand::text), '') AS brand
                         FROM "SecMaster"
                         WHERE UPPER(TRIM(month::text)) = %s AND year::numeric = %s
                           AND UPPER(TRIM(item_head::text)) IN ('PREMIUM', 'COMMODITY')
@@ -1939,13 +1954,14 @@ def top_skus(request):
                         params.append(fmt)
                     else:
                         sql += " AND UPPER(TRIM(format::text)) <> 'AMAZON'"
-                    sql += " GROUP BY 1, 2"
+                    sql += " GROUP BY 1, 2, 5"
                     run("secmaster", dest, sql, params)
                 if use_amazon:
                     run("amazon_sec_range", dest, """
                         WITH ml AS (
                             SELECT DISTINCT ON (format_sku_code)
                                    format_sku_code, item_head, per_unit_value,
+                                   NULLIF(TRIM(brand::text), '') AS brand,
                                    COALESCE(NULLIF(TRIM(item::text), ''),
                                             NULLIF(TRIM(product_name::text), '')) AS name
                             FROM master_sheet
@@ -1964,13 +1980,14 @@ def top_skus(request):
                         SELECT COALESCE(ml.name, b.asin) AS name,
                                UPPER(TRIM(ml.item_head::text)) AS head,
                                COALESCE(SUM(b.units * COALESCE(ml.per_unit_value::numeric, 0)), 0) AS ltrs,
-                               MAX(b.asin) AS code
+                               MAX(b.asin) AS code,
+                               ml.brand AS brand
                         FROM base b
                         CROSS JOIN latest l
                         JOIN ml ON UPPER(TRIM(ml.format_sku_code::text)) = UPPER(TRIM(b.asin::text))
                         WHERE b.to_day = l.md
                           AND UPPER(TRIM(ml.item_head::text)) IN ('PREMIUM', 'COMMODITY')
-                        GROUP BY 1, 2
+                        GROUP BY 1, 2, ml.brand
                     """, [y, mname])
 
     cur_map = acc[(month_num, year)]
@@ -1978,7 +1995,9 @@ def top_skus(request):
     def build_sku_delta_rows(rows):
         out = []
         for s in rows:
-            prev = prev_map.get(s["name"].upper())
+            prev = prev_map.get(
+                (s["name"].upper(), (s.get("brand") or "").upper())
+            )
             prev_ltrs = round(prev["ltrs"], 2) if prev else 0.0
             ltrs = round(s["ltrs"], 2)
             if prev_ltrs > 0:
@@ -1989,6 +2008,7 @@ def top_skus(request):
                 "name": s["name"],
                 "head": s["head"],
                 "code": s.get("code"),
+                "brand": s.get("brand"),
                 "ltrs": ltrs,
                 "prev_ltrs": prev_ltrs,
                 "delta_pct": delta_pct,
