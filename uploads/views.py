@@ -54,6 +54,11 @@ UPLOAD_ALLOWED_TABLES = {
     "zepto_ads",
     "bigbasket_ads",
     "flipkart_ads",
+    # Ads — daily copy tables (the "Daily" option of the ads uploaders writes
+    # here; "Range" keeps writing the originals above). Same schema/dedup keys.
+    "swiggyads_daily",
+    "zeptoads_daily",
+    "bigbasketads_daily",
     # Brand Fund
     "zepto_brandfund",
     "swiggy_brandfund",
@@ -157,6 +162,9 @@ UPLOAD_DATE_DELETE_TABLES = {
     "zepto_ads": "date",
     "bigbasket_ads": "date",
     "flipkart_ads": "date",
+    "swiggyads_daily": "date",
+    "zeptoads_daily": "date",
+    "bigbasketads_daily": "date",
     "amazon_coupon": "date",
 }
 

@@ -12,7 +12,15 @@
       "Bash(grep -n \"KPI grid\\\\|amd-kpi-grid\\\\|amd-kpi {\" C:/Users/Udaykaran/Documents/frontend/src/App.css | head -10)",
       "Read(//c/Users/Udaykaran/Documents/frontend/src/**)",
       "Bash(python manage.py runserver)",
-      "Bash(pip --version)"
+      "Bash(pip --version)",
+      "Bash(git fetch *)",
+      "Bash(git add *)",
+      "Bash(git commit -m '@ *)",
+      "Bash(git config *)",
+      "Bash(git commit *)",
+      "Bash(git stash *)",
+      "Bash(git pull *)",
+      "Bash(python -m py_compile platforms/views.py platforms/primary_monthly_targets.py shipment/views.py shipment/urls.py)"
     ]
   }
 }

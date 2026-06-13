@@ -1207,3 +1207,24 @@ def platform_sales_invoices(request, slug: str):
         all_params or None,
     )
     return Response({"data": data, "count": total, "page": page, "page_size": page_size})
+
+
+@api_view(["GET"])
+@permission_classes([require("sap.view")])
+def distributor_inventory(request):
+    """Distributor inventory by purchase price (FIFO lots) for one card.
+
+    GET /api/sap/distributor-inventory?card_code=CUSTA000907[&card_name=...]
+    Returns the layered on-hand position for the current (opening) month. See
+    sap/distributor_inventory.py and the FIFO master-view plan doc.
+    """
+    from .distributor_inventory import build_distributor_inventory
+
+    card_code = str(request.query_params.get("card_code") or "CUSTA000907").strip()
+    card_name = str(request.query_params.get("card_name") or "").strip() or None
+    try:
+        payload = build_distributor_inventory(card_code, card_name)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("[dist-inv] failed for card_code=%s", card_code)
+        raise SAPError(f"Distributor inventory error: {exc}")
+    return Response(payload)

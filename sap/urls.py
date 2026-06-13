@@ -4,6 +4,7 @@ from . import views
 
 urlpatterns = [
     path("sales-analysis", views.sales_analysis, name="sap-sales-analysis"),
+    path("distributor-inventory", views.distributor_inventory, name="sap-distributor-inventory"),
     path("distributors", views.distributors, name="sap-distributors"),
     path("distributors/<str:card_code>", views.distributor_detail, name="sap-distributor-detail"),
     path("distributor-orders/<str:card_code>", views.distributor_orders, name="sap-distributor-orders"),
