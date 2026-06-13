@@ -1185,7 +1185,7 @@ def _source_backed_dashboard_row(
 
 
 @api_view(["POST"])
-@permission_classes([require("platform.month_targets.edit")])
+@permission_classes([require("target_sheet.edit")])
 def month_targets_refresh_all(request):
     """POST /api/platform/month-targets/refresh
 
@@ -1270,7 +1270,7 @@ def month_targets_list(request, slug: str):
 
 
 @api_view(["POST"])
-@permission_classes([require("platform.month_targets.edit")])
+@permission_classes([require("target_sheet.edit")])
 def month_targets_create(request, slug: str):
     """POST /api/platform/<slug>/month-targets
 
@@ -1364,7 +1364,7 @@ def month_targets_create(request, slug: str):
 
 
 @api_view(["POST"])
-@permission_classes([require("platform.month_targets.edit")])
+@permission_classes([require("target_sheet.edit")])
 def month_targets_refresh_platform(request, slug: str):
     """POST /api/platform/<slug>/month-targets/refresh
 
@@ -1396,7 +1396,7 @@ def month_targets_refresh_platform(request, slug: str):
 
 
 @api_view(["POST"])
-@permission_classes([require("platform.month_targets.edit")])
+@permission_classes([require("target_sheet.edit")])
 def month_targets_refresh(request, slug: str, row_id: int):
     """POST /api/platform/<slug>/month-targets/<id>/refresh
 
@@ -1476,7 +1476,7 @@ def _insert_log(
 
 
 @api_view(["POST"])
-@permission_classes([require("platform.month_targets.edit")])
+@permission_classes([require("target_sheet.edit")])
 def month_targets_update(request, slug: str, row_id: int):
     """POST /api/platform/<slug>/month-targets/<id>/update
 

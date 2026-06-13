@@ -695,7 +695,7 @@ def primary_month_targets_list(request, slug: str):
 
 
 @api_view(["POST"])
-@permission_classes([require("platform.month_targets.edit")])
+@permission_classes([require("target_sheet.edit")])
 def primary_month_targets_create(request, slug: str):
     _ensure_scope(request.user, slug)
     meta = _platform_target_meta(slug)
@@ -784,7 +784,7 @@ def primary_month_targets_create(request, slug: str):
 
 
 @api_view(["POST"])
-@permission_classes([require("platform.month_targets.edit")])
+@permission_classes([require("target_sheet.edit")])
 def primary_month_targets_refresh_platform(request, slug: str):
     _ensure_scope(request.user, slug)
     meta = _platform_target_meta(slug)
@@ -858,7 +858,7 @@ def _insert_log(
 
 
 @api_view(["POST"])
-@permission_classes([require("platform.month_targets.edit")])
+@permission_classes([require("target_sheet.edit")])
 def primary_month_targets_update(request, slug: str, row_id: int):
     _ensure_scope(request.user, slug)
     meta = _platform_target_meta(slug)
@@ -1339,7 +1339,7 @@ def primary_month_targets_dashboard(request):
 
 
 @api_view(["POST"])
-@permission_classes([require("platform.month_targets.edit")])
+@permission_classes([require("target_sheet.edit")])
 def primary_month_targets_refresh_all(request):
     body = request.data if request.data else request.query_params
     month, year = _parse_month_year_or_current(body)

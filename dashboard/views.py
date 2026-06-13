@@ -2458,7 +2458,10 @@ def _manual_decimal_value(value):
 def _clean_primary_manual_updates(updates: dict, expected_format: str = "") -> dict:
     cleaned = {}
     normalized_format = str(expected_format or "").strip().upper()
-    allowed_columns = set(PRIMARY_REMARK_UPDATE_COLUMNS)
+    # Status (like remark) is editable on every primary format in the UI, so
+    # allow it for all formats — not only the CITY MALL / FLIPKART GROCERY
+    # "full manual" ones. GRN date / delivered qty stay restricted to those.
+    allowed_columns = set(PRIMARY_REMARK_UPDATE_COLUMNS) | {"status"}
     if normalized_format in PRIMARY_MANUAL_FULL_UPDATE_FORMATS:
         allowed_columns.update(PRIMARY_MANUAL_FULL_UPDATE_COLUMNS)
     for raw_col, raw_value in updates.items():
@@ -2481,7 +2484,16 @@ def _primary_manual_format_guard(expected_format: str) -> tuple[str, list]:
     if expected_format:
         if expected_format == "AMAZON":
             raise ValueError("Amazon remarks are not editable here.")
-        return 'AND UPPER(TRIM("format"::text)) = %s', [expected_format]
+        # Match on a normalized format (strip spaces/punctuation) so a platform's
+        # two stored spellings — e.g. "BIGBASKET" vs "BIG BASKET" — both resolve
+        # to the same rows. The UI's format filter carries both variants but the
+        # save only sends the first, so an exact match missed rows stored under
+        # the other spelling ("Matching editable row not found").
+        return (
+            "AND REGEXP_REPLACE(UPPER(TRIM(\"format\"::text)), '[^A-Z0-9]+', '', 'g')"
+            " = REGEXP_REPLACE(%s, '[^A-Z0-9]+', '', 'g')",
+            [expected_format],
+        )
     return (
         'AND UPPER(TRIM("format"::text)) <> \'AMAZON\'',
         [],

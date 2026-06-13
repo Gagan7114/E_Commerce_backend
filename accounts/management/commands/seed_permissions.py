@@ -7,7 +7,7 @@ from accounts.models import User
 
 
 class Command(BaseCommand):
-    help = "Seed or update the 25 ECMS custom permission codes."
+    help = "Seed or update the ECMS custom permission codes."
 
     def handle(self, *args, **options):
         ct = ContentType.objects.get_for_model(User)

@@ -1,7 +1,7 @@
 """Central catalog of ECMS custom permission codes and default groups.
 
 This module is the single source of truth for:
-  - The 25 custom permission codes the app recognizes.
+  - The custom permission codes the app recognizes.
   - The default group -> permission assignments.
 
 Both seed_permissions and seed_groups read from here, and the data migrations
@@ -19,6 +19,7 @@ PERMISSION_CATALOG: tuple[tuple[str, str], ...] = (
     ("platform.po.view", "View platform purchase orders"),
     ("platform.inventory.view", "View platform inventory"),
     ("platform.secondary.view", "View platform secondary sales"),
+    ("platform.month_targets.view", "View primary and secondary target sheets"),
     # Platform — scope codes (which platform slug the user is allowed on)
     ("platform.*.access", "Access every platform (admin wildcard)"),
     ("platform.blinkit.access", "Access Blinkit platform"),
@@ -47,11 +48,14 @@ PERMISSION_CATALOG: tuple[tuple[str, str], ...] = (
     ("admin.warehouse.view", "View warehouse tables in admin"),
     # Uploads
     ("upload.use", "Use the bulk upload tool"),
+    # Target sheets
+    ("target_sheet.edit", "Edit primary and secondary target sheets"),
 )
 
 _PLATFORM_ACTION_CODES = [
     "platform.view", "platform.stats.view", "platform.po.view",
     "platform.inventory.view", "platform.secondary.view",
+    "platform.month_targets.view",
 ]
 
 

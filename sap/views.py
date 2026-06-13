@@ -105,11 +105,11 @@ _SALES_ANALYSIS_FILTERS = {
     "item_head": "U_TYPE",
     "sub_group": "U_Sub_Group",
     "sales_person": "U_SALES_PERSON",
-    "cardname": "CardName",
+    "cardname": ("CardName", "CARDNAME"),
 }
 # Filters that accept multiple values (sent as repeated `?key=A&key=B…`).
 # The view reads these via getlist; _row_matches treats them as set-membership.
-_SALES_ANALYSIS_MULTI_FILTERS = {"cardname"}
+_SALES_ANALYSIS_MULTI_FILTERS = {"cardname", "item_head"}
 _SALES_ANALYSIS_SEARCH_COLS = (
     "CardCode",
     "CardName",
@@ -152,7 +152,7 @@ def _row_matches(row: dict, query: str, filters: dict) -> bool:
         selected = filters.get(param)
         if not selected:
             continue
-        row_val = str(row.get(column) or "").strip().lower()
+        row_val = str(_row_value(row, column) or "").strip().lower()
         if isinstance(selected, set):
             if row_val not in selected:
                 return False
@@ -161,8 +161,21 @@ def _row_matches(row: dict, query: str, filters: dict) -> bool:
 
     if not query:
         return True
-    haystack = " ".join(str(row.get(col) or "") for col in _SALES_ANALYSIS_SEARCH_COLS)
+    haystack = " ".join(str(_row_value(row, col) or "") for col in _SALES_ANALYSIS_SEARCH_COLS)
     return query.lower() in haystack.lower()
+
+
+def _row_value(row: dict, column):
+    columns = column if isinstance(column, (tuple, list)) else (column,)
+    for key in columns:
+        if key in row:
+            return row.get(key)
+    lower_map = {str(key).lower(): key for key in row.keys()}
+    for key in columns:
+        actual = lower_map.get(str(key).lower())
+        if actual is not None:
+            return row.get(actual)
+    return None
 
 
 def _filter_options(rows: list[dict], filters: dict, query: str) -> dict:
@@ -189,7 +202,7 @@ def _filter_options(rows: list[dict], filters: dict, query: str) -> dict:
             source_rows = rows
         values: set[str] = set()
         for row in source_rows:
-            raw = row.get(column)
+            raw = _row_value(row, column)
             if raw is None:
                 continue
             s = str(raw).strip()
