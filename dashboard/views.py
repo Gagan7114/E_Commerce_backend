@@ -2156,7 +2156,8 @@ def platform_expiry_alert_pos(request, slug: str):
                         MAX(po_status)                                          AS po_status,
                         MAX(fulfillment_center)                                 AS location,
                         COALESCE(SUM(total_order_liters), 0)                    AS total_litrs,
-                        COALESCE(SUM(requested_qty), 0)                         AS total_units
+                        COALESCE(SUM(requested_qty), 0)                         AS total_units,
+                        COALESCE(SUM(requested_qty), 0)                         AS total_order_units
                     FROM reporting."Amazon PO"
                     WHERE days_to_expiry IS NOT NULL
                       AND days_to_expiry >= 1
@@ -2184,7 +2185,8 @@ def platform_expiry_alert_pos(request, slug: str):
                         MAX(po_status)                              AS po_status,
                         MAX(location)                               AS location,
                         COALESCE(SUM(total_order_liters), 0)            AS total_litrs,
-                        COALESCE(SUM(total_order_amt_exclusive), 0)     AS total_units
+                        COALESCE(SUM(total_order_amt_exclusive), 0)     AS total_units,
+                        COALESCE(SUM(order_qty), 0)                     AS total_order_units
                     FROM public.master_po
                     WHERE UPPER(TRIM(format::text)) = %s
                       AND days_to_expiry IS NOT NULL
