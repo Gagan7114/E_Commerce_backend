@@ -2706,6 +2706,284 @@ def _blinkit_soh_doh_total(rows: list[dict], elapsed_day: int) -> dict:
     return total
 
 
+# ── Region (city-wise) DOH ───────────────────────────────────────────────────
+# Same SOH/DOH math as ``blinkit_soh_doh_dashboard`` but grouped by **city**
+# instead of by item. Stock comes from ``all_platform_inventory`` (its
+# ``location`` column is the source table's city for these formats, and it
+# already carries ``soh_ltr`` via ``master_sheet.per_unit_value``). Sales come
+# from the raw per-platform secondary table, which has a matching city column;
+# litres reuse the same per-unit conversion so SOH and DRR litres share a basis.
+# DOH = SOH units / DRR units, and is 0 (never ∞) when there are no sales.
+#
+# Only the source table + its column names differ per platform, so everything
+# below is parametrized by this config. Identifiers are hardcoded constants
+# (never request input), so f-string interpolation into SQL is safe.
+_REGION_DOH_PLATFORMS = {
+    "swiggy": {
+        "label": "Swiggy",
+        "inventory_format": "SWIGGY",
+        "master_format_key": "swiggy",
+        "sales_table": '"swiggySec"',
+        "sales_source": "swiggySec",
+        "city_col": '"CITY"',
+        "sku_col": '"ITEM_CODE"',
+        "date_col": '"ORDERED_DATE"',
+        # Units count combos to match the SOH/DOH dashboard quantity; litres
+        # convert only the base units (same basis as the inventory view).
+        "units_expr": 'COALESCE(s."COMBO_UNITS_SOLD", 0) + COALESCE(s."UNITS_SOLD", 0)',
+        "base_units_col": 's."UNITS_SOLD"',
+    },
+    "zepto": {
+        "label": "Zepto",
+        "inventory_format": "ZEPTO",
+        "master_format_key": "zepto",
+        "sales_table": '"zeptoSec"',
+        "sales_source": "zeptoSec",
+        "city_col": '"City"',
+        "sku_col": '"SKU Number"',
+        "date_col": '"Date"',
+        # Zepto has no combo concept — units = base sold units.
+        "units_expr": 'COALESCE(s."Sales (Qty) - Units", 0)',
+        "base_units_col": 's."Sales (Qty) - Units"',
+    },
+}
+
+
+def _region_doh_empty_total() -> dict:
+    return {
+        "soh_units": 0.0,
+        "soh_ltr": 0.0,
+        "units_sold": 0.0,
+        "ltr_sold": 0.0,
+        "drr_units": 0.0,
+        "drr_ltr": 0.0,
+        "doh": 0.0,
+    }
+
+
+def _region_doh_total(rows: list[dict], elapsed_day: int) -> dict:
+    total = _region_doh_empty_total()
+    total["soh_units"] = sum(_num(row.get("soh_units")) for row in rows)
+    total["soh_ltr"] = sum(_num(row.get("soh_ltr")) for row in rows)
+    total["units_sold"] = sum(_num(row.get("units_sold")) for row in rows)
+    total["ltr_sold"] = sum(_num(row.get("ltr_sold")) for row in rows)
+    if elapsed_day > 0:
+        total["drr_units"] = total["units_sold"] / elapsed_day
+        total["drr_ltr"] = total["ltr_sold"] / elapsed_day
+    total["doh"] = _safe_div(total["soh_units"], total["drr_units"])
+    return total
+
+
+def _region_doh_payload(
+    slug: str,
+    cfg: dict,
+    *,
+    requested_date,
+    effective_date=None,
+    sales_max_date=None,
+    month_start=None,
+    elapsed_day: int = 0,
+    defaulted_to_latest: bool = False,
+    rows: list[dict] | None = None,
+    total: dict | None = None,
+) -> dict:
+    def _iso(value):
+        return value.isoformat() if hasattr(value, "isoformat") else value
+
+    return {
+        "source": {"sales": cfg["sales_source"], "inventory": "all_platform_inventory"},
+        "format": cfg["inventory_format"],
+        "platform": slug,
+        "dashboard_title": f"{cfg['label']} Region DOH Dashboard",
+        "requested_date": _iso(requested_date),
+        "effective_date": _iso(effective_date),
+        "sales_max_date": _iso(sales_max_date),
+        "max_sales_date": _iso(sales_max_date),
+        "month_start": _iso(month_start),
+        "elapsed_day": elapsed_day,
+        "defaulted_to_latest": defaulted_to_latest,
+        "rows": rows or [],
+        "total": total or _region_doh_empty_total(),
+    }
+
+
+def _region_doh_dashboard_response(request, slug: str):
+    cfg = _REGION_DOH_PLATFORMS[slug]
+    _ensure_scope(request.user, slug)
+    inventory_format = cfg["inventory_format"]
+
+    requested_date = _parse_price_upload_date(request.query_params.get("date", ""))
+    defaulted_to_latest = False
+    if requested_date is None:
+        requested_date = _scalar(
+            """
+            SELECT MAX(inventory_date)
+            FROM all_platform_inventory
+            WHERE UPPER(TRIM(format::text)) = %s
+            """,
+            [inventory_format],
+        )
+        defaulted_to_latest = True
+
+    if requested_date is None:
+        return Response(
+            _region_doh_payload(
+                slug, cfg,
+                requested_date=None,
+                defaulted_to_latest=defaulted_to_latest,
+            )
+        )
+
+    effective_date = _scalar(
+        """
+        SELECT MAX(inventory_date)
+        FROM all_platform_inventory
+        WHERE UPPER(TRIM(format::text)) = %s
+          AND inventory_date <= %s
+        """,
+        [inventory_format, requested_date],
+    )
+    if effective_date is None:
+        return Response(
+            _region_doh_payload(
+                slug, cfg,
+                requested_date=requested_date,
+                defaulted_to_latest=defaulted_to_latest,
+            )
+        )
+
+    month_start = effective_date.replace(day=1)
+    max_sales_date = _scalar(
+        f"""
+        SELECT MAX(s.{cfg['date_col']}::date)
+        FROM {cfg['sales_table']} s
+        WHERE s.{cfg['date_col']}::date >= %s
+          AND s.{cfg['date_col']}::date <= %s
+        """,
+        [month_start, effective_date],
+    )
+    sales_end_date = max_sales_date or effective_date
+    elapsed_day = _sec_elapsed_day(max_sales_date)
+
+    rows = _dict_rows(
+        f"""
+        WITH master_lookup AS (
+            SELECT sku_key, per_unit_value
+            FROM (
+                SELECT
+                    UPPER(TRIM(ms.format_sku_code::text)) AS sku_key,
+                    ms.per_unit_value,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY UPPER(TRIM(ms.format_sku_code::text))
+                        ORDER BY
+                            CASE WHEN ms.per_unit_value IS NULL THEN 1 ELSE 0 END,
+                            ms.ctid
+                    ) AS rn
+                FROM public.master_sheet ms
+                WHERE NULLIF(TRIM(ms.format_sku_code::text), '') IS NOT NULL
+                  AND REGEXP_REPLACE(LOWER(TRIM(COALESCE(ms.format, '')::text)), '[^a-z0-9]+', '', 'g') = %s
+            ) ranked
+            WHERE rn = 1
+        ),
+        sales AS (
+            SELECT
+                UPPER(TRIM(COALESCE(s.{cfg['city_col']}::text, ''))) AS city_key,
+                MIN(NULLIF(TRIM(s.{cfg['city_col']}::text), '')) AS city,
+                COALESCE(SUM({cfg['units_expr']}), 0)::numeric AS units_sold,
+                COALESCE(
+                    SUM(COALESCE({cfg['base_units_col']}, 0)::double precision
+                        * COALESCE(ml.per_unit_value, 0)),
+                    0
+                )::numeric AS ltr_sold
+            FROM {cfg['sales_table']} s
+            LEFT JOIN master_lookup ml
+              ON ml.sku_key = UPPER(TRIM(s.{cfg['sku_col']}::text))
+            WHERE s.{cfg['date_col']}::date >= %s
+              AND s.{cfg['date_col']}::date <= %s
+            GROUP BY UPPER(TRIM(COALESCE(s.{cfg['city_col']}::text, '')))
+        ),
+        inventory AS (
+            SELECT
+                UPPER(TRIM(COALESCE(location::text, ''))) AS city_key,
+                MIN(NULLIF(TRIM(location::text), '')) AS city,
+                COALESCE(SUM(soh_unit), 0)::numeric AS soh_units,
+                COALESCE(SUM(soh_ltr), 0)::numeric AS soh_ltr
+            FROM all_platform_inventory
+            WHERE UPPER(TRIM(format::text)) = %s
+              AND inventory_date = %s
+            GROUP BY UPPER(TRIM(COALESCE(location::text, '')))
+        )
+        SELECT
+            COALESCE(NULLIF(i.city, ''), NULLIF(s.city, '')) AS city,
+            COALESCE(i.soh_units, 0) AS soh_units,
+            COALESCE(i.soh_ltr, 0) AS soh_ltr,
+            COALESCE(s.units_sold, 0) AS units_sold,
+            COALESCE(s.ltr_sold, 0) AS ltr_sold
+        FROM inventory i
+        FULL OUTER JOIN sales s
+          ON i.city_key = s.city_key
+        WHERE COALESCE(i.city_key, s.city_key) <> ''
+        ORDER BY COALESCE(NULLIF(i.city, ''), NULLIF(s.city, '')) ASC NULLS LAST
+        """,
+        [
+            cfg["master_format_key"],
+            month_start,
+            sales_end_date,
+            inventory_format,
+            effective_date,
+        ],
+    )
+
+    normalized_rows = []
+    for row in rows:
+        units_sold = _num(row.get("units_sold"))
+        ltr_sold = _num(row.get("ltr_sold"))
+        soh_units = _num(row.get("soh_units"))
+        soh_ltr = _num(row.get("soh_ltr"))
+        drr_units = _safe_div(units_sold, elapsed_day)
+        drr_ltr = _safe_div(ltr_sold, elapsed_day)
+        normalized_rows.append({
+            "city": row.get("city") or "",
+            "soh_units": soh_units,
+            "soh_ltr": soh_ltr,
+            "units_sold": units_sold,
+            "ltr_sold": ltr_sold,
+            "drr_units": drr_units,
+            "drr_ltr": drr_ltr,
+            "doh": _safe_div(soh_units, drr_units),
+        })
+
+    total = _region_doh_total(normalized_rows, elapsed_day)
+
+    return Response(
+        _region_doh_payload(
+            slug, cfg,
+            requested_date=requested_date,
+            effective_date=effective_date,
+            sales_max_date=max_sales_date,
+            month_start=month_start,
+            elapsed_day=elapsed_day,
+            defaulted_to_latest=defaulted_to_latest,
+            rows=normalized_rows,
+            total=total,
+        )
+    )
+
+
+@api_view(["GET"])
+@permission_classes([require("platform.inventory.view")])
+@cached_get(timeout=60, prefix="plat.region_doh")
+def swiggy_region_doh_dashboard(request):
+    return _region_doh_dashboard_response(request, "swiggy")
+
+
+@api_view(["GET"])
+@permission_classes([require("platform.inventory.view")])
+@cached_get(timeout=60, prefix="plat.region_doh")
+def zepto_region_doh_dashboard(request):
+    return _region_doh_dashboard_response(request, "zepto")
+
+
 def _amazon_soh_month_name(raw_value) -> str | None:
     value = str(raw_value or "").strip()
     if not value:
