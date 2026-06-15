@@ -7,10 +7,40 @@ view on every read.
 """
 
 import logging
+import threading
 
 from django.db import connection
 
 logger = logging.getLogger(__name__)
+
+# Serializes background refreshes so concurrent triggers (sheet-edit saves,
+# uploads firing close together) don't spawn parallel rebuilds of the same
+# matview. Postgres would queue them at the DB level anyway, but coalescing in
+# the app avoids redundant multi-second REFRESH runs.
+_ASYNC_REFRESH_LOCK = threading.Lock()
+
+
+def refresh_master_po_mv_async() -> None:
+    """Refresh master_po_mv in a background daemon thread; returns immediately.
+
+    Lets a request handler (e.g. a Sheet Preview save) respond in the time the
+    UPDATE takes instead of blocking on the multi-second REFRESH MATERIALIZED
+    VIEW. The refresh runs after the request's transaction has committed, so the
+    rebuilt matview includes the just-saved rows. Best-effort; never raises.
+    """
+
+    def _run():
+        with _ASYNC_REFRESH_LOCK:
+            try:
+                refresh_master_po_mv()
+            finally:
+                # Background threads get their own DB connection — close it so it
+                # isn't leaked back into the pool.
+                connection.close()
+
+    threading.Thread(
+        target=_run, name="refresh-master-po-mv-async", daemon=True
+    ).start()
 
 
 def refresh_master_po_mv() -> bool:

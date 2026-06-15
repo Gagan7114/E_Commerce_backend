@@ -2590,11 +2590,11 @@ def update_primary_manual_fields(request, table_name: str):
         return Response({"detail": f"Update failed: {exc}"}, status=400)
 
     # The edited status / GRN date / delivered qty / remark feeds the master_po
-    # materialized view (master_po_mv). Refresh it now so the dashboards and
-    # pendency reflect the change immediately instead of staying stale until the
-    # next upload. Best-effort (never raises).
-    from platforms.master_po_refresh import refresh_master_po_mv
-    refresh_master_po_mv()
+    # materialized view (master_po_mv). Refresh it in the background so this save
+    # returns immediately; the dashboards/pendency pick up the change a few
+    # seconds later when the rebuild finishes. Best-effort (never raises).
+    from platforms.master_po_refresh import refresh_master_po_mv_async
+    refresh_master_po_mv_async()
 
     return Response({"row": dict(zip(cols, row))})
 
@@ -2678,10 +2678,11 @@ def bulk_update_primary_manual_fields(request, table_name: str):
         )
 
     # Refresh the master_po materialized view so the edited status / GRN /
-    # delivered / remark shows up on the dashboards and pendency right away
-    # (one refresh after the whole batch). Best-effort (never raises).
+    # delivered / remark shows up on the dashboards and pendency. Done in the
+    # background (one refresh after the whole batch) so the save returns right
+    # away instead of blocking on the multi-second rebuild. Best-effort.
     if updated:
-        from platforms.master_po_refresh import refresh_master_po_mv
-        refresh_master_po_mv()
+        from platforms.master_po_refresh import refresh_master_po_mv_async
+        refresh_master_po_mv_async()
 
     return Response({"updated": updated, "rows": saved_rows})
