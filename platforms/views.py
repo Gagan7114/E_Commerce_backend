@@ -7376,6 +7376,180 @@ def amazon_mp_dashboard(request, slug: str):
     return _amazon_mp_dashboard_response(request)
 
 
+# ── Amazon Coupon Dashboard ──────────────────────────────────────────────────
+# Sourced from amazon_coupon_master. KPIs are grand-total columns; the table is
+# coupon-name-wise; the item_head split powers a Premium/Commodity donut.
+@api_view(["GET"])
+@permission_classes([require("platform.stats.view")])
+@cached_get(timeout=60, prefix="plat.amazon_coupon")
+def amazon_coupon_dashboard(request, slug: str):
+    _ensure_scope(request.user, slug)
+    if slug != "amazon":
+        raise ValidationError("Coupon Dashboard is available only for Amazon.")
+    return _amazon_coupon_dashboard_response(request)
+
+
+def _coupon_empty_kpi() -> dict:
+    return {
+        "clips": 0.0,
+        "redemptions": 0.0,
+        "budget_spent": 0.0,
+        "budget_remaining": 0.0,
+        "total_budget": 0.0,
+    }
+
+
+def _amazon_coupon_dashboard_response(request):
+    # The `date` column is a daily snapshot; values are cumulative-as-of-date
+    # within a campaign. So we report ONE snapshot date at a time (latest by
+    # default) instead of summing across dates, which would double-count.
+    requested_date = _parse_price_upload_date(request.query_params.get("date", ""))
+    defaulted_to_latest = False
+    if requested_date is None:
+        requested_date = _scalar("SELECT MAX(date) FROM amazon_coupon_master", [])
+        defaulted_to_latest = True
+
+    available_dates = [
+        {
+            "date": row["date"].isoformat()
+            if hasattr(row["date"], "isoformat")
+            else row["date"],
+            "rows": int(row["rows"] or 0),
+        }
+        for row in _dict_rows(
+            """
+            SELECT date, COUNT(*) AS rows
+            FROM amazon_coupon_master
+            WHERE date IS NOT NULL
+            GROUP BY date
+            ORDER BY date DESC
+            LIMIT 90
+            """,
+            [],
+        )
+    ]
+
+    effective_date = None
+    if requested_date is not None:
+        effective_date = _scalar(
+            "SELECT MAX(date) FROM amazon_coupon_master WHERE date <= %s",
+            [requested_date],
+        )
+
+    base = {
+        "platform": "amazon",
+        "dashboard_title": "Amazon Coupon Dashboard",
+        "source": "amazon_coupon_master",
+        "requested_date": requested_date.isoformat()
+        if hasattr(requested_date, "isoformat")
+        else requested_date,
+        "effective_date": effective_date.isoformat()
+        if hasattr(effective_date, "isoformat")
+        else effective_date,
+        "defaulted_to_latest": defaulted_to_latest,
+        "available_dates": available_dates,
+    }
+
+    if effective_date is None:
+        return Response({**base, "kpi": _coupon_empty_kpi(), "coupons": [], "item_head": []})
+
+    kpi_rows = _dict_rows(
+        """
+        SELECT
+            COALESCE(SUM(clips), 0)            AS clips,
+            COALESCE(SUM(redemptions), 0)      AS redemptions,
+            COALESCE(SUM(budget_spent), 0)     AS budget_spent,
+            COALESCE(SUM(budget_remaining), 0) AS budget_remaining,
+            COALESCE(SUM(total_budget), 0)     AS total_budget
+        FROM amazon_coupon_master
+        WHERE date = %s
+        """,
+        [effective_date],
+    )
+    kpi = kpi_rows[0] if kpi_rows else {}
+
+    # Coupon-name-wise rows for the snapshot date. budget_used is a derived
+    # "% of budget consumed" (spent / total) since the raw column isn't additive.
+    coupons = _dict_rows(
+        """
+        SELECT
+            coupon_name,
+            MAX(item_head)                     AS item_head,
+            MAX(brand)                         AS brand,
+            COALESCE(SUM(clips), 0)            AS clips,
+            COALESCE(SUM(redemptions), 0)      AS redemptions,
+            COALESCE(SUM(budget_spent), 0)     AS budget_spent,
+            COALESCE(SUM(budget_remaining), 0) AS budget_remaining,
+            COALESCE(SUM(total_budget), 0)     AS total_budget,
+            CASE
+                WHEN COALESCE(SUM(total_budget), 0) > 0
+                    THEN 100.0 * SUM(budget_spent) / SUM(total_budget)
+                ELSE 0
+            END                                AS budget_used
+        FROM amazon_coupon_master
+        WHERE date = %s
+          AND NULLIF(TRIM(coupon_name::text), '') IS NOT NULL
+        GROUP BY coupon_name
+        ORDER BY COALESCE(SUM(budget_spent), 0) DESC
+        """,
+        [effective_date],
+    )
+
+    item_head = _dict_rows(
+        """
+        SELECT
+            COALESCE(NULLIF(UPPER(TRIM(item_head::text)), ''), 'OTHER') AS label,
+            COALESCE(SUM(budget_spent), 0)     AS budget_spent,
+            COALESCE(SUM(redemptions), 0)      AS redemptions,
+            COALESCE(SUM(total_budget), 0)     AS total_budget,
+            COUNT(DISTINCT coupon_name)        AS coupons
+        FROM amazon_coupon_master
+        WHERE date = %s
+        GROUP BY COALESCE(NULLIF(UPPER(TRIM(item_head::text)), ''), 'OTHER')
+        ORDER BY COALESCE(SUM(budget_spent), 0) DESC
+        """,
+        [effective_date],
+    )
+
+    def _f(value):
+        return float(value or 0)
+
+    return Response({
+        **base,
+        "kpi": {
+            "clips": _f(kpi.get("clips")),
+            "redemptions": _f(kpi.get("redemptions")),
+            "budget_spent": _f(kpi.get("budget_spent")),
+            "budget_remaining": _f(kpi.get("budget_remaining")),
+            "total_budget": _f(kpi.get("total_budget")),
+        },
+        "coupons": [
+            {
+                "coupon_name": row.get("coupon_name") or "",
+                "item_head": row.get("item_head") or "",
+                "brand": row.get("brand") or "",
+                "clips": _f(row.get("clips")),
+                "redemptions": _f(row.get("redemptions")),
+                "budget_spent": _f(row.get("budget_spent")),
+                "budget_remaining": _f(row.get("budget_remaining")),
+                "budget_used": _f(row.get("budget_used")),
+                "total_budget": _f(row.get("total_budget")),
+            }
+            for row in coupons
+        ],
+        "item_head": [
+            {
+                "label": row.get("label") or "OTHER",
+                "budget_spent": _f(row.get("budget_spent")),
+                "redemptions": _f(row.get("redemptions")),
+                "total_budget": _f(row.get("total_budget")),
+                "coupons": int(row.get("coupons") or 0),
+            }
+            for row in item_head
+        ],
+    })
+
+
 def _bigbasket_sec_dashboard_response(request):
     month, year, defaulted_to_latest = _parse_sec_month_year(
         request.query_params,
