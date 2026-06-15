@@ -3839,6 +3839,35 @@ class SapInventoryView(_SafeAPIView):
             r['per_unit'] = m.get('per_unit')
             r['format_sku_code'] = m.get('format_sku_code')
 
+        # Volume + carton data per product, so a hand-built truck (Manual Product
+        # Selection) can be packed by liters. per_liter + case_pack come from
+        # reporting."Amazon PO" (the same source the planner uses), latest non-null
+        # per ASIN. Products with no Amazon-PO history get null per_liter and can't
+        # be volume-packed — the picker hides those.
+        asins = list({(r.get('format_sku_code') or '').strip().upper()
+                      for r in rows if r.get('format_sku_code')})
+        pl_map = {}
+        if asins:
+            with connection.cursor() as cur:
+                cur.execute("""
+                    SELECT UPPER(TRIM(asin)) AS asin,
+                           MAX(per_liter) AS per_liter,
+                           MAX(case_pack) AS case_pack
+                    FROM reporting."Amazon PO"
+                    WHERE UPPER(TRIM(asin)) = ANY(%s)
+                      AND per_liter IS NOT NULL AND per_liter > 0
+                    GROUP BY UPPER(TRIM(asin))
+                """, [asins])
+                for asin, per_liter, case_pack in cur.fetchall():
+                    pl_map[asin] = {
+                        'per_liter': float(per_liter) if per_liter is not None else None,
+                        'case_pack': float(case_pack) if case_pack is not None else None,
+                    }
+        for r in rows:
+            pl = pl_map.get((r.get('format_sku_code') or '').strip().upper()) or {}
+            r['per_liter'] = pl.get('per_liter')
+            r['case_pack'] = pl.get('case_pack')
+
         total_units = sum(float(r.get('OnHand') or 0) for r in rows)
         total_value = sum(float(r.get('StockValue') or 0) for r in rows)
         zero_stock = sum(1 for r in rows if float(r.get('OnHand') or 0) == 0)
