@@ -98,8 +98,9 @@ class IsShipmentManager(BasePermission):
 # Priority helpers
 # ---------------------------------------------------------------------------
 
-# Vendor Central commit caps may be exceeded by up to this factor (10% over).
-CAP_TOLERANCE = 1.10
+# Vendor Central commit caps may be exceeded by up to this factor (7% over).
+# Single source of truth — the frontend uses the same 0.07 tolerance.
+CAP_TOLERANCE = 1.07
 
 
 def _compute_priority(drr_unit, soh_unit, doh, days_to_expiry, po_status):
@@ -743,8 +744,8 @@ def _filler_pass(loaded, leftover_pool, capacity, primary_fc=None, mark_key='_fi
 
 def _enforce_commit_caps(loaded, not_loaded, commit_caps, key_field='appointment_id'):
     """Trim ``loaded`` so each capped group respects its Vendor Central commit,
-    allowing up to CAP_TOLERANCE (10%) over:
-    sum(planned_qty) ≤ units_cap×1.1 AND sum(planned_qty/case_pack) ≤ cartons_cap×1.1.
+    allowing up to CAP_TOLERANCE (7%) over:
+    sum(planned_qty) ≤ units_cap×1.07 AND sum(planned_qty/case_pack) ≤ cartons_cap×1.07.
     Lowest-priority items are dropped first; removed items go to ``not_loaded``
     with a clear ``unfit_reason`` so the UI can explain them.
 
@@ -794,12 +795,15 @@ def _enforce_commit_caps(loaded, not_loaded, commit_caps, key_field='appointment
             else:
                 continue
         cap = norm_caps[gk] or {}
-        # Allow up to 10% over the Vendor Central commit (units AND cartons).
+        # Allow up to 7% over the Vendor Central commit (units AND cartons).
         cap_u = (float(cap.get('units') or 0) * CAP_TOLERANCE) or float('inf')
         cap_c = (float(cap.get('cartons') or 0) * CAP_TOLERANCE) or float('inf')
 
-        pq = int(it.get('planned_qty') or 0)
-        cp = max(int(it.get('case_pack') or 1), 1)
+        # planned_qty / case_pack are DecimalFields — keep them as floats so the
+        # running cap comparison stays accurate (int() truncation undercounts
+        # units and overcounts cartons, weakening the cap).
+        pq = float(it.get('planned_qty') or 0)
+        cp = max(float(it.get('case_pack') or 1), 1.0)
         c_units = pq / cp
 
         t = totals[gk]
@@ -814,16 +818,17 @@ def _enforce_commit_caps(loaded, not_loaded, commit_caps, key_field='appointment
             # (A partial of an item that already fit the truck can't overflow it.)
             ru = max(0.0, cap_u - t['u'])                  # units headroom
             rc_units = max(0.0, cap_c - t['c']) * cp        # carton headroom, in units
-            allow = int(min(pq, ru, rc_units))
+            allow = math.floor(min(pq, ru, rc_units))       # whole units only
             if allow > 0:
                 per_liter = float(it.get('per_liter') or 0)
+                short = int(round(pq - allow))
                 it['planned_qty'] = allow
                 it['planned_liters'] = round(allow * per_liter, 4)
                 it['short_reason'] = (
                     f'Capped at Vendor Central commit for this {label} '
                     f'(cap: {int(cap.get("units") or 0)} units / '
-                    f'{int(cap.get("cartons") or 0)} cartons, +10% allowed) — '
-                    f'rest short-supplied.'
+                    f'{int(cap.get("cartons") or 0)} cartons, +7% allowed) — '
+                    f'{short} units short-supplied.'
                 )
                 t['u'] += allow
                 t['c'] += allow / cp
@@ -837,12 +842,39 @@ def _enforce_commit_caps(loaded, not_loaded, commit_caps, key_field='appointment
                 removed['unfit_reason'] = (
                     f'Exceeds Vendor Central commit cap for this {label} '
                     f'(cap: {int(cap.get("units") or 0)} units / '
-                    f'{int(cap.get("cartons") or 0)} cartons, +10% allowed).'
+                    f'{int(cap.get("cartons") or 0)} cartons, +7% allowed).'
                 )
                 extras.append(removed)
 
     new_loaded = [it for i, it in enumerate(loaded) if keep_flags[i]]
     return new_loaded, list(not_loaded) + extras
+
+
+def _lookup_appointment_commit(appointment_id):
+    """Vendor Central commit (units / cartons) for an appointment, read live from
+    public.appointment_commit. This is the single source of truth for manual-plan
+    and draft enforcement — never trust commit caps sent by the client. Returns
+    {'units': float, 'cartons': float} or None when the appointment has no commit."""
+    aid = str(appointment_id or '').strip()
+    if not aid:
+        return None
+    try:
+        with connection.cursor() as cur:
+            cur.execute(
+                "SELECT MAX(unit_count), MAX(carton_count) FROM public.appointment_commit "
+                "WHERE TRIM(appointment_id) = %s",
+                [aid],
+            )
+            r = cur.fetchone()
+    except Exception:
+        return None
+    if not r:
+        return None
+    units = float(r[0] or 0)
+    cartons = float(r[1] or 0)
+    if units <= 0 and cartons <= 0:
+        return None
+    return {'units': units, 'cartons': cartons}
 
 
 # ── Live BH-FGM warehouse stock, bridged to Amazon ASINs ─────────────────────
@@ -2179,6 +2211,50 @@ class ShipmentListCreateView(_SafeAPIView):
                             status=409,
                         )
 
+            # Appointment-commitment guard (units + cartons). Aggregate across ALL
+            # active shipments for this appointment (this new one included) and reject
+            # if the total would breach the Vendor Central commit (+7%). Serialized by
+            # the advisory lock above, so two concurrent saves can't both pass. Applies
+            # to auto + manual alike; no-op when the appointment has no commit on file.
+            if appointment_id and loaded_items:
+                appt_cap = _lookup_appointment_commit(appointment_id)
+                if appt_cap:
+                    new_u = sum(float(it.get('planned_qty') or 0) for it in loaded_items)
+                    new_c = sum(float(it.get('planned_qty') or 0)
+                                / max(float(it.get('case_pack') or 1), 1.0) for it in loaded_items)
+                    with connection.cursor() as _agg_cur:
+                        _agg_cur.execute(
+                            """
+                            SELECT COALESCE(SUM(COALESCE(si.planned_qty, 0)), 0),
+                                   COALESCE(SUM(COALESCE(si.planned_qty, 0)
+                                            / GREATEST(COALESCE(si.case_pack, 1), 1)), 0)
+                            FROM sp_items si
+                            JOIN sp_shipments s ON s.id = si.shipment_id
+                            WHERE si.not_loaded = FALSE
+                              AND s.status != 'rejected'
+                              AND TRIM(s.appointment_id) = %s
+                            """,
+                            [appointment_id],
+                        )
+                        _row = _agg_cur.fetchone()
+                    exist_u = float(_row[0] or 0)
+                    exist_c = float(_row[1] or 0)
+                    cap_u = appt_cap['units'] * CAP_TOLERANCE if appt_cap['units'] > 0 else float('inf')
+                    cap_c = appt_cap['cartons'] * CAP_TOLERANCE if appt_cap['cartons'] > 0 else float('inf')
+                    if (exist_u + new_u) > cap_u + 1e-6 or (exist_c + new_c) > cap_c + 1e-6:
+                        return Response(
+                            {
+                                'error': 'Exceeds the appointment commitment',
+                                'detail': (
+                                    f'Appointment {appointment_id} commit is '
+                                    f'{int(appt_cap["units"])} units / {int(appt_cap["cartons"])} cartons (+7% allowed). '
+                                    f'Active shipments already use {int(round(exist_u))} units / {int(round(exist_c))} cartons; '
+                                    f'this plan adds {int(round(new_u))} units / {int(round(new_c))} cartons.'
+                                ),
+                            },
+                            status=409,
+                        )
+
             shipment = Shipment.objects.create(
                 appointment_id=appointment_id or '',
                 appointment_time=appointment.get('appointment_time') if appointment else None,
@@ -2553,6 +2629,43 @@ def _check_qty_conflicts(shipment):
                 'planned_qty': planned,
                 'locked_shipment_ids': [r[0] for r in locked],
             })
+
+    # Appointment-commitment guard: the total committed across all active shipments
+    # for this appointment must stay within the Vendor Central commit (+7%). Catches
+    # over-commit that per-line (ASIN, PO, FC) checks miss (e.g. two shipments that
+    # individually fit but together exceed the appointment), and qty edits on Review.
+    aid = str(getattr(shipment, 'appointment_id', '') or '').strip()
+    if aid:
+        appt_cap = _lookup_appointment_commit(aid)
+        if appt_cap:
+            with connection.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT COALESCE(SUM(COALESCE(si.planned_qty, 0)), 0),
+                           COALESCE(SUM(COALESCE(si.planned_qty, 0)
+                                    / GREATEST(COALESCE(si.case_pack, 1), 1)), 0)
+                    FROM sp_items si
+                    JOIN sp_shipments s ON s.id = si.shipment_id
+                    WHERE si.not_loaded = FALSE
+                      AND s.status != 'rejected'
+                      AND TRIM(s.appointment_id) = %s
+                    """,
+                    [aid],
+                )
+                row = cur.fetchone()
+            tot_u = float(row[0] or 0)
+            tot_c = float(row[1] or 0)
+            cap_u = appt_cap['units'] * CAP_TOLERANCE if appt_cap['units'] > 0 else float('inf')
+            cap_c = appt_cap['cartons'] * CAP_TOLERANCE if appt_cap['cartons'] > 0 else float('inf')
+            if tot_u > cap_u + 1e-6 or tot_c > cap_c + 1e-6:
+                conflicts.append({
+                    'reason': 'appointment_commit_exceeded',
+                    'appointment_id': aid,
+                    'commit_units': appt_cap['units'],
+                    'commit_cartons': appt_cap['cartons'],
+                    'total_units': round(tot_u, 2),
+                    'total_cartons': round(tot_c, 2),
+                })
     return conflicts
 
 
@@ -3096,6 +3209,9 @@ class ManualPlanView(_SafeAPIView):
         selected_items = request.data.get('items', [])
         truck_size = request.data.get('truck_size', '15_ton')
         capacity_override = request.data.get('truck_capacity_liters')
+        # Appointment-driven manual: the appointment's Vendor Central commit is
+        # enforced from the DB (not from client-sent caps) — see below.
+        appointment_id = str(request.data.get('appointment_id') or '').strip()
         # Respect live BH-FGM stock by default — same constraint as the auto /
         # appointment planner, so a manual plan can't ship more than is physically
         # available. Toggleable via respect_stock (default on).
@@ -3119,6 +3235,22 @@ class ManualPlanView(_SafeAPIView):
 
         if not selected_items:
             return Response({'error': 'No items selected'}, status=400)
+
+        # No-per-litre items are NOT stripped out here. They flow through the same
+        # packer as the auto planner (_pack_into_capacity), which ships zero-volume
+        # OTHER-bucket items at full qty and sets the rest aside as not-loaded with a
+        # clear "No per-liter data…" reason AND a proper computed priority badge.
+        # This makes manual handle missing per-litre identically to auto.
+
+        # A single truck ships from ONE fulfillment center. Reject mixed-FC payloads
+        # (the auto planner enforces this too) so a direct API call can't bypass it.
+        fcs = {str(it.get('destination_fc') or '').strip().upper()
+               for it in selected_items if it.get('destination_fc')}
+        if len(fcs) > 1:
+            return Response(
+                {'error': f'Items span multiple fulfillment centers ({", ".join(sorted(fcs))}); a truck must be a single FC.'},
+                status=400,
+            )
 
         for item in selected_items:
             bucket, score, reason = _compute_priority(
@@ -3158,11 +3290,25 @@ class ManualPlanView(_SafeAPIView):
             planned_liters = round(sum(float(it.get('planned_liters') or 0) for it in loaded), 4)
             load_pct = round((planned_liters / capacity * 100) if capacity > 0 else 0, 2)
 
+        # Authoritative appointment-commitment cap (units + cartons), read live from
+        # the DB regardless of any client-sent caps. Trims the plan to the Vendor
+        # Central commit (+7%) so even a direct API call stays within commitment.
+        appt_cap = _lookup_appointment_commit(appointment_id) if appointment_id else None
+        if appt_cap:
+            for it in loaded:
+                it['appointment_id'] = appointment_id  # tag so the cap groups them
+            loaded, not_loaded = _enforce_commit_caps(
+                loaded, not_loaded, {appointment_id: appt_cap}, key_field='appointment_id',
+            )
+            planned_liters = round(sum(float(it.get('planned_liters') or 0) for it in loaded), 4)
+            load_pct = round((planned_liters / capacity * 100) if capacity > 0 else 0, 2)
+
         return Response({
             'loaded_items': loaded,
             'not_loaded_items': not_loaded,
             'priority_actual': priority_actual,
             'commit_caps': commit_caps,
+            'appointment_commit': appt_cap,
             'respect_stock': respect_stock,
             'load_summary': {
                 'truck_size': truck_size,
