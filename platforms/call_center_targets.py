@@ -1,18 +1,26 @@
-"""Call Center monthly targets — a single, isolated target store.
+"""Call Center monthly figures — a single, isolated editable store.
 
 Self-contained on purpose: this module does NOT read or write the existing
 `month_targets` / `primary_month_targets` tables or any platform/dashboard
-logic. It backs one numeric target per (month, year, item_head) for the
-frontend's Call Center card, stored in `call_center_targets` (see migration
-0043_call_center_targets).
+logic. It backs the editable cells of the frontend's Call Center row — the
+`targets`, `done_ltrs` and source `date` per (month, year, item_head) — stored
+in `call_center_targets` (see migrations 0043 + 0044). Every other column the
+row shows (Achieved %, Est.Ltr, DRR…) is derived on the frontend from these
+three, exactly like the real platform rows.
 
 Contract (the frontend depends on this exactly):
   GET  /api/platform/call-center-targets?month=<int>&year=<int>
-       -> {"premium": <number|null>, "commodity": <number|null>}
+       -> {"premium":   {"targets": <num|null>, "done_ltrs": <num|null>,
+                         "date": "YYYY-MM-DD"|null} | null,
+           "commodity": { ...same... } | null}
+       (a section is null when no row has been saved for it yet)
   POST /api/platform/call-center-targets
        body {"month": <int>, "year": <int>,
-             "item_head": "PREMIUM"|"COMMODITY", "targets": <number|null>}
-       -> {"ok": true, "item_head": "...", "targets": <number|null>}
+             "item_head": "PREMIUM"|"COMMODITY",
+             "field": "targets"|"done_ltrs"|"date",
+             "value": <number|string|null>}
+       -> {"ok": true, "item_head": "...",
+           "targets": <num|null>, "done_ltrs": <num|null>, "date": <str|null>}
 
 Permissions mirror the existing targets endpoints (see monthly_targets.py /
 primary_monthly_targets.py): the GET path requires the view permission
@@ -35,6 +43,15 @@ from accounts.permissions import require
 
 
 ITEM_HEADS = ("PREMIUM", "COMMODITY")
+
+# Editable field name -> physical column. Whitelisted so the column can be
+# interpolated into the upsert SQL safely (never user-controlled SQL).
+FIELD_COLUMNS = {
+    "targets": "targets",
+    "done_ltrs": "done_ltrs",
+    "date": "data_date",
+}
+NUMERIC_FIELDS = ("targets", "done_ltrs")
 
 # Same permission classes the existing targets endpoints use:
 #   GET  -> require("platform.month_targets.view")  (the targets-list/dashboard view perm)
@@ -74,6 +91,28 @@ def _as_number(value) -> float | None:
     return float(value)
 
 
+def _as_date_str(value) -> str | None:
+    """A DATE column comes back as a datetime.date; expose it as 'YYYY-MM-DD'."""
+    if value is None:
+        return None
+    if hasattr(value, "isoformat"):
+        return value.isoformat()
+    return str(value)
+
+
+def _section(row) -> dict | None:
+    """Shape one DB row (targets, done_ltrs, data_date) for the frontend, or
+    None when no row has been saved for that item_head yet."""
+    if row is None:
+        return None
+    targets, done_ltrs, data_date = row
+    return {
+        "targets": _as_number(targets),
+        "done_ltrs": _as_number(done_ltrs),
+        "date": _as_date_str(data_date),
+    }
+
+
 @api_view(["GET", "POST"])
 def call_center_targets(request):
     if request.method == "POST":
@@ -84,8 +123,8 @@ def call_center_targets(request):
 def _get(request):
     """GET /api/platform/call-center-targets?month=<int>&year=<int>
 
-    Returns the saved PREMIUM / COMMODITY targets for the month, or null each
-    when no row exists yet.
+    Returns the saved PREMIUM / COMMODITY figures for the month (targets,
+    done_ltrs, date), or null per section when no row exists yet.
     """
     _enforce(request, _VIEW_PERMISSION)
     month, year = _parse_month_year(request.query_params)
@@ -93,7 +132,7 @@ def _get(request):
     with connection.cursor() as cur:
         cur.execute(
             """
-            SELECT UPPER(TRIM(item_head)), targets
+            SELECT UPPER(TRIM(item_head)), targets, done_ltrs, data_date
               FROM call_center_targets
              WHERE month = %s AND year = %s
                AND UPPER(TRIM(item_head)) IN ('PREMIUM', 'COMMODITY')
@@ -102,17 +141,37 @@ def _get(request):
         )
         rows = cur.fetchall()
 
-    saved = {head: targets for head, targets in rows}
+    saved = {head: (targets, done_ltrs, data_date)
+             for head, targets, done_ltrs, data_date in rows}
     return Response({
-        "premium": _as_number(saved.get("PREMIUM")),
-        "commodity": _as_number(saved.get("COMMODITY")),
+        "premium": _section(saved.get("PREMIUM")),
+        "commodity": _section(saved.get("COMMODITY")),
     })
+
+
+def _coerce_value(field: str, raw):
+    """Validate + coerce a field's incoming value to the type its column needs.
+
+    Returns a value safe to bind for `targets`/`done_ltrs` (Decimal or None) or
+    `date` (a 'YYYY-MM-DD' string or None — Postgres casts it to DATE).
+    """
+    if raw is None or raw == "":
+        return None
+    if field in NUMERIC_FIELDS:
+        try:
+            return Decimal(str(raw))
+        except (InvalidOperation, ValueError, TypeError):
+            raise ValidationError(f"`{field}` must be a number (or null to clear).")
+    # field == "date": keep the string; the column is DATE so an invalid string
+    # surfaces as a DB error, but normal input is 'YYYY-MM-DD'.
+    return str(raw)
 
 
 def _post(request):
     """POST /api/platform/call-center-targets
 
-    Upsert one (month, year, item_head) target. `targets` may be null to clear.
+    Upsert ONE editable field (targets | done_ltrs | date) for one
+    (month, year, item_head). `value` may be null to clear that field.
     """
     _enforce(request, _EDIT_PERMISSION)
     body = request.data or {}
@@ -122,30 +181,32 @@ def _post(request):
     if item_head not in ITEM_HEADS:
         raise ValidationError(f"`item_head` must be one of {ITEM_HEADS}.")
 
-    raw_targets = body.get("targets", None)
-    if raw_targets is None or raw_targets == "":
-        targets: Decimal | None = None
-    else:
-        try:
-            targets = Decimal(str(raw_targets))
-        except (InvalidOperation, ValueError, TypeError):
-            raise ValidationError("`targets` must be a number (or null to clear).")
+    field = str(body.get("field") or "targets").strip().lower()
+    if field not in FIELD_COLUMNS:
+        raise ValidationError(f"`field` must be one of {tuple(FIELD_COLUMNS)}.")
+    column = FIELD_COLUMNS[field]
 
+    value = _coerce_value(field, body.get("value"))
+
+    # `column` is whitelisted via FIELD_COLUMNS, never user SQL.
     with connection.cursor() as cur:
         cur.execute(
-            """
-            INSERT INTO call_center_targets (month, year, item_head, targets, updated_at)
+            f"""
+            INSERT INTO call_center_targets
+                (month, year, item_head, {column}, updated_at)
             VALUES (%s, %s, %s, %s, NOW())
             ON CONFLICT (month, year, item_head)
-            DO UPDATE SET targets = EXCLUDED.targets, updated_at = NOW()
-            RETURNING targets
+            DO UPDATE SET {column} = EXCLUDED.{column}, updated_at = NOW()
+            RETURNING targets, done_ltrs, data_date
             """,
-            [month, year, item_head, targets],
+            [month, year, item_head, value],
         )
-        saved_targets = cur.fetchone()[0]
+        targets, done_ltrs, data_date = cur.fetchone()
 
     return Response({
         "ok": True,
         "item_head": item_head,
-        "targets": _as_number(saved_targets),
+        "targets": _as_number(targets),
+        "done_ltrs": _as_number(done_ltrs),
+        "date": _as_date_str(data_date),
     })
