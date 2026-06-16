@@ -538,6 +538,101 @@ def _compute_live_doh_by_asin():
     return by_asin, meta
 
 
+_DOH_AUTOFILL_CACHE = {'date': None, 'at': 0.0, 'data': None}
+
+
+def _doh_autofill_by_asin(effective_date):
+    """Rolling-window DOH per ASIN WITH inventory attributes (item_head/category/
+    brand/per_unit) for the DOH Auto-Fill view. Same heavy aggregate as
+    `_compute_live_doh_by_asin` but carrying the extra columns Auto-Fill needs.
+    TTL-cached by snapshot date — DOH changes only daily, so repeated Auto-Fill
+    runs reuse it instead of re-running the rolling-window aggregate each time."""
+    now = time.time()
+    c = _DOH_AUTOFILL_CACHE
+    if c['data'] is not None and c['date'] == effective_date and (now - c['at'] < _DOH_TTL):
+        return c['data']
+
+    month_name = effective_date.strftime('%B').upper()
+    year = effective_date.year
+    date_keys = _rolling_window_date_keys(effective_date, DRR_WINDOW_DAYS)
+    placeholders = ', '.join(['(%s, %s, %s)'] * len(date_keys))
+    flat_date_params = [v for triple in date_keys for v in triple]
+
+    with connection.cursor() as cur:
+        cur.execute(f"""
+            WITH sales AS (
+                SELECT
+                    UPPER(TRIM(COALESCE(asin::text, ''))) AS asin_key,
+                    COALESCE(SUM(shipped_units), 0)::numeric  AS units_sold,
+                    COALESCE(SUM(shipped_litres), 0)::numeric AS ltr_sold
+                FROM amazon_sec_range_master_view
+                WHERE ("year", UPPER(TRIM("month"::text)), UPPER(TRIM(month_day::text))) IN ({placeholders})
+                GROUP BY UPPER(TRIM(COALESCE(asin::text, '')))
+            ),
+            inventory AS (
+                SELECT
+                    UPPER(TRIM(COALESCE(asin::text, ''))) AS asin_key,
+                    MIN(NULLIF(TRIM(item_head::text), ''))    AS item_head,
+                    MIN(NULLIF(TRIM(category::text), ''))     AS category,
+                    MIN(NULLIF(TRIM(sub_category::text), '')) AS sub_category,
+                    MIN(NULLIF(TRIM(brand_2::text), ''))      AS brand,
+                    MIN(NULLIF(TRIM(per_unit::text), ''))     AS per_unit,
+                    MIN(NULLIF(TRIM(asin::text), ''))         AS asin,
+                    COALESCE(SUM(sellable_on_hand_units), 0)::numeric AS soh_unit,
+                    COALESCE(SUM(soh_ltr), 0)::numeric                AS soh_ltr
+                FROM amazon_master_inventory
+                WHERE "year" = %s
+                  AND UPPER(TRIM("month"::text)) = %s
+                  AND inventory_date = %s
+                  AND NULLIF(TRIM(COALESCE(asin::text, '')), '') IS NOT NULL
+                GROUP BY UPPER(TRIM(COALESCE(asin::text, '')))
+            )
+            SELECT
+                i.asin_key,
+                i.asin, i.item_head, i.category, i.sub_category, i.brand, i.per_unit,
+                i.soh_unit, i.soh_ltr,
+                COALESCE(s.units_sold, 0) AS units_sold,
+                COALESCE(s.ltr_sold,  0) AS ltr_sold
+            FROM inventory i
+            LEFT JOIN sales s ON s.asin_key = i.asin_key
+        """, flat_date_params + [year, month_name, effective_date])
+        doh_rows = _row_to_dict(cur, cur.fetchall())
+
+    window = float(DRR_WINDOW_DAYS)
+    doh_by_asin = {}
+    for r in doh_rows:
+        row = _serialize_row(r)
+        units_sold = float(row.get('units_sold') or 0)
+        ltr_sold = float(row.get('ltr_sold') or 0)
+        soh_unit = float(row.get('soh_unit') or 0)
+        soh_ltr = float(row.get('soh_ltr') or 0)
+        drr_unit = units_sold / window
+        drr_ltr = ltr_sold / window
+        doh = ((soh_unit / drr_unit) - 2) if drr_unit > 0 else 0.0
+        asin_up = str(row.get('asin_key') or '').upper()
+        if not asin_up:
+            continue
+        doh_by_asin[asin_up] = {
+            'asin': row.get('asin'),
+            'item_head_live': row.get('item_head'),
+            'category_live': row.get('category'),
+            'sub_category_live': row.get('sub_category'),
+            'brand_live': row.get('brand'),
+            'per_unit_live': row.get('per_unit'),
+            'units_sold': units_sold,
+            'ltr_sold': ltr_sold,
+            'soh_unit': soh_unit,
+            'soh_ltr': soh_ltr,
+            'drr_unit': drr_unit,
+            'drr_ltr': drr_ltr,
+            'doh': doh,
+        }
+    c['date'] = effective_date
+    c['at'] = now
+    c['data'] = doh_by_asin
+    return doh_by_asin
+
+
 # ---------------------------------------------------------------------------
 # Appointment endpoints
 # ---------------------------------------------------------------------------
@@ -754,7 +849,7 @@ def _enforce_commit_caps(loaded, not_loaded, commit_caps, key_field='appointment
     for manual). For ``po_number`` the comparison is uppercase-trimmed. Zero
     caps mean "no cap" for that field. DOH fillers (which have no appointment of
     their own) are counted toward the single appointment's cap, so the truck
-    total — fillers included — respects the Vendor Central commit ×1.1.
+    total — fillers included — respects the Vendor Central commit ×1.07.
     """
     if not commit_caps:
         return loaded, not_loaded
@@ -1861,10 +1956,11 @@ class AppointmentItemsView(_SafeAPIView):
 
         # Appointment POs come FIRST and in full: pack the appointment's own POs
         # (highest priority_score first) straight into the truck, limited only by
-        # physical capacity — the priority slider does NOT restrict or reduce the
-        # appointment's own POs. The Vendor Central units/cartons cap (with +10%
-        # tolerance) is still applied at the end. Leftover capacity is then filled
-        # by the maximize-fill / DOH-filler waterfall below.
+        # physical capacity. By design `priority=None` here — the PREMIUM/COMMODITY/
+        # OTHER slider intentionally does NOT shrink the appointment's own POs (that
+        # would drop committed goods); it only steers the discretionary DOH-filler
+        # waterfall below and the standalone DOH Auto-Fill view. The Vendor Central
+        # units/cartons cap (with +7% tolerance) is still applied at the end.
         loaded, not_loaded, capacity, planned_liters, load_pct, priority_actual = _auto_plan_truck(
             items, truck_size, capacity_override, priority=None,
         )
@@ -2330,6 +2426,9 @@ class ShipmentListCreateView(_SafeAPIView):
                     priority_reason=item_data.get('priority_reason') or '',
                     is_auto_selected=True,
                     not_loaded=not_loaded,
+                    # Record/audit: why this line wasn't fully shipped (from the planner).
+                    unfit_reason=item_data.get('unfit_reason') or '',
+                    short_reason=item_data.get('short_reason') or '',
                 )
 
             all_items = (
@@ -2576,42 +2675,57 @@ class ShipmentDispatchView(_SafeAPIView):
 
 def _check_qty_conflicts(shipment):
     conflicts = []
-    loaded_items = shipment.items.filter(not_loaded=False)
-    for item in loaded_items:
+    loaded_items = list(shipment.items.filter(not_loaded=False))
+    # Batched availability check (was 2 queries PER item → N+1 on submit/approve):
+    # one grouped query for OTHER non-rejected shipments' committed qty per
+    # (ASIN, PO, FC), and one for the PO's original accepted qty. FC is part of the
+    # key so a commitment at one FC never reduces another FC's availability.
+    committed = {}    # (asin, po_up, fc_up) -> {'qty': float, 'ids': [shipment ids]}
+    po_accepted = {}  # (asin, po_up, fc_up) -> original accepted_qty
+    po_uppers = list({(it.po_number or '').strip().upper()
+                      for it in loaded_items if (it.po_number or '').strip()})
+    if po_uppers:
         with connection.cursor() as cur:
-            # Qty committed to OTHER non-rejected shipments for this (ASIN, PO, FC).
-            # Any non-rejected shipment reserves its planned_qty, so the leftover
-            # available to this shipment is (PO original) - (others' committed).
-            # FC is part of the key so a commitment at one FC never reduces another
-            # FC's availability (matches the FC-specific ceiling read below).
             cur.execute("""
-                SELECT s.id, si.planned_qty
+                SELECT si.asin,
+                       UPPER(TRIM(si.po_number)) AS po_up,
+                       UPPER(TRIM(COALESCE(si.destination_fc, ''))) AS fc_up,
+                       COALESCE(SUM(COALESCE(si.planned_qty, 0)), 0) AS qty,
+                       ARRAY_AGG(DISTINCT s.id) AS ids
                 FROM sp_items si
                 JOIN sp_shipments s ON s.id = si.shipment_id
-                WHERE si.asin = %s
-                  AND UPPER(TRIM(si.po_number)) = UPPER(TRIM(%s))
-                  AND UPPER(TRIM(COALESCE(si.destination_fc, ''))) = UPPER(TRIM(COALESCE(%s, '')))
+                WHERE UPPER(TRIM(si.po_number)) = ANY(%s)
                   AND s.status != 'rejected'
                   AND s.id != %s
                   AND si.not_loaded = FALSE
-            """, [item.asin, item.po_number, item.destination_fc or '', shipment.id])
-            locked = cur.fetchall()
-            # The item's stored accepted_qty may itself be a leftover remainder
-            # (it's set to "orderable at creation"), so read the PO's original
-            # ordered qty from the source table for the availability ceiling.
+                GROUP BY si.asin, UPPER(TRIM(si.po_number)),
+                         UPPER(TRIM(COALESCE(si.destination_fc, '')))
+            """, [po_uppers, shipment.id])
+            for asin, po_up, fc_up, qty, ids in cur.fetchall():
+                committed[(asin, po_up, fc_up)] = {'qty': float(qty or 0), 'ids': list(ids or [])}
             cur.execute("""
-                SELECT accepted_qty FROM reporting."Amazon PO"
-                WHERE asin = %s
-                  AND UPPER(TRIM(po_number)) = UPPER(TRIM(%s))
-                  AND fulfillment_center = %s
-                LIMIT 1
-            """, [item.asin, item.po_number, item.destination_fc or ''])
-            po_row = cur.fetchone()
+                SELECT asin,
+                       UPPER(TRIM(po_number)) AS po_up,
+                       UPPER(TRIM(COALESCE(fulfillment_center, ''))) AS fc_up,
+                       MAX(accepted_qty) AS accepted
+                FROM reporting."Amazon PO"
+                WHERE UPPER(TRIM(po_number)) = ANY(%s)
+                GROUP BY asin, UPPER(TRIM(po_number)),
+                         UPPER(TRIM(COALESCE(fulfillment_center, '')))
+            """, [po_uppers])
+            for asin, po_up, fc_up, accepted in cur.fetchall():
+                if accepted is not None:
+                    po_accepted[(asin, po_up, fc_up)] = float(accepted)
 
-        locked_qty = sum(float(r[1] or 0) for r in locked)
+    for item in loaded_items:
+        key = (item.asin or '',
+               (item.po_number or '').strip().upper(),
+               (item.destination_fc or '').strip().upper())
+        c = committed.get(key) or {'qty': 0.0, 'ids': []}
+        locked_qty = c['qty']
         planned = float(item.planned_qty or 0)
-        if po_row and po_row[0] is not None:
-            original = float(po_row[0] or 0)
+        if key in po_accepted:
+            original = po_accepted[key]
             available = original - locked_qty
         else:
             # Source row not found — fall back to the item's stored orderable qty
@@ -2627,7 +2741,7 @@ def _check_qty_conflicts(shipment):
                 'locked_qty': locked_qty,
                 'available_qty': available,
                 'planned_qty': planned,
-                'locked_shipment_ids': [r[0] for r in locked],
+                'locked_shipment_ids': c['ids'],
             })
 
     # Appointment-commitment guard: the total committed across all active shipments
@@ -2794,6 +2908,13 @@ class POListView(_SafeAPIView):
         # and inbound on-order.
         stock_detail = _bh_fgm_stock_detail()
         reserved = _reserved_stock_by_asin()
+        # Live DRR / SOH / DOH per ASIN — the SAME snapshot the auto planner and
+        # the SOH/DOH dashboard use. Without this the Manual PO picker had no
+        # demand data, so the manual planner's _compute_priority saw DRR=0 and
+        # bucketed EVERY line as HOLD. Now manual priority matches auto exactly.
+        # Use the TTL-cached wrapper (DOH changes only daily) so the 60s picker
+        # poll doesn't re-run the heavy rolling-window aggregate every time.
+        doh_by_asin, _ = _live_doh_by_asin()
         for r in rows:
             a = str(r.get('asin') or '').strip().upper()
             d = stock_detail.get(a)
@@ -2804,6 +2925,22 @@ class POListView(_SafeAPIView):
                 r['sap_available'] = max(0.0, d['onhand'] - reserved.get(a, 0.0))
             else:
                 r['sap_stock'] = r['sap_on_order'] = r['sap_reserved'] = r['sap_available'] = None
+            live = doh_by_asin.get(a, {}) if doh_by_asin else {}
+            r['soh_unit'] = live.get('soh_unit', 0) or 0
+            r['soh_ltr']  = live.get('soh_ltr',  0) or 0
+            r['drr_unit'] = live.get('drr_unit', 0) or 0
+            r['drr_ltr']  = live.get('drr_ltr',  0) or 0
+            r['doh']      = live.get('doh',      0) or 0
+            # Compute the priority bucket/score/reason here (identical to the auto
+            # planner's pool) so the Manual PO picker shows the right badges and
+            # sorts by priority_score, instead of treating every row as HOLD.
+            bucket, score, reason = _compute_priority(
+                r['drr_unit'], r['soh_unit'], r['doh'],
+                r.get('days_to_expiry'), r.get('po_status'),
+            )
+            r['priority_bucket'] = bucket
+            r['priority_score']  = score
+            r['priority_reason'] = reason
 
         return Response({
             'results': [_serialize_row(r) for r in rows],
@@ -3216,6 +3353,10 @@ class ManualPlanView(_SafeAPIView):
         # appointment planner, so a manual plan can't ship more than is physically
         # available. Toggleable via respect_stock (default on).
         respect_stock = str(request.data.get('respect_stock', True)).lower() not in ('0', 'false', 'no', 'off')
+        # DOH filler (from the Plan Review "DOH filler" button) — top up leftover truck
+        # capacity with same-FC PENDING in-stock POs NOT in this selection, ranked by
+        # DOH urgency. Same engine as the auto planner. Off by default.
+        doh_fill = str(request.data.get('doh_fill', False)).lower() in ('1', 'true', 'yes', 'on')
 
         # Vendor Central commit caps per PO (manual planner). Same shape as the
         # auto endpoint, just keyed by PO number instead of appointment_id.
@@ -3282,6 +3423,30 @@ class ManualPlanView(_SafeAPIView):
         loaded, not_loaded, capacity, planned_liters, load_pct, priority_actual = _auto_plan_truck(
             selected_items, truck_size, capacity_override
         )
+
+        # DOH filler — top up leftover truck capacity with same-FC PENDING in-stock
+        # POs not already in this selection, ranked by DOH (the SAME engine the auto
+        # planner uses). Runs BEFORE the commit caps so the fillers are trimmed to the
+        # appointment commit too, and shares avail_remaining so it never re-allocates
+        # stock already claimed by the selected items.
+        if doh_fill and capacity > planned_liters + 0.001 and fcs:
+            fc = next(iter(fcs))
+            selected_po_uppers = sorted({
+                str(it.get('po_number') or '').strip().upper()
+                for it in selected_items if it.get('po_number')
+            })
+            doh_by_asin, _ = _live_doh_by_asin()
+            doh_pool = _fetch_doh_filler_pool(fc, selected_po_uppers, doh_by_asin)
+            _apply_stock_caps(doh_pool, avail_total, avail_remaining, respect_stock, stock_detail, reserved)
+            if doh_pool:
+                loaded, _doh_unfit = _filler_pass(
+                    loaded, doh_pool, capacity,
+                    primary_fc=fc,
+                    mark_key='_doh_filler',
+                    reason='DOH filler · same-FC PENDING POs not in this selection, ranked by DOH urgency.',
+                )
+                planned_liters = round(sum(float(it.get('planned_liters') or 0) for it in loaded), 4)
+                load_pct = round((planned_liters / capacity * 100) if capacity > 0 else 0, 2)
 
         if commit_caps:
             loaded, not_loaded = _enforce_commit_caps(
@@ -3402,85 +3567,9 @@ class DOHAutoFillView(_SafeAPIView):
                 'message': 'No inventory snapshots found in amazon_master_inventory.',
             })
 
-        month_name = effective_date.strftime('%B').upper()
-        year = effective_date.year
-
-        date_keys = _rolling_window_date_keys(effective_date, DRR_WINDOW_DAYS)
-        placeholders = ', '.join(['(%s, %s, %s)'] * len(date_keys))
-        flat_date_params = [v for triple in date_keys for v in triple]
-
-        # 2) Compute live DOH per ASIN over a rolling DRR_WINDOW_DAYS window
-        #    (mirrors SOH/DOH dashboard logic via the shared helper).
-        with connection.cursor() as cur:
-            cur.execute(f"""
-                WITH sales AS (
-                    SELECT
-                        UPPER(TRIM(COALESCE(asin::text, ''))) AS asin_key,
-                        COALESCE(SUM(shipped_units), 0)::numeric  AS units_sold,
-                        COALESCE(SUM(shipped_litres), 0)::numeric AS ltr_sold
-                    FROM amazon_sec_range_master_view
-                    WHERE ("year", UPPER(TRIM("month"::text)), UPPER(TRIM(month_day::text))) IN ({placeholders})
-                    GROUP BY UPPER(TRIM(COALESCE(asin::text, '')))
-                ),
-                inventory AS (
-                    SELECT
-                        UPPER(TRIM(COALESCE(asin::text, ''))) AS asin_key,
-                        MIN(NULLIF(TRIM(item_head::text), ''))    AS item_head,
-                        MIN(NULLIF(TRIM(category::text), ''))     AS category,
-                        MIN(NULLIF(TRIM(sub_category::text), '')) AS sub_category,
-                        MIN(NULLIF(TRIM(brand_2::text), ''))      AS brand,
-                        MIN(NULLIF(TRIM(per_unit::text), ''))     AS per_unit,
-                        MIN(NULLIF(TRIM(asin::text), ''))         AS asin,
-                        COALESCE(SUM(sellable_on_hand_units), 0)::numeric AS soh_unit,
-                        COALESCE(SUM(soh_ltr), 0)::numeric                AS soh_ltr
-                    FROM amazon_master_inventory
-                    WHERE "year" = %s
-                      AND UPPER(TRIM("month"::text)) = %s
-                      AND inventory_date = %s
-                      AND NULLIF(TRIM(COALESCE(asin::text, '')), '') IS NOT NULL
-                    GROUP BY UPPER(TRIM(COALESCE(asin::text, '')))
-                )
-                SELECT
-                    i.asin_key,
-                    i.asin, i.item_head, i.category, i.sub_category, i.brand, i.per_unit,
-                    i.soh_unit, i.soh_ltr,
-                    COALESCE(s.units_sold, 0) AS units_sold,
-                    COALESCE(s.ltr_sold,  0) AS ltr_sold
-                FROM inventory i
-                LEFT JOIN sales s ON s.asin_key = i.asin_key
-            """, flat_date_params + [year, month_name, effective_date])
-            doh_rows = _row_to_dict(cur, cur.fetchall())
-
-        # Compute DOH per ASIN: (soh_unit / drr_unit) - 2, drr = units_sold / DRR_WINDOW_DAYS
-        window = float(DRR_WINDOW_DAYS)
-        doh_by_asin = {}
-        for r in doh_rows:
-            row = _serialize_row(r)
-            units_sold = float(row.get('units_sold') or 0)
-            ltr_sold = float(row.get('ltr_sold') or 0)
-            soh_unit = float(row.get('soh_unit') or 0)
-            soh_ltr = float(row.get('soh_ltr') or 0)
-            drr_unit = units_sold / window
-            drr_ltr = ltr_sold / window
-            doh = ((soh_unit / drr_unit) - 2) if drr_unit > 0 else 0.0
-            asin_up = str(row.get('asin_key') or '').upper()
-            if not asin_up:
-                continue
-            doh_by_asin[asin_up] = {
-                'asin': row.get('asin'),
-                'item_head_live': row.get('item_head'),
-                'category_live': row.get('category'),
-                'sub_category_live': row.get('sub_category'),
-                'brand_live': row.get('brand'),
-                'per_unit_live': row.get('per_unit'),
-                'units_sold': units_sold,
-                'ltr_sold': ltr_sold,
-                'soh_unit': soh_unit,
-                'soh_ltr': soh_ltr,
-                'drr_unit': drr_unit,
-                'drr_ltr': drr_ltr,
-                'doh': doh,
-            }
+        # Heavy rolling-window DOH aggregate (WITH inventory attributes) — TTL-cached
+        # by snapshot date so repeated Auto-Fill runs reuse it (DOH changes daily).
+        doh_by_asin = _doh_autofill_by_asin(effective_date)
 
         # 3) Fetch available POs (FC-scoped if fc provided)
         po_where = [
@@ -3891,6 +3980,274 @@ class PoShortSupplyView(_SafeAPIView):
             'results': results,
             'count': len(results),
             'total_short_units': round(total_short_units, 4),
+        })
+
+
+_FC_CHANNEL_CACHE = {'at': 0.0, 'data': None}
+
+
+def _fc_channel_map():
+    """{FC (upper) → channel} from fc_city_state_channel_master. Tiny + near-static,
+    so cache for 5 min to avoid a per-request query."""
+    now = time.time()
+    c = _FC_CHANNEL_CACHE
+    if c['data'] is not None and (now - c['at'] < 300):
+        return c['data']
+    m = {}
+    try:
+        with connection.cursor() as cur:
+            cur.execute("SELECT UPPER(TRIM(fc::text)), channel FROM public.fc_city_state_channel_master")
+            for fc, ch in cur.fetchall():
+                if fc:
+                    m[fc] = ch
+    except Exception:
+        pass
+    c['at'] = now
+    c['data'] = m
+    return m
+
+
+class ShipmentRecordView(_SafeAPIView):
+    """Audit 'Record' (Data → Record): every ACTIVE shipment (not rejected) with its
+    items grouped by PO, each ASIN tagged shipped / short / not_loaded plus the reason
+    it wasn't fully shipped. Two cheap queries (shipments, then their items by
+    shipment_id) so it stays fast; newest shipments first."""
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        limit = _safe_int(request.query_params.get('limit'), 200, lo=1, hi=2000)
+        status_filter = request.query_params.get('status', '').strip().lower()
+
+        with connection.cursor() as cur:
+            where = ["s.status != 'rejected'"]
+            params = []
+            if status_filter and status_filter not in ('', 'all', 'active'):
+                where.append("LOWER(s.status) = %s")
+                params.append(status_filter)
+            cur.execute(f"""
+                SELECT s.id, s.status, s.planning_mode, s.appointment_id,
+                       s.destination_fc, s.truck_size, s.created_at, s.appointment_time
+                FROM sp_shipments s
+                WHERE {' AND '.join(where)}
+                ORDER BY s.created_at DESC NULLS LAST, s.id DESC
+                LIMIT %s
+            """, params + [limit])
+            ship_rows = _row_to_dict(cur, cur.fetchall())
+            ship_ids = [r['id'] for r in ship_rows]
+
+            items_by_ship = {}
+            if ship_ids:
+                cur.execute("""
+                    SELECT si.shipment_id, si.po_number, si.asin, si.internal_sku,
+                           si.product_name, si.item, si.destination_fc, si.item_head,
+                           si.accepted_qty, si.planned_qty, si.planned_liters,
+                           si.case_pack, si.not_loaded,
+                           si.unfit_reason, si.short_reason,
+                           si.priority_bucket, si.priority_reason,
+                           si.expiry_date, si.days_to_expiry
+                    FROM sp_items si
+                    WHERE si.shipment_id = ANY(%s)
+                    ORDER BY si.not_loaded ASC, UPPER(TRIM(si.po_number)), si.asin
+                """, [ship_ids])
+                for r in _row_to_dict(cur, cur.fetchall()):
+                    items_by_ship.setdefault(r['shipment_id'], []).append(r)
+
+        # FC → channel for display (tiny, cached map).
+        channel_map = _fc_channel_map()
+
+        results = []
+        for sh in ship_rows:
+            items = items_by_ship.get(sh['id'], [])
+            pos = {}
+            summ = {'asins': 0, 'shipped': 0, 'short': 0, 'not_loaded': 0,
+                    'ordered_units': 0.0, 'shipped_units': 0.0, 'short_units': 0.0}
+            for it in items:
+                ordered = float(it.get('accepted_qty') or 0)
+                planned = 0.0 if it.get('not_loaded') else float(it.get('planned_qty') or 0)
+                short = max(0.0, ordered - planned)
+                if it.get('not_loaded'):
+                    status = 'not_loaded'
+                    reason = it.get('unfit_reason') or it.get('priority_reason') or 'Not loaded (reason not recorded)'
+                elif short > 1e-6:
+                    status = 'short'
+                    reason = it.get('short_reason') or (
+                        f'Shipped {int(round(planned))} of {int(round(ordered))} '
+                        f'— {int(round(short))} short'
+                    )
+                else:
+                    status = 'shipped'
+                    reason = ''
+                summ['asins'] += 1
+                summ[status] += 1
+                summ['ordered_units'] += ordered
+                summ['shipped_units'] += planned
+                summ['short_units'] += short
+                po = (it.get('po_number') or '—').strip() or '—'
+                pos.setdefault(po, []).append(_serialize_row({
+                    'asin': it.get('asin'),
+                    'item': it.get('item') or it.get('product_name'),
+                    'internal_sku': it.get('internal_sku'),
+                    'item_head': it.get('item_head'),
+                    'destination_fc': it.get('destination_fc'),
+                    'ordered_qty': ordered,
+                    'shipped_qty': planned,
+                    'short_qty': short,
+                    'planned_liters': float(it.get('planned_liters') or 0),
+                    'case_pack': it.get('case_pack'),
+                    'priority_bucket': it.get('priority_bucket'),
+                    'expiry_date': it.get('expiry_date'),
+                    'days_to_expiry': it.get('days_to_expiry'),
+                    'status': status,
+                    'reason': reason,
+                }))
+
+            fc = str(sh.get('destination_fc') or '').strip().upper()
+            results.append(_serialize_row({
+                'id': sh['id'],
+                'status': sh['status'],
+                'planning_mode': sh['planning_mode'],
+                'appointment_id': sh['appointment_id'],
+                'destination_fc': sh['destination_fc'],
+                'channel': channel_map.get(fc),
+                'truck_size': sh['truck_size'],
+                'created_at': sh['created_at'],
+                'appointment_time': sh['appointment_time'],
+                'summary': {
+                    'pos': len(pos),
+                    'asins': summ['asins'],
+                    'shipped': summ['shipped'],
+                    'short': summ['short'],
+                    'not_loaded': summ['not_loaded'],
+                    'ordered_units': round(summ['ordered_units'], 2),
+                    'shipped_units': round(summ['shipped_units'], 2),
+                    'short_units': round(summ['short_units'], 2),
+                },
+                'pos': [
+                    {'po_number': po, 'items': its}
+                    for po, its in sorted(pos.items())
+                ],
+            }))
+
+        return Response({'results': results, 'count': len(results)})
+
+
+class ShipmentKpiView(_SafeAPIView):
+    """Live planner KPIs (Data → KPIs), computed from sp_shipments / sp_items over
+    ACTIVE shipments (not rejected): truck fill %, unit fill %, short-supply %,
+    commitment adherence, line/status/mode breakdowns, and inventory-snapshot
+    freshness. A few cheap aggregate queries — no heavy joins."""
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        import json as _json
+        with connection.cursor() as cur:
+            cur.execute("""
+                SELECT
+                    COUNT(*)                                              AS shipments,
+                    COUNT(*) FILTER (WHERE status = 'draft')             AS draft,
+                    COUNT(*) FILTER (WHERE status = 'pending_approval')  AS pending,
+                    COUNT(*) FILTER (WHERE status = 'approved')          AS approved,
+                    COUNT(*) FILTER (WHERE status = 'dispatched')        AS dispatched,
+                    COUNT(*) FILTER (WHERE planning_mode = 'manual')     AS manual_mode,
+                    COUNT(*) FILTER (WHERE planning_mode IN ('appointment', 'doh')) AS auto_mode,
+                    COALESCE(SUM(planned_liters), 0)        AS planned_liters,
+                    COALESCE(SUM(truck_capacity_liters), 0) AS capacity_liters
+                FROM sp_shipments
+                WHERE status != 'rejected'
+            """)
+            sh = dict(zip([c[0] for c in cur.description], cur.fetchone()))
+
+            cur.execute("""
+                SELECT
+                    COALESCE(SUM(si.accepted_qty), 0) AS ordered_units,
+                    COALESCE(SUM(CASE WHEN si.not_loaded = FALSE THEN si.planned_qty ELSE 0 END), 0) AS shipped_units,
+                    COUNT(*)                                                       AS total_lines,
+                    COUNT(*) FILTER (WHERE si.not_loaded = TRUE)                   AS not_loaded_lines,
+                    COUNT(*) FILTER (WHERE si.not_loaded = FALSE AND si.planned_qty < si.accepted_qty) AS short_lines,
+                    COUNT(*) FILTER (WHERE si.not_loaded = FALSE AND si.planned_qty >= si.accepted_qty) AS full_lines
+                FROM sp_items si
+                JOIN sp_shipments s ON s.id = si.shipment_id
+                WHERE s.status != 'rejected'
+            """)
+            it = dict(zip([c[0] for c in cur.description], cur.fetchone()))
+
+            cur.execute("""
+                SELECT commitment_snapshot
+                FROM sp_shipments
+                WHERE status != 'rejected' AND commitment_snapshot IS NOT NULL
+            """)
+            snaps = [r[0] for r in cur.fetchall()]
+
+        # Commitment adherence from the frozen per-appointment snapshots.
+        appt_total = appt_within = 0
+        commit_u = filled_u = commit_c = filled_c = 0.0
+        for snap in snaps:
+            if isinstance(snap, str):
+                try:
+                    snap = _json.loads(snap)
+                except (ValueError, TypeError):
+                    snap = []
+            for e in (snap or []):
+                cu = float(e.get('committed_units') or 0)
+                fu = float(e.get('filled_units') or 0)
+                cc = float(e.get('committed_cartons') or 0)
+                fc = float(e.get('filled_cartons') or 0)
+                if cu <= 0 and cc <= 0:
+                    continue
+                appt_total += 1
+                commit_u += cu; filled_u += fu
+                commit_c += cc; filled_c += fc
+                within_u = cu <= 0 or fu <= cu * CAP_TOLERANCE + 1e-6
+                within_c = cc <= 0 or fc <= cc * CAP_TOLERANCE + 1e-6
+                if within_u and within_c:
+                    appt_within += 1
+
+        _, meta = _live_doh_by_asin()
+
+        ordered = float(it['ordered_units'] or 0)
+        shipped = float(it['shipped_units'] or 0)
+        short = max(0.0, ordered - shipped)
+        cap = float(sh['capacity_liters'] or 0)
+        pl = float(sh['planned_liters'] or 0)
+        pct = lambda a, b: round((a / b * 100), 1) if b else 0.0  # noqa: E731
+
+        return Response({
+            'shipments': {
+                'active': int(sh['shipments'] or 0),
+                'draft': int(sh['draft'] or 0),
+                'pending_approval': int(sh['pending'] or 0),
+                'approved': int(sh['approved'] or 0),
+                'dispatched': int(sh['dispatched'] or 0),
+                'auto': int(sh['auto_mode'] or 0),
+                'manual': int(sh['manual_mode'] or 0),
+            },
+            'truck_fill_pct': pct(pl, cap),
+            'planned_liters': round(pl, 0),
+            'capacity_liters': round(cap, 0),
+            'unit_fill_pct': pct(shipped, ordered),
+            'short_supply_pct': pct(short, ordered),
+            'ordered_units': round(ordered, 0),
+            'shipped_units': round(shipped, 0),
+            'short_units': round(short, 0),
+            'lines': {
+                'total': int(it['total_lines'] or 0),
+                'full': int(it['full_lines'] or 0),
+                'short': int(it['short_lines'] or 0),
+                'not_loaded': int(it['not_loaded_lines'] or 0),
+            },
+            'commitment': {
+                'appointments': appt_total,
+                'within_cap': appt_within,
+                'adherence_pct': pct(appt_within, appt_total),
+                'unit_fill_of_commit_pct': pct(filled_u, commit_u),
+                'carton_fill_of_commit_pct': pct(filled_c, commit_c),
+            },
+            'snapshot': {
+                # _doh_snapshot_meta already returns effective_date as an ISO string.
+                'effective_date': meta.get('effective_date'),
+                'age_days': meta.get('snapshot_age_days'),
+                'is_stale': meta.get('is_stale', False),
+            },
         })
 
 

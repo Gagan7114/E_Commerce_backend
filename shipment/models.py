@@ -120,9 +120,26 @@ class ShipmentItem(models.Model):
     is_changed = models.BooleanField(default=False)
     change_reason = models.TextField(blank=True)
     not_loaded = models.BooleanField(default=False)
+    # Why an item wasn't fully shipped — captured from the planner at draft time so
+    # the Record/audit view can show it. unfit_reason: why a NOT-loaded item couldn't
+    # ship; short_reason: why a loaded item shipped partial (short-supplied).
+    unfit_reason = models.TextField(blank=True)
+    short_reason = models.TextField(blank=True)
 
     class Meta:
         db_table = 'sp_items'
+        indexes = [
+            # Almost every planner/dashboard query scans loaded items grouped/joined
+            # by (asin, po_number) with not_loaded=FALSE (availability checks,
+            # committed/locked lookups, short-supply, the advisory-lock save guard).
+            # A partial composite index keeps that to an index scan over only the
+            # loaded rows instead of a full table scan.
+            models.Index(
+                fields=['asin', 'po_number'],
+                condition=models.Q(not_loaded=False),
+                name='sp_items_loaded_asin_po',
+            ),
+        ]
 
 
 class ShipmentAuditLog(models.Model):
