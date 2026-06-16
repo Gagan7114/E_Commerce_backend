@@ -1,6 +1,6 @@
 from django.urls import path
 
-from . import views, monthly_targets, primary_monthly_targets
+from . import views, monthly_targets, primary_monthly_targets, call_center_targets
 
 urlpatterns = [
     # Cross-platform dashboard — registered before the <slug:slug> routes so
@@ -29,6 +29,13 @@ urlpatterns = [
         "primary-overview-total",
         views.primary_overview_total,
         name="platform-primary-overview-total",
+    ),
+    # Call Center monthly target (isolated single-target store). Registered
+    # before the <slug:slug> routes so it isn't matched as a platform slug.
+    path(
+        "call-center-targets",
+        call_center_targets.call_center_targets,
+        name="call-center-targets",
     ),
 
     path("<slug:slug>/stats", views.platform_stats, name="platform-stats"),

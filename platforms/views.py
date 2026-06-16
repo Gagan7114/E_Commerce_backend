@@ -2569,7 +2569,7 @@ def blinkit_soh_doh_dashboard(request, slug: str):
     max_sales_date = _scalar(
         f"""
         SELECT MAX({sale_date_expr})
-        FROM "SecMaster"
+        FROM secmaster_mv
         WHERE REGEXP_REPLACE(LOWER(TRIM("format"::text)), '[^a-z0-9]+', '', 'g') = %s
           AND ({sale_date_expr}) >= %s
           AND ({sale_date_expr}) <= %s
@@ -2592,7 +2592,7 @@ def blinkit_soh_doh_dashboard(request, slug: str):
                 MIN(NULLIF(TRIM("item"::text), '')) AS item,
                 COALESCE(SUM("quantity"), 0)::numeric AS quantity,
                 COALESCE(SUM("ltr_sold"), 0)::numeric AS ltr_sold
-            FROM "SecMaster"
+            FROM secmaster_mv
             WHERE REGEXP_REPLACE(LOWER(TRIM("format"::text)), '[^a-z0-9]+', '', 'g') = %s
               AND ({sale_date_expr}) >= %s
               AND ({sale_date_expr}) <= %s
@@ -4901,7 +4901,7 @@ def _parse_sec_month_year(params, *, latest_source: str = "flipkart_grocery") ->
             latest = _dict_rows(
                 f"""
                 SELECT "month", "year"
-                FROM "SecMaster"
+                FROM secmaster_mv
                 WHERE REGEXP_REPLACE(LOWER(TRIM("format"::text)), '[^a-z0-9]+', '', 'g') = %s
                   AND ({date_expr}) IS NOT NULL
                 ORDER BY ({date_expr}) DESC
@@ -5597,7 +5597,7 @@ def _top_ltr_items_from_secmaster(
             COALESCE(SUM("quantity"), 0) AS shipped_units,
             COALESCE(SUM("ltr_sold"), 0) AS shipped_ltr,
             COALESCE(SUM({value_column}), 0) AS shipped_value
-        FROM "SecMaster"
+        FROM secmaster_mv
         WHERE REGEXP_REPLACE(LOWER(TRIM("format"::text)), '[^a-z0-9]+', '', 'g') = %s
           AND UPPER(TRIM("month"::text)) = %s
           AND "year"::numeric = %s
@@ -5843,9 +5843,9 @@ _SEC_DASHBOARD_YEAR_SOURCES = {
         ("amazon_sec_range_master_view", '"year"', None),
         ("amazon_sec_daily_master_view", '"year"', None),
     ),
-    "blinkit": (("SecMaster", '"year"', "blinkit"),),
-    "zepto": (("SecMaster", '"year"', "zepto"),),
-    "bigbasket": (("SecMaster", '"year"', "bigbasket"),),
+    "blinkit": (("secmaster_mv", '"year"', "blinkit"),),
+    "zepto": (("secmaster_mv", '"year"', "zepto"),),
+    "bigbasket": (("secmaster_mv", '"year"', "bigbasket"),),
     "swiggy": (("swiggySec", 'EXTRACT(YEAR FROM "ORDERED_DATE")::int', None),),
     "flipkart": (("flipkart_secondary_all", '"year"', None),),
     "flipkart_grocery": (("flipkart_grocery_master", '"year"', None),),
@@ -7563,7 +7563,7 @@ def _bigbasket_sec_dashboard_response(request):
     max_date = _scalar(
         f"""
         SELECT MAX("date")
-        FROM "SecMaster"
+        FROM secmaster_mv
         WHERE REGEXP_REPLACE(LOWER(TRIM("format"::text)), '[^a-z0-9]+', '', 'g') = 'bigbasket'
           AND UPPER(TRIM("month"::text)) = %s
           AND "year"::numeric = %s
@@ -7580,7 +7580,7 @@ def _bigbasket_sec_dashboard_response(request):
             COALESCE(SUM("quantity"), 0) AS shipped_units,
             COALESCE(SUM("ltr_sold"), 0) AS shipped_ltr,
             COALESCE(SUM("sales_amt_exc"), 0) AS shipped_value
-        FROM "SecMaster"
+        FROM secmaster_mv
         WHERE REGEXP_REPLACE(LOWER(TRIM("format"::text)), '[^a-z0-9]+', '', 'g') = 'bigbasket'
           AND UPPER(TRIM("month"::text)) = %s
           AND "year"::numeric = %s
@@ -7621,7 +7621,7 @@ def _bigbasket_sec_dashboard_response(request):
             COALESCE(SUM("sales_amt_exc"), 0) AS shipped_value,
             COALESCE(SUM("quantity"), 0) AS shipped_units,
             COALESCE(SUM("ltr_sold"), 0) AS shipped_ltr
-        FROM "SecMaster"
+        FROM secmaster_mv
         WHERE REGEXP_REPLACE(LOWER(TRIM("format"::text)), '[^a-z0-9]+', '', 'g') = 'bigbasket'
           AND UPPER(TRIM("month"::text)) = %s
           AND "year"::numeric = %s
@@ -7680,7 +7680,7 @@ def _bigbasket_sec_dashboard_response(request):
     )
 
     sec_trend = _build_sec_keyed_trend(
-        table="SecMaster",
+        table="secmaster_mv",
         date_col='"date"',
         month=month,
         year=year,
@@ -8167,7 +8167,7 @@ def _blinkit_sec_dashboard_response(request):
     max_date = _scalar(
         f"""
         SELECT MAX("date")
-        FROM "SecMaster"
+        FROM secmaster_mv
         WHERE REGEXP_REPLACE(LOWER(TRIM("format"::text)), '[^a-z0-9]+', '', 'g') = 'blinkit'
           AND UPPER(TRIM("month"::text)) = %s
           AND "year"::numeric = %s
@@ -8185,7 +8185,7 @@ def _blinkit_sec_dashboard_response(request):
             COALESCE(SUM("quantity"), 0) AS shipped_units,
             COALESCE(SUM("ltr_sold"), 0) AS shipped_ltr,
             COALESCE(SUM("sales_amt_exc"), 0) AS shipped_value
-        FROM "SecMaster"
+        FROM secmaster_mv
         WHERE REGEXP_REPLACE(LOWER(TRIM("format"::text)), '[^a-z0-9]+', '', 'g') = 'blinkit'
           AND UPPER(TRIM("month"::text)) = %s
           AND "year"::numeric = %s
@@ -8217,7 +8217,7 @@ def _blinkit_sec_dashboard_response(request):
             COALESCE(SUM("sales_amt_exc"), 0) AS shipped_value,
             COALESCE(SUM("quantity"), 0) AS shipped_units,
             COALESCE(SUM("ltr_sold"), 0) AS shipped_ltr
-        FROM "SecMaster"
+        FROM secmaster_mv
         WHERE REGEXP_REPLACE(LOWER(TRIM("format"::text)), '[^a-z0-9]+', '', 'g') = 'blinkit'
           AND UPPER(TRIM("month"::text)) = %s
           AND "year"::numeric = %s
@@ -8279,7 +8279,7 @@ def _blinkit_sec_dashboard_response(request):
     yearly_trend = []
 
     sec_trend = _build_sec_keyed_trend(
-        table="SecMaster",
+        table="secmaster_mv",
         date_col='"date"',
         month=month,
         year=year,
@@ -8609,7 +8609,7 @@ def _zepto_sec_dashboard_response(request):
     max_date = _scalar(
         f"""
         SELECT MAX({date_expr})
-        FROM "SecMaster"
+        FROM secmaster_mv
         WHERE REGEXP_REPLACE(LOWER(TRIM("format"::text)), '[^a-z0-9]+', '', 'g') = 'zepto'
           AND UPPER(TRIM("month"::text)) = %s
           AND "year"::numeric = %s
@@ -8627,7 +8627,7 @@ def _zepto_sec_dashboard_response(request):
             COALESCE(SUM("quantity"), 0) AS shipped_units,
             COALESCE(SUM("ltr_sold"), 0) AS shipped_ltr,
             COALESCE(SUM("sales_amt_exc"), 0) AS shipped_value
-        FROM "SecMaster"
+        FROM secmaster_mv
         WHERE REGEXP_REPLACE(LOWER(TRIM("format"::text)), '[^a-z0-9]+', '', 'g') = 'zepto'
           AND UPPER(TRIM("month"::text)) = %s
           AND "year"::numeric = %s
@@ -8659,7 +8659,7 @@ def _zepto_sec_dashboard_response(request):
             COALESCE(SUM("sales_amt_exc"), 0) AS shipped_value,
             COALESCE(SUM("quantity"), 0) AS shipped_units,
             COALESCE(SUM("ltr_sold"), 0) AS shipped_ltr
-        FROM "SecMaster"
+        FROM secmaster_mv
         WHERE REGEXP_REPLACE(LOWER(TRIM("format"::text)), '[^a-z0-9]+', '', 'g') = 'zepto'
           AND UPPER(TRIM("month"::text)) = %s
           AND "year"::numeric = %s
@@ -8712,7 +8712,7 @@ def _zepto_sec_dashboard_response(request):
     )
 
     sec_trend = _build_sec_keyed_trend(
-        table="SecMaster",
+        table="secmaster_mv",
         date_col='"date"',
         month=month,
         year=year,
@@ -8774,7 +8774,7 @@ def sku_analysis_dashboard(request, slug: str):
     max_date = _scalar(
         """
         SELECT MAX("date")
-        FROM "SecMaster"
+        FROM secmaster_mv
         WHERE REGEXP_REPLACE(LOWER(TRIM("format"::text)), '[^a-z0-9]+', '', 'g') = 'blinkit'
           AND UPPER(TRIM("month"::text)) = %s
           AND "year"::numeric = %s
@@ -8787,7 +8787,7 @@ def sku_analysis_dashboard(request, slug: str):
         item_head = _scalar(
             """
             SELECT UPPER(TRIM("item_head"::text))
-            FROM "SecMaster"
+            FROM secmaster_mv
             WHERE REGEXP_REPLACE(LOWER(TRIM("format"::text)), '[^a-z0-9]+', '', 'g') = 'blinkit'
               AND UPPER(TRIM("item"::text)) = UPPER(TRIM(%s))
               AND NULLIF(TRIM("item_head"::text), '') IS NOT NULL
@@ -8814,7 +8814,7 @@ def sku_analysis_dashboard(request, slug: str):
             COALESCE(SUM("quantity"), 0) AS qty_sold,
             COALESCE(SUM("ltr_sold"), 0) AS liter_sold,
             COALESCE(SUM("sales_amt_exc"), 0) AS sales_amount
-        FROM "SecMaster"
+        FROM secmaster_mv
         WHERE {daily_where_sql}
           AND "date" IS NOT NULL
         GROUP BY "date"
@@ -8842,7 +8842,7 @@ def sku_analysis_dashboard(request, slug: str):
             COALESCE(NULLIF(TRIM("item"::text), ''), '-') AS sku,
             COALESCE(NULLIF(UPPER(TRIM("item_head"::text)), ''), 'OTHER') AS item_head,
             COALESCE(SUM("ltr_sold"), 0) AS ltrs_sold
-        FROM "SecMaster"
+        FROM secmaster_mv
         WHERE REGEXP_REPLACE(LOWER(TRIM("format"::text)), '[^a-z0-9]+', '', 'g') = 'blinkit'
           AND UPPER(TRIM("month"::text)) = %s
           AND "year"::numeric = %s
@@ -8860,7 +8860,7 @@ def sku_analysis_dashboard(request, slug: str):
         SELECT
             COALESCE(NULLIF(TRIM("item"::text), ''), '-') AS item,
             COALESCE(NULLIF(UPPER(TRIM("item_head"::text)), ''), 'OTHER') AS item_head
-        FROM "SecMaster"
+        FROM secmaster_mv
         WHERE REGEXP_REPLACE(LOWER(TRIM("format"::text)), '[^a-z0-9]+', '', 'g') = 'blinkit'
           AND UPPER(TRIM("month"::text)) = %s
           AND "year"::numeric = %s
@@ -8907,7 +8907,7 @@ def _bigbasket_sku_analysis_dashboard_response(request):
     max_date = _scalar(
         f"""
         SELECT MAX({sale_date_expr_plain})
-        FROM "SecMaster"
+        FROM secmaster_mv
         WHERE REGEXP_REPLACE(LOWER(TRIM("format"::text)), '[^a-z0-9]+', '', 'g') = 'bigbasket'
           AND UPPER(TRIM("month"::text)) = %s
           AND "year"::numeric = %s
@@ -8920,7 +8920,7 @@ def _bigbasket_sku_analysis_dashboard_response(request):
         item_head = _scalar(
             f"""
             SELECT UPPER(TRIM(sm."item_head"::text))
-            FROM "SecMaster" sm
+            FROM secmaster_mv sm
             WHERE REGEXP_REPLACE(LOWER(TRIM(sm."format"::text)), '[^a-z0-9]+', '', 'g') = 'bigbasket'
               AND UPPER(TRIM(sm."item"::text)) = UPPER(TRIM(%s))
               AND UPPER(TRIM(sm."month"::text)) = %s
@@ -8950,7 +8950,7 @@ def _bigbasket_sku_analysis_dashboard_response(request):
             COALESCE(SUM(sm."quantity"), 0) AS qty_sold,
             COALESCE(SUM(sm."ltr_sold"), 0) AS liter_sold,
             COALESCE(SUM(sm."sales_amt_exc"), 0) AS sales_amount
-        FROM "SecMaster" sm
+        FROM secmaster_mv sm
         WHERE {daily_where_sql}
           AND ({sale_date_expr}) IS NOT NULL
         GROUP BY {sale_date_expr}
@@ -8978,7 +8978,7 @@ def _bigbasket_sku_analysis_dashboard_response(request):
             COALESCE(NULLIF(TRIM("item"::text), ''), '-') AS sku,
             COALESCE(NULLIF(UPPER(TRIM("item_head"::text)), ''), 'OTHER') AS item_head,
             COALESCE(SUM("quantity"), 0) AS ltrs_sold
-        FROM "SecMaster"
+        FROM secmaster_mv
         WHERE REGEXP_REPLACE(LOWER(TRIM("format"::text)), '[^a-z0-9]+', '', 'g') = 'bigbasket'
           AND UPPER(TRIM("month"::text)) = %s
           AND "year"::numeric = %s
@@ -8996,7 +8996,7 @@ def _bigbasket_sku_analysis_dashboard_response(request):
         SELECT
             COALESCE(NULLIF(TRIM("item"::text), ''), '-') AS item,
             COALESCE(NULLIF(UPPER(TRIM("item_head"::text)), ''), 'OTHER') AS item_head
-        FROM "SecMaster"
+        FROM secmaster_mv
         WHERE REGEXP_REPLACE(LOWER(TRIM("format"::text)), '[^a-z0-9]+', '', 'g') = 'bigbasket'
           AND UPPER(TRIM("month"::text)) = %s
           AND "year"::numeric = %s
@@ -9048,7 +9048,7 @@ def _zepto_sku_analysis_dashboard_response(request):
     max_date = _scalar(
         f"""
         SELECT MAX({zepto_sale_date_expr_plain})
-        FROM "SecMaster"
+        FROM secmaster_mv
         WHERE REGEXP_REPLACE(LOWER(TRIM("format"::text)), '[^a-z0-9]+', '', 'g') = 'zepto'
           AND UPPER(TRIM("month"::text)) = %s
           AND "year"::numeric = %s
@@ -9061,7 +9061,7 @@ def _zepto_sku_analysis_dashboard_response(request):
         item_head = _scalar(
             """
             SELECT UPPER(TRIM("item_head"::text))
-            FROM "SecMaster"
+            FROM secmaster_mv
             WHERE REGEXP_REPLACE(LOWER(TRIM("format"::text)), '[^a-z0-9]+', '', 'g') = 'zepto'
               AND UPPER(TRIM("item"::text)) = UPPER(TRIM(%s))
               AND UPPER(TRIM("month"::text)) = %s
@@ -9098,7 +9098,7 @@ def _zepto_sku_analysis_dashboard_response(request):
             COALESCE(SUM(sm."quantity"), 0) AS qty_sold,
             COALESCE(SUM(sm."ltr_sold"), 0) AS liter_sold,
             COALESCE(SUM(sm."sales_amt_exc"), 0) AS sales_amount
-        FROM "SecMaster" sm
+        FROM secmaster_mv sm
         WHERE {daily_where_sql}
           AND ({zepto_sale_date_expr}) IS NOT NULL
         GROUP BY {zepto_sale_date_expr}
@@ -9126,7 +9126,7 @@ def _zepto_sku_analysis_dashboard_response(request):
             COALESCE(NULLIF(TRIM("item"::text), ''), '-') AS sku,
             COALESCE(NULLIF(UPPER(TRIM("item_head"::text)), ''), 'OTHER') AS item_head,
             COALESCE(SUM(sm."sales_amt_exc"), 0) AS sales
-        FROM "SecMaster" sm
+        FROM secmaster_mv sm
         WHERE REGEXP_REPLACE(LOWER(TRIM(sm."format"::text)), '[^a-z0-9]+', '', 'g') = 'zepto'
           AND UPPER(TRIM(sm."month"::text)) = %s
           AND sm."year"::numeric = %s
@@ -9146,7 +9146,7 @@ def _zepto_sku_analysis_dashboard_response(request):
         SELECT
             COALESCE(NULLIF(TRIM("item"::text), ''), '-') AS item,
             COALESCE(NULLIF(UPPER(TRIM("item_head"::text)), ''), 'OTHER') AS item_head
-        FROM "SecMaster"
+        FROM secmaster_mv
         WHERE REGEXP_REPLACE(LOWER(TRIM("format"::text)), '[^a-z0-9]+', '', 'g') = 'zepto'
           AND UPPER(TRIM("month"::text)) = %s
           AND "year"::numeric = %s
@@ -9415,7 +9415,7 @@ def _blinkit_drr_dashboard_response(request):
     max_date = _scalar(
         """
         SELECT MAX("date"::date)
-        FROM "SecMaster"
+        FROM secmaster_mv
         WHERE REGEXP_REPLACE(LOWER(TRIM("format"::text)), '[^a-z0-9]+', '', 'g') = 'blinkit'
           AND UPPER(TRIM("month"::text)) = %s
           AND "year"::numeric = %s
@@ -9477,7 +9477,7 @@ def _blinkit_drr_dashboard_response(request):
             "date"::date AS sale_date,
             COALESCE(SUM("sales_amt_exc"), 0) AS ops,
             COALESCE(SUM("ltr_sold"), 0) AS ltr
-        FROM "SecMaster"
+        FROM secmaster_mv
         WHERE REGEXP_REPLACE(LOWER(TRIM("format"::text)), '[^a-z0-9]+', '', 'g') = 'blinkit'
           AND UPPER(TRIM("month"::text)) = %s
           AND "year"::numeric = %s
@@ -9511,7 +9511,7 @@ def _blinkit_drr_dashboard_response(request):
                 COALESCE(SUM("quantity"), 0)::numeric AS qty,
                 COALESCE(SUM("ltr_sold"), 0)::numeric AS ltr,
                 COALESCE(SUM("sales_amt_exc"), 0)::numeric AS value
-            FROM "SecMaster"
+            FROM secmaster_mv
             WHERE REGEXP_REPLACE(LOWER(TRIM("format"::text)), '[^a-z0-9]+', '', 'g') = 'blinkit'
               AND "date"::date >= %s
               AND "date"::date <= %s
@@ -9667,7 +9667,7 @@ def _inventory_drr_dashboard_response(request, slug: str):
     max_date = _scalar(
         f"""
         SELECT MAX({sale_date_expr})
-        FROM "SecMaster"
+        FROM secmaster_mv
         WHERE REGEXP_REPLACE(LOWER(TRIM("format"::text)), '[^a-z0-9]+', '', 'g') = %s
           AND UPPER(TRIM("month"::text)) = %s
           AND "year"::numeric = %s
@@ -9733,7 +9733,7 @@ def _inventory_drr_dashboard_response(request, slug: str):
             {sale_date_expr} AS sale_date,
             COALESCE(SUM("sales_amt_exc"), 0) AS ops,
             COALESCE(SUM("ltr_sold"), 0) AS ltr
-        FROM "SecMaster"
+        FROM secmaster_mv
         WHERE REGEXP_REPLACE(LOWER(TRIM("format"::text)), '[^a-z0-9]+', '', 'g') = %s
           AND UPPER(TRIM("month"::text)) = %s
           AND "year"::numeric = %s
@@ -9768,7 +9768,7 @@ def _inventory_drr_dashboard_response(request, slug: str):
                 COALESCE(SUM("quantity"), 0)::numeric AS qty,
                 COALESCE(SUM("ltr_sold"), 0)::numeric AS ltr,
                 COALESCE(SUM("sales_amt_exc"), 0)::numeric AS value
-            FROM "SecMaster"
+            FROM secmaster_mv
             WHERE REGEXP_REPLACE(LOWER(TRIM("format"::text)), '[^a-z0-9]+', '', 'g') = %s
               AND ({sale_date_expr}) >= %s
               AND ({sale_date_expr}) <= %s
@@ -10507,7 +10507,7 @@ def _bigbasket_month_on_month_analysis_response(request):
     max_date = _scalar(
         """
         SELECT MAX("date")
-        FROM "SecMaster"
+        FROM secmaster_mv
         WHERE REGEXP_REPLACE(LOWER(TRIM("format"::text)), '[^a-z0-9]+', '', 'g') = 'bigbasket'
           AND UPPER(TRIM("month"::text)) = %s
           AND "year"::numeric = %s
@@ -10538,7 +10538,7 @@ def _bigbasket_month_on_month_analysis_response(request):
             UPPER(TRIM("month"::text)) AS month_name,
             "year"::numeric AS year,
             COALESCE(SUM("ltr_sold"), 0) AS ltr
-        FROM "SecMaster"
+        FROM secmaster_mv
         WHERE REGEXP_REPLACE(LOWER(TRIM("format"::text)), '[^a-z0-9]+', '', 'g') = 'bigbasket'
           AND ({" OR ".join(clauses)})
         GROUP BY

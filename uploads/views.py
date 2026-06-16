@@ -191,6 +191,12 @@ _MASTER_PO_SOURCE_TABLES = frozenset({
     "master_sheet",
 })
 _AMAZON_MP_SOURCE_TABLES = frozenset({"amazon_mp", "master_sheet"})
+# Secondary tables that feed the SecMaster matview (secmaster_mv); master_sheet +
+# monthly_landing_rate are its lateral-join inputs (item_head / landing rates).
+_SECMASTER_SOURCE_TABLES = frozenset({
+    "swiggySec", "bigbasketSec", "jiomartSec", "flipkartSec",
+    "zeptoSec", "blinkitSec", "master_sheet", "monthly_landing_rate",
+})
 
 # Serializes background refreshes so two near-simultaneous uploads don't run
 # REFRESH concurrently (the later one includes the earlier's rows, so the final
@@ -198,12 +204,14 @@ _AMAZON_MP_SOURCE_TABLES = frozenset({"amazon_mp", "master_sheet"})
 _MATVIEW_REFRESH_LOCK = threading.Lock()
 
 
-def _refresh_matviews_async(do_master_po: bool, do_amazon_mp: bool) -> None:
+def _refresh_matviews_async(
+    do_master_po: bool, do_amazon_mp: bool, do_secmaster: bool = False
+) -> None:
     """Refresh the dashboard matviews OFF the request thread so the upload
     responds immediately. The matviews still refresh (REFRESH recomputes the
     same rows — no data is changed or dropped); only the wait moves off the
     upload's response. The dashboard reflects the upload a few seconds later."""
-    if not (do_master_po or do_amazon_mp):
+    if not (do_master_po or do_amazon_mp or do_secmaster):
         return
 
     def _worker():
@@ -211,6 +219,7 @@ def _refresh_matviews_async(do_master_po: bool, do_amazon_mp: bool) -> None:
         from platforms.master_po_refresh import (
             refresh_amazon_mp_master,
             refresh_master_po_mv,
+            refresh_secmaster_mv,
         )
         with _MATVIEW_REFRESH_LOCK:
             try:
@@ -218,6 +227,9 @@ def _refresh_matviews_async(do_master_po: bool, do_amazon_mp: bool) -> None:
                     refresh_master_po_mv()
                 if do_amazon_mp:
                     refresh_amazon_mp_master()
+                if do_secmaster:
+                    # ~10s rebuild for DRR / Secondary / Summary dashboards.
+                    refresh_secmaster_mv()
             except Exception:  # noqa: BLE001 - a refresh failure must not crash
                 logger.exception("Background matview refresh failed")
             finally:
@@ -243,8 +255,9 @@ def _clear_upload_dependent_cache(table: str | None = None) -> None:
         logger.exception("Failed to clear cache after upload write")
     do_master_po = table is None or table in _MASTER_PO_SOURCE_TABLES
     do_amazon_mp = table is None or table in _AMAZON_MP_SOURCE_TABLES
+    do_secmaster = table is None or table in _SECMASTER_SOURCE_TABLES
     try:
-        _refresh_matviews_async(do_master_po, do_amazon_mp)
+        _refresh_matviews_async(do_master_po, do_amazon_mp, do_secmaster)
     except Exception:  # noqa: BLE001 - scheduling must never break an upload
         logger.exception("Failed to schedule dashboard matview refresh")
 
