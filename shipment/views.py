@@ -4149,7 +4149,9 @@ class ShipmentKpiView(_SafeAPIView):
                     COUNT(*) FILTER (WHERE status = 'approved')          AS approved,
                     COUNT(*) FILTER (WHERE status = 'dispatched')        AS dispatched,
                     COUNT(*) FILTER (WHERE planning_mode = 'manual')     AS manual_mode,
-                    COUNT(*) FILTER (WHERE planning_mode IN ('appointment', 'doh')) AS auto_mode,
+                    -- Everything that isn't manual (appointment, doh, and legacy
+                    -- NULL/empty modes) is auto, so auto + manual == active.
+                    COUNT(*) FILTER (WHERE planning_mode IS DISTINCT FROM 'manual') AS auto_mode,
                     COALESCE(SUM(planned_liters), 0)        AS planned_liters,
                     COALESCE(SUM(truck_capacity_liters), 0) AS capacity_liters
                 FROM sp_shipments
