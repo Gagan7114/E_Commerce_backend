@@ -43,6 +43,8 @@ UPLOAD_ALLOWED_TABLES = {
     "amazon_price_data", "amazon_sec_range_margins",
     "fk_grocery", "flipkart_grocery_master",
     "zomatoSec", "citymallSec",
+    # Amazon Secondary — state-wise variant (View By=[State])
+    "amazon_sec_state",
     # Amazon Marketplace GST MTR B2B report (raw, stored as-is)
     "amazon_mp",
     # Primary
