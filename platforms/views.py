@@ -7342,6 +7342,39 @@ def _amazon_mp_dashboard_response(request):
         )
     trend.sort(key=lambda item: item["month"])
 
+    # ASINs present in this month's marketplace data but missing from master_sheet
+    # (the asin = format_sku_code join found no row, so every master attribute —
+    # brand, item_head — is NULL). Surfaced so the user can add them to the master
+    # sheet and get them mapped to a brand / item head / category.
+    unmapped_rows = _dict_rows(
+        f"""
+        SELECT
+            UPPER(TRIM(asin)) AS asin,
+            MAX(item_description) AS item,
+            COALESCE(SUM(invoice_amount), 0) AS value,
+            COALESCE(SUM(quantity), 0) AS quantity
+        FROM amazon_mp_master
+        {where}
+          AND NULLIF(TRIM(asin), '') IS NOT NULL
+          AND brand IS NULL
+          AND item_head IS NULL
+        GROUP BY UPPER(TRIM(asin))
+        ORDER BY SUM(quantity) DESC NULLS LAST, UPPER(TRIM(asin))
+        LIMIT 500
+        """,
+        params,
+    )
+    unmapped_asins = [
+        {
+            "asin": row.get("asin"),
+            "item": row.get("item"),
+            "value": _num(row.get("value")),
+            "quantity": _num(row.get("quantity")),
+        }
+        for row in unmapped_rows
+        if row.get("asin")
+    ]
+
     return Response(
         {
             "dashboard_title": "Amazon MP Dashboard",
@@ -7362,6 +7395,7 @@ def _amazon_mp_dashboard_response(request):
             "brand": brand,
             "state": state,
             "trend": trend,
+            "unmapped_asins": unmapped_asins,
         }
     )
 
