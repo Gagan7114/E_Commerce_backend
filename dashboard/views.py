@@ -671,6 +671,261 @@ def category_litres(request):
     })
 
 
+# ─── /state-sales ───
+# Canonical India state/UT names + common aliases seen across master_po
+# (fulfilment state) and amazon_sec_state (consumer ship-to state). Anything not
+# resolvable to a canonical name is counted in the total but left off the map.
+_INDIA_STATE_ALIASES = {
+    "ORISSA": "ODISHA",
+    "PONDICHERRY": "PUDUCHERRY",
+    "NCT OF DELHI": "DELHI",
+    "NEW DELHI": "DELHI",
+    "DELHI (NCT)": "DELHI",
+    "UTTARANCHAL": "UTTARAKHAND",
+    "UTTRAKHAND": "UTTARAKHAND",
+    "UTTER PRADESH": "UTTAR PRADESH",
+    "TAMILNADU": "TAMIL NADU",
+    "TAMILNADU STATE": "TAMIL NADU",
+    "TELENGANA": "TELANGANA",
+    "TELANAGANA": "TELANGANA",
+    "CHATTISGARH": "CHHATTISGARH",
+    "CHHATTIGARH": "CHHATTISGARH",
+    "MAHARASTRA": "MAHARASHTRA",
+    "MHARASHTRA": "MAHARASHTRA",
+    "MUMBAI MAHARASHTRA": "MAHARASHTRA",
+    "HARYAN": "HARYANA",
+    "KARANATAKA": "KARNATAKA",
+    "GUJRAT": "GUJARAT",
+    "GAUJRAT": "GUJARAT",
+    "ANDRHRA PRADESH": "ANDHRA PRADESH",
+    "J AND K": "JAMMU AND KASHMIR",
+    "JAMMU AND KASHMIR (UT)": "JAMMU AND KASHMIR",
+    "ANDAMAN AND NICOBAR": "ANDAMAN AND NICOBAR ISLANDS",
+    "DADRA AND NAGAR HAVELI": "DADRA AND NAGAR HAVELI AND DAMAN AND DIU",
+    "DAMAN AND DIU": "DADRA AND NAGAR HAVELI AND DAMAN AND DIU",
+}
+# ISO 3166-2:IN two-letter codes Amazon sometimes ships instead of full names.
+_INDIA_STATE_CODES = {
+    "AP": "ANDHRA PRADESH", "AR": "ARUNACHAL PRADESH", "AS": "ASSAM",
+    "BR": "BIHAR", "CG": "CHHATTISGARH", "CT": "CHHATTISGARH", "GA": "GOA",
+    "GJ": "GUJARAT", "HR": "HARYANA", "HP": "HIMACHAL PRADESH", "JH": "JHARKHAND",
+    "JK": "JAMMU AND KASHMIR", "KA": "KARNATAKA", "KL": "KERALA",
+    "MP": "MADHYA PRADESH", "MH": "MAHARASHTRA", "MN": "MANIPUR",
+    "ML": "MEGHALAYA", "MZ": "MIZORAM", "NL": "NAGALAND", "OD": "ODISHA",
+    "OR": "ODISHA", "PB": "PUNJAB", "RJ": "RAJASTHAN", "SK": "SIKKIM",
+    "TN": "TAMIL NADU", "TG": "TELANGANA", "TS": "TELANGANA", "TR": "TRIPURA",
+    "UP": "UTTAR PRADESH", "UK": "UTTARAKHAND", "UT": "UTTARAKHAND",
+    "WB": "WEST BENGAL", "AN": "ANDAMAN AND NICOBAR ISLANDS", "CH": "CHANDIGARH",
+    "DL": "DELHI", "DN": "DADRA AND NAGAR HAVELI AND DAMAN AND DIU",
+    "DD": "DADRA AND NAGAR HAVELI AND DAMAN AND DIU", "LA": "LADAKH",
+    "LD": "LAKSHADWEEP", "PY": "PUDUCHERRY",
+}
+_INDIA_STATE_BLANKS = {"", "UNKNOWN", "NA", "N/A", "-", "OTHER", "OTHERS", "NULL", "UNK"}
+# Canonical 28 states + 8 UTs (UPPERCASE). A value is placed on the map only if
+# it resolves to one of these — anything else (cities, junk, foreign) is counted
+# in the total but kept off the map so pct_mapped stays honest.
+_INDIA_STATES_CANON = {
+    "ANDHRA PRADESH", "ARUNACHAL PRADESH", "ASSAM", "BIHAR", "CHHATTISGARH",
+    "GOA", "GUJARAT", "HARYANA", "HIMACHAL PRADESH", "JHARKHAND", "KARNATAKA",
+    "KERALA", "MADHYA PRADESH", "MAHARASHTRA", "MANIPUR", "MEGHALAYA", "MIZORAM",
+    "NAGALAND", "ODISHA", "PUNJAB", "RAJASTHAN", "SIKKIM", "TAMIL NADU",
+    "TELANGANA", "TRIPURA", "UTTAR PRADESH", "UTTARAKHAND", "WEST BENGAL",
+    "ANDAMAN AND NICOBAR ISLANDS", "CHANDIGARH",
+    "DADRA AND NAGAR HAVELI AND DAMAN AND DIU", "DELHI", "JAMMU AND KASHMIR",
+    "LADAKH", "LAKSHADWEEP", "PUDUCHERRY",
+}
+# Compact (alpha-only) → canonical, for no-space variants like "ANDHRAPRADESH".
+_INDIA_STATES_COMPACT = {re.sub(r"[^A-Z]", "", s): s for s in _INDIA_STATES_CANON}
+
+
+def _norm_state(raw):
+    s = str(raw or "").strip().upper().replace("&", " AND ")
+    s = re.sub(r"\s+", " ", s).strip()
+    if s in _INDIA_STATE_BLANKS:
+        return None
+    # Drop trailing junk: "ODISHA,MOBILE-9437…", "PUNJAB (SAS NAGAR)".
+    s = re.sub(r"\s+", " ", re.split(r"[,(]", s)[0]).strip()
+    s = _INDIA_STATE_ALIASES.get(s, s)
+    if s in _INDIA_STATES_CANON:
+        return s
+    if s in _INDIA_STATE_CODES:
+        return _INDIA_STATE_CODES[s]
+    compact = re.sub(r"[^A-Z]", "", s)
+    if compact in _INDIA_STATE_CODES:        # "U.P." → "UP"
+        return _INDIA_STATE_CODES[compact]
+    if compact in _INDIA_STATES_COMPACT:     # "ANDHRAPRADESH", "WESTBENGAL"
+        return _INDIA_STATES_COMPACT[compact]
+    return None
+
+
+@api_view(["GET"])
+@permission_classes([require("dashboard.view")])
+@cached_get(timeout=120, prefix="dash.state_sales")
+def state_sales(request):
+    """State-wise units sold for the India map on Home.
+
+    Amazon → amazon_sec_state (shipped_units, joined to master_sheet on ASIN for
+    brand/category/sub_category). Every other platform → master_po (delivered_qty;
+    brand/category/sub_category live on the row). Filters: platform, brand
+    (Jivo/Sano, multi), category (multi), sub_category (multi). Category and
+    sub_category option lists are sourced from master_po."""
+    today = date.today()
+    try:
+        month_num = int(request.GET.get("month") or today.month)
+    except (TypeError, ValueError):
+        month_num = today.month
+    try:
+        year = int(request.GET.get("year") or today.year)
+    except (TypeError, ValueError):
+        year = today.year
+    if not 1 <= month_num <= 12:
+        month_num = today.month
+    month_name = calendar.month_name[month_num].upper()
+
+    platform = (request.GET.get("platform") or "").strip().lower() or None
+    brands = [b.strip().upper() for b in request.GET.getlist("brand")
+              if b.strip() and b.strip().lower() != "all"]
+    cats = [c.strip().upper() for c in request.GET.getlist("category") if c.strip()]
+    subs = [s.strip().upper() for s in request.GET.getlist("sub_category") if s.strip()]
+
+    use_master = platform != "amazon"
+    use_amazon = platform is None or platform == "amazon"
+
+    by_state = {}        # canonical name -> {units, by_platform}
+    total_units = 0.0    # incl. rows whose state can't be mapped
+    errors = []
+
+    def add(raw_state, fmt, units):
+        nonlocal total_units
+        u = float(units or 0)
+        total_units += u
+        canon = _norm_state(raw_state)
+        if canon is None:
+            return
+        e = by_state.setdefault(canon, {"units": 0.0, "by_platform": {}})
+        e["units"] += u
+        e["by_platform"][fmt] = e["by_platform"].get(fmt, 0.0) + u
+
+    with connection.cursor() as cur:
+        if use_master:
+            sql = """
+                SELECT COALESCE(state::text, '') AS state,
+                       UPPER(TRIM(format::text)) AS fmt,
+                       COALESCE(SUM(delivered_qty), 0) AS units
+                FROM public.master_po
+                WHERE UPPER(TRIM(delivery_month::text)) = %s
+                  AND delivered_year = %s
+            """
+            params = [month_name, year]
+            if platform:
+                fmt = _CATEGORY_SLUG_TO_FORMAT.get(
+                    platform, platform.replace("_", " ").upper()
+                )
+                sql += " AND UPPER(TRIM(format::text)) = %s"
+                params.append(fmt)
+            else:
+                sql += " AND UPPER(TRIM(format::text)) <> 'AMAZON'"
+            if brands:
+                sql += " AND UPPER(TRIM(brand::text)) = ANY(%s)"
+                params.append(brands)
+            if cats:
+                sql += " AND UPPER(TRIM(category::text)) = ANY(%s)"
+                params.append(cats)
+            if subs:
+                sql += " AND UPPER(TRIM(sub_category::text)) = ANY(%s)"
+                params.append(subs)
+            sql += " GROUP BY 1, 2"
+            try:
+                cur.execute(sql, params)
+                for st, fmt, units in cur.fetchall():
+                    add(st, fmt, units)
+            except Exception as e:
+                errors.append({"source": "master_po", "error": str(e)})
+
+        if use_amazon:
+            sql_a = """
+                SELECT COALESCE(a.state::text, '') AS state,
+                       COALESCE(SUM(a.shipped_units), 0) AS units
+                FROM public.amazon_sec_state a
+                LEFT JOIN public.master_sheet m
+                  ON UPPER(TRIM(m.format_sku_code::text)) = UPPER(TRIM(a.asin))
+                 AND UPPER(TRIM(m.format::text)) = 'AMAZON'
+                WHERE EXTRACT(MONTH FROM a.from_date) = %s
+                  AND EXTRACT(YEAR FROM a.from_date) = %s
+            """
+            pa = [month_num, year]
+            if brands:
+                sql_a += " AND UPPER(TRIM(m.brand::text)) = ANY(%s)"
+                pa.append(brands)
+            if cats:
+                sql_a += " AND UPPER(TRIM(m.category::text)) = ANY(%s)"
+                pa.append(cats)
+            if subs:
+                sql_a += " AND UPPER(TRIM(m.sub_category::text)) = ANY(%s)"
+                pa.append(subs)
+            sql_a += " GROUP BY 1"
+            try:
+                cur.execute(sql_a, pa)
+                for st, units in cur.fetchall():
+                    add(st, "AMAZON", units)
+            except Exception as e:
+                errors.append({"source": "amazon_sec_state", "error": str(e)})
+
+        # Dropdown options — categories + sub_categories from master_po.
+        categories_all, sub_categories_all = [], []
+        try:
+            cur.execute(
+                "SELECT DISTINCT UPPER(TRIM(category::text)) FROM public.master_po "
+                "WHERE NULLIF(TRIM(category::text), '') IS NOT NULL ORDER BY 1"
+            )
+            categories_all = [r[0] for r in cur.fetchall()]
+            cur.execute(
+                "SELECT DISTINCT UPPER(TRIM(category::text)), UPPER(TRIM(sub_category::text)) "
+                "FROM public.master_po WHERE NULLIF(TRIM(sub_category::text), '') IS NOT NULL "
+                "ORDER BY 1, 2"
+            )
+            sub_categories_all = [
+                {"category": r[0], "sub_category": r[1]} for r in cur.fetchall()
+            ]
+        except Exception as e:
+            errors.append({"source": "filter_options", "error": str(e)})
+
+    states = sorted(
+        (
+            {
+                "state": name,
+                "units": round(v["units"], 2),
+                "by_platform": {k: round(x, 2) for k, x in v["by_platform"].items()},
+            }
+            for name, v in by_state.items()
+            if v["units"] > 0
+        ),
+        key=lambda s: s["units"],
+        reverse=True,
+    )
+    mapped_units = round(sum(s["units"] for s in states), 2)
+    total_units = round(total_units, 2)
+
+    return Response({
+        "month": month_num,
+        "year": year,
+        "platform": platform,
+        "brands": brands,
+        "categories": cats,
+        "sub_categories": subs,
+        "states": states,
+        "total_units": total_units,
+        "mapped_units": mapped_units,
+        "pct_mapped": round(mapped_units / total_units * 100, 1) if total_units else 0,
+        "filter_options": {
+            "brands": ["JIVO", "SANO"],
+            "categories": categories_all,
+            "sub_categories": sub_categories_all,
+        },
+        "errors": errors,
+    })
+
+
 # ─── /category-breakdown ───
 @api_view(["GET"])
 @permission_classes([require("dashboard.view")])
