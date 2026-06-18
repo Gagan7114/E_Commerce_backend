@@ -45,6 +45,8 @@ UPLOAD_ALLOWED_TABLES = {
     "zomatoSec", "citymallSec",
     # Amazon Secondary — state-wise variant (View By=[State])
     "amazon_sec_state",
+    # Flipkart Secondary — state-wise variant (B2C "Sales Report" GST export)
+    "flipkart_state_sales",
     # Amazon Marketplace GST MTR B2B report (raw, stored as-is)
     "amazon_mp",
     # Primary

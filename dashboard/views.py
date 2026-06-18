@@ -773,11 +773,12 @@ _SEC_SLUG_TO_FORMAT = {
 def state_sales(request):
     """State-wise consumer units sold for the India map on Home (secondary data).
 
-    Every non-Amazon platform comes from the "SecMaster" view: SUM(quantity)
-    grouped on the view's already-resolved `state` (Jio Mart ships a DELIVERY_STATE
-    directly; the QC platforms get state from city_state_mapping inside the view).
-    Flipkart is excluded — its only geo is a Location-Id code. Amazon →
-    amazon_sec_state (shipped_units, joined to master_sheet on ASIN).
+    QC platforms come from the "SecMaster" view: SUM(quantity) grouped on the
+    view's already-resolved `state` (Jio Mart ships a DELIVERY_STATE directly; the
+    QC platforms get state from city_state_mapping inside the view). Amazon →
+    amazon_sec_state (shipped_units, joined to master_sheet on ASIN). Flipkart →
+    flipkart_state_sales_master (SUM(item_quantity) for Sale events, grouped on
+    customer_delivery_state).
 
     Filters: platform, brand (Jivo/Sano, multi), category (multi), sub_category
     (multi). Category/sub_category option lists come from master_sheet."""
@@ -800,8 +801,9 @@ def state_sales(request):
     cats = [c.strip().upper() for c in request.GET.getlist("category") if c.strip()]
     subs = [s.strip().upper() for s in request.GET.getlist("sub_category") if s.strip()]
 
-    use_other = platform != "amazon"        # any non-Amazon platform
+    use_other = platform not in ("amazon", "flipkart")   # SecMaster QC platforms
     use_amazon = platform is None or platform == "amazon"
+    use_flipkart = platform is None or platform == "flipkart"
 
     by_state = {}        # canonical name -> {units, by_platform}
     total_units = 0.0    # incl. rows whose state can't be mapped
@@ -886,6 +888,36 @@ def state_sales(request):
             except Exception as e:
                 errors.append({"source": "amazon_sec_state", "error": str(e)})
 
+        if use_flipkart:
+            # Flipkart consumer sales by delivery state, from the FSN-enriched
+            # master view. Count Sale events only (gross units sold; Returns /
+            # Cancellations excluded). item_quantity is TEXT -> strip to numeric;
+            # order_date is ISO text ('YYYY-MM-DD …') -> match on the YYYY-MM prefix.
+            sql_f = """
+                SELECT COALESCE(customer_delivery_state::text, '') AS state,
+                       COALESCE(SUM(NULLIF(regexp_replace(item_quantity, '[^0-9.-]', '', 'g'), '')::numeric), 0) AS units
+                FROM public.flipkart_state_sales_master
+                WHERE left(order_date, 7) = %s
+                  AND UPPER(TRIM(event_type::text)) = 'SALE'
+            """
+            pf = ["%04d-%02d" % (year, month_num)]
+            if brands:
+                sql_f += " AND UPPER(TRIM(brand::text)) = ANY(%s)"
+                pf.append(brands)
+            if cats:
+                sql_f += " AND UPPER(TRIM(category::text)) = ANY(%s)"
+                pf.append(cats)
+            if subs:
+                sql_f += " AND UPPER(TRIM(sub_category::text)) = ANY(%s)"
+                pf.append(subs)
+            sql_f += " GROUP BY 1"
+            try:
+                cur.execute(sql_f, pf)
+                for st, units in cur.fetchall():
+                    add(st, "FLIPKART", units)
+            except Exception as e:
+                errors.append({"source": "flipkart_state_sales_master", "error": str(e)})
+
         # Dropdown options — categories + sub_categories from master_sheet (the
         # catalog that feeds SecMaster.category; a cheap superset, vs a full
         # DISTINCT scan of the heavy view).
@@ -952,8 +984,9 @@ def state_sales_detail(request):
 
     Drill-down for a click on the State-wise Sales map. Returns the underlying
     rows for `state` from the same sources as /state-sales — "SecMaster" for the
-    non-Amazon platforms and amazon_sec_state for Amazon — honouring the same
-    platform / brand / category / sub_category / month filters, paginated.
+    QC platforms, amazon_sec_state for Amazon, flipkart_state_sales_master for
+    Flipkart — honouring the same platform / brand / category / sub_category /
+    month filters, paginated.
 
     State matching mirrors the map's aggregation exactly: because the raw `state`
     spellings are messy (Jio Mart mixed-case, Amazon codes/misspellings), we pull
@@ -988,8 +1021,9 @@ def state_sales_detail(request):
     except (TypeError, ValueError):
         offset = 0
 
-    use_other = platform != "amazon"
+    use_other = platform not in ("amazon", "flipkart")
     use_amazon = platform is None or platform == "amazon"
+    use_flipkart = platform is None or platform == "flipkart"
 
     empty = {
         "state": canon, "month": month_num, "year": year, "platform": platform,
@@ -1003,7 +1037,7 @@ def state_sales_detail(request):
     errors = []
     with connection.cursor() as cur:
         # 1) Resolve the messy raw spellings that normalise to `canon`, per source.
-        sec_raws, az_raws = [], []
+        sec_raws, az_raws, fk_states = [], [], []
         if use_other:
             ds = ("SELECT DISTINCT COALESCE(state::text, '') FROM \"SecMaster\" "
                   "WHERE UPPER(TRIM(month::text)) = %s AND year::numeric = %s "
@@ -1027,6 +1061,17 @@ def state_sales_detail(request):
                 az_raws = [r[0] for r in cur.fetchall() if _norm_state(r[0]) == canon]
             except Exception as e:
                 errors.append({"source": "amazon_states", "error": str(e)})
+        if use_flipkart:
+            try:
+                cur.execute(
+                    "SELECT DISTINCT COALESCE(customer_delivery_state::text, '') "
+                    "FROM public.flipkart_state_sales_master "
+                    "WHERE left(order_date, 7) = %s AND UPPER(TRIM(event_type::text)) = 'SALE'",
+                    ["%04d-%02d" % (year, month_num)],
+                )
+                fk_states = [r[0] for r in cur.fetchall() if _norm_state(r[0]) == canon]
+            except Exception as e:
+                errors.append({"source": "flipkart_states", "error": str(e)})
 
         # 2) Build a UNION of the sources that actually carry this state, with
         #    window totals so the page also reports the full row/unit counts.
@@ -1075,6 +1120,28 @@ def state_sales_detail(request):
             if subs:
                 b += " AND UPPER(TRIM(m.sub_category::text)) = ANY(%s)"; p.append(subs)
             b += " AND COALESCE(a.state::text, '') = ANY(%s)"; p.append(az_raws)
+            branches.append(b); params += p
+        if use_flipkart and fk_states:
+            b = """
+                SELECT NULLIF(LEFT(f.order_date, 10), '')::date AS d, 'FLIPKART' AS platform,
+                       regexp_replace(upper(f.fsn), '[^A-Z0-9]+', '', 'g')::text AS sku,
+                       f.product_title::text AS name,
+                       UPPER(TRIM(f.brand::text)) AS brand, f.category::text AS category,
+                       f.sub_category::text AS sub_category,
+                       COALESCE(NULLIF(regexp_replace(f.item_quantity, '[^0-9.-]', '', 'g'), '')::numeric, 0) AS units,
+                       NULL::text AS city
+                FROM public.flipkart_state_sales_master f
+                WHERE left(f.order_date, 7) = %s
+                  AND UPPER(TRIM(f.event_type::text)) = 'SALE'
+            """
+            p = ["%04d-%02d" % (year, month_num)]
+            if brands:
+                b += " AND UPPER(TRIM(f.brand::text)) = ANY(%s)"; p.append(brands)
+            if cats:
+                b += " AND UPPER(TRIM(f.category::text)) = ANY(%s)"; p.append(cats)
+            if subs:
+                b += " AND UPPER(TRIM(f.sub_category::text)) = ANY(%s)"; p.append(subs)
+            b += " AND COALESCE(f.customer_delivery_state::text, '') = ANY(%s)"; p.append(fk_states)
             branches.append(b); params += p
 
         if not branches:
