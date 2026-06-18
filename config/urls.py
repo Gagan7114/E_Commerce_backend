@@ -22,6 +22,7 @@ urlpatterns = [
     path("api/uploads", amazon_uploads.uploads_collection, name="amazon-uploads"),
     path("api/uploads/<int:upload_id>", amazon_uploads.upload_detail, name="amazon-upload-detail"),
     path("api/reports/raw", platform_reports.report_raw, name="reports-raw"),
+    path("api/reports/export", platform_reports.report_export, name="reports-export"),
     path("api/reports/columns", platform_reports.report_columns, name="reports-columns"),
     path("api/reports/amazon-po/matrix", amazon_uploads.amazon_po_matrix, name="amazon-po-matrix"),
     path("api/reports/amazon-po/new-po", amazon_uploads.amazon_po_new_po_dashboard, name="amazon-po-new-po"),

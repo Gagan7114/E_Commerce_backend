@@ -5,9 +5,14 @@ Exposes a whitelisted set of database views as JSON for the global Reports page
 SELECT <cols> FROM <view> WHERE <filters> LIMIT N.
 """
 
+import io
 import re
+from datetime import datetime
+from decimal import Decimal
 
 from django.db import connection
+from django.http import HttpResponse
+from openpyxl import Workbook
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.exceptions import ValidationError
 from rest_framework.permissions import IsAuthenticated
@@ -69,6 +74,47 @@ def _safe_col(name: str) -> str:
 
 def _normalised_format(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", (value or "").lower())
+
+
+# xlsx hard cap is 1,048,576 rows (incl. the header) — stay safely under it.
+EXPORT_MAX_ROWS = 1_000_000
+
+
+def _coerce(v):
+    """Make a DB value safe for an openpyxl write-only cell."""
+    if isinstance(v, Decimal):
+        return float(v)
+    if isinstance(v, datetime) and v.tzinfo is not None:
+        return v.replace(tzinfo=None)  # openpyxl can't store tz-aware datetimes
+    if isinstance(v, (bytes, bytearray, memoryview)):
+        return bytes(v).decode("utf-8", "replace")
+    return v
+
+
+def _build_filters(catalog, fmt, date_from, date_to):
+    """WHERE clause + params from the platform/date filters (shared by raw+export)."""
+    where_parts: list[str] = []
+    params: list = []
+    if fmt and catalog["format_column"]:
+        col = catalog["format_column"]
+        where_parts.append(
+            f"REGEXP_REPLACE(LOWER(TRIM(\"{col}\"::text)), '[^a-z0-9]+', '', 'g') = %s"
+        )
+        params.append(_normalised_format(fmt))
+    if catalog["date_column"]:
+        date_expr = catalog.get("date_expr") or f'("{catalog["date_column"]}")::date'
+        if date_from:
+            if not _DATE.match(date_from):
+                raise ValidationError("`date_from` must be YYYY-MM-DD.")
+            where_parts.append(f"{date_expr} >= %s")
+            params.append(date_from)
+        if date_to:
+            if not _DATE.match(date_to):
+                raise ValidationError("`date_to` must be YYYY-MM-DD.")
+            where_parts.append(f"{date_expr} <= %s")
+            params.append(date_to)
+    where_clause = ("WHERE " + " AND ".join(where_parts)) if where_parts else ""
+    return where_clause, params
 
 
 @api_view(["GET"])
@@ -235,3 +281,92 @@ def report_raw(request):
         "page": page,
         "page_size": page_size,
     })
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def report_export(request):
+    """Stream ALL matching rows for the current report as one .xlsx file.
+
+    The /raw endpoint caps at 50k for the on-screen table; this runs a single
+    query and writes every row with openpyxl in write-only mode (bounded memory,
+    chunked fetch), so big exports — hundreds of thousands of rows — come down as
+    one Excel file. One query = one consistent snapshot, so there are no
+    pagination gaps/duplicates. Body: {view, columns[], labels[], platform,
+    date_from, date_to, filters[[k,v]...], filename}."""
+    data = request.data or {}
+    view_raw = (data.get("view") or "").strip()
+    columns = [str(c).strip() for c in (data.get("columns") or []) if str(c).strip()]
+    labels = [str(x) for x in (data.get("labels") or [])]
+    date_from = (data.get("date_from") or "").strip()
+    date_to = (data.get("date_to") or "").strip()
+    if date_from and not _DATE.match(date_from):
+        raise ValidationError("`date_from` must be YYYY-MM-DD.")
+    if date_to and not _DATE.match(date_to):
+        raise ValidationError("`date_to` must be YYYY-MM-DD.")
+
+    wb = Workbook(write_only=True)
+    ws = wb.create_sheet("Report")
+    total = 0
+
+    if reports_sap.is_sap_view(view_raw):
+        try:
+            sap_rows, _ = reports_sap.fetch_for(
+                view_raw,
+                from_date=date_from,
+                to_date=date_to,
+                page=0,
+                page_size=EXPORT_MAX_ROWS,
+            )
+        except ValueError as exc:
+            raise ValidationError(str(exc))
+        keys = columns or (list(sap_rows[0].keys()) if sap_rows else [])
+        ws.append(labels if labels and len(labels) == len(keys) else keys)
+        for r in sap_rows[:EXPORT_MAX_ROWS]:
+            ws.append([_coerce(r.get(k)) for k in keys])
+            total += 1
+    else:
+        view = _safe_view(view_raw)
+        catalog = REPORT_VIEW_CATALOG[view]
+        for c in columns:
+            _safe_col(c)
+        select_clause = ", ".join(f'"{c}"' for c in columns) if columns else "*"
+        fmt = (data.get("platform") or data.get("fmt") or "").strip()
+        where_clause, params = _build_filters(catalog, fmt, date_from, date_to)
+        sql = (
+            f'SELECT {select_clause} FROM "{view}" {where_clause} '
+            f"LIMIT {EXPORT_MAX_ROWS}"
+        )
+        with connection.cursor() as cur:
+            cur.execute(sql, params)
+            keys = columns or [c[0] for c in (cur.description or [])]
+            ws.append(labels if labels and len(labels) == len(keys) else keys)
+            while True:
+                chunk = cur.fetchmany(2000)
+                if not chunk:
+                    break
+                for row in chunk:
+                    ws.append([_coerce(v) for v in row])
+                    total += 1
+
+    # Filters sheet — mirror the on-screen filters, then the real exported count.
+    ws2 = wb.create_sheet("Filters")
+    for pair in data.get("filters") or []:
+        if isinstance(pair, (list, tuple)) and len(pair) >= 2:
+            ws2.append([str(pair[0]), "" if pair[1] is None else str(pair[1])])
+    ws2.append(["Total Rows", total])
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    raw_name = (data.get("filename") or f"report_{view_raw}").strip() or "report"
+    filename = re.sub(r'[\\/:*?"<>|]+', "_", raw_name)
+    if not filename.lower().endswith(".xlsx"):
+        filename += ".xlsx"
+    resp = HttpResponse(
+        buf.getvalue(),
+        content_type=(
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        ),
+    )
+    resp["Content-Disposition"] = f'attachment; filename="{filename}"'
+    return resp

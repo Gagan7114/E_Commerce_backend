@@ -758,17 +758,29 @@ def _norm_state(raw):
     return None
 
 
+# Frontend platform slug → "SecMaster".format value (secondary source). BigBasket
+# and Jio Mart carry a space in the view's format string. Flipkart is intentionally
+# absent — it has no usable state in the secondary feed and is excluded from the map.
+_SEC_SLUG_TO_FORMAT = {
+    "blinkit": "BLINKIT", "zepto": "ZEPTO", "swiggy": "SWIGGY",
+    "bigbasket": "BIG BASKET", "jiomart": "JIO MART",
+}
+
+
 @api_view(["GET"])
 @permission_classes([require("dashboard.view")])
 @cached_get(timeout=120, prefix="dash.state_sales")
 def state_sales(request):
-    """State-wise units sold for the India map on Home.
+    """State-wise consumer units sold for the India map on Home (secondary data).
 
-    Amazon → amazon_sec_state (shipped_units, joined to master_sheet on ASIN for
-    brand/category/sub_category). Every other platform → master_po (delivered_qty;
-    brand/category/sub_category live on the row). Filters: platform, brand
-    (Jivo/Sano, multi), category (multi), sub_category (multi). Category and
-    sub_category option lists are sourced from master_po."""
+    Every non-Amazon platform comes from the "SecMaster" view: SUM(quantity)
+    grouped on the view's already-resolved `state` (Jio Mart ships a DELIVERY_STATE
+    directly; the QC platforms get state from city_state_mapping inside the view).
+    Flipkart is excluded — its only geo is a Location-Id code. Amazon →
+    amazon_sec_state (shipped_units, joined to master_sheet on ASIN).
+
+    Filters: platform, brand (Jivo/Sano, multi), category (multi), sub_category
+    (multi). Category/sub_category option lists come from master_sheet."""
     today = date.today()
     try:
         month_num = int(request.GET.get("month") or today.month)
@@ -788,7 +800,7 @@ def state_sales(request):
     cats = [c.strip().upper() for c in request.GET.getlist("category") if c.strip()]
     subs = [s.strip().upper() for s in request.GET.getlist("sub_category") if s.strip()]
 
-    use_master = platform != "amazon"
+    use_other = platform != "amazon"        # any non-Amazon platform
     use_amazon = platform is None or platform == "amazon"
 
     by_state = {}        # canonical name -> {units, by_platform}
@@ -807,24 +819,27 @@ def state_sales(request):
         e["by_platform"][fmt] = e["by_platform"].get(fmt, 0.0) + u
 
     with connection.cursor() as cur:
-        if use_master:
+        if use_other:
+            # Secondary (consumer) sales from the "SecMaster" view. `state` is
+            # resolved inside the view (Jio Mart direct + QC via city_state_mapping),
+            # so we just group on it. Flipkart is excluded — its only geo is a
+            # Location-Id code, which would otherwise inflate the unmapped total.
             sql = """
                 SELECT COALESCE(state::text, '') AS state,
                        UPPER(TRIM(format::text)) AS fmt,
-                       COALESCE(SUM(delivered_qty), 0) AS units
-                FROM public.master_po
-                WHERE UPPER(TRIM(delivery_month::text)) = %s
-                  AND delivered_year = %s
+                       COALESCE(SUM(quantity), 0) AS units
+                FROM "SecMaster"
+                WHERE UPPER(TRIM(month::text)) = %s
+                  AND year::numeric = %s
+                  AND UPPER(TRIM(format::text)) NOT IN ('AMAZON', 'FLIPKART')
             """
             params = [month_name, year]
             if platform:
-                fmt = _CATEGORY_SLUG_TO_FORMAT.get(
+                fmt = _SEC_SLUG_TO_FORMAT.get(
                     platform, platform.replace("_", " ").upper()
                 )
-                sql += " AND UPPER(TRIM(format::text)) = %s"
+                sql += " AND LOWER(TRIM(format::text)) = LOWER(%s)"
                 params.append(fmt)
-            else:
-                sql += " AND UPPER(TRIM(format::text)) <> 'AMAZON'"
             if brands:
                 sql += " AND UPPER(TRIM(brand::text)) = ANY(%s)"
                 params.append(brands)
@@ -840,7 +855,7 @@ def state_sales(request):
                 for st, fmt, units in cur.fetchall():
                     add(st, fmt, units)
             except Exception as e:
-                errors.append({"source": "master_po", "error": str(e)})
+                errors.append({"source": "secmaster", "error": str(e)})
 
         if use_amazon:
             sql_a = """
@@ -871,17 +886,19 @@ def state_sales(request):
             except Exception as e:
                 errors.append({"source": "amazon_sec_state", "error": str(e)})
 
-        # Dropdown options — categories + sub_categories from master_po.
+        # Dropdown options — categories + sub_categories from master_sheet (the
+        # catalog that feeds SecMaster.category; a cheap superset, vs a full
+        # DISTINCT scan of the heavy view).
         categories_all, sub_categories_all = [], []
         try:
             cur.execute(
-                "SELECT DISTINCT UPPER(TRIM(category::text)) FROM public.master_po "
+                "SELECT DISTINCT UPPER(TRIM(category::text)) FROM master_sheet "
                 "WHERE NULLIF(TRIM(category::text), '') IS NOT NULL ORDER BY 1"
             )
             categories_all = [r[0] for r in cur.fetchall()]
             cur.execute(
                 "SELECT DISTINCT UPPER(TRIM(category::text)), UPPER(TRIM(sub_category::text)) "
-                "FROM public.master_po WHERE NULLIF(TRIM(sub_category::text), '') IS NOT NULL "
+                "FROM master_sheet WHERE NULLIF(TRIM(sub_category::text), '') IS NOT NULL "
                 "ORDER BY 1, 2"
             )
             sub_categories_all = [
@@ -923,6 +940,183 @@ def state_sales(request):
             "sub_categories": sub_categories_all,
         },
         "errors": errors,
+    })
+
+
+# ─── /state-sales/detail ───
+@api_view(["GET"])
+@permission_classes([require("dashboard.view")])
+@cached_get(timeout=120, prefix="dash.state_sales_detail")
+def state_sales_detail(request):
+    """Raw line-item rows behind one state on the Home map (secondary data).
+
+    Drill-down for a click on the State-wise Sales map. Returns the underlying
+    rows for `state` from the same sources as /state-sales — "SecMaster" for the
+    non-Amazon platforms and amazon_sec_state for Amazon — honouring the same
+    platform / brand / category / sub_category / month filters, paginated.
+
+    State matching mirrors the map's aggregation exactly: because the raw `state`
+    spellings are messy (Jio Mart mixed-case, Amazon codes/misspellings), we pull
+    each source's small set of distinct spellings, keep those that _norm_state to
+    the requested canonical state, then fetch rows matching those exact spellings
+    — so the page totals reconcile with the number the user clicked."""
+    today = date.today()
+    try:
+        month_num = int(request.GET.get("month") or today.month)
+    except (TypeError, ValueError):
+        month_num = today.month
+    try:
+        year = int(request.GET.get("year") or today.year)
+    except (TypeError, ValueError):
+        year = today.year
+    if not 1 <= month_num <= 12:
+        month_num = today.month
+    month_name = calendar.month_name[month_num].upper()
+
+    canon = _norm_state(request.GET.get("state"))
+    platform = (request.GET.get("platform") or "").strip().lower() or None
+    brands = [b.strip().upper() for b in request.GET.getlist("brand")
+              if b.strip() and b.strip().lower() != "all"]
+    cats = [c.strip().upper() for c in request.GET.getlist("category") if c.strip()]
+    subs = [s.strip().upper() for s in request.GET.getlist("sub_category") if s.strip()]
+    try:
+        limit = min(max(int(request.GET.get("limit") or 50), 1), 1000)
+    except (TypeError, ValueError):
+        limit = 50
+    try:
+        offset = max(int(request.GET.get("offset") or 0), 0)
+    except (TypeError, ValueError):
+        offset = 0
+
+    use_other = platform != "amazon"
+    use_amazon = platform is None or platform == "amazon"
+
+    empty = {
+        "state": canon, "month": month_num, "year": year, "platform": platform,
+        "brands": brands, "categories": cats, "sub_categories": subs,
+        "limit": limit, "offset": offset, "total_rows": 0, "total_units": 0,
+        "rows": [], "errors": [],
+    }
+    if canon is None:
+        return Response(empty)
+
+    errors = []
+    with connection.cursor() as cur:
+        # 1) Resolve the messy raw spellings that normalise to `canon`, per source.
+        sec_raws, az_raws = [], []
+        if use_other:
+            ds = ("SELECT DISTINCT COALESCE(state::text, '') FROM \"SecMaster\" "
+                  "WHERE UPPER(TRIM(month::text)) = %s AND year::numeric = %s "
+                  "AND UPPER(TRIM(format::text)) NOT IN ('AMAZON', 'FLIPKART')")
+            dp = [month_name, year]
+            if platform:
+                ds += " AND LOWER(TRIM(format::text)) = LOWER(%s)"
+                dp.append(_SEC_SLUG_TO_FORMAT.get(platform, platform.replace("_", " ").upper()))
+            try:
+                cur.execute(ds, dp)
+                sec_raws = [r[0] for r in cur.fetchall() if _norm_state(r[0]) == canon]
+            except Exception as e:
+                errors.append({"source": "secmaster_states", "error": str(e)})
+        if use_amazon:
+            try:
+                cur.execute(
+                    "SELECT DISTINCT COALESCE(state::text, '') FROM public.amazon_sec_state "
+                    "WHERE EXTRACT(MONTH FROM from_date) = %s AND EXTRACT(YEAR FROM from_date) = %s",
+                    [month_num, year],
+                )
+                az_raws = [r[0] for r in cur.fetchall() if _norm_state(r[0]) == canon]
+            except Exception as e:
+                errors.append({"source": "amazon_states", "error": str(e)})
+
+        # 2) Build a UNION of the sources that actually carry this state, with
+        #    window totals so the page also reports the full row/unit counts.
+        branches, params = [], []
+        if use_other and sec_raws:
+            b = """
+                SELECT s.date::date AS d, UPPER(TRIM(s.format::text)) AS platform,
+                       s.sku_code::text AS sku, s.sku_name::text AS name,
+                       UPPER(TRIM(s.brand::text)) AS brand, s.category::text AS category,
+                       s.sub_category::text AS sub_category,
+                       COALESCE(s.quantity, 0)::numeric AS units, s.city::text AS city
+                FROM "SecMaster" s
+                WHERE UPPER(TRIM(s.month::text)) = %s AND s.year::numeric = %s
+                  AND UPPER(TRIM(s.format::text)) NOT IN ('AMAZON', 'FLIPKART')
+            """
+            p = [month_name, year]
+            if platform:
+                b += " AND LOWER(TRIM(s.format::text)) = LOWER(%s)"
+                p.append(_SEC_SLUG_TO_FORMAT.get(platform, platform.replace("_", " ").upper()))
+            if brands:
+                b += " AND UPPER(TRIM(s.brand::text)) = ANY(%s)"; p.append(brands)
+            if cats:
+                b += " AND UPPER(TRIM(s.category::text)) = ANY(%s)"; p.append(cats)
+            if subs:
+                b += " AND UPPER(TRIM(s.sub_category::text)) = ANY(%s)"; p.append(subs)
+            b += " AND COALESCE(s.state::text, '') = ANY(%s)"; p.append(sec_raws)
+            branches.append(b); params += p
+        if use_amazon and az_raws:
+            b = """
+                SELECT a.from_date::date AS d, 'AMAZON' AS platform,
+                       a.asin::text AS sku, m.product_name::text AS name,
+                       UPPER(TRIM(m.brand::text)) AS brand, m.category::text AS category,
+                       m.sub_category::text AS sub_category,
+                       COALESCE(a.shipped_units, 0)::numeric AS units, NULL::text AS city
+                FROM public.amazon_sec_state a
+                LEFT JOIN public.master_sheet m
+                  ON UPPER(TRIM(m.format_sku_code::text)) = UPPER(TRIM(a.asin))
+                 AND UPPER(TRIM(m.format::text)) = 'AMAZON'
+                WHERE EXTRACT(MONTH FROM a.from_date) = %s AND EXTRACT(YEAR FROM a.from_date) = %s
+            """
+            p = [month_num, year]
+            if brands:
+                b += " AND UPPER(TRIM(m.brand::text)) = ANY(%s)"; p.append(brands)
+            if cats:
+                b += " AND UPPER(TRIM(m.category::text)) = ANY(%s)"; p.append(cats)
+            if subs:
+                b += " AND UPPER(TRIM(m.sub_category::text)) = ANY(%s)"; p.append(subs)
+            b += " AND COALESCE(a.state::text, '') = ANY(%s)"; p.append(az_raws)
+            branches.append(b); params += p
+
+        if not branches:
+            empty["errors"] = errors
+            return Response(empty)
+
+        union = " UNION ALL ".join(f"({b})" for b in branches)
+        final = f"""
+            SELECT d, platform, sku, name, brand, category, sub_category, units, city,
+                   COUNT(*) OVER() AS total_rows,
+                   COALESCE(SUM(units) OVER(), 0) AS total_units
+            FROM ( {union} ) u
+            ORDER BY d DESC NULLS LAST, units DESC NULLS LAST
+            LIMIT %s OFFSET %s
+        """
+        params += [limit, offset]
+        rows, total_rows, total_units = [], 0, 0.0
+        try:
+            cur.execute(final, params)
+            for r in cur.fetchall():
+                total_rows = int(r[9] or 0)
+                total_units = float(r[10] or 0)
+                rows.append({
+                    "date": r[0].isoformat() if r[0] else None,
+                    "platform": r[1],
+                    "sku": r[2],
+                    "name": r[3],
+                    "brand": r[4],
+                    "category": r[5],
+                    "sub_category": r[6],
+                    "units": round(float(r[7] or 0), 2),
+                    "city": r[8],
+                })
+        except Exception as e:
+            errors.append({"source": "state_detail_rows", "error": str(e)})
+
+    return Response({
+        "state": canon, "month": month_num, "year": year, "platform": platform,
+        "brands": brands, "categories": cats, "sub_categories": subs,
+        "limit": limit, "offset": offset,
+        "total_rows": total_rows, "total_units": round(total_units, 2),
+        "rows": rows, "errors": errors,
     })
 
 
