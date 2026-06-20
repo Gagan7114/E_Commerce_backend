@@ -766,6 +766,131 @@ _SEC_SLUG_TO_FORMAT = {
     "bigbasket": "BIG BASKET", "jiomart": "JIO MART",
 }
 
+# Metric the State-wise Sales map can show. The same toggle drives the map, the
+# Top-states list and the drill-down drawer. `label`/`unit` are echoed to the
+# client so the UI never has to hard-code them.
+_STATE_METRICS = {
+    "units": {"label": "Units sold", "unit": "units"},
+    "value": {"label": "Sales value", "unit": "₹"},
+    "litres": {"label": "Litres sold", "unit": "L"},
+}
+
+
+def _state_metric(request):
+    """Normalise the ?metric= param to one of units|value|litres (default units)."""
+    m = (request.GET.get("metric") or "units").strip().lower()
+    if m in ("ltr", "ltrs", "litre", "litres", "liter", "liters"):
+        return "litres"
+    if m in ("val", "value", "amount", "revenue", "gmv", "sales"):
+        return "value"
+    if m in ("unit", "units", "qty", "quantity"):
+        return "units"
+    return "units"
+
+
+def _state_periods(request, today):
+    """Resolve the month selection into a list of (year, month) periods.
+
+    Single mode (back-compat): one period from ?month/?year. Range mode: every
+    month from from_month/from_year to to_month/to_year inclusive — triggered when
+    both from_month and to_month are supplied — capped at 36 months. Returns
+    (mode, periods, echo) where `echo` is the month fields to mirror back to the
+    client (month/year for single; from_*/to_* for range)."""
+    def _int(name, default):
+        try:
+            return int(request.GET.get(name) or default)
+        except (TypeError, ValueError):
+            return default
+
+    month_num = _int("month", today.month)
+    year = _int("year", today.year)
+    if not 1 <= month_num <= 12:
+        month_num = today.month
+
+    if request.GET.get("from_month") and request.GET.get("to_month"):
+        fmn = _int("from_month", month_num)
+        tmn = _int("to_month", month_num)
+        fy = _int("from_year", year)
+        ty = _int("to_year", year)
+        if not 1 <= fmn <= 12:
+            fmn = month_num
+        if not 1 <= tmn <= 12:
+            tmn = month_num
+        start = fy * 12 + (fmn - 1)
+        end = ty * 12 + (tmn - 1)
+        if end < start:
+            start, end = end, start
+        end = min(end, start + 35)  # cap the span at 36 months
+        periods = [(k // 12, (k % 12) + 1) for k in range(start, end + 1)]
+        echo = {
+            "from_month": (start % 12) + 1, "from_year": start // 12,
+            "to_month": (end % 12) + 1, "to_year": end // 12,
+        }
+        return "range", periods, echo
+    return "single", [(year, month_num)], {"month": month_num, "year": year}
+
+
+# Per-source aggregate expressions for each metric. {metric: SQL}. The table
+# aliases (s./a./f. or none) match how each query below references its columns.
+_SEC_METRIC_SQL = {
+    "units": "COALESCE(SUM(quantity), 0)",
+    "value": "COALESCE(SUM(amount), 0)",
+    "litres": "COALESCE(SUM(ltr_sold), 0)",
+}
+_AZ_METRIC_SQL = {
+    "units": "COALESCE(SUM(a.shipped_units), 0)",
+    "value": "COALESCE(SUM(a.shipped_revenue), 0)",
+    "litres": (
+        "COALESCE(SUM(CASE WHEN UPPER(TRIM(m.is_litre::text)) = 'Y' "
+        "THEN a.shipped_units::numeric * m.per_unit_value ELSE 0 END), 0)"
+    ),
+}
+_FK_QTY_SQL = "NULLIF(regexp_replace(item_quantity, '[^0-9.-]', '', 'g'), '')::numeric"
+_FK_METRIC_SQL = {
+    "units": "COALESCE(SUM(%s), 0)" % _FK_QTY_SQL,
+    "value": (
+        "COALESCE(SUM(NULLIF(regexp_replace(final_invoice_amount, "
+        "'[^0-9.-]', '', 'g'), '')::numeric), 0)"
+    ),
+    "litres": (
+        "COALESCE(SUM(CASE WHEN UPPER(TRIM(is_litre::text)) = 'Y' "
+        "THEN %s * per_unit_value ELSE 0 END), 0)" % _FK_QTY_SQL
+    ),
+}
+
+
+def _sec_month_filter(periods, alias=""):
+    """(sql, params) matching SecMaster month/year against any of `periods`.
+
+    `alias` is an optional column prefix (e.g. "s.") for queries that alias the
+    table."""
+    m, y = f"{alias}month", f"{alias}year"
+    sql = " AND (" + " OR ".join(
+        [f"(UPPER(TRIM({m}::text)) = %s AND {y}::numeric = %s)"] * len(periods)
+    ) + ")"
+    params = []
+    for yr, mn in periods:
+        params += [calendar.month_name[mn].upper(), yr]
+    return sql, params
+
+
+def _az_month_filter(periods, alias="a."):
+    """(sql, params) matching amazon_sec_state.from_date against any of `periods`."""
+    col = f"{alias}from_date"
+    sql = " AND (" + " OR ".join(
+        [f"(EXTRACT(MONTH FROM {col}) = %s AND EXTRACT(YEAR FROM {col}) = %s)"]
+        * len(periods)
+    ) + ")"
+    params = []
+    for yr, mn in periods:
+        params += [mn, yr]
+    return sql, params
+
+
+def _fk_yms(periods):
+    """['YYYY-MM', ...] for matching flipkart order_date prefixes."""
+    return ["%04d-%02d" % (yr, mn) for yr, mn in periods]
+
 
 @api_view(["GET"])
 @permission_classes([require("dashboard.view")])
@@ -780,20 +905,16 @@ def state_sales(request):
     flipkart_state_sales_master (SUM(item_quantity) for Sale events, grouped on
     customer_delivery_state).
 
+    Metric (?metric=units|value|litres, default units) picks the figure summed
+    per state: units = quantity, value = sales amount/revenue, litres = litres
+    sold. Period is either a single month (?month/?year) or a range
+    (?from_month/?from_year .. ?to_month/?to_year), capped at 36 months.
+
     Filters: platform, brand (Jivo/Sano, multi), category (multi), sub_category
     (multi). Category/sub_category option lists come from master_sheet."""
     today = date.today()
-    try:
-        month_num = int(request.GET.get("month") or today.month)
-    except (TypeError, ValueError):
-        month_num = today.month
-    try:
-        year = int(request.GET.get("year") or today.year)
-    except (TypeError, ValueError):
-        year = today.year
-    if not 1 <= month_num <= 12:
-        month_num = today.month
-    month_name = calendar.month_name[month_num].upper()
+    metric = _state_metric(request)
+    mode, periods, month_echo = _state_periods(request, today)
 
     platform = (request.GET.get("platform") or "").strip().lower() or None
     brands = [b.strip().upper() for b in request.GET.getlist("brand")
@@ -805,19 +926,19 @@ def state_sales(request):
     use_amazon = platform is None or platform == "amazon"
     use_flipkart = platform is None or platform == "flipkart"
 
-    by_state = {}        # canonical name -> {units, by_platform}
-    total_units = 0.0    # incl. rows whose state can't be mapped
+    by_state = {}        # canonical name -> {value, by_platform}
+    total_value = 0.0    # incl. rows whose state can't be mapped
     errors = []
 
-    def add(raw_state, fmt, units):
-        nonlocal total_units
-        u = float(units or 0)
-        total_units += u
+    def add(raw_state, fmt, value):
+        nonlocal total_value
+        u = float(value or 0)
+        total_value += u
         canon = _norm_state(raw_state)
         if canon is None:
             return
-        e = by_state.setdefault(canon, {"units": 0.0, "by_platform": {}})
-        e["units"] += u
+        e = by_state.setdefault(canon, {"value": 0.0, "by_platform": {}})
+        e["value"] += u
         e["by_platform"][fmt] = e["by_platform"].get(fmt, 0.0) + u
 
     with connection.cursor() as cur:
@@ -826,16 +947,16 @@ def state_sales(request):
             # resolved inside the view (Jio Mart direct + QC via city_state_mapping),
             # so we just group on it. Flipkart is excluded — its only geo is a
             # Location-Id code, which would otherwise inflate the unmapped total.
+            sec_month_sql, sec_month_params = _sec_month_filter(periods)
             sql = """
                 SELECT COALESCE(state::text, '') AS state,
                        UPPER(TRIM(format::text)) AS fmt,
-                       COALESCE(SUM(quantity), 0) AS units
+                       %s AS units
                 FROM "SecMaster"
-                WHERE UPPER(TRIM(month::text)) = %s
-                  AND year::numeric = %s
-                  AND UPPER(TRIM(format::text)) NOT IN ('AMAZON', 'FLIPKART')
-            """
-            params = [month_name, year]
+                WHERE UPPER(TRIM(format::text)) NOT IN ('AMAZON', 'FLIPKART')
+            """ % _SEC_METRIC_SQL[metric]
+            sql += sec_month_sql
+            params = list(sec_month_params)
             if platform:
                 fmt = _SEC_SLUG_TO_FORMAT.get(
                     platform, platform.replace("_", " ").upper()
@@ -860,17 +981,18 @@ def state_sales(request):
                 errors.append({"source": "secmaster", "error": str(e)})
 
         if use_amazon:
+            az_month_sql, az_month_params = _az_month_filter(periods)
             sql_a = """
                 SELECT COALESCE(a.state::text, '') AS state,
-                       COALESCE(SUM(a.shipped_units), 0) AS units
+                       %s AS units
                 FROM public.amazon_sec_state a
                 LEFT JOIN public.master_sheet m
                   ON UPPER(TRIM(m.format_sku_code::text)) = UPPER(TRIM(a.asin))
                  AND UPPER(TRIM(m.format::text)) = 'AMAZON'
-                WHERE EXTRACT(MONTH FROM a.from_date) = %s
-                  AND EXTRACT(YEAR FROM a.from_date) = %s
-            """
-            pa = [month_num, year]
+                WHERE 1 = 1
+            """ % _AZ_METRIC_SQL[metric]
+            sql_a += az_month_sql
+            pa = list(az_month_params)
             if brands:
                 sql_a += " AND UPPER(TRIM(m.brand::text)) = ANY(%s)"
                 pa.append(brands)
@@ -895,12 +1017,12 @@ def state_sales(request):
             # order_date is ISO text ('YYYY-MM-DD …') -> match on the YYYY-MM prefix.
             sql_f = """
                 SELECT COALESCE(customer_delivery_state::text, '') AS state,
-                       COALESCE(SUM(NULLIF(regexp_replace(item_quantity, '[^0-9.-]', '', 'g'), '')::numeric), 0) AS units
+                       %s AS units
                 FROM public.flipkart_state_sales_master
-                WHERE left(order_date, 7) = %s
+                WHERE left(order_date, 7) = ANY(%%s)
                   AND UPPER(TRIM(event_type::text)) = 'SALE'
-            """
-            pf = ["%04d-%02d" % (year, month_num)]
+            """ % _FK_METRIC_SQL[metric]
+            pf = [_fk_yms(periods)]
             if brands:
                 sql_f += " AND UPPER(TRIM(brand::text)) = ANY(%s)"
                 pf.append(brands)
@@ -943,29 +1065,38 @@ def state_sales(request):
         (
             {
                 "state": name,
-                "units": round(v["units"], 2),
+                # `units` kept for back-compat; `value` is the metric-selected
+                # number the UI reads. Both carry the same figure.
+                "units": round(v["value"], 2),
+                "value": round(v["value"], 2),
                 "by_platform": {k: round(x, 2) for k, x in v["by_platform"].items()},
             }
             for name, v in by_state.items()
-            if v["units"] > 0
+            if v["value"] > 0
         ),
-        key=lambda s: s["units"],
+        key=lambda s: s["value"],
         reverse=True,
     )
-    mapped_units = round(sum(s["units"] for s in states), 2)
-    total_units = round(total_units, 2)
+    mapped_value = round(sum(s["value"] for s in states), 2)
+    total_value = round(total_value, 2)
 
     return Response({
-        "month": month_num,
-        "year": year,
+        "metric": metric,
+        "metric_label": _STATE_METRICS[metric]["label"],
+        "metric_unit": _STATE_METRICS[metric]["unit"],
+        "mode": mode,
+        **month_echo,
         "platform": platform,
         "brands": brands,
         "categories": cats,
         "sub_categories": subs,
         "states": states,
-        "total_units": total_units,
-        "mapped_units": mapped_units,
-        "pct_mapped": round(mapped_units / total_units * 100, 1) if total_units else 0,
+        # `*_units` kept for back-compat; `*_value` is metric-aware.
+        "total_units": total_value,
+        "mapped_units": mapped_value,
+        "total_value": total_value,
+        "mapped_value": mapped_value,
+        "pct_mapped": round(mapped_value / total_value * 100, 1) if total_value else 0,
         "filter_options": {
             "brands": ["JIVO", "SANO"],
             "categories": categories_all,
@@ -994,17 +1125,30 @@ def state_sales_detail(request):
     the requested canonical state, then fetch rows matching those exact spellings
     — so the page totals reconcile with the number the user clicked."""
     today = date.today()
-    try:
-        month_num = int(request.GET.get("month") or today.month)
-    except (TypeError, ValueError):
-        month_num = today.month
-    try:
-        year = int(request.GET.get("year") or today.year)
-    except (TypeError, ValueError):
-        year = today.year
-    if not 1 <= month_num <= 12:
-        month_num = today.month
-    month_name = calendar.month_name[month_num].upper()
+    metric = _state_metric(request)
+    mode, periods, month_echo = _state_periods(request, today)
+
+    # Row-level metric expression per source (no SUM — one value per line item).
+    sec_row = {
+        "units": "COALESCE(s.quantity, 0)::numeric",
+        "value": "COALESCE(s.amount, 0)::numeric",
+        "litres": "COALESCE(s.ltr_sold, 0)::numeric",
+    }[metric]
+    az_row = {
+        "units": "COALESCE(a.shipped_units, 0)::numeric",
+        "value": "COALESCE(a.shipped_revenue, 0)::numeric",
+        "litres": ("CASE WHEN UPPER(TRIM(m.is_litre::text)) = 'Y' THEN "
+                   "COALESCE(a.shipped_units, 0)::numeric * COALESCE(m.per_unit_value, 0) "
+                   "ELSE 0 END"),
+    }[metric]
+    _fk_q = "NULLIF(regexp_replace(f.item_quantity, '[^0-9.-]', '', 'g'), '')::numeric"
+    fk_row = {
+        "units": f"COALESCE({_fk_q}, 0)",
+        "value": ("COALESCE(NULLIF(regexp_replace(f.final_invoice_amount, "
+                  "'[^0-9.-]', '', 'g'), '')::numeric, 0)"),
+        "litres": (f"CASE WHEN UPPER(TRIM(f.is_litre::text)) = 'Y' THEN "
+                   f"COALESCE({_fk_q}, 0) * COALESCE(f.per_unit_value, 0) ELSE 0 END"),
+    }[metric]
 
     canon = _norm_state(request.GET.get("state"))
     platform = (request.GET.get("platform") or "").strip().lower() or None
@@ -1026,10 +1170,13 @@ def state_sales_detail(request):
     use_flipkart = platform is None or platform == "flipkart"
 
     empty = {
-        "state": canon, "month": month_num, "year": year, "platform": platform,
+        "state": canon, "metric": metric,
+        "metric_label": _STATE_METRICS[metric]["label"],
+        "metric_unit": _STATE_METRICS[metric]["unit"], "mode": mode, **month_echo,
+        "platform": platform,
         "brands": brands, "categories": cats, "sub_categories": subs,
         "limit": limit, "offset": offset, "total_rows": 0, "total_units": 0,
-        "rows": [], "errors": [],
+        "total_value": 0, "rows": [], "errors": [],
     }
     if canon is None:
         return Response(empty)
@@ -1039,10 +1186,11 @@ def state_sales_detail(request):
         # 1) Resolve the messy raw spellings that normalise to `canon`, per source.
         sec_raws, az_raws, fk_states = [], [], []
         if use_other:
+            sec_mf, sec_mp = _sec_month_filter(periods)
             ds = ("SELECT DISTINCT COALESCE(state::text, '') FROM \"SecMaster\" "
-                  "WHERE UPPER(TRIM(month::text)) = %s AND year::numeric = %s "
-                  "AND UPPER(TRIM(format::text)) NOT IN ('AMAZON', 'FLIPKART')")
-            dp = [month_name, year]
+                  "WHERE UPPER(TRIM(format::text)) NOT IN ('AMAZON', 'FLIPKART')")
+            ds += sec_mf
+            dp = list(sec_mp)
             if platform:
                 ds += " AND LOWER(TRIM(format::text)) = LOWER(%s)"
                 dp.append(_SEC_SLUG_TO_FORMAT.get(platform, platform.replace("_", " ").upper()))
@@ -1052,11 +1200,12 @@ def state_sales_detail(request):
             except Exception as e:
                 errors.append({"source": "secmaster_states", "error": str(e)})
         if use_amazon:
+            az_mf, az_mp = _az_month_filter(periods, alias="")
             try:
                 cur.execute(
                     "SELECT DISTINCT COALESCE(state::text, '') FROM public.amazon_sec_state "
-                    "WHERE EXTRACT(MONTH FROM from_date) = %s AND EXTRACT(YEAR FROM from_date) = %s",
-                    [month_num, year],
+                    "WHERE 1 = 1" + az_mf,
+                    list(az_mp),
                 )
                 az_raws = [r[0] for r in cur.fetchall() if _norm_state(r[0]) == canon]
             except Exception as e:
@@ -1066,8 +1215,8 @@ def state_sales_detail(request):
                 cur.execute(
                     "SELECT DISTINCT COALESCE(customer_delivery_state::text, '') "
                     "FROM public.flipkart_state_sales_master "
-                    "WHERE left(order_date, 7) = %s AND UPPER(TRIM(event_type::text)) = 'SALE'",
-                    ["%04d-%02d" % (year, month_num)],
+                    "WHERE left(order_date, 7) = ANY(%s) AND UPPER(TRIM(event_type::text)) = 'SALE'",
+                    [_fk_yms(periods)],
                 )
                 fk_states = [r[0] for r in cur.fetchall() if _norm_state(r[0]) == canon]
             except Exception as e:
@@ -1077,17 +1226,18 @@ def state_sales_detail(request):
         #    window totals so the page also reports the full row/unit counts.
         branches, params = [], []
         if use_other and sec_raws:
-            b = """
+            sec_mf, sec_mp = _sec_month_filter(periods, alias="s.")
+            b = f"""
                 SELECT s.date::date AS d, UPPER(TRIM(s.format::text)) AS platform,
                        s.sku_code::text AS sku, s.sku_name::text AS name,
                        UPPER(TRIM(s.brand::text)) AS brand, s.category::text AS category,
                        s.sub_category::text AS sub_category,
-                       COALESCE(s.quantity, 0)::numeric AS units, s.city::text AS city
+                       {sec_row} AS units, s.city::text AS city
                 FROM "SecMaster" s
-                WHERE UPPER(TRIM(s.month::text)) = %s AND s.year::numeric = %s
-                  AND UPPER(TRIM(s.format::text)) NOT IN ('AMAZON', 'FLIPKART')
+                WHERE UPPER(TRIM(s.format::text)) NOT IN ('AMAZON', 'FLIPKART')
             """
-            p = [month_name, year]
+            b += sec_mf
+            p = list(sec_mp)
             if platform:
                 b += " AND LOWER(TRIM(s.format::text)) = LOWER(%s)"
                 p.append(_SEC_SLUG_TO_FORMAT.get(platform, platform.replace("_", " ").upper()))
@@ -1100,19 +1250,21 @@ def state_sales_detail(request):
             b += " AND COALESCE(s.state::text, '') = ANY(%s)"; p.append(sec_raws)
             branches.append(b); params += p
         if use_amazon and az_raws:
-            b = """
+            az_mf, az_mp = _az_month_filter(periods)
+            b = f"""
                 SELECT a.from_date::date AS d, 'AMAZON' AS platform,
                        a.asin::text AS sku, m.product_name::text AS name,
                        UPPER(TRIM(m.brand::text)) AS brand, m.category::text AS category,
                        m.sub_category::text AS sub_category,
-                       COALESCE(a.shipped_units, 0)::numeric AS units, NULL::text AS city
+                       {az_row} AS units, NULL::text AS city
                 FROM public.amazon_sec_state a
                 LEFT JOIN public.master_sheet m
                   ON UPPER(TRIM(m.format_sku_code::text)) = UPPER(TRIM(a.asin))
                  AND UPPER(TRIM(m.format::text)) = 'AMAZON'
-                WHERE EXTRACT(MONTH FROM a.from_date) = %s AND EXTRACT(YEAR FROM a.from_date) = %s
+                WHERE 1 = 1
             """
-            p = [month_num, year]
+            b += az_mf
+            p = list(az_mp)
             if brands:
                 b += " AND UPPER(TRIM(m.brand::text)) = ANY(%s)"; p.append(brands)
             if cats:
@@ -1122,19 +1274,19 @@ def state_sales_detail(request):
             b += " AND COALESCE(a.state::text, '') = ANY(%s)"; p.append(az_raws)
             branches.append(b); params += p
         if use_flipkart and fk_states:
-            b = """
+            b = f"""
                 SELECT NULLIF(LEFT(f.order_date, 10), '')::date AS d, 'FLIPKART' AS platform,
                        regexp_replace(upper(f.fsn), '[^A-Z0-9]+', '', 'g')::text AS sku,
                        f.product_title::text AS name,
                        UPPER(TRIM(f.brand::text)) AS brand, f.category::text AS category,
                        f.sub_category::text AS sub_category,
-                       COALESCE(NULLIF(regexp_replace(f.item_quantity, '[^0-9.-]', '', 'g'), '')::numeric, 0) AS units,
+                       {fk_row} AS units,
                        NULL::text AS city
                 FROM public.flipkart_state_sales_master f
-                WHERE left(f.order_date, 7) = %s
+                WHERE left(f.order_date, 7) = ANY(%s)
                   AND UPPER(TRIM(f.event_type::text)) = 'SALE'
             """
-            p = ["%04d-%02d" % (year, month_num)]
+            p = [_fk_yms(periods)]
             if brands:
                 b += " AND UPPER(TRIM(f.brand::text)) = ANY(%s)"; p.append(brands)
             if cats:
@@ -1172,17 +1324,25 @@ def state_sales_detail(request):
                     "brand": r[4],
                     "category": r[5],
                     "sub_category": r[6],
+                    # `units` is the metric-selected figure (kept for back-compat);
+                    # `value` is the same number under a metric-neutral key.
                     "units": round(float(r[7] or 0), 2),
+                    "value": round(float(r[7] or 0), 2),
                     "city": r[8],
                 })
         except Exception as e:
             errors.append({"source": "state_detail_rows", "error": str(e)})
 
     return Response({
-        "state": canon, "month": month_num, "year": year, "platform": platform,
+        "state": canon, "metric": metric,
+        "metric_label": _STATE_METRICS[metric]["label"],
+        "metric_unit": _STATE_METRICS[metric]["unit"], "mode": mode, **month_echo,
+        "platform": platform,
         "brands": brands, "categories": cats, "sub_categories": subs,
         "limit": limit, "offset": offset,
-        "total_rows": total_rows, "total_units": round(total_units, 2),
+        "total_rows": total_rows,
+        "total_units": round(total_units, 2),
+        "total_value": round(total_units, 2),
         "rows": rows, "errors": errors,
     })
 
@@ -1342,6 +1502,475 @@ def category_breakdown(request):
         }
     out["errors"] = errors
     return Response(out)
+
+
+def _friendly_platform_name(slug, fmt_label):
+    """Fallback display name for a platform; the frontend overrides this with its
+    own platform list (matched by slug) when it has one."""
+    if slug == "amazon":
+        return "Amazon"
+    if fmt_label:
+        return str(fmt_label).title()
+    return (slug or "Unknown").replace("_", " ").title()
+
+
+# ─── /category-platform-breakdown ───
+@api_view(["GET"])
+@permission_classes([require("dashboard.view")])
+@cached_get(timeout=120, prefix="dash.category_platform_breakdown")
+def category_platform_breakdown(request):
+    """Per-platform units + litres for ONE category or sub_category within a head.
+
+    Drill-down for the home "Category Split" card: click a (sub)category row and
+    see every platform that sold it, with units sold and litres sold. Same source
+    semantics as /category-breakdown (primary = master_po + Amazon PO; secondary =
+    SecMaster + amazon_sec_range, latest cumulative snapshot). Deliberately spans
+    ALL platforms regardless of any platform filter — the whole point of the
+    drill-down is the cross-platform split for the picked item.
+
+    Query params: month, year, source (primary|secondary), head (premium|commodity),
+    dimension (category|sub_category), name (the clicked label; '' or 'Uncategorized'
+    matches rows with a null/blank value)."""
+    today = date.today()
+    try:
+        month_num = int(request.GET.get("month") or today.month)
+    except (TypeError, ValueError):
+        month_num = today.month
+    try:
+        year = int(request.GET.get("year") or today.year)
+    except (TypeError, ValueError):
+        year = today.year
+    if not 1 <= month_num <= 12:
+        month_num = today.month
+    month_name = calendar.month_name[month_num].upper()  # e.g. 'MAY'
+
+    source = "secondary" if (request.GET.get("source") or "").strip().lower() == "secondary" else "primary"
+
+    head_in = (request.GET.get("head") or "premium").strip().lower()
+    head_sql = "COMMODITY" if head_in == "commodity" else "PREMIUM"
+    head_key = "commodity" if head_in == "commodity" else "premium"
+
+    dimension = "category" if (request.GET.get("dimension") or "").strip().lower() == "category" else "sub_category"
+    dim_col = dimension  # column name in every source table
+
+    name = (request.GET.get("name") or "").strip()
+    # /category-breakdown surfaces null/blank (sub)categories as "Uncategorized";
+    # mirror that so a click on that row matches the same rows here.
+    is_uncat = name == "" or name.upper() == "UNCATEGORIZED"
+    name_u = name.upper()
+
+    # Format string ('BLINKIT', 'BIG BASKET', …) → frontend slug. Reverse the
+    # per-source slug maps the rest of this module uses.
+    if source == "primary":
+        slug_by_format = {v: k for k, v in _CATEGORY_SLUG_TO_FORMAT.items()}
+    else:
+        slug_by_format = {v: k for k, v in _SEC_SLUG_TO_FORMAT.items()}
+
+    rows_out = {}  # slug -> {"slug","format","name","units","ltrs"}
+    errors = []
+
+    def add(fmt_label, slug, units, ltrs):
+        u = float(units or 0)
+        litres = float(ltrs or 0)
+        if u == 0 and litres == 0:
+            return
+        key = slug or (fmt_label or "").strip().lower().replace(" ", "_") or "unknown"
+        row = rows_out.get(key)
+        if row is None:
+            row = {
+                "slug": key,
+                "format": fmt_label,
+                "name": _friendly_platform_name(key, fmt_label),
+                "units": 0.0,
+                "ltrs": 0.0,
+            }
+            rows_out[key] = row
+        row["units"] += u
+        row["ltrs"] += litres
+
+    def dim_filter(col):
+        """(SQL fragment, extra params) restricting `col` to the picked value."""
+        if is_uncat:
+            return f" AND COALESCE(NULLIF(TRIM({col}::text), ''), '') = ''", []
+        return f" AND UPPER(TRIM({col}::text)) = %s", [name_u]
+
+    def run(label, sql, params, handler):
+        try:
+            cur.execute(sql, params)
+            handler(cur.fetchall())
+        except Exception as e:  # noqa: BLE001
+            errors.append({"source": label, "error": str(e)})
+
+    with connection.cursor() as cur:
+        if source == "primary":
+            # master_po — every non-Amazon platform, grouped by format.
+            dim_sql, dim_params = dim_filter("sub_category" if dim_col == "sub_category" else "category")
+            sql = f"""
+                SELECT UPPER(TRIM(format::text)) AS fmt,
+                       COALESCE(SUM(delivered_qty), 0) AS units,
+                       COALESCE(SUM(total_delivered_liters), 0) AS ltrs
+                FROM public.master_po
+                WHERE UPPER(TRIM(delivery_month::text)) = %s
+                  AND delivered_year = %s
+                  AND UPPER(TRIM(item_head::text)) = %s
+                  AND UPPER(TRIM(format::text)) <> 'AMAZON'
+                  {dim_sql}
+                GROUP BY 1
+            """
+            run(
+                "master_po", sql, [month_name, year, head_sql, *dim_params],
+                lambda rows: [
+                    add(fmt, slug_by_format.get(fmt), units, ltrs)
+                    for fmt, units, ltrs in rows
+                ],
+            )
+            # Amazon PO (reporting) — single platform.
+            dim_sql, dim_params = dim_filter(dim_col)
+            sql = f"""
+                SELECT COALESCE(SUM(filled_units), 0) AS units,
+                       COALESCE(SUM(total_delivered_liters), 0) AS ltrs
+                FROM reporting."Amazon PO"
+                WHERE po_month = %s AND year = %s
+                  AND UPPER(TRIM(item_head::text)) = %s
+                  {dim_sql}
+            """
+            run(
+                "amazon_po", sql, [month_num, year, head_sql, *dim_params],
+                lambda rows: [add("AMAZON", "amazon", r[0], r[1]) for r in rows],
+            )
+        else:  # secondary
+            dim_sql, dim_params = dim_filter(dim_col)
+            sql = f"""
+                SELECT UPPER(TRIM(format::text)) AS fmt,
+                       COALESCE(SUM(quantity), 0) AS units,
+                       COALESCE(SUM(ltr_sold), 0) AS ltrs
+                FROM "SecMaster"
+                WHERE UPPER(TRIM(month::text)) = %s
+                  AND year::numeric = %s
+                  AND UPPER(TRIM(item_head::text)) = %s
+                  AND UPPER(TRIM(format::text)) <> 'AMAZON'
+                  {dim_sql}
+                GROUP BY 1
+            """
+            run(
+                "secmaster", sql, [month_name, year, head_sql, *dim_params],
+                lambda rows: [
+                    add(fmt, slug_by_format.get(fmt), units, ltrs)
+                    for fmt, units, ltrs in rows
+                ],
+            )
+            # Amazon secondary — latest cumulative snapshot, units × per_unit_value.
+            dim_sql, dim_params = dim_filter(f"ml.{dim_col}")
+            sql = f"""
+                WITH ml AS (
+                    SELECT DISTINCT ON (format_sku_code)
+                           format_sku_code, category, sub_category, item_head, per_unit_value
+                    FROM master_sheet
+                    WHERE format_sku_code IS NOT NULL AND format_sku_code::text <> ''
+                    ORDER BY format_sku_code
+                ),
+                base AS (
+                    SELECT r.asin,
+                           COALESCE(r.shipped_units, 0) AS units,
+                           EXTRACT(DAY FROM r.to_date)::int AS to_day
+                    FROM amazon_sec_range r
+                    WHERE EXTRACT(YEAR FROM r.from_date) = %s
+                      AND UPPER(to_char(r.from_date, 'FMMonth')) = %s
+                ),
+                latest AS (SELECT MAX(to_day) AS md FROM base)
+                SELECT COALESCE(SUM(b.units), 0) AS units,
+                       COALESCE(SUM(b.units * COALESCE(ml.per_unit_value::numeric, 0)), 0) AS ltrs
+                FROM base b
+                CROSS JOIN latest l
+                JOIN ml ON UPPER(TRIM(ml.format_sku_code::text)) = UPPER(TRIM(b.asin::text))
+                WHERE b.to_day = l.md
+                  AND UPPER(TRIM(ml.item_head::text)) = %s
+                  {dim_sql}
+            """
+            run(
+                "amazon_sec_range", sql, [year, month_name, head_sql, *dim_params],
+                lambda rows: [add("AMAZON", "amazon", r[0], r[1]) for r in rows],
+            )
+
+    platforms_list = sorted(rows_out.values(), key=lambda r: r["ltrs"], reverse=True)
+    for r in platforms_list:
+        r["units"] = round(r["units"], 2)
+        r["ltrs"] = round(r["ltrs"], 2)
+
+    return Response({
+        "source": source,
+        "head": head_key,
+        "dimension": dimension,
+        "name": name or "Uncategorized",
+        "month": month_num,
+        "year": year,
+        "platforms": platforms_list,
+        "total_units": round(sum(r["units"] for r in platforms_list), 2),
+        "total_ltrs": round(sum(r["ltrs"] for r in platforms_list), 2),
+        "errors": errors,
+    })
+
+
+def _category_sku_rows(
+    cur,
+    *,
+    source,
+    is_amazon,
+    fmt,
+    head_sql,
+    month_num,
+    month_name,
+    year,
+    dim_col,
+    is_uncat,
+    name_u,
+):
+    """SKU rows [(code, name, brand, units, ltrs)] for one platform in one month.
+
+    Queries only the single source table backing the platform. Shared by the SKU
+    drill-down so the trailing-month comparison runs the same SQL per month."""
+
+    def dim_filter(col):
+        if is_uncat:
+            return f" AND COALESCE(NULLIF(TRIM({col}::text), ''), '') = ''", []
+        return f" AND UPPER(TRIM({col}::text)) = %s", [name_u]
+
+    if source == "primary" and not is_amazon:
+        dim_sql, dim_params = dim_filter(dim_col)
+        cur.execute(f"""
+            SELECT COALESCE(NULLIF(TRIM(sku_code::text), ''), '—') AS code,
+                   COALESCE(NULLIF(TRIM(sku_name::text), ''), '') AS sku_name,
+                   UPPER(TRIM(COALESCE(brand::text, ''))) AS brand,
+                   COALESCE(SUM(delivered_qty), 0) AS units,
+                   COALESCE(SUM(total_delivered_liters), 0) AS ltrs
+            FROM public.master_po
+            WHERE UPPER(TRIM(delivery_month::text)) = %s
+              AND delivered_year = %s
+              AND UPPER(TRIM(item_head::text)) = %s
+              AND UPPER(TRIM(format::text)) = %s
+              {dim_sql}
+            GROUP BY 1, 2, 3
+        """, [month_name, year, head_sql, fmt, *dim_params])
+        return cur.fetchall()
+
+    if source == "primary" and is_amazon:
+        dim_sql, dim_params = dim_filter(dim_col)
+        cur.execute(f"""
+            SELECT COALESCE(NULLIF(TRIM(asin::text), ''), '—') AS code,
+                   COALESCE(NULLIF(TRIM(sku_name::text), ''), '') AS sku_name,
+                   UPPER(TRIM(COALESCE(brand::text, ''))) AS brand,
+                   COALESCE(SUM(filled_units), 0) AS units,
+                   COALESCE(SUM(total_delivered_liters), 0) AS ltrs
+            FROM reporting."Amazon PO"
+            WHERE po_month = %s AND year = %s
+              AND UPPER(TRIM(item_head::text)) = %s
+              {dim_sql}
+            GROUP BY 1, 2, 3
+        """, [month_num, year, head_sql, *dim_params])
+        return cur.fetchall()
+
+    if source == "secondary" and not is_amazon:
+        dim_sql, dim_params = dim_filter(dim_col)
+        cur.execute(f"""
+            SELECT COALESCE(NULLIF(TRIM(sku_code::text), ''), '—') AS code,
+                   COALESCE(NULLIF(TRIM(sku_name::text), ''), '') AS sku_name,
+                   UPPER(TRIM(COALESCE(brand::text, ''))) AS brand,
+                   COALESCE(SUM(quantity), 0) AS units,
+                   COALESCE(SUM(ltr_sold), 0) AS ltrs
+            FROM "SecMaster"
+            WHERE UPPER(TRIM(month::text)) = %s
+              AND year::numeric = %s
+              AND UPPER(TRIM(item_head::text)) = %s
+              AND UPPER(TRIM(format::text)) = %s
+              {dim_sql}
+            GROUP BY 1, 2, 3
+        """, [month_name, year, head_sql, fmt, *dim_params])
+        return cur.fetchall()
+
+    # secondary + amazon — latest cumulative snapshot, units × per_unit_value.
+    dim_sql, dim_params = dim_filter(f"ml.{dim_col}")
+    cur.execute(f"""
+        WITH ml AS (
+            SELECT DISTINCT ON (format_sku_code)
+                   format_sku_code, category, sub_category, item_head,
+                   per_unit_value, product_name, brand
+            FROM master_sheet
+            WHERE format_sku_code IS NOT NULL AND format_sku_code::text <> ''
+            ORDER BY format_sku_code
+        ),
+        base AS (
+            SELECT r.asin,
+                   COALESCE(r.shipped_units, 0) AS units,
+                   EXTRACT(DAY FROM r.to_date)::int AS to_day
+            FROM amazon_sec_range r
+            WHERE EXTRACT(YEAR FROM r.from_date) = %s
+              AND UPPER(to_char(r.from_date, 'FMMonth')) = %s
+        ),
+        latest AS (SELECT MAX(to_day) AS md FROM base)
+        SELECT UPPER(TRIM(b.asin::text)) AS code,
+               COALESCE(NULLIF(TRIM(ml.product_name::text), ''), '') AS sku_name,
+               UPPER(TRIM(COALESCE(ml.brand::text, ''))) AS brand,
+               COALESCE(SUM(b.units), 0) AS units,
+               COALESCE(SUM(b.units * COALESCE(ml.per_unit_value::numeric, 0)), 0) AS ltrs
+        FROM base b
+        CROSS JOIN latest l
+        JOIN ml ON UPPER(TRIM(ml.format_sku_code::text)) = UPPER(TRIM(b.asin::text))
+        WHERE b.to_day = l.md
+          AND UPPER(TRIM(ml.item_head::text)) = %s
+          {dim_sql}
+        GROUP BY 1, 2, 3
+    """, [year, month_name, head_sql, *dim_params])
+    return cur.fetchall()
+
+
+# ─── /category-sku-breakdown ───
+@api_view(["GET"])
+@permission_classes([require("dashboard.view")])
+@cached_get(timeout=120, prefix="dash.category_sku_breakdown")
+def category_sku_breakdown(request):
+    """SKU-wise units + litres for ONE platform within a category / sub_category,
+    optionally across the trailing N months for a month-over-month comparison.
+
+    Second drill level under /category-platform-breakdown: pick a platform and
+    list every SKU it sold for the chosen (sub)category, with units sold and
+    litres sold. Same source semantics; queries only the single source table that
+    backs the requested platform (Amazon → Amazon PO / amazon_sec_range, everyone
+    else → master_po / SecMaster filtered by format).
+
+    months=N (1-6, default 1) returns each SKU's `by_month` map keyed YYYY-MM plus
+    a top-level `months` list (oldest→newest); `units`/`ltrs` mirror the latest
+    (selected) month so they match the platform-level totals."""
+    today = date.today()
+    try:
+        month_num = int(request.GET.get("month") or today.month)
+    except (TypeError, ValueError):
+        month_num = today.month
+    try:
+        year = int(request.GET.get("year") or today.year)
+    except (TypeError, ValueError):
+        year = today.year
+    if not 1 <= month_num <= 12:
+        month_num = today.month
+    month_name = calendar.month_name[month_num].upper()
+
+    source = "secondary" if (request.GET.get("source") or "").strip().lower() == "secondary" else "primary"
+
+    head_in = (request.GET.get("head") or "premium").strip().lower()
+    head_sql = "COMMODITY" if head_in == "commodity" else "PREMIUM"
+    head_key = "commodity" if head_in == "commodity" else "premium"
+
+    dimension = "category" if (request.GET.get("dimension") or "").strip().lower() == "category" else "sub_category"
+    dim_col = dimension
+
+    name = (request.GET.get("name") or "").strip()
+    is_uncat = name == "" or name.upper() == "UNCATEGORIZED"
+    name_u = name.upper()
+
+    platform = (request.GET.get("platform") or "").strip().lower()
+    if not platform:
+        return Response({"detail": "platform is required."}, status=400)
+
+    is_amazon = platform == "amazon"
+    if source == "primary":
+        fmt = _CATEGORY_SLUG_TO_FORMAT.get(platform, platform.replace("_", " ").upper())
+    else:
+        fmt = _SEC_SLUG_TO_FORMAT.get(platform, platform.replace("_", " ").upper())
+
+    try:
+        months_n = int(request.GET.get("months") or 1)
+    except (TypeError, ValueError):
+        months_n = 1
+    months_n = max(1, min(months_n, 6))
+
+    # Trailing N months ending at the selected month (oldest → newest).
+    month_list = _trailing_months(month_num, year, months_n)
+
+    month_meta = []
+    sku_map = {}  # code -> {code, name, brand, by_month: {key: {units, ltrs}}}
+    errors = []
+    with connection.cursor() as cur:
+        for m, y, mname in month_list:
+            key_m = f"{y:04d}-{m:02d}"
+            month_meta.append({
+                "key": key_m,
+                "month": m,
+                "year": y,
+                "label": f"{calendar.month_abbr[m]} {y}",
+            })
+            try:
+                month_rows = _category_sku_rows(
+                    cur,
+                    source=source,
+                    is_amazon=is_amazon,
+                    fmt=fmt,
+                    head_sql=head_sql,
+                    month_num=m,
+                    month_name=mname,
+                    year=y,
+                    dim_col=dim_col,
+                    is_uncat=is_uncat,
+                    name_u=name_u,
+                )
+            except Exception as e:  # noqa: BLE001
+                errors.append({"month": key_m, "error": str(e)})
+                continue
+            for code, sku_name, brand, units, ltrs in month_rows:
+                u = float(units or 0)
+                litres = float(ltrs or 0)
+                if u == 0 and litres == 0:
+                    continue
+                rec = sku_map.get(code)
+                if rec is None:
+                    rec = {"code": code, "name": sku_name or "", "brand": brand or "", "by_month": {}}
+                    sku_map[code] = rec
+                if sku_name:
+                    rec["name"] = sku_name
+                if brand:
+                    rec["brand"] = brand
+                cell = rec["by_month"].setdefault(key_m, {"units": 0.0, "ltrs": 0.0})
+                cell["units"] += u
+                cell["ltrs"] += litres
+
+    latest_key = month_meta[-1]["key"] if month_meta else None
+    skus = []
+    for rec in sku_map.values():
+        by_month = {}
+        for mm in month_meta:
+            cell = rec["by_month"].get(mm["key"]) or {"units": 0.0, "ltrs": 0.0}
+            by_month[mm["key"]] = {
+                "units": round(cell["units"], 2),
+                "ltrs": round(cell["ltrs"], 2),
+            }
+        cur_cell = by_month.get(latest_key) or {"units": 0.0, "ltrs": 0.0}
+        skus.append({
+            "code": rec["code"],
+            "name": rec["name"],
+            "brand": rec["brand"],
+            "units": cur_cell["units"],
+            "ltrs": cur_cell["ltrs"],
+            "by_month": by_month,
+            # Sort by total litres across the window so a SKU that was big last
+            # month stays visible even if it sold nothing this month.
+            "_sort": sum(c["ltrs"] for c in by_month.values()),
+        })
+    skus.sort(key=lambda s: (s["_sort"], s["ltrs"]), reverse=True)
+    for s in skus:
+        del s["_sort"]
+
+    return Response({
+        "source": source,
+        "head": head_key,
+        "dimension": dimension,
+        "name": name or "Uncategorized",
+        "platform": platform,
+        "month": month_num,
+        "year": year,
+        "months": month_meta,
+        "skus": skus,
+        "total_units": round(sum(s["units"] for s in skus), 2),
+        "total_ltrs": round(sum(s["ltrs"] for s in skus), 2),
+        "errors": errors,
+    })
 
 
 # Month name (UPPER) → month number, for normalising the text month columns
