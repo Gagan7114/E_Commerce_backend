@@ -3621,6 +3621,10 @@ def _ads_build_where(request, *, allow_date: bool = True):
     year_param = (request.query_params.get("year") or "").strip()
     month_param = (request.query_params.get("month") or "").strip().upper()
     date_param = (request.query_params.get("date") or "").strip()
+    from_param = (request.query_params.get("from_date") or "").strip()
+    to_param = (request.query_params.get("to_date") or "").strip()
+
+    _iso = r"^\d{4}-\d{2}-\d{2}$"
 
     base_clauses: list[str] = []
     base_params: list = []
@@ -3634,20 +3638,41 @@ def _ads_build_where(request, *, allow_date: bool = True):
         base_clauses.append("month = %s")
         base_params.append(month_param)
 
-    # Trend version starts from the base (year/month) clauses; a specific date
-    # is added below as an UPPER BOUND so the trend spans up to that date.
+    # Trend version starts from the base (year/month) clauses; a date filter is
+    # added below.
     trend_clauses = list(base_clauses)
     trend_params = list(base_params)
 
-    # Full version (summary / breakdown) narrows to the EXACT date if present.
+    # Full version (summary / breakdown) narrows to the date filter too.
     full_clauses = list(base_clauses)
     full_params = list(base_params)
-    if allow_date and date_param:
-        if not re.match(r"^\d{4}-\d{2}-\d{2}$", date_param):
+
+    if allow_date and (from_param or to_param):
+        # Calendar From/To range — both summary/breakdown and trend are scoped to
+        # [from, to]; either bound may be omitted (open-ended on that side).
+        if from_param:
+            if not re.match(_iso, from_param):
+                raise ValidationError(
+                    f"Invalid from_date value: {from_param!r} (expected YYYY-MM-DD)"
+                )
+            for clauses, prms in ((full_clauses, full_params), (trend_clauses, trend_params)):
+                clauses.append("date >= %s::date")
+                prms.append(from_param)
+        if to_param:
+            if not re.match(_iso, to_param):
+                raise ValidationError(
+                    f"Invalid to_date value: {to_param!r} (expected YYYY-MM-DD)"
+                )
+            for clauses, prms in ((full_clauses, full_params), (trend_clauses, trend_params)):
+                clauses.append("date <= %s::date")
+                prms.append(to_param)
+    elif allow_date and date_param:
+        # Backward-compatible single exact date; the trend follows it as an
+        # inclusive upper bound (up-to-that-date) so the line still spans days.
+        if not re.match(_iso, date_param):
             raise ValidationError(f"Invalid date value: {date_param!r} (expected YYYY-MM-DD)")
         full_clauses.append("date = %s::date")
         full_params.append(date_param)
-        # Trend follows the date as an inclusive upper bound (up-to-that-date).
         trend_clauses.append("date <= %s::date")
         trend_params.append(date_param)
 
@@ -3658,6 +3683,8 @@ def _ads_build_where(request, *, allow_date: bool = True):
         "year": year_param or None,
         "month": month_param or None,
         "date": date_param or None,
+        "from_date": from_param or None,
+        "to_date": to_param or None,
     }
 
 
