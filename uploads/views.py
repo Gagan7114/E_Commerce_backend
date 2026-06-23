@@ -159,6 +159,10 @@ PRIMARY_PO_JIVO_ONLY_TABLES = frozenset({"total_po", "total_po_zbs"})
 # substring of sku_name (e.g. "Jivo - Canola Refined Oil", "Sano - Pomace Olive Oil").
 PRIMARY_PO_ACCEPTED_BRANDS = ("jivo", "sano")
 
+# Maps an upload table to the column(s) a date-range delete filters on. A plain
+# string is a single date column; a (start, end) tuple is for sources whose rows
+# span a window (Amazon Secondary "range": from_date → to_date) — both endpoints
+# must fall inside the selected delete window.
 UPLOAD_DATE_DELETE_TABLES = {
     "amazon_ads": "date",
     "blinkit_ads": "date",
@@ -170,6 +174,8 @@ UPLOAD_DATE_DELETE_TABLES = {
     "zeptoads_daily": "date",
     "bigbasketads_daily": "date",
     "amazon_coupon": "date",
+    "amazon_sec_daily": "report_date",
+    "amazon_sec_range": ("from_date", "to_date"),
 }
 
 INVENTORY_DOH_UPLOAD_PLATFORMS = {
@@ -1384,12 +1390,19 @@ def delete_upload_rows_by_date(request):
         or body.get("date")
     )
 
-    date_column = UPLOAD_DATE_DELETE_TABLES.get(table)
-    if not date_column:
+    table_config = UPLOAD_DATE_DELETE_TABLES.get(table)
+    if not table_config:
         return Response(
-            {"detail": "Date delete is allowed only for Ads and Coupon upload tables."},
+            {"detail": "Date delete is allowed only for Ads, Coupon and Amazon Secondary upload tables."},
             status=400,
         )
+    # Single date column, or a (start, end) pair for window rows (see the
+    # UPLOAD_DATE_DELETE_TABLES comment). The end column is config-driven (never
+    # taken from the request) so it can be safely interpolated into the SQL.
+    if isinstance(table_config, (tuple, list)):
+        date_column, end_date_column = table_config
+    else:
+        date_column, end_date_column = table_config, None
     if requested_column and requested_column != date_column:
         return Response({"detail": "Invalid date column for this upload table."}, status=400)
     if not start_date or not end_date:
@@ -1399,13 +1412,25 @@ def delete_upload_rows_by_date(request):
 
     with transaction.atomic():
         with connection.cursor() as cur:
-            cur.execute(
-                f"""
-                DELETE FROM {_quote_ident(table)}
-                WHERE {_quote_ident(date_column)} BETWEEN %s AND %s
-                """,
-                [start_date, end_date],
-            )
+            if end_date_column:
+                # Window rows: delete only those whose whole [start, end] span
+                # falls inside the selected delete window.
+                cur.execute(
+                    f"""
+                    DELETE FROM {_quote_ident(table)}
+                    WHERE {_quote_ident(date_column)} >= %s
+                      AND {_quote_ident(end_date_column)} <= %s
+                    """,
+                    [start_date, end_date],
+                )
+            else:
+                cur.execute(
+                    f"""
+                    DELETE FROM {_quote_ident(table)}
+                    WHERE {_quote_ident(date_column)} BETWEEN %s AND %s
+                    """,
+                    [start_date, end_date],
+                )
             deleted = cur.rowcount
 
     if deleted:
@@ -1415,6 +1440,7 @@ def delete_upload_rows_by_date(request):
         "ok": True,
         "table": table,
         "date_column": date_column,
+        "end_date_column": end_date_column,
         "from_date": start_date.isoformat(),
         "to_date": end_date.isoformat(),
         "deleted": deleted,
