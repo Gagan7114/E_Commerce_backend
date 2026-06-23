@@ -69,6 +69,7 @@ urlpatterns = [
     path("<slug:slug>/bigbasket-ads-dashboard", views.bigbasket_ads_dashboard, name="platform-bigbasket-ads-dashboard"),
     path("<slug:slug>/blinkit-ads-dashboard", views.blinkit_ads_dashboard, name="platform-blinkit-ads-dashboard"),
     path("<slug:slug>/flipkart-ads-dashboard", views.flipkart_ads_dashboard, name="platform-flipkart-ads-dashboard"),
+    path("<slug:slug>/flipkart-fsn-dashboard", views.flipkart_fsn_dashboard, name="platform-flipkart-fsn-dashboard"),
     path("<slug:slug>/blinkit-brandfund-dashboard", views.blinkit_brandfund_dashboard, name="platform-blinkit-brandfund-dashboard"),
     path("<slug:slug>/swiggy-brandfund-dashboard", views.swiggy_brandfund_dashboard, name="platform-swiggy-brandfund-dashboard"),
     path("<slug:slug>/zepto-brandfund-dashboard", views.zepto_brandfund_dashboard, name="platform-zepto-brandfund-dashboard"),

@@ -58,6 +58,9 @@ UPLOAD_ALLOWED_TABLES = {
     "zepto_ads",
     "bigbasket_ads",
     "flipkart_ads",
+    # Flipkart "Consolidated FSN Report" — raw 14-col upload; the 5 master_sheet
+    # columns are joined live in the consolidated_fsn_report_master view.
+    "consolidated_fsn_report",
     # Ads — daily copy tables (the "Daily" option of the ads uploaders writes
     # here; "Range" keeps writing the originals above). Same schema/dedup keys.
     "swiggyads_daily",
@@ -1917,6 +1920,11 @@ def _batch_upload(body, *, forced_table: str | None = None):
     upsert = bool(body.get("upsert", True))
     expected_platform_format = body.get("expected_platform_format")
     source_platform_format = body.get("source_platform_format")
+    # Full-snapshot datasets (e.g. the Flipkart Consolidated FSN Report, which
+    # carries no per-row date) send replace_all on their FIRST chunk to wipe the
+    # table before reloading. Never honoured for primary PO tables (guarded
+    # below) so it can't be misused to clear order history.
+    replace_all = bool(body.get("replace_all", False))
 
     if table not in UPLOAD_ALLOWED_TABLES:
         return Response(
@@ -2049,6 +2057,10 @@ def _batch_upload(body, *, forced_table: str | None = None):
     last_error: str | None = None
 
     with connection.cursor() as cur:
+        # Wipe-and-reload snapshot upload: clear the whole table before inserting
+        # this (first) chunk's rows. Guarded off the primary PO tables.
+        if replace_all and table not in PRIMARY_UPLOAD_TABLES:
+            cur.execute(f'DELETE FROM {_quote_ident(table)}')
         for i in range(0, len(data), BATCH_SIZE):
             batch = data[i : i + BATCH_SIZE]
             if batch and replace_by_primary_key:

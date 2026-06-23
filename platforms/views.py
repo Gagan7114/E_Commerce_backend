@@ -4166,6 +4166,128 @@ def flipkart_ads_dashboard(request, slug: str):
     ))
 
 
+# ─── Flipkart FSN Dashboard ──────────────────────────────────────────────────
+# Source: consolidated_fsn_report (the Flipkart Consolidated FSN Report upload).
+# It has NO date column, so this dashboard has no date filters / time trend; the
+# "Ad spend vs Revenue" chart is a per-sub-category bar comparison instead, and
+# the breakdown table can be re-grouped by item / sub_category / category /
+# item_head / campaign via the `dimension` query param.
+
+_FSN_METRIC_SPECS = [
+    {"key": "ad_spend",   "label": "Ad spend",     "format": "inr",     "agg": "sum",
+     "expr": "COALESCE(SUM(ad_spend), 0)"},
+    {"key": "revenue",    "label": "Revenue",      "format": "inr",     "agg": "sum",
+     "expr": "COALESCE(SUM(total_revenue), 0)"},
+    {"key": "roi",        "label": "ROI",          "format": "ratio",   "agg": "avg",
+     "expr": "CASE WHEN COALESCE(SUM(ad_spend), 0) > 0 "
+             "THEN COALESCE(SUM(total_revenue), 0)::numeric / SUM(ad_spend) ELSE 0 END"},
+    {"key": "acos",       "label": "ACOS",         "format": "percent", "agg": "avg",
+     "expr": "CASE WHEN COALESCE(SUM(total_revenue), 0) > 0 "
+             "THEN COALESCE(SUM(ad_spend), 0)::numeric / SUM(total_revenue) * 100 ELSE 0 END"},
+    {"key": "views",      "label": "Views",        "format": "count",   "agg": "sum",
+     "expr": "COALESCE(SUM(views), 0)"},
+    {"key": "clicks",     "label": "Clicks",       "format": "count",   "agg": "sum",
+     "expr": "COALESCE(SUM(clicks), 0)"},
+    {"key": "ctr",        "label": "CTR",          "format": "percent", "agg": "avg",
+     "expr": "CASE WHEN COALESCE(SUM(views), 0) > 0 "
+             "THEN COALESCE(SUM(clicks), 0)::numeric / SUM(views) * 100 ELSE 0 END"},
+    {"key": "cpc",        "label": "CPC",          "format": "inr",     "agg": "avg",
+     "expr": "CASE WHEN COALESCE(SUM(clicks), 0) > 0 "
+             "THEN COALESCE(SUM(ad_spend), 0)::numeric / SUM(clicks) ELSE 0 END"},
+    {"key": "units_sold", "label": "Units sold",   "format": "count",   "agg": "sum",
+     "expr": "COALESCE(SUM(direct_units_sold), 0) + COALESCE(SUM(indirect_units_sold), 0)"},
+    {"key": "direct_units", "label": "Direct units", "format": "count", "agg": "sum",
+     "expr": "COALESCE(SUM(direct_units_sold), 0)"},
+    {"key": "cvr",        "label": "CVR",          "format": "percent", "agg": "avg",
+     "expr": "CASE WHEN COALESCE(SUM(clicks), 0) > 0 "
+             "THEN COALESCE(SUM(direct_units_sold), 0)::numeric / SUM(clicks) * 100 ELSE 0 END"},
+]
+
+# dimension query value -> (table column, human label)
+_FSN_DIMENSIONS = {
+    "item":         ("item",          "Items"),
+    "sub_category": ("sub_category",  "Sub Categories"),
+    "category":     ("category",      "Categories"),
+    "item_head":    ("item_head",     "Item Heads"),
+    "campaign_name": ("campaign_name", "Campaigns"),
+}
+
+
+@api_view(["GET"])
+@permission_classes([require("platform.stats.view")])
+@cached_get(timeout=60, prefix="plat.fk_fsn")
+def flipkart_fsn_dashboard(request, slug: str):
+    _ensure_scope(request.user, slug)
+    if slug != "flipkart":
+        raise ValidationError("Flipkart FSN Dashboard is available only for Flipkart.")
+
+    dim_param = (request.GET.get("dimension") or "item").strip()
+    dim_col, dim_label = _FSN_DIMENSIONS.get(dim_param, _FSN_DIMENSIONS["item"])
+
+    source = "consolidated_fsn_report"
+    where_sql = "WHERE UPPER(TRIM(format::text)) = 'FLIPKART'"
+    metric_select_sql = ", ".join(
+        f'{s["expr"]} AS "{s["key"]}"' for s in _FSN_METRIC_SPECS
+    )
+
+    # 1) Summary (single row of totals).
+    summary_rows = _dict_rows(
+        f"SELECT {metric_select_sql} FROM {source} {where_sql}", []
+    )
+    summary = dict(summary_rows[0]) if summary_rows else {s["key"]: 0 for s in _FSN_METRIC_SPECS}
+
+    # 2) Breakdown by the chosen dimension.
+    dim_expr = f"COALESCE(NULLIF(TRIM({dim_col}::text), ''), '(Unmapped)')"
+    breakdown_rows = _dict_rows(
+        f"SELECT {dim_expr} AS dimension, {metric_select_sql} "
+        f"FROM {source} {where_sql} GROUP BY {dim_expr} "
+        f"ORDER BY COALESCE(SUM(ad_spend), 0) DESC",
+        [],
+    )
+
+    # 3) Chart — Ad spend vs Revenue across sub-categories (top 12 by spend).
+    subcat_expr = "COALESCE(NULLIF(TRIM(sub_category::text), ''), '(Unmapped)')"
+    trend_rows = _dict_rows(
+        f"SELECT {subcat_expr} AS label, "
+        f"COALESCE(SUM(ad_spend), 0) AS spend, "
+        f"COALESCE(SUM(total_revenue), 0) AS revenue, {metric_select_sql} "
+        f"FROM {source} {where_sql} GROUP BY {subcat_expr} "
+        f"ORDER BY COALESCE(SUM(ad_spend), 0) DESC LIMIT 12",
+        [],
+    )
+
+    default_visible = {
+        "ad_spend", "revenue", "roi", "views", "clicks",
+        "ctr", "cpc", "units_sold", "cvr",
+    }
+    return Response({
+        "source": source,
+        "dashboard_title": "Flipkart FSN Dashboard",
+        "dimension_label": dim_label,
+        "dimension_key": dim_param,
+        "summary": summary,
+        "available_metrics": [
+            {"key": s["key"], "label": s["label"], "format": s["format"], "agg": s["agg"]}
+            for s in _FSN_METRIC_SPECS
+        ],
+        "default_metric_keys": ["ad_spend", "revenue", "roi", "acos"],
+        "trend_axes": {
+            "spend":   {"label": "Ad spend", "format": "inr"},
+            "revenue": {"label": "Revenue",  "format": "inr"},
+        },
+        "trend_rows": trend_rows,
+        "breakdown_columns": [
+            {"key": s["key"], "label": s["label"], "format": s["format"], "agg": s["agg"],
+             "default_visible": s["key"] in default_visible}
+            for s in _FSN_METRIC_SPECS
+        ],
+        "breakdown_rows": breakdown_rows,
+        "max_date": None,
+        "filter_options": {"years": [], "months": [], "dates": []},
+        "filters": {},
+    })
+
+
 # ─── Brand Fund Dashboards (Blinkit / Swiggy / Zepto) ────────────────────────
 # Source views: blinkit_brandfund_master / swiggy_brandfund_master /
 # zepto_brandfund_master. All three share the same column shape:
