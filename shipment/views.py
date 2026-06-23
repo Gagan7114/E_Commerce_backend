@@ -177,8 +177,19 @@ def _pack_into_capacity(items, capacity_lt):
         # Effective shippable units = ordered, capped by live stock when set.
         # accepted_qty itself is never changed (Ordered/Short stay correct).
         sc = item.get('stock_cap')
-        cap_units = accepted_qty if sc is None else min(accepted_qty, max(0.0, float(sc)))
-        total_liters = (round(cap_units * per_liter, 4) if sc is not None
+        # ship_cap: user-chosen units to ship (manual short-supply). Caps the
+        # shippable qty exactly like stock_cap; accepted_qty is left untouched so
+        # Ordered/Short stay correct and the user's short_reason (carried on the
+        # item) is preserved through to the saved record.
+        uc = item.get('ship_cap')
+        caps = [accepted_qty]
+        if sc is not None:
+            caps.append(max(0.0, float(sc)))
+        if uc is not None:
+            caps.append(max(0.0, float(uc)))
+        cap_units = min(caps)
+        capped = (sc is not None) or (uc is not None)
+        total_liters = (round(cap_units * per_liter, 4) if capped
                         else float(item.get('total_accepted_liters') or 0))
 
         if accepted_qty == 0:
