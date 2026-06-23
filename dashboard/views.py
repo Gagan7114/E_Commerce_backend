@@ -965,7 +965,7 @@ def state_sales(request):
                 SELECT COALESCE(state::text, '') AS state,
                        UPPER(TRIM(format::text)) AS fmt,
                        %s AS units
-                FROM "SecMaster"
+                FROM secmaster_mv
                 WHERE UPPER(TRIM(format::text)) NOT IN ('AMAZON', 'FLIPKART')
             """ % _SEC_METRIC_SQL[metric]
             sql += sec_month_sql
@@ -1268,7 +1268,7 @@ def state_sales_detail(request):
                        UPPER(TRIM(s.brand::text)) AS brand, s.category::text AS category,
                        s.sub_category::text AS sub_category,
                        {sec_row} AS units, s.city::text AS city
-                FROM "SecMaster" s
+                FROM secmaster_mv s
                 WHERE UPPER(TRIM(s.format::text)) NOT IN ('AMAZON', 'FLIPKART')
             """
             b += sec_mf
@@ -1481,7 +1481,7 @@ def category_breakdown(request):
                 sql = """
                     SELECT UPPER(TRIM(item_head::text)) AS head, category, sub_category,
                            COALESCE(SUM(ltr_sold), 0) AS ltrs
-                    FROM "SecMaster"
+                    FROM secmaster_mv
                     WHERE UPPER(TRIM(month::text)) = %s
                       AND year::numeric = %s
                       AND UPPER(TRIM(item_head::text)) IN ('PREMIUM', 'COMMODITY')
@@ -1685,7 +1685,7 @@ def category_platform_breakdown(request):
                 SELECT UPPER(TRIM(format::text)) AS fmt,
                        COALESCE(SUM(quantity), 0) AS units,
                        COALESCE(SUM(ltr_sold), 0) AS ltrs
-                FROM "SecMaster"
+                FROM secmaster_mv
                 WHERE UPPER(TRIM(month::text)) = %s
                   AND year::numeric = %s
                   AND UPPER(TRIM(item_head::text)) = %s
@@ -1818,7 +1818,7 @@ def _category_sku_rows(
                    UPPER(TRIM(COALESCE(brand::text, ''))) AS brand,
                    COALESCE(SUM(quantity), 0) AS units,
                    COALESCE(SUM(ltr_sold), 0) AS ltrs
-            FROM "SecMaster"
+            FROM secmaster_mv
             WHERE UPPER(TRIM(month::text)) = %s
               AND year::numeric = %s
               AND UPPER(TRIM(item_head::text)) = %s
@@ -2359,7 +2359,7 @@ def _secondary_yoy_month_year(params) -> tuple[int, int, bool, list[dict]]:
         "secmaster",
         f"""
         SELECT MAX(({secmaster_date_expr})::date)
-        FROM "SecMaster"
+        FROM secmaster_mv
         WHERE REGEXP_REPLACE(LOWER(TRIM("format"::text)), '[^a-z0-9]+', '', 'g')
               IN ('blinkit', 'swiggy', 'zepto', 'bigbasket')
         """,
@@ -2493,7 +2493,7 @@ def secondary_yoy_growth(request):
                 ) AS value,
                 COALESCE(SUM("quantity"), 0) AS units,
                 MAX(({secmaster_date_expr})::date) AS max_date
-            FROM "SecMaster"
+            FROM secmaster_mv
             WHERE REGEXP_REPLACE(LOWER(TRIM("format"::text)), '[^a-z0-9]+', '', 'g')
                   IN ({fmt_placeholders})
               AND UPPER(TRIM("month"::text)) = %s
@@ -3004,7 +3004,7 @@ def top_skus(request):
                             SELECT COALESCE(NULLIF(TRIM(item::text), ''), 'Unknown') AS name,
                                    UPPER(TRIM(item_head::text)) AS head,
                                    COALESCE(SUM(ltr_sold), 0) AS ltrs
-                            FROM "SecMaster"
+                            FROM secmaster_mv
                             WHERE "date" >= %s
                               AND "date" <= %s
                               AND UPPER(TRIM(item_head::text)) IN ('PREMIUM', 'COMMODITY')
@@ -3130,7 +3130,7 @@ def top_skus(request):
                                COALESCE(SUM(ltr_sold), 0) AS ltrs,
                                MAX(NULLIF(TRIM(sku_code::text), '')) AS code,
                                NULLIF(TRIM(brand::text), '') AS brand
-                        FROM "SecMaster"
+                        FROM secmaster_mv
                         WHERE UPPER(TRIM(month::text)) = %s AND year::numeric = %s
                           AND UPPER(TRIM(item_head::text)) IN ('PREMIUM', 'COMMODITY')
                     """
