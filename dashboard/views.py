@@ -6,6 +6,7 @@ from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 
 from django.db import connection, transaction
+from django.core.cache import cache
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.response import Response
 
@@ -892,6 +893,14 @@ def _fk_yms(periods):
     return ["%04d-%02d" % (yr, mn) for yr, mn in periods]
 
 
+# Category / sub-category dropdown options for the state-sales map. They depend
+# only on master_sheet (the catalog), not on the chosen filters or period, so we
+# cache them globally for a few minutes instead of re-running two DISTINCT scans
+# on every filter toggle (e.g. Jivo/Sano), which added latency to each change.
+_STATE_FILTER_OPTS_KEY = "dash.state_sales.filter_options.v1"
+_STATE_FILTER_OPTS_TTL = 600  # 10 min; new master_sheet uploads show within that
+
+
 @api_view(["GET"])
 @permission_classes([require("dashboard.view")])
 @cached_get(timeout=120, prefix="dash.state_sales")
@@ -921,6 +930,10 @@ def state_sales(request):
               if b.strip() and b.strip().lower() != "all"]
     cats = [c.strip().upper() for c in request.GET.getlist("category") if c.strip()]
     subs = [s.strip().upper() for s in request.GET.getlist("sub_category") if s.strip()]
+    # Item head (Premium / Commodity / Other) — the UI sends a single value, but
+    # we accept a list for symmetry with the other multi-value filters.
+    heads = [h.strip().upper() for h in request.GET.getlist("item_head")
+             if h.strip() and h.strip().lower() != "all"]
 
     use_other = platform not in ("amazon", "flipkart")   # SecMaster QC platforms
     use_amazon = platform is None or platform == "amazon"
@@ -972,6 +985,9 @@ def state_sales(request):
             if subs:
                 sql += " AND UPPER(TRIM(sub_category::text)) = ANY(%s)"
                 params.append(subs)
+            if heads:
+                sql += " AND UPPER(TRIM(item_head::text)) = ANY(%s)"
+                params.append(heads)
             sql += " GROUP BY 1, 2"
             try:
                 cur.execute(sql, params)
@@ -1002,6 +1018,9 @@ def state_sales(request):
             if subs:
                 sql_a += " AND UPPER(TRIM(m.sub_category::text)) = ANY(%s)"
                 pa.append(subs)
+            if heads:
+                sql_a += " AND UPPER(TRIM(m.item_head::text)) = ANY(%s)"
+                pa.append(heads)
             sql_a += " GROUP BY 1"
             try:
                 cur.execute(sql_a, pa)
@@ -1032,6 +1051,9 @@ def state_sales(request):
             if subs:
                 sql_f += " AND UPPER(TRIM(sub_category::text)) = ANY(%s)"
                 pf.append(subs)
+            if heads:
+                sql_f += " AND UPPER(TRIM(item_head::text)) = ANY(%s)"
+                pf.append(heads)
             sql_f += " GROUP BY 1"
             try:
                 cur.execute(sql_f, pf)
@@ -1042,24 +1064,39 @@ def state_sales(request):
 
         # Dropdown options — categories + sub_categories from master_sheet (the
         # catalog that feeds SecMaster.category; a cheap superset, vs a full
-        # DISTINCT scan of the heavy view).
-        categories_all, sub_categories_all = [], []
-        try:
-            cur.execute(
-                "SELECT DISTINCT UPPER(TRIM(category::text)) FROM master_sheet "
-                "WHERE NULLIF(TRIM(category::text), '') IS NOT NULL ORDER BY 1"
-            )
-            categories_all = [r[0] for r in cur.fetchall()]
-            cur.execute(
-                "SELECT DISTINCT UPPER(TRIM(category::text)), UPPER(TRIM(sub_category::text)) "
-                "FROM master_sheet WHERE NULLIF(TRIM(sub_category::text), '') IS NOT NULL "
-                "ORDER BY 1, 2"
-            )
-            sub_categories_all = [
-                {"category": r[0], "sub_category": r[1]} for r in cur.fetchall()
-            ]
-        except Exception as e:
-            errors.append({"source": "filter_options", "error": str(e)})
+        # DISTINCT scan of the heavy view). Cached globally (see key above) so a
+        # cache miss scans once and every later filter change reuses it.
+        filter_options = cache.get(_STATE_FILTER_OPTS_KEY)
+        if filter_options is None:
+            categories_all, sub_categories_all = [], []
+            try:
+                cur.execute(
+                    "SELECT DISTINCT UPPER(TRIM(category::text)) FROM master_sheet "
+                    "WHERE NULLIF(TRIM(category::text), '') IS NOT NULL ORDER BY 1"
+                )
+                categories_all = [r[0] for r in cur.fetchall()]
+                cur.execute(
+                    "SELECT DISTINCT UPPER(TRIM(category::text)), UPPER(TRIM(sub_category::text)) "
+                    "FROM master_sheet WHERE NULLIF(TRIM(sub_category::text), '') IS NOT NULL "
+                    "ORDER BY 1, 2"
+                )
+                sub_categories_all = [
+                    {"category": r[0], "sub_category": r[1]} for r in cur.fetchall()
+                ]
+                filter_options = {
+                    "brands": ["JIVO", "SANO"],
+                    "categories": categories_all,
+                    "sub_categories": sub_categories_all,
+                }
+                cache.set(_STATE_FILTER_OPTS_KEY, filter_options, _STATE_FILTER_OPTS_TTL)
+            except Exception as e:
+                # Don't cache a partial/failed scan — fall back to what we have.
+                errors.append({"source": "filter_options", "error": str(e)})
+                filter_options = {
+                    "brands": ["JIVO", "SANO"],
+                    "categories": categories_all,
+                    "sub_categories": sub_categories_all,
+                }
 
     states = sorted(
         (
@@ -1097,11 +1134,7 @@ def state_sales(request):
         "total_value": total_value,
         "mapped_value": mapped_value,
         "pct_mapped": round(mapped_value / total_value * 100, 1) if total_value else 0,
-        "filter_options": {
-            "brands": ["JIVO", "SANO"],
-            "categories": categories_all,
-            "sub_categories": sub_categories_all,
-        },
+        "filter_options": filter_options,
         "errors": errors,
     })
 
@@ -1156,6 +1189,8 @@ def state_sales_detail(request):
               if b.strip() and b.strip().lower() != "all"]
     cats = [c.strip().upper() for c in request.GET.getlist("category") if c.strip()]
     subs = [s.strip().upper() for s in request.GET.getlist("sub_category") if s.strip()]
+    heads = [h.strip().upper() for h in request.GET.getlist("item_head")
+             if h.strip() and h.strip().lower() != "all"]
     try:
         limit = min(max(int(request.GET.get("limit") or 50), 1), 1000)
     except (TypeError, ValueError):
@@ -1247,6 +1282,8 @@ def state_sales_detail(request):
                 b += " AND UPPER(TRIM(s.category::text)) = ANY(%s)"; p.append(cats)
             if subs:
                 b += " AND UPPER(TRIM(s.sub_category::text)) = ANY(%s)"; p.append(subs)
+            if heads:
+                b += " AND UPPER(TRIM(s.item_head::text)) = ANY(%s)"; p.append(heads)
             b += " AND COALESCE(s.state::text, '') = ANY(%s)"; p.append(sec_raws)
             branches.append(b); params += p
         if use_amazon and az_raws:
@@ -1271,6 +1308,8 @@ def state_sales_detail(request):
                 b += " AND UPPER(TRIM(m.category::text)) = ANY(%s)"; p.append(cats)
             if subs:
                 b += " AND UPPER(TRIM(m.sub_category::text)) = ANY(%s)"; p.append(subs)
+            if heads:
+                b += " AND UPPER(TRIM(m.item_head::text)) = ANY(%s)"; p.append(heads)
             b += " AND COALESCE(a.state::text, '') = ANY(%s)"; p.append(az_raws)
             branches.append(b); params += p
         if use_flipkart and fk_states:
@@ -1293,6 +1332,8 @@ def state_sales_detail(request):
                 b += " AND UPPER(TRIM(f.category::text)) = ANY(%s)"; p.append(cats)
             if subs:
                 b += " AND UPPER(TRIM(f.sub_category::text)) = ANY(%s)"; p.append(subs)
+            if heads:
+                b += " AND UPPER(TRIM(f.item_head::text)) = ANY(%s)"; p.append(heads)
             b += " AND COALESCE(f.customer_delivery_state::text, '') = ANY(%s)"; p.append(fk_states)
             branches.append(b); params += p
 
