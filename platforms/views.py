@@ -3706,6 +3706,7 @@ def _ads_dashboard_payload(
     trend_params: list,
     filters: dict,
     allow_date_filter: bool = True,
+    summary_max_date_keys: list | None = None,
 ) -> dict:
     # Comma-separated "expr AS \"key\"" for the SELECT list.
     metric_select_sql = ", ".join(
@@ -3730,6 +3731,24 @@ def _ads_dashboard_payload(
     max_date = summary.pop("max_date", None)
     if hasattr(max_date, "isoformat"):
         max_date = max_date.isoformat()
+
+    # 1b) Max-date-only summary override. For range-snapshot sources (e.g. Zepto
+    # ads), each date is a cumulative month-to-date snapshot, so SUMming across
+    # dates over-counts. For the listed metric keys, replace the period sum with
+    # the value from the latest (max) date only. Breakdown/trend are untouched.
+    if summary_max_date_keys and max_date:
+        md_specs = [s for s in metric_specs if s["key"] in summary_max_date_keys]
+        if md_specs:
+            md_select = ", ".join(f'{s["expr"]} AS "{s["key"]}"' for s in md_specs)
+            md_where = (where_sql + " AND " if where_sql else "WHERE ") + "date = %s::date"
+            md_rows = _dict_rows(
+                f"SELECT {md_select} FROM {source} {md_where}",
+                list(params) + [max_date],
+            )
+            if md_rows:
+                for s in md_specs:
+                    if s["key"] in md_rows[0]:
+                        summary[s["key"]] = md_rows[0][s["key"]]
 
     # 2) Breakdown by dimension
     spend_alias = f'"{spend_metric}"'
@@ -4038,6 +4057,9 @@ def zepto_ads_dashboard(request, slug: str):
         trend_where_sql=trend_where_sql,
         trend_params=trend_params,
         filters=filters,
+        # zepto_ads_master holds cumulative range snapshots — the Ad spent KPI
+        # must reflect the latest date only, not the sum across snapshots.
+        summary_max_date_keys=["ad_spent"],
     ))
 
 

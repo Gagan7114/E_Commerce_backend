@@ -1264,7 +1264,9 @@ def state_sales_detail(request):
             sec_mf, sec_mp = _sec_month_filter(periods, alias="s.")
             b = f"""
                 SELECT s.date::date AS d, UPPER(TRIM(s.format::text)) AS platform,
-                       s.sku_code::text AS sku, s.sku_name::text AS name,
+                       s.sku_code::text AS sku,
+                       COALESCE(NULLIF(TRIM(s.item::text), ''),
+                                NULLIF(TRIM(s.sku_name::text), '')) AS name,
                        UPPER(TRIM(s.brand::text)) AS brand, s.category::text AS category,
                        s.sub_category::text AS sub_category,
                        {sec_row} AS units, s.city::text AS city
