@@ -1744,6 +1744,12 @@ def _update_total_po_grn_dates(data: list[dict], target_table: str = "total_po")
     prepared: dict[tuple[str, str], dict] = {}
     skipped = 0
 
+    def _grn_qty(value) -> float:
+        try:
+            return float(str(value).replace(",", "").strip() or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
     for row in data:
         po_number = str(row.get("po_number") or "").strip()
         sku_code = str(row.get("sku_code") or "").strip()
@@ -1753,7 +1759,26 @@ def _update_total_po_grn_dates(data: list[dict], target_table: str = "total_po")
             continue
 
         key = (po_number.lower(), sku_code.lower())
-        if key in prepared:
+        existing = prepared.get(key)
+        if existing is not None:
+            # The same PO+SKU can legitimately appear on several GRN lines: more
+            # than one lot, or a receipt line plus a debit-note / zero-qty
+            # adjustment line. Received qty is additive across those lines, so
+            # SUM delivered_qty rather than keeping a single line. Previously a
+            # later line overwrote the earlier one, so a 0-qty DN line silently
+            # wiped a real receipt (e.g. MBJPO71303 SKU 240878: 56 received + a
+            # 0-qty DN line -> stored 0, losing 14 L). Keep the first non-empty
+            # grn_date / status.
+            if "delivered_qty" in existing or "delivered_qty" in row:
+                total_qty = _grn_qty(existing.get("delivered_qty")) + _grn_qty(
+                    row.get("delivered_qty")
+                )
+                existing["delivered_qty"] = (
+                    str(int(total_qty)) if total_qty == int(total_qty) else str(total_qty)
+                )
+            for fld in ("grn_date", "status"):
+                if not str(existing.get(fld) or "").strip() and str(row.get(fld) or "").strip():
+                    existing[fld] = row[fld]
             skipped += 1
             continue
         prepared[key] = row
