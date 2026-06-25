@@ -75,8 +75,11 @@ def apply_po_completion_delivery_dates(formats=PO_COMPLETION_FORMATS) -> None:
                 [fmts, fmts],
             )
             # 2) undelivered SKUs of a completed PO inherit the PO's delivery date.
+            #    MATERIALIZED forces the per-PO delivery-date aggregate to be
+            #    computed ONCE; without it Postgres inlined the CTE and re-ran the
+            #    full aggregate per candidate row (nested loop) — ~40s vs ~7s.
             cur.execute(
-                f"""WITH pd AS (
+                f"""WITH pd AS MATERIALIZED (
                         SELECT po_number, MAX(grn_date) AS d FROM total_po_zbs
                         WHERE {fp} AND COALESCE(delivered_qty, 0) > 0 AND grn_date IS NOT NULL
                         GROUP BY po_number)

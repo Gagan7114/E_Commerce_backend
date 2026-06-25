@@ -4090,6 +4090,92 @@ def bigbasket_ads_dashboard(request, slug: str):
     ))
 
 
+# ── Daily ads dashboards (Swiggy / Zepto / BigBasket) ─────────────────────────
+# Same payload as the range dashboards above, sourced from the *ads_daily copy
+# tables' master views. Daily rows are per-day (non-cumulative), so the summary
+# SUMs are correct as-is — no max-date override (unlike zepto_ads_master).
+
+@api_view(["GET"])
+@permission_classes([require("platform.stats.view")])
+@cached_get(timeout=60, prefix="plat.swiggy_ads_daily")
+def swiggy_ads_daily_dashboard(request, slug: str):
+    _ensure_scope(request.user, slug)
+    if slug != "swiggy":
+        raise ValidationError("Swiggy Daily Ads Dashboard is available only for Swiggy.")
+    where_sql, params, trend_where_sql, trend_params, filters = _ads_build_where(request, allow_date=True)
+    return Response(_ads_dashboard_payload(
+        source="swiggyads_daily_master",
+        title="Swiggy Daily ADS Dashboard",
+        dimension_key="item",
+        dimension_label="Items",
+        dimension_unmapped="(Unmapped)",
+        metric_specs=_quick_commerce_metrics(gmv_field="direct_gmv", include_indirect_qty=False, include_indirect_gmv=False),
+        default_metric_keys=_QC_DEFAULT_METRIC_KEYS,
+        default_visible_columns=_QC_DEFAULT_VISIBLE_COLUMNS,
+        spend_metric="ad_spent",
+        revenue_metric="gmv",
+        where_sql=where_sql,
+        params=params,
+        trend_where_sql=trend_where_sql,
+        trend_params=trend_params,
+        filters=filters,
+    ))
+
+
+@api_view(["GET"])
+@permission_classes([require("platform.stats.view")])
+@cached_get(timeout=60, prefix="plat.zepto_ads_daily")
+def zepto_ads_daily_dashboard(request, slug: str):
+    _ensure_scope(request.user, slug)
+    if slug != "zepto":
+        raise ValidationError("Zepto Daily Ads Dashboard is available only for Zepto.")
+    where_sql, params, trend_where_sql, trend_params, filters = _ads_build_where(request, allow_date=True)
+    return Response(_ads_dashboard_payload(
+        source="zeptoads_daily_master",
+        title="Zepto Daily ADS Dashboard",
+        dimension_key="item",
+        dimension_label="Items",
+        dimension_unmapped="(Unmapped)",
+        metric_specs=_quick_commerce_metrics(gmv_field="gmv", include_indirect_qty=True, include_indirect_gmv=False),
+        default_metric_keys=_QC_DEFAULT_METRIC_KEYS,
+        default_visible_columns=_QC_DEFAULT_VISIBLE_COLUMNS,
+        spend_metric="ad_spent",
+        revenue_metric="gmv",
+        where_sql=where_sql,
+        params=params,
+        trend_where_sql=trend_where_sql,
+        trend_params=trend_params,
+        filters=filters,
+    ))
+
+
+@api_view(["GET"])
+@permission_classes([require("platform.stats.view")])
+@cached_get(timeout=60, prefix="plat.bb_ads_daily")
+def bigbasket_ads_daily_dashboard(request, slug: str):
+    _ensure_scope(request.user, slug)
+    if slug != "bigbasket":
+        raise ValidationError("BigBasket Daily Ads Dashboard is available only for BigBasket.")
+    where_sql, params, trend_where_sql, trend_params, filters = _ads_build_where(request, allow_date=True)
+    return Response(_ads_dashboard_payload(
+        source="bigbasketads_daily_master",
+        title="BigBasket Daily ADS Dashboard",
+        dimension_key="item",
+        dimension_label="Items",
+        dimension_unmapped="(Unmapped)",
+        metric_specs=_quick_commerce_metrics(gmv_field="gmv", include_indirect_qty=True, include_indirect_gmv=False),
+        default_metric_keys=_QC_DEFAULT_METRIC_KEYS,
+        default_visible_columns=_QC_DEFAULT_VISIBLE_COLUMNS,
+        spend_metric="ad_spent",
+        revenue_metric="gmv",
+        where_sql=where_sql,
+        params=params,
+        trend_where_sql=trend_where_sql,
+        trend_params=trend_params,
+        filters=filters,
+    ))
+
+
 @api_view(["GET"])
 @permission_classes([require("platform.stats.view")])
 @cached_get(timeout=60, prefix="plat.blinkit_ads")

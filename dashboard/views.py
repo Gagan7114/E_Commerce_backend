@@ -256,6 +256,12 @@ def table_distinct_values(request, table_name: str, column_name: str):
             placeholders = ", ".join(["%s"] * len(cleaned_values))
             where.append(f"COALESCE(\"{col}\"::text, '') IN ({placeholders})")
             params.extend(cleaned_values)
+    # Server-side value search: lets the picker find values past the 5000-row
+    # cap (e.g. a PO number that sorts beyond the first 5000 distinct values).
+    search_raw = (request.query_params.get("search") or "").strip()
+    if search_raw:
+        where.append(f"COALESCE({qc}::text, '') ILIKE %s")
+        params.append(f"%{search_raw}%")
     where_sql = f"WHERE {' AND '.join(where)}" if where else ""
     try:
         with connection.cursor() as cur:

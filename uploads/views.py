@@ -243,6 +243,12 @@ def _refresh_matviews_async(
                 if do_secmaster:
                     # ~10s rebuild for DRR / Secondary / Summary dashboards.
                     refresh_secmaster_mv()
+                # The matviews are now fresh. Clear the cache AGAIN: a dashboard
+                # read that raced in before this refresh finished would have
+                # cached a stale response (TTL 60s) — drop it so the next read
+                # serves fresh data and the dashboard updates without waiting out
+                # the cache or a manual refresh.
+                cache.clear()
             except Exception:  # noqa: BLE001 - a refresh failure must not crash
                 logger.exception("Background matview refresh failed")
             finally:
@@ -1677,23 +1683,40 @@ def _upsert_primary_upload_row(
 
 def _execute_batch_insert_rows(
     cur,
-    sql: str,
+    qtable: str,
+    col_list: str,
+    placeholders: str,
+    upsert_clause: str,
     rows: list[dict],
     columns: list[str],
     column_types: dict[str, str],
     *,
     tracks_upsert_counts: bool,
 ):
+    """Insert many rows with a single multi-row INSERT per sub-chunk — one DB
+    round-trip each — instead of one execute() per row. This is the hot path for
+    every non-primary upload; the per-row version made an upload of N rows do N
+    network round-trips to the DB (the visible multi-second lag). Sub-chunks stay
+    well under PostgreSQL's 65535 bind-parameter limit. Returns the RETURNING
+    rows ([(inserted_bool,), ...]) when counting upserts, else None.
+    """
     results = []
-    for row in rows:
-        cur.execute(sql, _upload_row_values(row, columns, column_types))
+    if not rows:
+        return results if tracks_upsert_counts else None
+    returning = " RETURNING (xmax::text = '0') AS inserted" if tracks_upsert_counts else ""
+    ncols = max(1, len(columns))
+    max_rows = max(1, min(len(rows), 50000 // ncols))
+    for start in range(0, len(rows), max_rows):
+        chunk = rows[start : start + max_rows]
+        values_sql = ", ".join([f"({placeholders})"] * len(chunk))
+        stmt = f"INSERT INTO {qtable} ({col_list}) VALUES {values_sql}{upsert_clause}{returning}"
+        params: list = []
+        for row in chunk:
+            params.extend(_upload_row_values(row, columns, column_types))
+        cur.execute(stmt, params)
         if tracks_upsert_counts:
-            result = cur.fetchone()
-            if result is not None:
-                results.append(result)
-    if tracks_upsert_counts:
-        return results
-    return None
+            results.extend(cur.fetchall())
+    return results if tracks_upsert_counts else None
 
 
 def _update_total_po_grn_dates(data: list[dict], target_table: str = "total_po") -> Response:
@@ -2040,11 +2063,9 @@ def _batch_upload(body, *, forced_table: str | None = None):
             upsert_clause = f" ON CONFLICT ({conflict_cols}) DO NOTHING"
 
     sql = f'INSERT INTO {_quote_ident(table)} ({col_list}) VALUES ({placeholders}){upsert_clause}'
-    batch_sql = f'INSERT INTO {_quote_ident(table)} ({col_list}) VALUES %s{upsert_clause}'
     tracks_upsert_counts = bool(upsert and unique_key)
     if tracks_upsert_counts:
         sql += " RETURNING (xmax::text = '0') AS inserted"
-        batch_sql += " RETURNING (xmax::text = '0') AS inserted"
 
     success = 0
     created = 0
@@ -2098,7 +2119,10 @@ def _batch_upload(body, *, forced_table: str | None = None):
                 try:
                     batch_results = _execute_batch_insert_rows(
                         cur,
-                        batch_sql,
+                        _quote_ident(table),
+                        col_list,
+                        placeholders,
+                        upsert_clause,
                         batch,
                         columns,
                         column_types,
