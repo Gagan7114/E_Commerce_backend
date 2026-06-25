@@ -103,7 +103,6 @@ class PermissionAdmin(admin.ModelAdmin):
     def has_delete_permission(self, request, obj=None):
         return False
 
-
 @admin.register(InventoryDohNotification)
 class InventoryDohNotificationAdmin(admin.ModelAdmin):
     list_display = (
@@ -124,3 +123,4 @@ class InventoryDohNotificationAdmin(admin.ModelAdmin):
     search_fields = ("sku_code", "sku_name", "item", "brand", "category", "sub_category")
     readonly_fields = ("created_at", "updated_at", "first_seen_at", "last_seen_at")
     ordering = ("-last_seen_at", "format", "sku_code")
+
