@@ -53,6 +53,16 @@ REPORT_VIEW_CATALOG = {
         "format_column": None,
         "max_rows": 50000,
     },
+    # Amazon MP (Marketplace GST MTR B2B) raw table. Every column is stored
+    # verbatim as TEXT (see platforms/migrations/0034_amazon_mp_table.py), so
+    # there is no ::date-castable column to filter on — date_column=None means a
+    # selected date range is ignored and the full row set exports. The table is
+    # MP-only, so there is no format column to filter either.
+    "amazon_mp": {
+        "date_column": None,
+        "format_column": None,
+        "max_rows": 50000,
+    },
 }
 
 _IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
