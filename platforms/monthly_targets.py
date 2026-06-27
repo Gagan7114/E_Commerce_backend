@@ -34,6 +34,7 @@ from accounts.permissions import (
     require,
     user_platform_slugs,
 )
+from config.perf_cache import cached_get
 
 from .models import PlatformConfig
 
@@ -1233,6 +1234,7 @@ def month_targets_refresh_all(request):
 
 @api_view(["GET"])
 @permission_classes([require("platform.month_targets.view")])
+@cached_get(timeout=60, prefix="plat.month_targets_list")
 def month_targets_list(request, slug: str):
     """GET /api/platform/<slug>/month-targets?month=M&year=Y
 
@@ -1606,6 +1608,7 @@ def month_targets_update(request, slug: str, row_id: int):
 
 @api_view(["GET"])
 @permission_classes([require("platform.month_targets.view")])
+@cached_get(timeout=60, prefix="plat.month_targets_dashboard")
 def month_targets_dashboard(request):
     """GET /api/platform/month-targets/dashboard?month=M&year=Y
 

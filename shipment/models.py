@@ -84,6 +84,14 @@ class Shipment(models.Model):
     class Meta:
         db_table = 'sp_shipments'
         ordering = ['-created_at']
+        indexes = [
+            # Status is filtered/counted on nearly every shipment read — the list
+            # (status filter), stats/KPI conditional counts, pending-approvals,
+            # and the `status != 'rejected'` join guard used by the plan-review /
+            # appointment / PO-list aggregates. Without this it was a sequential
+            # scan of sp_shipments every time.
+            models.Index(fields=['status'], name='sp_shipments_status_idx'),
+        ]
 
 
 class ShipmentItem(models.Model):

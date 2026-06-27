@@ -11,3 +11,6 @@ gunicorn==23.0.0
 firebase-admin>=6.5.0,<7
 gspread>=6.1.0,<7
 google-auth>=2.35.0,<3
+# Optional: only used when REDIS_URL is set (shared cross-worker cache backend).
+# Harmless to install when unset — the LocMemCache default never imports it.
+redis>=5.0.0,<6

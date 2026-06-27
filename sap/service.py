@@ -18,6 +18,7 @@ from contextlib import contextmanager
 from typing import Any, Iterator
 
 from django.conf import settings
+from django.core.cache import cache
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +63,25 @@ def _assert_readonly(sql: str) -> None:
         raise RuntimeError("Only SELECT statements are allowed against SAP HANA.")
 
 
+def _apply_query_timeout(cur) -> None:
+    """Bound how long a single statement may run on the worker thread. Without
+    this, connectTimeout only protects the handshake — a slow query/proc would
+    pin a gunicorn worker until HANA returns. Best-effort: never break the query
+    if the driver doesn't expose setquerytimeout."""
+    try:
+        timeout_s = int(settings.HANA.get("query_timeout_s", 0) or 0)
+    except (TypeError, ValueError):
+        timeout_s = 0
+    if timeout_s <= 0:
+        return
+    try:
+        cur.setquerytimeout(timeout_s)
+    except Exception:
+        # Older/newer hdbcli without setquerytimeout — leave the query unbounded
+        # rather than fail it.
+        pass
+
+
 def select(
     sql: str, params: list | tuple | None = None, schema: str | None = None
 ) -> list[dict]:
@@ -71,6 +91,7 @@ def select(
     _assert_readonly(sql)
     with hana_connection(schema) as conn:
         cur = conn.cursor()
+        _apply_query_timeout(cur)
         cur.execute(sql, params or [])
         cols = [d[0] for d in cur.description]
         rows = cur.fetchall()
@@ -127,12 +148,30 @@ def report_sales_analysis(
     `source` picks which schema's REPORT_SALES_ANALYSIS to call — one of
     the keys in SALES_ANALYSIS_PROCEDURES (mart / oil). Defaults to mart.
 
+    The raw proc result is cached on (source, from_date, to_date) so that all
+    filter/search/page/aggregate permutations of the same date range share a
+    single HANA CALL within the cache TTL. Python filtering in the view is
+    unchanged — equivalent by construction (same proc + same inputs = same rows).
+
     Logs the raw row count returned by HANA so we can verify whether the
     procedure itself caps results or our pipeline drops some downstream.
     """
     source_key, procedure = _resolve_sales_analysis_procedure(source)
+
+    # Proc-level cache: key only on the inputs that actually reach HANA.
+    # Filter/search/page params never change what the proc returns, so caching
+    # on those (as the view-level @cached_get does) re-calls HANA needlessly.
+    _proc_key = f"sap:proc:{source_key}:{from_date}:{to_date}"
+    try:
+        _cached = cache.get(_proc_key)
+    except Exception:
+        _cached = None
+    if _cached is not None:
+        return _cached
+
     with hana_connection() as conn:
         cur = conn.cursor()
+        _apply_query_timeout(cur)
         cur.execute(f'CALL {procedure}(?, ?)', [from_date, to_date])
         cols = [d[0] for d in cur.description] if cur.description else []
         raw_rows = cur.fetchall() if cur.description else []
@@ -148,6 +187,10 @@ def report_sales_analysis(
         rowcount_attr,
         len(cols),
     )
+    try:
+        cache.set(_proc_key, result, timeout=120)
+    except Exception:
+        pass
     return result
 
 

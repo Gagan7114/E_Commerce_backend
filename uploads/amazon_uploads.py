@@ -32,6 +32,7 @@ from rest_framework.exceptions import PermissionDenied
 from rest_framework.response import Response
 
 from accounts.permissions import can_access_platform, require
+from config.perf_cache import cached_get
 
 try:
     from openpyxl import load_workbook
@@ -3329,6 +3330,7 @@ APPOINTMENT_REPORT_COLUMNS = (
 
 @api_view(["GET"])
 @permission_classes([require("platform.po.view")])
+@cached_get(timeout=60, prefix="amzpo.report")
 def amazon_po_report(request):
     _ensure_amazon_access(request.user)
     page, page_size, offset = _page_params(request)
@@ -3408,6 +3410,7 @@ def amazon_po_report(request):
 
 @api_view(["GET"])
 @permission_classes([require("platform.po.view")])
+@cached_get(timeout=300, prefix="amzpo.filter_options")
 def amazon_po_filter_options(request):
     _ensure_amazon_access(request.user)
     with connection.cursor() as cur:
@@ -3528,6 +3531,7 @@ def amazon_po_filter_options(request):
 
 @api_view(["GET"])
 @permission_classes([require("platform.po.view")])
+@cached_get(timeout=120, prefix="amzpo.new_po_dashboard")
 def amazon_po_new_po_dashboard(request):
     _ensure_amazon_access(request.user)
     q = request.query_params
@@ -3781,6 +3785,7 @@ def amazon_po_new_po_dashboard(request):
 
 @api_view(["GET"])
 @permission_classes([require("platform.po.view")])
+@cached_get(timeout=120, prefix="amzpo.matrix")
 def amazon_po_matrix(request):
     _ensure_amazon_access(request.user)
     q = request.query_params
@@ -3895,6 +3900,7 @@ def amazon_po_matrix(request):
 
 @api_view(["GET"])
 @permission_classes([require("platform.po.view")])
+@cached_get(timeout=60, prefix="amzpo.appointment_report")
 def appointment_report(request):
     _ensure_amazon_access(request.user)
     page, page_size, offset = _page_params(request)
@@ -3939,6 +3945,7 @@ def appointment_report(request):
 
 @api_view(["GET"])
 @permission_classes([require("platform.po.view")])
+@cached_get(timeout=300, prefix="amzpo.appointment_filter_options")
 def appointment_filter_options(request):
     _ensure_amazon_access(request.user)
     with connection.cursor() as cur:
@@ -3972,6 +3979,7 @@ def appointment_filter_options(request):
 
 @api_view(["GET"])
 @permission_classes([require("platform.po.view")])
+@cached_get(timeout=120, prefix="amzpo.product_master_lookup")
 def product_master_lookup(request):
     _ensure_amazon_access(request.user)
     page, page_size, offset = _page_params(request)
@@ -4012,6 +4020,7 @@ def product_master_lookup(request):
 
 @api_view(["GET"])
 @permission_classes([require("platform.po.view")])
+@cached_get(timeout=120, prefix="amzpo.fc_master_lookup")
 def fc_master_lookup(request):
     _ensure_amazon_access(request.user)
     page, page_size, offset = _page_params(request)
@@ -4037,6 +4046,7 @@ def fc_master_lookup(request):
 
 @api_view(["GET"])
 @permission_classes([require("platform.po.view")])
+@cached_get(timeout=120, prefix="amzpo.summary")
 def amazon_po_summary(request):
     _ensure_amazon_access(request.user)
     with connection.cursor() as cur:
@@ -4229,6 +4239,7 @@ def amazon_po_summary(request):
 
 @api_view(["GET"])
 @permission_classes([require("platform.po.view")])
+@cached_get(timeout=120, prefix="amzpo.appointment_summary")
 def appointment_summary(request):
     _ensure_amazon_access(request.user)
     with connection.cursor() as cur:

@@ -1381,7 +1381,11 @@ def _parse_upload_delete_date(value):
 
 
 @api_view(["POST"])
-@permission_classes([require("upload.use")])
+# Delete-by-date is more destructive than a normal upload, so it is gated on a
+# dedicated permission (NOT the shared `upload.use`). Users keep their normal
+# upload rights but cannot delete rows unless they explicitly hold this code.
+# Superusers bypass all permission checks.
+@permission_classes([require("upload.delete_by_date")])
 def delete_upload_rows_by_date(request):
     body = request.data or {}
     table = str(body.get("table") or "").strip()

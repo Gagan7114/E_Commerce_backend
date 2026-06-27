@@ -161,7 +161,7 @@ def table_count(request, table_name: str):
 # ─── /table-counts ───
 @api_view(["GET"])
 @permission_classes([require("dashboard.view")])
-@cached_get(timeout=60, prefix="dash.table_counts")
+@cached_get(timeout=60, prefix="dash.table_counts", shared=True)
 def table_counts(request):
     requested = request.query_params.get("tables", "")
     if requested:
@@ -187,7 +187,7 @@ def _fetch_latest_reporting_date(sql: str, params=None):
 
 @api_view(["GET"])
 @permission_classes([require("dashboard.view")])
-@cached_get(timeout=300, prefix="dash.latest_month")
+@cached_get(timeout=300, prefix="dash.latest_month", shared=True)
 def latest_month(request):
     """Calendar month used as the default dashboard period."""
     today = date.today()
@@ -401,7 +401,7 @@ def _inv_is_code_sql(col: str) -> str:
 
 @api_view(["GET"])
 @permission_classes([require("dashboard.view")])
-@cached_get(timeout=120, prefix="dash.inventory_charts")
+@cached_get(timeout=120, prefix="dash.inventory_charts", shared=True)
 def inventory_charts(request):
     """Inventory totals, city split, and top products per platform.
 
@@ -527,7 +527,7 @@ def inventory_charts(request):
 # ─── /primary-po-litres ───
 @api_view(["GET"])
 @permission_classes([require("dashboard.table.view")])
-@cached_get(timeout=120, prefix="dash.primary_po_litres")
+@cached_get(timeout=120, prefix="dash.primary_po_litres", shared=True)
 def primary_po_litres(request):
     """SUM(total_delivered_liters) for the current month from master_po + reporting.Amazon PO."""
     today = date.today()
@@ -581,7 +581,7 @@ _CATEGORY_SLUG_TO_FORMAT = {
 
 @api_view(["GET"])
 @permission_classes([require("dashboard.view")])
-@cached_get(timeout=120, prefix="dash.category_litres")
+@cached_get(timeout=120, prefix="dash.category_litres", shared=True)
 def category_litres(request):
     """Delivered litres grouped by oil category for one item head.
 
@@ -909,7 +909,7 @@ _STATE_FILTER_OPTS_TTL = 600  # 10 min; new master_sheet uploads show within tha
 
 @api_view(["GET"])
 @permission_classes([require("dashboard.view")])
-@cached_get(timeout=120, prefix="dash.state_sales")
+@cached_get(timeout=120, prefix="dash.state_sales", shared=True)
 def state_sales(request):
     """State-wise consumer units sold for the India map on Home (secondary data).
 
@@ -1148,7 +1148,7 @@ def state_sales(request):
 # ─── /state-sales/detail ───
 @api_view(["GET"])
 @permission_classes([require("dashboard.view")])
-@cached_get(timeout=120, prefix="dash.state_sales_detail")
+@cached_get(timeout=120, prefix="dash.state_sales_detail", shared=True)
 def state_sales_detail(request):
     """Raw line-item rows behind one state on the Home map (secondary data).
 
@@ -1399,7 +1399,7 @@ def state_sales_detail(request):
 # ─── /category-breakdown ───
 @api_view(["GET"])
 @permission_classes([require("dashboard.view")])
-@cached_get(timeout=120, prefix="dash.category_breakdown")
+@cached_get(timeout=120, prefix="dash.category_breakdown", shared=True)
 def category_breakdown(request):
     """Litres by category AND sub_category, for BOTH heads, from one source.
 
@@ -1566,7 +1566,7 @@ def _friendly_platform_name(slug, fmt_label):
 # ─── /category-platform-breakdown ───
 @api_view(["GET"])
 @permission_classes([require("dashboard.view")])
-@cached_get(timeout=120, prefix="dash.category_platform_breakdown")
+@cached_get(timeout=120, prefix="dash.category_platform_breakdown", shared=True)
 def category_platform_breakdown(request):
     """Per-platform units + litres for ONE category or sub_category within a head.
 
@@ -1875,7 +1875,7 @@ def _category_sku_rows(
 # ─── /category-sku-breakdown ───
 @api_view(["GET"])
 @permission_classes([require("dashboard.view")])
-@cached_get(timeout=120, prefix="dash.category_sku_breakdown")
+@cached_get(timeout=120, prefix="dash.category_sku_breakdown", shared=True)
 def category_sku_breakdown(request):
     """SKU-wise units + litres for ONE platform within a category / sub_category,
     optionally across the trailing N months for a month-over-month comparison.
@@ -2057,7 +2057,7 @@ def _month_token_to_num(tok):
 # ─── /category-trend ───
 @api_view(["GET"])
 @permission_classes([require("dashboard.view")])
-@cached_get(timeout=120, prefix="dash.category_trend")
+@cached_get(timeout=120, prefix="dash.category_trend", shared=True)
 def category_trend(request):
     """Premium / Commodity delivered litres over the trailing N months.
 
@@ -2409,7 +2409,7 @@ def _secondary_yoy_month_year(params) -> tuple[int, int, bool, list[dict]]:
 
 @api_view(["GET"])
 @permission_classes([require("dashboard.view")])
-@cached_get(timeout=120, prefix="dash.secondary_yoy_growth")
+@cached_get(timeout=120, prefix="dash.secondary_yoy_growth", shared=True)
 def secondary_yoy_growth(request):
     month, anchor_year, defaulted, errors = _secondary_yoy_month_year(request.GET)
     month_name = calendar.month_name[month].upper()
@@ -2712,7 +2712,7 @@ def secondary_yoy_growth(request):
 # --- /fulfilment-health ---
 @api_view(["GET"])
 @permission_classes([require("dashboard.view")])
-@cached_get(timeout=120, prefix="dash.fulfilment_health")
+@cached_get(timeout=120, prefix="dash.fulfilment_health", shared=True)
 def fulfilment_health(request):
     """Fill / miss rate for primary POs over a trailing date window.
 
@@ -2847,7 +2847,7 @@ def fulfilment_health(request):
 # ─── /top-skus ───
 @api_view(["GET"])
 @permission_classes([require("dashboard.view")])
-@cached_get(timeout=120, prefix="dash.top_skus")
+@cached_get(timeout=120, prefix="dash.top_skus", shared=True)
 def top_skus(request):
     """Top SKUs by delivered litres for a month, with prior-period delta.
 
@@ -3235,7 +3235,7 @@ def top_skus(request):
 # ─── /platform-expiry-alerts ───
 @api_view(["GET"])
 @permission_classes([require("dashboard.view")])
-@cached_get(timeout=120, prefix="dash.platform_expiry_alerts")
+@cached_get(timeout=120, prefix="dash.platform_expiry_alerts", shared=True)
 def platform_expiry_alerts(request):
     """Unique POs with 1 <= days_to_expiry <= 5 in the current month, per platform."""
     today = date.today()

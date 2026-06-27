@@ -11,6 +11,7 @@ from rest_framework.exceptions import NotFound, APIException, ValidationError
 from rest_framework.response import Response
 
 from accounts.permissions import require
+from config.perf_cache import cached_get
 
 from .service import (
     HANA_SCHEMAS,
@@ -230,6 +231,7 @@ def _sales_analysis_summary(rows: list[dict]) -> dict:
 
 @api_view(["GET"])
 @permission_classes([require("sap.view")])
+@cached_get(timeout=120, prefix="sap.sales_analysis")
 def sales_analysis(request):
     from_date = _date_param(request, "from_date")
     to_date = _date_param(request, "to_date")
@@ -344,6 +346,7 @@ def sales_analysis(request):
 
 @api_view(["GET"])
 @permission_classes([require("sap.view")])
+@cached_get(timeout=120, prefix="sap.distributors")
 def distributors(request):
     search = request.query_params.get("search", "").strip()
     page, page_size = _page(request)
@@ -383,6 +386,7 @@ def distributors(request):
 # ─── /distributors/{card_code} ───
 @api_view(["GET"])
 @permission_classes([require("sap.view")])
+@cached_get(timeout=60, prefix="sap.distributor_detail")
 def distributor_detail(request, card_code: str):
     bp_sql = """
         SELECT
@@ -423,6 +427,7 @@ def distributor_detail(request, card_code: str):
 # ─── /distributor-orders/{card_code} ───
 @api_view(["GET"])
 @permission_classes([require("sap.view")])
+@cached_get(timeout=60, prefix="sap.distributor_orders")
 def distributor_orders(request, card_code: str):
     page, page_size = _page(request)
     offset = page * page_size
@@ -448,6 +453,7 @@ def distributor_orders(request, card_code: str):
 # ─── /distributor-invoices/{card_code} ───
 @api_view(["GET"])
 @permission_classes([require("sap.invoice.view")])
+@cached_get(timeout=60, prefix="sap.distributor_invoices")
 def distributor_invoices(request, card_code: str):
     page, page_size = _page(request)
     offset = page * page_size
@@ -473,6 +479,7 @@ def distributor_invoices(request, card_code: str):
 # ─── /items ───
 @api_view(["GET"])
 @permission_classes([require("sap.view")])
+@cached_get(timeout=120, prefix="sap.items")
 def items(request):
     search = request.query_params.get("search", "").strip()
     page, page_size = _page(request)
@@ -534,6 +541,7 @@ def _warehouse_inactive_filter(raw: str) -> str:
 
 @api_view(["GET"])
 @permission_classes([require("sap.view")])
+@cached_get(timeout=120, prefix="sap.warehouses")
 def warehouses(request):
     search = request.query_params.get("search", "").strip()
     inactive = _warehouse_inactive_filter(request.query_params.get("inactive", ""))
@@ -569,6 +577,7 @@ def warehouses(request):
 # ─── /warehouses/{whs_code} ───
 @api_view(["GET"])
 @permission_classes([require("sap.view")])
+@cached_get(timeout=60, prefix="sap.warehouse_detail")
 def warehouse_detail(request, whs_code: str):
     warehouse_sql = f"""
         SELECT
@@ -607,6 +616,7 @@ def warehouse_detail(request, whs_code: str):
 # ─── /stock-by-warehouse ───
 @api_view(["GET"])
 @permission_classes([require("sap.view")])
+@cached_get(timeout=120, prefix="sap.stock_by_warehouse")
 def stock_by_warehouse(request):
     item_code = request.query_params.get("item_code", "").strip()
     where = 'WHERE T0."OnHand" > 0'
@@ -640,6 +650,7 @@ def _split_csv(raw: str) -> list[str]:
 
 @api_view(["GET"])
 @permission_classes([require("sap.view")])
+@cached_get(timeout=120, prefix="sap.inventory_overview")
 def inventory_overview(request):
     page, page_size = _page(request)
     offset = page * page_size
@@ -859,6 +870,7 @@ def inventory_overview(request):
 # "Stock Value by Warehouse" chart. Reads the mart or oil schema via ?source=.
 @api_view(["GET"])
 @permission_classes([require("sap.view")])
+@cached_get(timeout=120, prefix="sap.inventory_warehouse_comparison")
 def inventory_warehouse_comparison(request):
     source, schema = resolve_schema(request.query_params.get("source"))
     month_end = _month_end_from_params(request)
@@ -926,6 +938,7 @@ FG_GROUP_NAME = "FINISHED"
 
 @api_view(["GET"])
 @permission_classes([require("sap.view")])
+@cached_get(timeout=120, prefix="sap.inventory_finished_goods")
 def inventory_finished_goods(request):
     source, schema = resolve_schema(request.query_params.get("source"))
     placeholders = ",".join(["?"] * len(FG_WAREHOUSE_CODES))
@@ -1001,6 +1014,7 @@ def inventory_finished_goods(request):
 # ─── /sales-invoices ───
 @api_view(["GET"])
 @permission_classes([require("sap.invoice.view")])
+@cached_get(timeout=60, prefix="sap.sales_invoices")
 def sales_invoices(request):
     search = request.query_params.get("search", "").strip()
     page, page_size = _page(request)
@@ -1041,6 +1055,7 @@ def sales_invoices(request):
 # ─── /sales-invoices/{card_code} ───
 @api_view(["GET"])
 @permission_classes([require("sap.invoice.view")])
+@cached_get(timeout=60, prefix="sap.customer_sales_invoices")
 def customer_sales_invoices(request, card_code: str):
     page, page_size = _page(request)
     offset = page * page_size
@@ -1071,6 +1086,7 @@ def customer_sales_invoices(request, card_code: str):
 # ─── /sales-invoice-lines/{doc_entry} ───
 @api_view(["GET"])
 @permission_classes([require("sap.invoice.view")])
+@cached_get(timeout=60, prefix="sap.sales_invoice_lines")
 def sales_invoice_lines(request, doc_entry: int):
     header_sql = """
         SELECT
@@ -1121,6 +1137,7 @@ def _build_platform_where(slug: str) -> tuple[str, list]:
 # ─── /platform-distributors/{slug} ───
 @api_view(["GET"])
 @permission_classes([require("sap.view")])
+@cached_get(timeout=120, prefix="sap.platform_distributors")
 def platform_distributors(request, slug: str):
     platform_where, platform_params = _build_platform_where(slug)
     search = request.query_params.get("search", "").strip()
@@ -1166,6 +1183,7 @@ def platform_distributors(request, slug: str):
 # ─── /platform-distributors/{slug}/{card_code} ───
 @api_view(["GET"])
 @permission_classes([require("sap.view")])
+@cached_get(timeout=60, prefix="sap.platform_distributor_detail")
 def platform_distributor_detail(request, slug: str, card_code: str):
     _build_platform_where(slug)  # validate slug
     bp_sql = """
@@ -1204,6 +1222,7 @@ def platform_distributor_detail(request, slug: str, card_code: str):
 # ─── /platform-sales-invoices/{slug} ───
 @api_view(["GET"])
 @permission_classes([require("sap.invoice.view")])
+@cached_get(timeout=60, prefix="sap.platform_sales_invoices")
 def platform_sales_invoices(request, slug: str):
     platform_where, platform_params = _build_platform_where(slug)
     search = request.query_params.get("search", "").strip()
@@ -1253,6 +1272,7 @@ def platform_sales_invoices(request, slug: str):
 
 @api_view(["GET"])
 @permission_classes([require("sap.view")])
+@cached_get(timeout=180, prefix="sap.distributor_inventory")
 def distributor_inventory(request):
     """Distributor inventory by purchase price (FIFO lots) for one card.
 

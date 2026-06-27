@@ -52,19 +52,17 @@ class ShipmentSerializer(serializers.ModelSerializer):
         return _is_stale_draft(obj)
 
     def get_channel(self, obj):
-        """Channel (CORE/FRESH/NOW) mapped to this shipment's FC."""
+        """Channel (CORE/FRESH/NOW) mapped to this shipment's FC.
+
+        Reads the cached {UPPER(TRIM(fc)) -> channel} map (5-min TTL, near-static
+        master) instead of querying fc_city_state_channel_master once per object
+        — important when this serializer renders a list (pending-approvals)."""
         fc = (obj.destination_fc or '').strip()
         if not fc:
             return None
         try:
-            with connection.cursor() as cur:
-                cur.execute(
-                    "SELECT channel FROM public.fc_city_state_channel_master "
-                    "WHERE UPPER(TRIM(fc::text)) = UPPER(%s) LIMIT 1",
-                    [fc],
-                )
-                r = cur.fetchone()
-                return r[0] if r and r[0] else None
+            from .views import _fc_channel_map
+            return _fc_channel_map().get(fc.upper()) or None
         except Exception:
             return None
 
@@ -129,6 +127,12 @@ class ShipmentListSerializer(serializers.ModelSerializer):
         return obj.created_by.email if obj.created_by else None
 
     def get_item_count(self, obj):
+        # Prefer the `loaded_item_count` annotation set by the list view (one
+        # grouped query for the whole page). Fall back to a per-object count if
+        # the serializer is ever used on an un-annotated queryset.
+        count = getattr(obj, 'loaded_item_count', None)
+        if count is not None:
+            return count
         return obj.items.filter(not_loaded=False).count()
 
     def get_is_stale_draft(self, obj):

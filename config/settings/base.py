@@ -97,17 +97,38 @@ DATABASES = {
     },
 }
 
-# Explicit local-memory cache so `from django.core.cache import cache` is
-# deterministic across workers (Django's default is per-process LocMemCache;
-# we name it so it can be swapped for Redis in prod via env later).
-CACHES = {
-    "default": {
-        "BACKEND": "django.core.cache.backends.locmem.LocMemCache",
-        "LOCATION": "ecms-default",
-        "TIMEOUT": 300,
-        "OPTIONS": {"MAX_ENTRIES": 5000},
-    },
-}
+# Cache backend.
+#
+# Default is per-process LocMemCache (no infra, fully safe). Its weakness in
+# production is that it is NOT shared across gunicorn workers: every worker keeps
+# its own copy, so a request landing on a "cold" worker misses the cache and
+# re-runs the heavy dashboard SQL — the main cause of intermittent 1-2s loads.
+#
+# Set REDIS_URL (e.g. "redis://127.0.0.1:6379/1") to switch to a SHARED cache so
+# the first worker to compute a dashboard payload warms it for ALL workers (and,
+# combined with `shared=True` on user-independent endpoints, all users). This is
+# the single highest-leverage latency fix and requires only a running Redis +
+# the `redis` package (already in requirements). Defaults preserve current
+# behaviour exactly when REDIS_URL is unset.
+REDIS_URL = env("REDIS_URL", default="")
+if REDIS_URL:
+    CACHES = {
+        "default": {
+            "BACKEND": "django.core.cache.backends.redis.RedisCache",
+            "LOCATION": REDIS_URL,
+            "TIMEOUT": 300,
+            "KEY_PREFIX": "ecms",
+        },
+    }
+else:
+    CACHES = {
+        "default": {
+            "BACKEND": "django.core.cache.backends.locmem.LocMemCache",
+            "LOCATION": "ecms-default",
+            "TIMEOUT": 300,
+            "OPTIONS": {"MAX_ENTRIES": 5000},
+        },
+    }
 
 # SAP HANA credentials are consumed by sap/service.py via hdbcli,
 # not as a Django database connection.
@@ -120,6 +141,12 @@ HANA = {
     # Fail fast when HANA is unreachable (VPN down / host blocked) instead of
     # hanging on the OS default (~20-30s) and freezing every SAP-backed widget.
     "connect_timeout_ms": env.int("HANA_CONNECT_TIMEOUT_MS", default=5000),
+    # Per-statement timeout (seconds). connect_timeout only covers the initial
+    # handshake; once connected, a slow query/proc would otherwise block the
+    # gunicorn worker indefinitely (the failure mode behind the dashboard
+    # all-zeros incident). This caps any single SAP query so a worker is freed.
+    # 0 disables. Tune via HANA_QUERY_TIMEOUT_S.
+    "query_timeout_s": env.int("HANA_QUERY_TIMEOUT_S", default=30),
 }
 
 FIREBASE_CREDENTIALS_FILE = env("FIREBASE_CREDENTIALS_FILE", default="")
@@ -174,7 +201,17 @@ REST_FRAMEWORK = {
 
 SIMPLE_JWT = {
     "ACCESS_TOKEN_LIFETIME": timedelta(hours=24),
-    "REFRESH_TOKEN_LIFETIME": timedelta(days=7),
+    # Long-lived, rotating refresh token: as long as the user opens the app
+    # within this window the frontend silently renews the access token, so a
+    # logged-in user is never auto-logged-out — only a manual logout ends the
+    # session. Rotation issues a fresh refresh token on every renewal, which
+    # keeps extending the window for anyone who keeps using the app.
+    "REFRESH_TOKEN_LIFETIME": timedelta(days=365),
+    "ROTATE_REFRESH_TOKENS": True,
+    # We do NOT run the token_blacklist app, so rotation must not try to
+    # blacklist the old refresh token (that would error on a missing table).
+    # The old token simply stays valid until it expires on its own.
+    "BLACKLIST_AFTER_ROTATION": False,
     "ALGORITHM": "HS256",
     "SIGNING_KEY": env("JWT_SIGNING_KEY", default=SECRET_KEY),
     "USER_ID_FIELD": "id",

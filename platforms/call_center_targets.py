@@ -40,6 +40,7 @@ from rest_framework.exceptions import PermissionDenied, ValidationError
 from rest_framework.response import Response
 
 from accounts.permissions import require
+from config.perf_cache import cached_get
 
 
 ITEM_HEADS = ("PREMIUM", "COMMODITY")
@@ -114,6 +115,7 @@ def _section(row) -> dict | None:
 
 
 @api_view(["GET", "POST"])
+@cached_get(timeout=60, prefix="plat.call_center_targets")
 def call_center_targets(request):
     if request.method == "POST":
         return _post(request)

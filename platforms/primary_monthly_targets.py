@@ -19,6 +19,7 @@ from rest_framework.exceptions import PermissionDenied, ValidationError
 from rest_framework.response import Response
 
 from accounts.permissions import can_access_platform, require, user_platform_slugs
+from config.perf_cache import cached_get
 
 from .models import PlatformConfig
 
@@ -648,6 +649,7 @@ def _refresh_format_rows(fmt: str, month: int, year: int) -> list[dict]:
 
 @api_view(["GET"])
 @permission_classes([require("platform.month_targets.view")])
+@cached_get(timeout=60, prefix="plat.primary_month_targets_list")
 def primary_month_targets_list(request, slug: str):
     _ensure_scope(request.user, slug)
     meta = _platform_target_meta(slug)
@@ -1273,6 +1275,7 @@ def _num(v) -> float:
 
 @api_view(["GET"])
 @permission_classes([require("platform.month_targets.view")])
+@cached_get(timeout=60, prefix="plat.primary_month_targets_dashboard")
 def primary_month_targets_dashboard(request):
     month, year = _parse_month_year(request.query_params)
     row_defs = _dashboard_row_defs(request.user)

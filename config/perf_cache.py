@@ -13,8 +13,18 @@ Safety
 * Cache key includes the request path + sorted query string + user id, so
   every distinct request shape is cached independently and no user ever
   sees another user's data.
+* `shared=True` drops the user id from the key — use it ONLY for endpoints whose
+  response depends on the request params alone, not on the user (e.g. the
+  org-wide home dashboards, which do no per-user row filtering). This lets every
+  user reuse one cached payload instead of keeping N per-user copies, which is
+  what actually makes the cache effective for a team. Permission checks still run
+  first (this decorator is innermost, below @permission_classes), so a user
+  without access is rejected by DRF before the cache is ever consulted.
 * Cached payload is just the serialized response data; auth + permission
   checks always run BEFORE the cache lookup.
+* Cache reads are best-effort: if the backend (e.g. Redis) is unavailable, the
+  lookup is treated as a miss and the live view runs — a flaky cache can never
+  break a response.
 * Disable instantly by removing the decorator — no schema/data impact.
 """
 
@@ -27,16 +37,24 @@ from django.core.cache import cache
 from rest_framework.response import Response
 
 
-def _make_key(prefix: str, request, args, kwargs) -> str:
-    user_id = getattr(getattr(request, "user", None), "id", "anon") or "anon"
+def _make_key(prefix: str, request, args, kwargs, shared: bool = False) -> str:
+    if shared:
+        user_part = "shared"
+    else:
+        user_id = getattr(getattr(request, "user", None), "id", "anon") or "anon"
+        user_part = f"u={user_id}"
     query = sorted(request.GET.lists()) if hasattr(request, "GET") else []
-    raw = f"{prefix}|{request.path}|u={user_id}|q={query}|a={args}|k={sorted(kwargs.items())}"
+    raw = f"{prefix}|{request.path}|{user_part}|q={query}|a={args}|k={sorted(kwargs.items())}"
     digest = hashlib.md5(raw.encode("utf-8")).hexdigest()
     return f"perfcache:{prefix}:{digest}"
 
 
-def cached_get(timeout: int = 60, prefix: str = "view"):
-    """Cache a DRF GET view's Response for `timeout` seconds."""
+def cached_get(timeout: int = 60, prefix: str = "view", shared: bool = False):
+    """Cache a DRF GET view's Response for `timeout` seconds.
+
+    Set `shared=True` only on endpoints whose data is identical for every
+    authorized user (see module docstring).
+    """
 
     def decorator(view_func):
         @wraps(view_func)
@@ -45,8 +63,13 @@ def cached_get(timeout: int = 60, prefix: str = "view"):
             if method != "GET":
                 return view_func(request, *args, **kwargs)
 
-            key = _make_key(prefix, request, args, kwargs)
-            cached_data = cache.get(key)
+            key = _make_key(prefix, request, args, kwargs, shared=shared)
+            try:
+                cached_data = cache.get(key)
+            except Exception:
+                # A cache-backend failure (e.g. Redis down) must never break the
+                # endpoint — treat it as a miss and serve the live view.
+                cached_data = None
             if cached_data is not None:
                 return Response(cached_data)
 

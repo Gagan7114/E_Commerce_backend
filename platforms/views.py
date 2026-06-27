@@ -1668,6 +1668,7 @@ def pendency_dashboard(request, slug: str):
         SELECT
             COALESCE(NULLIF(TRIM("po_number"::text), ''), 'UNMAPPED') AS po_number,
             MAX(NULLIF(TRIM("vendor_new"::text), '')) AS distributor,
+            MAX(NULLIF(TRIM("location"::text), '')) AS location,
             TO_CHAR(
                 MAX(
                     CASE
@@ -7525,13 +7526,17 @@ def _amazon_mp_dashboard_response(request):
     where = "WHERE shipment_year = %s AND UPPER(TRIM(shipment_month)) = %s"
     params = [year, month_name]
 
+    # Litres and quantity are summed GROSS (ABS) so refunded/returned units count
+    # as positive volume — matching the Amazon MP sheet's Done Ltr / Done Unit
+    # (e.g. June: net 4,820 L vs the sheet's 5,524 L, the difference being 2x the
+    # refund litres). Revenue (invoice_amount / tax_exclusive_gross) stays NET.
     kpi_rows = _dict_rows(
         f"""
         SELECT
             COALESCE(SUM(invoice_amount), 0) AS inclusive,
             COALESCE(SUM(tax_exclusive_gross), 0) AS exclusive,
-            COALESCE(SUM(delivered_ltr), 0) AS ltrs,
-            COALESCE(SUM(quantity), 0) AS quantity,
+            COALESCE(SUM(ABS(delivered_ltr)), 0) AS ltrs,
+            COALESCE(SUM(ABS(quantity)), 0) AS quantity,
             COUNT(*) AS row_count
         FROM amazon_mp_master
         {where}
@@ -7545,8 +7550,8 @@ def _amazon_mp_dashboard_response(request):
             SELECT
                 {col_expr} AS label,
                 COALESCE(SUM(invoice_amount), 0) AS value,
-                COALESCE(SUM(delivered_ltr), 0) AS ltrs,
-                COALESCE(SUM(quantity), 0) AS quantity
+                COALESCE(SUM(ABS(delivered_ltr)), 0) AS ltrs,
+                COALESCE(SUM(ABS(quantity)), 0) AS quantity
             FROM amazon_mp_master
             {where}
             GROUP BY {col_expr}
@@ -7574,8 +7579,8 @@ def _amazon_mp_dashboard_response(request):
         SELECT
             UPPER(TRIM(shipment_month)) AS month_name,
             COALESCE(SUM(invoice_amount), 0) AS value,
-            COALESCE(SUM(delivered_ltr), 0) AS ltrs,
-            COALESCE(SUM(quantity), 0) AS quantity
+            COALESCE(SUM(ABS(delivered_ltr)), 0) AS ltrs,
+            COALESCE(SUM(ABS(quantity)), 0) AS quantity
         FROM amazon_mp_master
         WHERE shipment_year = %s
           AND NULLIF(TRIM(shipment_month), '') IS NOT NULL
@@ -7609,7 +7614,7 @@ def _amazon_mp_dashboard_response(request):
             UPPER(TRIM(asin)) AS asin,
             MAX(item_description) AS item,
             COALESCE(SUM(invoice_amount), 0) AS value,
-            COALESCE(SUM(quantity), 0) AS quantity
+            COALESCE(SUM(ABS(quantity)), 0) AS quantity
         FROM amazon_mp_master
         {where}
           AND NULLIF(TRIM(asin), '') IS NOT NULL

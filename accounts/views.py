@@ -22,8 +22,12 @@ from .serializers import MeSerializer
 UserModel = get_user_model()
 
 
-def _issue_token(user) -> str:
-    return str(RefreshToken.for_user(user).access_token)
+def _issue_tokens(user) -> dict:
+    # Hand back BOTH tokens: the short-lived access token used on every request,
+    # and the long-lived refresh token the frontend uses to silently renew it so
+    # the user is never forced to log in again.
+    refresh = RefreshToken.for_user(user)
+    return {"token": str(refresh.access_token), "refresh": str(refresh)}
 
 
 def _user_payload(user) -> dict:
@@ -51,7 +55,7 @@ class LoginView(APIView):
             return Response(
                 {"detail": "Account disabled"}, status=status.HTTP_403_FORBIDDEN
             )
-        return Response({"user": _user_payload(user), "token": _issue_token(user)})
+        return Response({"user": _user_payload(user), **_issue_tokens(user)})
 
 
 @api_view(["GET"])

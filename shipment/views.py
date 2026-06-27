@@ -2221,7 +2221,15 @@ class ShipmentListCreateView(_SafeAPIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
-        qs = Shipment.objects.select_related('created_by', 'approved_by').all()
+        from django.db.models import Count, Q
+        # Annotate the loaded-item count once in SQL instead of letting the
+        # serializer run one COUNT(*) per shipment (N+1: 200 shipments -> 201
+        # queries). ShipmentListSerializer.get_item_count reads this annotation.
+        qs = (
+            Shipment.objects
+            .select_related('created_by', 'approved_by')
+            .annotate(loaded_item_count=Count('items', filter=Q(items__not_loaded=False)))
+        )
         status_filter = request.query_params.get('status')
         if status_filter:
             qs = qs.filter(status=status_filter)
