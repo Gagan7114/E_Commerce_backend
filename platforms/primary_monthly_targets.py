@@ -21,6 +21,7 @@ from rest_framework.response import Response
 from accounts.permissions import can_access_platform, require, user_platform_slugs
 from config.perf_cache import cached_get
 
+from .master_po_refresh import refresh_amazon_mp_master
 from .models import PlatformConfig
 
 
@@ -283,22 +284,47 @@ def _read_amazon_secondary(item_head: str, month: int, year: int) -> dict:
     }
 
 
+# Parse amazon_mp's raw `shipment_date` to a real date using the SAME logic the
+# amazon_mp_master view uses to derive shipment_month/shipment_year (migration
+# 0038_amazon_mp_master_iso_shipment_date). The view accepts both `YYYY[-/]M[-/]D`
+# and `D[-/]M[-/]YY(YY)` with 1-2 digit day/month and 2- or 4-digit years and
+# either separator; deriving the displayed "latest date" with the IDENTICAL parser
+# keeps it consistent with how each row was bucketed into the month. A previous,
+# narrower parser here recognised only DD/MM/YY, YYYY-MM-DD and DD-MM-YYYY, so a
+# June row stored in any other accepted format (e.g. DD/MM/YYYY) still counted in
+# Done Ltrs but contributed NULL to MAX(date) — making the date column lag behind
+# the real latest shipment. Operates on the literal column "shipment_date".
+_AMP_SHIPMENT_DT_SQL = r"""
+    CASE
+        WHEN "shipment_date" ~ '^\s*\d{4}[-/]\d{1,2}[-/]\d{1,2}'
+            THEN TO_DATE(
+                (regexp_match("shipment_date", '^\s*(\d{4})[-/](\d{1,2})[-/](\d{1,2})'))[1] || '/' ||
+                (regexp_match("shipment_date", '^\s*(\d{4})[-/](\d{1,2})[-/](\d{1,2})'))[2] || '/' ||
+                (regexp_match("shipment_date", '^\s*(\d{4})[-/](\d{1,2})[-/](\d{1,2})'))[3],
+                'YYYY/MM/DD')
+        WHEN "shipment_date" ~ '^\s*\d{1,2}[-/]\d{1,2}[-/]\d{2,4}'
+            THEN TO_DATE(
+                (regexp_match("shipment_date", '^\s*(\d{1,2})[-/](\d{1,2})[-/](\d{2,4})'))[1] || '/' ||
+                (regexp_match("shipment_date", '^\s*(\d{1,2})[-/](\d{1,2})[-/](\d{2,4})'))[2] || '/' ||
+                CASE
+                    WHEN length((regexp_match("shipment_date", '^\s*\d{1,2}[-/]\d{1,2}[-/](\d{2,4})'))[1]) = 2
+                        THEN '20' || (regexp_match("shipment_date", '^\s*\d{1,2}[-/]\d{1,2}[-/](\d{2,4})'))[1]
+                    ELSE (regexp_match("shipment_date", '^\s*\d{1,2}[-/]\d{1,2}[-/](\d{2,4})'))[1]
+                END,
+                'DD/MM/YYYY')
+    END
+"""
+
+
 def _read_amazon_mp(item_head: str, month: int, year: int) -> dict:
     month_name = _MONTH_NAMES[month]
-    sql = """
+    sql = f"""
         SELECT
-            COALESCE(SUM("delivered_ltr"), 0) AS done_ltrs,
-            MAX(
-                CASE
-                    WHEN "shipment_date" ~ '^[0-9]{2}/[0-9]{2}/[0-9]{2}'
-                        THEN to_timestamp("shipment_date", 'DD/MM/YY HH24:MI')::date
-                    WHEN "shipment_date" ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}'
-                        THEN "shipment_date"::date
-                    WHEN "shipment_date" ~ '^[0-9]{2}-[0-9]{2}-[0-9]{4}'
-                        THEN to_date("shipment_date", 'DD-MM-YYYY')
-                    ELSE NULL
-                END
-            ) AS latest_date
+            -- GROSS litres (ABS): refunds (stored as negative qty) count as
+            -- positive delivered volume, matching the Amazon MP source sheet and
+            -- the MP detail dashboard (views.py _amazon_mp_dashboard_response).
+            COALESCE(SUM(ABS("delivered_ltr")), 0) AS done_ltrs,
+            MAX({_AMP_SHIPMENT_DT_SQL}) AS latest_date
         FROM "amazon_mp_master"
         WHERE UPPER(TRIM("item_head"::text)) = UPPER(TRIM(%s))
           AND UPPER(TRIM("shipment_month"::text)) = %s
@@ -429,18 +455,11 @@ def _read_amazon_mp_many(item_heads: tuple[str, ...], month: int, year: int) -> 
     sql = f"""
         SELECT
             UPPER(TRIM("item_head"::text)) AS item_head,
-            COALESCE(SUM("delivered_ltr"), 0) AS done_ltrs,
-            MAX(
-                CASE
-                    WHEN "shipment_date" ~ '^[0-9]{{2}}/[0-9]{{2}}/[0-9]{{2}}'
-                        THEN to_timestamp("shipment_date", 'DD/MM/YY HH24:MI')::date
-                    WHEN "shipment_date" ~ '^[0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}'
-                        THEN "shipment_date"::date
-                    WHEN "shipment_date" ~ '^[0-9]{{2}}-[0-9]{{2}}-[0-9]{{4}}'
-                        THEN to_date("shipment_date", 'DD-MM-YYYY')
-                    ELSE NULL
-                END
-            ) AS latest_date
+            -- GROSS litres (ABS): refunds (stored as negative qty) count as
+            -- positive delivered volume, matching the Amazon MP source sheet and
+            -- the MP detail dashboard (views.py _amazon_mp_dashboard_response).
+            COALESCE(SUM(ABS("delivered_ltr")), 0) AS done_ltrs,
+            MAX({_AMP_SHIPMENT_DT_SQL}) AS latest_date
         FROM "amazon_mp_master"
         WHERE UPPER(TRIM("item_head"::text)) IN ({item_placeholder})
           AND UPPER(TRIM("shipment_month"::text)) = %s
@@ -794,6 +813,12 @@ def primary_month_targets_refresh_platform(request, slug: str):
 
     body = request.data if request.data else request.query_params
     month, year = _parse_month_year_or_current(body)
+
+    # Amazon MP's done figures come from the amazon_mp_master SNAPSHOT, which only
+    # rebuilds on upload. A manual Refresh after a direct DB edit must rebuild it
+    # first, or it would just recompute from stale data. Best-effort; never raises.
+    if slug == "amazon_mp":
+        refresh_amazon_mp_master()
 
     with transaction.atomic():
         rows = _refresh_format_rows(fmt, month, year)
@@ -1346,6 +1371,12 @@ def primary_month_targets_dashboard(request):
 def primary_month_targets_refresh_all(request):
     body = request.data if request.data else request.query_params
     month, year = _parse_month_year_or_current(body)
+
+    # Rebuild the only materialized source feeding this dashboard — amazon_mp_master,
+    # behind the Amazon MP row — so a manual Refresh reflects direct DB edits, not
+    # just uploads. The other sources (master_po, amazon_sec_range_master_view,
+    # flipkart_secondary_all) are live views and need no rebuild. Never raises.
+    refresh_amazon_mp_master()
 
     row_defs = _dashboard_row_defs(request.user)
     formats = [d["format"] for d in row_defs]

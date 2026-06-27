@@ -36,7 +36,9 @@ from accounts.permissions import (
 )
 from config.perf_cache import cached_get
 
+from .master_po_refresh import refresh_amazon_mp_master
 from .models import PlatformConfig
+from .primary_monthly_targets import _AMP_SHIPMENT_DT_SQL
 
 
 # ─── Scope ───
@@ -754,24 +756,17 @@ def _read_amazon_mp_dashboard_many(
     sql = """
         SELECT
             UPPER(TRIM("item_head"::text)) AS item_head,
-            COALESCE(SUM("delivered_ltr"), 0) AS done_ltrs,
-            MAX(
-                CASE
-                    WHEN "shipment_date" ~ '^[0-9]{2}/[0-9]{2}/[0-9]{2}'
-                        THEN to_timestamp("shipment_date", 'DD/MM/YY HH24:MI')::date
-                    WHEN "shipment_date" ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}'
-                        THEN "shipment_date"::date
-                    WHEN "shipment_date" ~ '^[0-9]{2}-[0-9]{2}-[0-9]{4}'
-                        THEN to_date("shipment_date", 'DD-MM-YYYY')
-                    ELSE NULL
-                END
-            ) AS latest_date
+            -- GROSS litres (ABS): refunds (negative qty) count as positive
+            -- delivered volume, matching the Amazon MP source sheet and the MP
+            -- detail dashboard (views.py _amazon_mp_dashboard_response).
+            COALESCE(SUM(ABS("delivered_ltr")), 0) AS done_ltrs,
+            MAX(__DT__) AS latest_date
         FROM "amazon_mp_master"
         WHERE UPPER(TRIM("item_head"::text)) IN (__ITEMS__)
           AND UPPER(TRIM("shipment_month"::text)) = %s
           AND "shipment_year" = %s
         GROUP BY UPPER(TRIM("item_head"::text))
-    """.replace("__ITEMS__", item_placeholder)
+    """.replace("__DT__", _AMP_SHIPMENT_DT_SQL).replace("__ITEMS__", item_placeholder)
     with connection.cursor() as cur:
         cur.execute(sql, list(item_heads) + [month_name, year])
         rows = cur.fetchall()
@@ -1207,6 +1202,11 @@ def month_targets_refresh_all(request):
             "rows": [],
         })
 
+    # Amazon MP done figures come from the amazon_mp_master snapshot, which only
+    # rebuilds on upload — rebuild it so a manual Refresh reflects direct DB edits
+    # too. Best-effort; never raises. Other platforms read live sources.
+    refresh_amazon_mp_master()
+
     ordered_slugs = [slug for slug in IN_SCOPE_SLUGS if slug in allowed_slugs]
     platforms = {
         p.slug: p for p in PlatformConfig.objects.filter(slug__in=ordered_slugs)
@@ -1381,6 +1381,11 @@ def month_targets_refresh_platform(request, slug: str):
 
     body = request.data if request.data else request.query_params
     month, year = _parse_month_year_or_current(body)
+
+    # Rebuild the Amazon MP snapshot before recomputing so a manual Refresh after a
+    # direct DB edit isn't read from stale data. Best-effort; never raises.
+    if slug == "amazon_mp":
+        refresh_amazon_mp_master()
 
     with transaction.atomic():
         rows = _refresh_platform_rows(slug, p, month, year)
