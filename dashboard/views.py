@@ -3882,3 +3882,498 @@ def bulk_update_primary_manual_fields(request, table_name: str):
         refresh_master_po_mv_async()
 
     return Response({"updated": updated, "rows": saved_rows})
+
+
+# ===========================================================================
+# Realise Dashboard — ₹/L realisation = delivered VALUE (exclusive of tax /
+# margin) ÷ delivered LITRES, split PREMIUM / COMMODITY. The data source is
+# chosen automatically PER PLATFORM (no manual toggle):
+#     amazon, amazon_mp, flipkart  → Secondary (sell-out) datasets
+#     everything else              → Primary master_po
+# The SQL mirrors the proven /category-breakdown & /category-trend queries but
+# carries the delivered VALUE alongside litres so the client can compute ₹/L.
+# ===========================================================================
+
+# Platforms whose Realise is read from the Secondary datasets.
+_REALISE_SECONDARY_PLATFORMS = {"amazon", "amazon_mp", "flipkart"}
+
+# Primary-sourced slug → master_po.format (UPPER). These read from master_po.
+_REALISE_PRIMARY_FORMAT = {
+    "blinkit": "BLINKIT",
+    "zepto": "ZEPTO",
+    "swiggy": "SWIGGY",
+    "bigbasket": "BIG BASKET",
+    "jiomart": "JIO MART",
+    "zomato": "ZOMATO",
+    "citymall": "CITY MALL",
+    "flipkart_grocery": "FLIPKART GROCERY",
+}
+
+
+def _realise_source_label(platform):
+    """'secondary' for amazon/amazon_mp/flipkart, 'primary' for the rest,
+    'mixed' when no platform is selected (all platforms combined)."""
+    if not platform:
+        return "mixed"
+    return "secondary" if platform in _REALISE_SECONDARY_PLATFORMS else "primary"
+
+
+def _realise_platform(request):
+    """Normalise ?platform= → a slug, or None for 'all'."""
+    p = (request.GET.get("platform") or "").strip().lower()
+    if not p or p in ("all", "overall", "total"):
+        return None
+    return p
+
+
+def _realise_group_expr(group_by, source):
+    """SQL column expression for a group_by key under a given source family
+    ('primary' = master_po, 'secmaster', 'amazon', 'amazon_mp'). Returns None
+    when that source can't group by the requested dimension."""
+    if not group_by:
+        return "''::text"
+    gb = group_by.strip().lower()
+    if source == "primary":
+        return {
+            "category": "COALESCE(NULLIF(TRIM(category::text), ''), 'Uncategorized')",
+            "sub_category": "COALESCE(NULLIF(TRIM(sub_category::text), ''), 'Uncategorized')",
+            "brand": "COALESCE(NULLIF(TRIM(brand::text), ''), 'Unbranded')",
+            "state": "COALESCE(NULLIF(TRIM(state::text), ''), 'Unknown')",
+            "sku": "COALESCE(NULLIF(TRIM(sku_name::text), ''), NULLIF(TRIM(sku_code::text), ''), 'Unknown')",
+        }.get(gb)
+    if source == "secmaster":
+        return {
+            "category": "COALESCE(NULLIF(TRIM(category::text), ''), 'Uncategorized')",
+            "sub_category": "COALESCE(NULLIF(TRIM(sub_category::text), ''), 'Uncategorized')",
+            "brand": "COALESCE(NULLIF(TRIM(brand::text), ''), 'Unbranded')",
+            "state": "COALESCE(NULLIF(TRIM(state::text), ''), 'Unknown')",
+        }.get(gb)
+    if source == "amazon":
+        return {
+            "category": "COALESCE(NULLIF(TRIM(ml.category::text), ''), 'Uncategorized')",
+            "sub_category": "COALESCE(NULLIF(TRIM(ml.sub_category::text), ''), 'Uncategorized')",
+            "brand": "COALESCE(NULLIF(TRIM(ml.brand::text), ''), 'Unbranded')",
+            "sku": "COALESCE(NULLIF(TRIM(b.asin::text), ''), 'Unknown')",
+        }.get(gb)
+    if source == "amazon_mp":
+        return {
+            "category": "COALESCE(NULLIF(TRIM(category::text), ''), 'Uncategorized')",
+            "sub_category": "COALESCE(NULLIF(TRIM(sub_category::text), ''), 'Uncategorized')",
+            "brand": "COALESCE(NULLIF(TRIM(brand::text), ''), 'Unbranded')",
+            "state": "COALESCE(NULLIF(TRIM(ship_to_state::text), ''), 'Unknown')",
+            "sku": "COALESCE(NULLIF(TRIM(asin::text), ''), 'Unknown')",
+        }.get(gb)
+    return None
+
+
+def _realise_aggregate(platform, month_num, year, group_by=None, filters=None):
+    """Core aggregation. Returns (data, errors) where:
+        data = { name: {"PREMIUM": [value, ltrs], "COMMODITY": [value, ltrs]} }
+    `name` is '' when group_by is None (a single overall bucket). Dispatches to
+    the right source(s) by platform; for 'all' it unions every source."""
+    filters = filters or {}
+    month_name = calendar.month_name[month_num].upper()
+    head_filter = (filters.get("item_head") or "").strip().upper() or None
+    if head_filter not in ("PREMIUM", "COMMODITY"):
+        head_filter = None
+    cat_filter = (filters.get("category") or "").strip().upper() or None
+    brand_filter = (filters.get("brand") or "").strip().upper() or None
+
+    if platform and platform in _REALISE_SECONDARY_PLATFORMS:
+        primary_formats, secondary = [], [platform]
+    elif platform:
+        primary_formats = [_REALISE_PRIMARY_FORMAT.get(platform, platform.replace("_", " ").upper())]
+        secondary = []
+    else:  # all platforms
+        primary_formats = list(_REALISE_PRIMARY_FORMAT.values())
+        secondary = list(_REALISE_SECONDARY_PLATFORMS)
+
+    data = {}
+    errors = []
+
+    def absorb(rows):
+        for name, head_val, value, ltrs in rows:
+            head = str(head_val).strip().upper() if head_val else ""
+            if head not in ("PREMIUM", "COMMODITY"):
+                continue
+            key = str(name).strip() if name is not None else ""
+            slot = data.setdefault(key, {"PREMIUM": [0.0, 0.0], "COMMODITY": [0.0, 0.0]})
+            slot[head][0] += float(value or 0)
+            slot[head][1] += float(ltrs or 0)
+
+    def run(label, sql, params):
+        try:
+            cur.execute(sql, params)
+            absorb(cur.fetchall())
+        except Exception as e:  # noqa: BLE001
+            errors.append({"source": label, "error": str(e)})
+
+    with connection.cursor() as cur:
+        # ---- PRIMARY: master_po -------------------------------------------
+        if primary_formats:
+            grp = _realise_group_expr(group_by, "primary")
+            if grp is None:
+                errors.append({"source": "master_po", "error": f"group_by '{group_by}' unsupported"})
+            else:
+                fmt_ph = ", ".join(["%s"] * len(primary_formats))
+                sql = f"""
+                    SELECT {grp} AS name, UPPER(TRIM(item_head::text)) AS head,
+                           COALESCE(SUM(total_delivered_amt_exclusive), 0) AS value,
+                           COALESCE(SUM(total_delivered_liters), 0) AS ltrs
+                    FROM public.master_po
+                    WHERE UPPER(TRIM(delivery_month::text)) = %s
+                      AND delivered_year = %s
+                      AND UPPER(TRIM(item_head::text)) IN ('PREMIUM', 'COMMODITY')
+                      AND UPPER(TRIM(format::text)) IN ({fmt_ph})
+                """
+                params = [month_name, year, *primary_formats]
+                if head_filter:
+                    sql += " AND UPPER(TRIM(item_head::text)) = %s"
+                    params.append(head_filter)
+                if cat_filter:
+                    sql += " AND UPPER(TRIM(category::text)) = %s"
+                    params.append(cat_filter)
+                if brand_filter:
+                    sql += " AND UPPER(TRIM(brand::text)) = %s"
+                    params.append(brand_filter)
+                sql += " GROUP BY 1, 2"
+                run("master_po", sql, params)
+
+        # ---- SECONDARY: one branch per secondary-routed platform ----------
+        for sp in secondary:
+            if sp == "flipkart":
+                grp = _realise_group_expr(group_by, "secmaster")
+                if grp is None:
+                    errors.append({"source": "SecMaster", "error": f"group_by '{group_by}' unsupported"})
+                    continue
+                sql = f"""
+                    SELECT {grp} AS name, UPPER(TRIM(item_head::text)) AS head,
+                           COALESCE(SUM(amount), 0) AS value,
+                           COALESCE(SUM(ltr_sold), 0) AS ltrs
+                    FROM "SecMaster"
+                    WHERE UPPER(TRIM(month::text)) = %s
+                      AND year::numeric = %s
+                      AND UPPER(TRIM(format::text)) = 'FLIPKART'
+                      AND UPPER(TRIM(item_head::text)) IN ('PREMIUM', 'COMMODITY')
+                """
+                params = [month_name, year]
+                if head_filter:
+                    sql += " AND UPPER(TRIM(item_head::text)) = %s"
+                    params.append(head_filter)
+                if cat_filter:
+                    sql += " AND UPPER(TRIM(category::text)) = %s"
+                    params.append(cat_filter)
+                if brand_filter:
+                    sql += " AND UPPER(TRIM(brand::text)) = %s"
+                    params.append(brand_filter)
+                sql += " GROUP BY 1, 2"
+                run("secmaster_flipkart", sql, params)
+
+            elif sp == "amazon_mp":
+                grp = _realise_group_expr(group_by, "amazon_mp")
+                if grp is None:
+                    errors.append({"source": "amazon_mp", "error": f"group_by '{group_by}' unsupported"})
+                    continue
+                sql = f"""
+                    SELECT {grp} AS name, UPPER(TRIM(item_head::text)) AS head,
+                           COALESCE(SUM(tax_exclusive_gross), 0) AS value,
+                           COALESCE(SUM(delivered_ltr), 0) AS ltrs
+                    FROM amazon_mp_master
+                    WHERE UPPER(TRIM(shipment_month::text)) = %s
+                      AND shipment_year = %s
+                      AND UPPER(TRIM(item_head::text)) IN ('PREMIUM', 'COMMODITY')
+                """
+                params = [month_name, year]
+                if head_filter:
+                    sql += " AND UPPER(TRIM(item_head::text)) = %s"
+                    params.append(head_filter)
+                if cat_filter:
+                    sql += " AND UPPER(TRIM(category::text)) = %s"
+                    params.append(cat_filter)
+                if brand_filter:
+                    sql += " AND UPPER(TRIM(brand::text)) = %s"
+                    params.append(brand_filter)
+                sql += " GROUP BY 1, 2"
+                run("amazon_mp", sql, params)
+
+            elif sp == "amazon":
+                grp = _realise_group_expr(group_by, "amazon")
+                if grp is None:
+                    errors.append({"source": "amazon_sec_range", "error": f"group_by '{group_by}' unsupported"})
+                    continue
+                # Latest cumulative monthly snapshot (max to_date day) joined to
+                # master_sheet for head/category/brand. value = shipped_revenue,
+                # litres = shipped_units * per_unit_value.
+                sql = f"""
+                    WITH ml AS (
+                        SELECT DISTINCT ON (format_sku_code)
+                               format_sku_code, item_head, category, sub_category,
+                               brand, per_unit_value
+                        FROM master_sheet
+                        WHERE format_sku_code IS NOT NULL AND format_sku_code::text <> ''
+                        ORDER BY format_sku_code
+                    ),
+                    base AS (
+                        SELECT r.asin,
+                               COALESCE(r.shipped_units, 0) AS units,
+                               COALESCE(r.shipped_revenue, 0) AS revenue,
+                               EXTRACT(DAY FROM r.to_date)::int AS to_day
+                        FROM amazon_sec_range r
+                        WHERE EXTRACT(YEAR FROM r.from_date) = %s
+                          AND UPPER(to_char(r.from_date, 'FMMonth')) = %s
+                    ),
+                    latest AS (SELECT MAX(to_day) AS md FROM base)
+                    SELECT {grp} AS name, UPPER(TRIM(ml.item_head::text)) AS head,
+                           COALESCE(SUM(b.revenue), 0) AS value,
+                           COALESCE(SUM(b.units * COALESCE(ml.per_unit_value::numeric, 0)), 0) AS ltrs
+                    FROM base b
+                    CROSS JOIN latest l
+                    JOIN ml ON UPPER(TRIM(ml.format_sku_code::text)) = UPPER(TRIM(b.asin::text))
+                    WHERE b.to_day = l.md
+                      AND UPPER(TRIM(ml.item_head::text)) IN ('PREMIUM', 'COMMODITY')
+                """
+                params = [year, month_name]
+                if head_filter:
+                    sql += " AND UPPER(TRIM(ml.item_head::text)) = %s"
+                    params.append(head_filter)
+                if cat_filter:
+                    sql += " AND UPPER(TRIM(ml.category::text)) = %s"
+                    params.append(cat_filter)
+                if brand_filter:
+                    sql += " AND UPPER(TRIM(ml.brand::text)) = %s"
+                    params.append(brand_filter)
+                sql += " GROUP BY 1, 2"
+                run("amazon_sec_range", sql, params)
+
+    return data, errors
+
+
+def _realise_totals(data):
+    """Collapse a {name: {head: [value, ltrs]}} dict into a single overall
+    {value, ltrs, premium:{...}, commodity:{...}} block."""
+    p_val = p_ltr = c_val = c_ltr = 0.0
+    for slot in data.values():
+        p_val += slot["PREMIUM"][0]
+        p_ltr += slot["PREMIUM"][1]
+        c_val += slot["COMMODITY"][0]
+        c_ltr += slot["COMMODITY"][1]
+    return {
+        "value": round(p_val + c_val, 2),
+        "ltrs": round(p_ltr + c_ltr, 2),
+        "premium": {"value": round(p_val, 2), "ltrs": round(p_ltr, 2)},
+        "commodity": {"value": round(c_val, 2), "ltrs": round(c_ltr, 2)},
+    }
+
+
+def _realise_prev_month(month_num, year):
+    return (12, year - 1) if month_num == 1 else (month_num - 1, year)
+
+
+def _realise_month_year(request):
+    today = date.today()
+    try:
+        month_num = int(request.GET.get("month") or today.month)
+    except (TypeError, ValueError):
+        month_num = today.month
+    try:
+        year = int(request.GET.get("year") or today.year)
+    except (TypeError, ValueError):
+        year = today.year
+    if not 1 <= month_num <= 12:
+        month_num = today.month
+    return month_num, year
+
+
+def _realise_filters(request):
+    return {
+        "item_head": request.GET.get("item_head") or request.GET.get("head"),
+        "category": request.GET.get("category"),
+        "brand": request.GET.get("brand"),
+    }
+
+
+@api_view(["GET"])
+@permission_classes([require("dashboard.view")])
+@cached_get(timeout=120, prefix="dash.realise_overview", shared=True)
+def realise_overview(request):
+    """Row-1 KPI totals: overall / premium / commodity value+litres for the
+    selected month and the previous month (for MoM deltas)."""
+    platform = _realise_platform(request)
+    month_num, year = _realise_month_year(request)
+    filters = _realise_filters(request)
+
+    cur_data, cur_err = _realise_aggregate(platform, month_num, year, None, filters)
+    pm, py = _realise_prev_month(month_num, year)
+    prev_data, prev_err = _realise_aggregate(platform, pm, py, None, filters)
+
+    return Response({
+        "platform": platform,
+        "source": _realise_source_label(platform),
+        "month": month_num,
+        "year": year,
+        "current": _realise_totals(cur_data),
+        "previous": _realise_totals(prev_data),
+        "errors": cur_err + prev_err,
+    })
+
+
+@api_view(["GET"])
+@permission_classes([require("dashboard.view")])
+@cached_get(timeout=120, prefix="dash.realise_breakdown", shared=True)
+def realise_breakdown(request):
+    """Grouped realise rows. ?group_by=category|sub_category|brand|sku|state."""
+    platform = _realise_platform(request)
+    month_num, year = _realise_month_year(request)
+    filters = _realise_filters(request)
+    group_by = (request.GET.get("group_by") or "category").strip().lower()
+    allowed = {"category", "sub_category", "brand", "sku", "state"}
+    if group_by not in allowed:
+        group_by = "category"
+
+    data, errors = _realise_aggregate(platform, month_num, year, group_by, filters)
+
+    rows = []
+    for name, slot in data.items():
+        p_val, p_ltr = slot["PREMIUM"]
+        c_val, c_ltr = slot["COMMODITY"]
+        rows.append({
+            "name": name or "Uncategorized",
+            "value": round(p_val + c_val, 2),
+            "ltrs": round(p_ltr + c_ltr, 2),
+            "premium": {"value": round(p_val, 2), "ltrs": round(p_ltr, 2)},
+            "commodity": {"value": round(c_val, 2), "ltrs": round(c_ltr, 2)},
+        })
+    rows.sort(key=lambda r: r["ltrs"], reverse=True)
+    total_ltrs = round(sum(r["ltrs"] for r in rows), 2)
+    total_value = round(sum(r["value"] for r in rows), 2)
+
+    return Response({
+        "platform": platform,
+        "source": _realise_source_label(platform),
+        "group_by": group_by,
+        "month": month_num,
+        "year": year,
+        "rows": rows,
+        "total": {"value": total_value, "ltrs": total_ltrs},
+        "errors": errors,
+    })
+
+
+@api_view(["GET"])
+@permission_classes([require("dashboard.view")])
+@cached_get(timeout=120, prefix="dash.realise_trend", shared=True)
+def realise_trend(request):
+    """Trailing-N-month realise series (overall + premium + commodity), for the
+    MoM line and the premium/commodity mix chart. month/year is the window end."""
+    platform = _realise_platform(request)
+    end_month, end_year = _realise_month_year(request)
+    filters = _realise_filters(request)
+    try:
+        n_months = int(request.GET.get("months") or 12)
+    except (TypeError, ValueError):
+        n_months = 12
+    n_months = max(1, min(n_months, 24))
+
+    window = _trailing_months(end_month, end_year, n_months)
+    series = []
+    errors = []
+    for (m, y, _name) in window:
+        data, err = _realise_aggregate(platform, m, y, None, filters)
+        errors.extend(err)
+        t = _realise_totals(data)
+        series.append({
+            "month": m,
+            "year": y,
+            "label": f"{calendar.month_abbr[m]} '{str(y)[2:]}",
+            "value": t["value"],
+            "ltrs": t["ltrs"],
+            "premium": t["premium"],
+            "commodity": t["commodity"],
+        })
+
+    return Response({
+        "platform": platform,
+        "source": _realise_source_label(platform),
+        "months": n_months,
+        "series": series,
+        "errors": errors,
+    })
+
+
+@api_view(["GET"])
+@permission_classes([require("dashboard.view")])
+@cached_get(timeout=120, prefix="dash.realise_waterfall", shared=True)
+def realise_waterfall(request):
+    """Per-litre realise bridge (Primary platforms only): gross (inclusive) →
+    tax & margin → distributor commission → net realise. Secondary platforms
+    have no margin/commission ledger, so this returns available=False there."""
+    platform = _realise_platform(request)
+    month_num, year = _realise_month_year(request)
+    filters = _realise_filters(request)
+
+    # Only the Primary (master_po) source carries the margin / commission ledger.
+    if platform and platform in _REALISE_SECONDARY_PLATFORMS:
+        return Response({
+            "platform": platform, "source": "secondary",
+            "available": False, "month": month_num, "year": year,
+        })
+
+    if platform:
+        formats = [_REALISE_PRIMARY_FORMAT.get(platform, platform.replace("_", " ").upper())]
+    else:
+        formats = list(_REALISE_PRIMARY_FORMAT.values())
+
+    month_name = calendar.month_name[month_num].upper()
+    head_filter = (filters.get("item_head") or "").strip().upper()
+    cat_filter = (filters.get("category") or "").strip().upper()
+    fmt_ph = ", ".join(["%s"] * len(formats))
+    sql = f"""
+        SELECT COALESCE(SUM(total_deliver_amt_inclusive), 0) AS inclusive,
+               COALESCE(SUM(total_delivered_amt_exclusive), 0) AS exclusive,
+               COALESCE(SUM(total_delivered_amt_without_margin), 0) AS without_margin,
+               COALESCE(SUM(total_distributor_commission), 0) AS commission,
+               COALESCE(SUM(total_delivered_liters), 0) AS ltrs
+        FROM public.master_po
+        WHERE UPPER(TRIM(delivery_month::text)) = %s
+          AND delivered_year = %s
+          AND UPPER(TRIM(item_head::text)) IN ('PREMIUM', 'COMMODITY')
+          AND UPPER(TRIM(format::text)) IN ({fmt_ph})
+    """
+    params = [month_name, year, *formats]
+    if head_filter in ("PREMIUM", "COMMODITY"):
+        sql += " AND UPPER(TRIM(item_head::text)) = %s"
+        params.append(head_filter)
+    if cat_filter:
+        sql += " AND UPPER(TRIM(category::text)) = %s"
+        params.append(cat_filter)
+
+    errors = []
+    row = None
+    try:
+        with connection.cursor() as cur:
+            cur.execute(sql, params)
+            row = cur.fetchone()
+    except Exception as e:  # noqa: BLE001
+        errors.append({"source": "master_po", "error": str(e)})
+
+    inclusive, exclusive, without_margin, commission, ltrs = (
+        [float(v or 0) for v in row] if row else [0.0] * 5
+    )
+    per = (lambda v: round(v / ltrs, 2)) if ltrs else (lambda v: 0.0)
+
+    return Response({
+        "platform": platform,
+        "source": "primary",
+        "available": ltrs > 0,
+        "month": month_num,
+        "year": year,
+        "ltrs": round(ltrs, 2),
+        # Per-litre bridge steps.
+        "gross_rate": per(inclusive),
+        "tax_and_margin": per(inclusive - exclusive),
+        "commission": per(commission),
+        "net_realise": per(exclusive - commission),
+        # Headline realise (exclusive ÷ litres) for cross-checking the KPI.
+        "realise_exclusive": per(exclusive),
+        "errors": errors,
+    })
