@@ -86,6 +86,32 @@ def _normalised_format(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", (value or "").lower())
 
 
+def _parse_formats(raw: str) -> list[str]:
+    """Split a comma-separated platform filter into distinct normalised formats.
+
+    The UI may send one platform ("BIG BASKET") or several ("BLINKIT,ZEPTO")
+    when the user multi-selects. Blank/duplicate entries are dropped; order is
+    preserved so the generated IN-clause params are stable."""
+    seen: list[str] = []
+    for part in (raw or "").split(","):
+        norm = _normalised_format(part)
+        if norm and norm not in seen:
+            seen.append(norm)
+    return seen
+
+
+def _format_filter(col: str, formats: list[str]) -> tuple[str, list]:
+    """Build a normalised platform WHERE fragment + params for one or many formats.
+
+    A single format keeps the original `= %s` shape; multiple formats become an
+    `IN (%s, %s, ...)` over the same REGEXP_REPLACE-normalised column expression."""
+    expr = f"REGEXP_REPLACE(LOWER(TRIM(\"{col}\"::text)), '[^a-z0-9]+', '', 'g')"
+    if len(formats) == 1:
+        return f"{expr} = %s", [formats[0]]
+    placeholders = ", ".join(["%s"] * len(formats))
+    return f"{expr} IN ({placeholders})", list(formats)
+
+
 # xlsx hard cap is 1,048,576 rows (incl. the header) — stay safely under it.
 EXPORT_MAX_ROWS = 1_000_000
 
@@ -102,15 +128,16 @@ def _coerce(v):
 
 
 def _build_filters(catalog, fmt, date_from, date_to):
-    """WHERE clause + params from the platform/date filters (shared by raw+export)."""
+    """WHERE clause + params from the platform/date filters (shared by raw+export).
+
+    `fmt` may be a single platform or a comma-separated list (multi-select)."""
     where_parts: list[str] = []
     params: list = []
-    if fmt and catalog["format_column"]:
-        col = catalog["format_column"]
-        where_parts.append(
-            f"REGEXP_REPLACE(LOWER(TRIM(\"{col}\"::text)), '[^a-z0-9]+', '', 'g') = %s"
-        )
-        params.append(_normalised_format(fmt))
+    formats = _parse_formats(fmt)
+    if formats and catalog["format_column"]:
+        frag, frag_params = _format_filter(catalog["format_column"], formats)
+        where_parts.append(frag)
+        params.extend(frag_params)
     if catalog["date_column"]:
         date_expr = catalog.get("date_expr") or f'("{catalog["date_column"]}")::date'
         if date_from:
@@ -225,12 +252,11 @@ def report_raw(request):
     params: list = []
 
     fmt = (request.query_params.get("platform") or request.query_params.get("fmt") or "").strip()
-    if fmt and catalog["format_column"]:
-        col = catalog["format_column"]
-        where_parts.append(
-            f"REGEXP_REPLACE(LOWER(TRIM(\"{col}\"::text)), '[^a-z0-9]+', '', 'g') = %s"
-        )
-        params.append(_normalised_format(fmt))
+    formats = _parse_formats(fmt)
+    if formats and catalog["format_column"]:
+        frag, frag_params = _format_filter(catalog["format_column"], formats)
+        where_parts.append(frag)
+        params.extend(frag_params)
 
     date_from = (request.query_params.get("date_from") or "").strip()
     date_to = (request.query_params.get("date_to") or "").strip()
