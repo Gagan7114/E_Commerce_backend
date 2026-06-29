@@ -6,6 +6,7 @@ from uploads.views import (
     PRIMARY_PO_JIVO_ONLY_TABLES,
     _default_blank_status_to_pending,
     _filter_primary_jivo_rows,
+    _restore_precise_landing_rate,
     _row_mentions_jivo,
 )
 
@@ -70,3 +71,59 @@ class BlankStatusToPendingTests(SimpleTestCase):
         n = _default_blank_status_to_pending(rows)
         self.assertEqual(n, 0)
         self.assertEqual([r["status"] for r in rows], ["EXPIRED", "COMPLETED", "PENDING"])
+
+
+class RestorePreciseLandingRateTests(SimpleTestCase):
+    """A landing_rate pre-rounded to a whole rupee is restored to basic_rate x GST
+    when (and only when) exactly one standard slab reproduces the rounded value."""
+
+    def test_rounded_gst_value_is_restored(self):
+        # Real City Mall PO-1420772 lines: basic x 1.05, file-rounded to a rupee.
+        rows = [
+            {"sku_code": "A", "basic_rate": "137.14", "landing_rate": "144"},
+            {"sku_code": "B", "basic_rate": "150.48", "landing_rate": "158"},
+            {"sku_code": "C", "basic_rate": "761.9", "landing_rate": "800"},
+        ]
+        n = _restore_precise_landing_rate(rows)
+        self.assertEqual(n, 3)
+        self.assertEqual(
+            [r["landing_rate"] for r in rows],
+            ["143.9970", "158.0040", "799.9950"],
+        )
+
+    def test_18_percent_slab_is_detected(self):
+        rows = [{"sku_code": "A", "basic_rate": "137.14", "landing_rate": "162"}]
+        n = _restore_precise_landing_rate(rows)
+        self.assertEqual(n, 1)
+        self.assertEqual(rows[0]["landing_rate"], "161.8252")
+
+    def test_already_decimal_rate_is_untouched(self):
+        rows = [{"sku_code": "A", "basic_rate": "150.48", "landing_rate": "158.004"}]
+        n = _restore_precise_landing_rate(rows)
+        self.assertEqual(n, 0)
+        self.assertEqual(rows[0]["landing_rate"], "158.004")
+
+    def test_margin_ratio_is_untouched(self):
+        # x1.40 is a margin markup, not a GST slab — must be left as-is.
+        rows = [{"sku_code": "A", "basic_rate": "100", "landing_rate": "140"}]
+        n = _restore_precise_landing_rate(rows)
+        self.assertEqual(n, 0)
+        self.assertEqual(rows[0]["landing_rate"], "140")
+
+    def test_exact_whole_rupee_gst_value_is_not_rewritten(self):
+        # basic 200 x 1.05 = 210 exactly: already precise, nothing to change.
+        rows = [{"sku_code": "A", "basic_rate": "200", "landing_rate": "210"}]
+        n = _restore_precise_landing_rate(rows)
+        self.assertEqual(n, 0)
+        self.assertEqual(rows[0]["landing_rate"], "210")
+
+    def test_missing_or_zero_inputs_are_skipped(self):
+        rows = [
+            {"sku_code": "A", "basic_rate": "100"},                       # no landing_rate
+            {"sku_code": "B", "landing_rate": "105"},                     # no basic_rate
+            {"sku_code": "C", "basic_rate": "0", "landing_rate": "0"},    # zero basic
+            {"sku_code": "D", "basic_rate": "", "landing_rate": "144"},   # blank basic
+        ]
+        n = _restore_precise_landing_rate(rows)
+        self.assertEqual(n, 0)
+        self.assertNotIn("landing_rate", rows[0])

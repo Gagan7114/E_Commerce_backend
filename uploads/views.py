@@ -14,7 +14,7 @@ Returns: {"success": N, "failed": M, "error": "..." | null}
 from __future__ import annotations
 
 from datetime import date, datetime
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_UP
 from difflib import SequenceMatcher
 import logging
 import re
@@ -161,6 +161,20 @@ PRIMARY_PO_JIVO_ONLY_TABLES = frozenset({"total_po", "total_po_zbs"})
 # Brands accepted into the primary PO tables, matched case-insensitively as a
 # substring of sku_name (e.g. "Jivo - Canola Refined Oil", "Sano - Pomace Olive Oil").
 PRIMARY_PO_ACCEPTED_BRANDS = ("jivo", "sano")
+
+# Standard GST multipliers (1 + rate) used to restore a precise landing_rate when
+# a platform PO file ships it pre-rounded to a whole rupee (e.g. City Mall stores
+# 144 where basic_rate 137.14 x 1.05 = 143.997). On ingest we only override the
+# rounded value when exactly one of these slabs, applied to basic_rate and rounded
+# to the nearest rupee, reproduces the file's value — so margin-based ratios
+# (e.g. x1.40) and already-decimal rates are left untouched. See
+# _restore_precise_landing_rate.
+PRIMARY_PO_GST_MULTIPLIERS = (
+    Decimal("1.05"),
+    Decimal("1.12"),
+    Decimal("1.18"),
+    Decimal("1.28"),
+)
 
 # Maps an upload table to the column(s) a date-range delete filters on. A plain
 # string is a single date column; a (start, end) tuple is for sources whose rows
@@ -1522,6 +1536,48 @@ def _default_blank_status_to_pending(data: list[dict]) -> int:
     return count
 
 
+def _restore_precise_landing_rate(data: list[dict]) -> int:
+    """Restore the full-precision landing_rate when a file shipped it pre-rounded.
+
+    Some platform PO exports (e.g. City Mall) store landing_rate already rounded
+    to a whole rupee, so the downstream amount (order_qty x landing_rate) drifts a
+    few rupees from the source sheet, which keeps the exact basic_rate x GST value.
+
+    For each row we only override the value when it is provably a rounded GST
+    figure: landing_rate is a whole number and exactly ONE standard GST slab
+    (PRIMARY_PO_GST_MULTIPLIERS), applied to basic_rate and rounded to the nearest
+    rupee, reproduces it. That proves the slab, so we replace the rounded value
+    with basic_rate x slab. Rows that already carry decimals, margin-based ratios
+    that no slab reproduces (e.g. x1.40), or ambiguous matches are left untouched.
+    Returns the number of rows whose landing_rate was made precise.
+    """
+    count = 0
+    for row in data:
+        if "landing_rate" not in row or "basic_rate" not in row:
+            continue
+        basic = _as_decimal(row.get("basic_rate"), default=None)
+        landing = _as_decimal(row.get("landing_rate"), default=None)
+        if basic is None or landing is None or basic <= 0:
+            continue
+        # Only act on a value the file rounded to a whole rupee; decimals are
+        # already precise and must not be touched.
+        if landing != landing.to_integral_value():
+            continue
+        matches = []
+        for slab in PRIMARY_PO_GST_MULTIPLIERS:
+            precise = basic * slab
+            if precise.to_integral_value(rounding=ROUND_HALF_UP) == landing:
+                matches.append(precise)
+        if len(matches) != 1:
+            continue
+        precise = matches[0].quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
+        if precise == landing:
+            continue
+        row["landing_rate"] = str(precise)
+        count += 1
+    return count
+
+
 def _validate_primary_upload_format(table: str, data: list[dict], expected_format: str | None):
     if table not in PRIMARY_UPLOAD_TABLES or not expected_format:
         return None
@@ -2043,6 +2099,15 @@ def _batch_upload(body, *, forced_table: str | None = None):
             logger.info(
                 "Defaulted %s blank-status row(s) to PENDING on %s upload",
                 defaulted_pending_status, table,
+            )
+        # Some PO files (e.g. City Mall) ship landing_rate pre-rounded to a whole
+        # rupee, which drifts the derived amount from the source sheet. Restore the
+        # precise basic_rate x GST value where it can be proven (see helper).
+        restored_landing_rates = _restore_precise_landing_rate(data)
+        if restored_landing_rates:
+            logger.info(
+                "Restored precise landing_rate on %s row(s) for %s upload",
+                restored_landing_rates, table,
             )
 
     if upsert and table in UPLOAD_FORCED_UNIQUE_KEYS:
