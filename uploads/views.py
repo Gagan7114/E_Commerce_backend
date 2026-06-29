@@ -224,6 +224,12 @@ _SECMASTER_SOURCE_TABLES = frozenset({
     "swiggySec", "bigbasketSec", "jiomartSec", "flipkartSec",
     "zeptoSec", "blinkitSec", "master_sheet", "monthly_landing_rate",
 })
+# Tables feeding the Blinkit/Swiggy ads-master matviews (uploads migration 0060):
+# the raw ads rows, the campaign -> SKU bridge, and the SKU master (for item /
+# category / per-litre enrichment).
+_ADS_MASTER_SOURCE_TABLES = frozenset({
+    "blinkit_ads", "swiggy_ads", "ads_master_bs", "master_sheet",
+})
 
 # Serializes background refreshes so two near-simultaneous uploads don't run
 # REFRESH concurrently (the later one includes the earlier's rows, so the final
@@ -232,18 +238,20 @@ _MATVIEW_REFRESH_LOCK = threading.Lock()
 
 
 def _refresh_matviews_async(
-    do_master_po: bool, do_amazon_mp: bool, do_secmaster: bool = False
+    do_master_po: bool, do_amazon_mp: bool, do_secmaster: bool = False,
+    do_ads_master: bool = False,
 ) -> None:
     """Refresh the dashboard matviews OFF the request thread so the upload
     responds immediately. The matviews still refresh (REFRESH recomputes the
     same rows — no data is changed or dropped); only the wait moves off the
     upload's response. The dashboard reflects the upload a few seconds later."""
-    if not (do_master_po or do_amazon_mp or do_secmaster):
+    if not (do_master_po or do_amazon_mp or do_secmaster or do_ads_master):
         return
 
     def _worker():
         from django.db import connection
         from platforms.master_po_refresh import (
+            refresh_ads_master_mvs,
             refresh_amazon_mp_master,
             refresh_master_po_mv,
             refresh_secmaster_mv,
@@ -257,6 +265,9 @@ def _refresh_matviews_async(
                 if do_secmaster:
                     # ~10s rebuild for DRR / Secondary / Summary dashboards.
                     refresh_secmaster_mv()
+                if do_ads_master:
+                    # Blinkit / Swiggy ADS dashboards.
+                    refresh_ads_master_mvs()
                 # The matviews are now fresh. Clear the cache AGAIN: a dashboard
                 # read that raced in before this refresh finished would have
                 # cached a stale response (TTL 60s) — drop it so the next read
@@ -289,8 +300,9 @@ def _clear_upload_dependent_cache(table: str | None = None) -> None:
     do_master_po = table is None or table in _MASTER_PO_SOURCE_TABLES
     do_amazon_mp = table is None or table in _AMAZON_MP_SOURCE_TABLES
     do_secmaster = table is None or table in _SECMASTER_SOURCE_TABLES
+    do_ads_master = table is None or table in _ADS_MASTER_SOURCE_TABLES
     try:
-        _refresh_matviews_async(do_master_po, do_amazon_mp, do_secmaster)
+        _refresh_matviews_async(do_master_po, do_amazon_mp, do_secmaster, do_ads_master)
     except Exception:  # noqa: BLE001 - scheduling must never break an upload
         logger.exception("Failed to schedule dashboard matview refresh")
 

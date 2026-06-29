@@ -162,6 +162,36 @@ def refresh_secmaster_mv_async() -> None:
     ).start()
 
 
+# Separate lock for the ads-master matviews (blinkit_ads_master_mv /
+# swiggy_ads_master_mv from uploads migration 0060), so ads uploads coalesce
+# without blocking the master_po / secmaster refreshes.
+_ADS_MASTER_REFRESH_LOCK = threading.Lock()
+
+
+def refresh_ads_master_mvs() -> bool:
+    """Refresh blinkit_ads_master_mv / swiggy_ads_master_mv if present.
+
+    Both are materialized copies (uploads migration 0060) of views whose per-row
+    LATERAL join is too expensive to recompute on every dashboard read. Their
+    sources (blinkit_ads / swiggy_ads / ads_master_bs / master_sheet) only change
+    on upload, so refreshing after uploads keeps the dashboards current while
+    making every read a cheap table scan. Best-effort; never raises. Returns True
+    if at least one matview was refreshed."""
+    refreshed = False
+    for mv in ("public.blinkit_ads_master_mv", "public.swiggy_ads_master_mv"):
+        try:
+            with connection.cursor() as cur:
+                cur.execute("SELECT to_regclass(%s)", [mv])
+                if cur.fetchone()[0] is None:
+                    # Migration 0060 not applied yet -> nothing to refresh.
+                    continue
+                cur.execute(f"REFRESH MATERIALIZED VIEW {mv}")
+            refreshed = True
+        except Exception:  # noqa: BLE001 - a refresh failure must not break callers
+            logger.exception("Failed to refresh %s", mv)
+    return refreshed
+
+
 def refresh_amazon_mp_master() -> bool:
     """Refresh public.amazon_mp_master if it's a materialized view (migration
     0041). Best-effort; never raises.
