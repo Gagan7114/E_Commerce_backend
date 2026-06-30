@@ -6,6 +6,11 @@ urlpatterns = [
     # Cross-platform dashboard — registered before the <slug:slug> routes so
     # "month-targets" isn't matched as a platform slug.
     path(
+        "ads-summary",
+        views.marketing_ads_summary,
+        name="marketing-ads-summary",
+    ),
+    path(
         "month-targets/dashboard",
         monthly_targets.month_targets_dashboard,
         name="month-targets-dashboard",

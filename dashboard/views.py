@@ -3689,10 +3689,11 @@ def _manual_decimal_value(value):
 def _clean_primary_manual_updates(updates: dict, expected_format: str = "") -> dict:
     cleaned = {}
     normalized_format = str(expected_format or "").strip().upper()
-    # Status (like remark) is editable on every primary format in the UI, so
-    # allow it for all formats — not only the CITY MALL / FLIPKART GROCERY
-    # "full manual" ones. GRN date / delivered qty stay restricted to those.
-    allowed_columns = set(PRIMARY_REMARK_UPDATE_COLUMNS) | {"status"}
+    # Status and PO expiry date (like remark) are editable on every primary
+    # format in the UI, so allow them for all formats — not only the CITY MALL /
+    # FLIPKART GROCERY "full manual" ones. GRN date / delivered qty stay
+    # restricted to those.
+    allowed_columns = set(PRIMARY_REMARK_UPDATE_COLUMNS) | {"status", "po_expiry_date"}
     if normalized_format in PRIMARY_MANUAL_FULL_UPDATE_FORMATS:
         allowed_columns.update(PRIMARY_MANUAL_FULL_UPDATE_COLUMNS)
     for raw_col, raw_value in updates.items():
@@ -3701,7 +3702,7 @@ def _clean_primary_manual_updates(updates: dict, expected_format: str = "") -> d
             continue
         if col == "remark":
             cleaned[col] = None if raw_value is None else str(raw_value).strip()
-        elif col == "grn_date":
+        elif col in ("grn_date", "po_expiry_date"):
             cleaned[col] = _manual_date_value(raw_value)
         elif col == "delivered_qty":
             cleaned[col] = _manual_decimal_value(raw_value)
@@ -3992,14 +3993,19 @@ def _realise_aggregate(platform, month_num, year, group_by=None, filters=None):
     errors = []
 
     def absorb(rows):
-        for name, head_val, value, ltrs in rows:
+        # Each row carries (name, head, delivered value, litres, distributor
+        # commission). Commission is the margin the distributor keeps — read
+        # directly from master_po (Primary) and derived for Amazon; sources
+        # without a commission ledger (flipkart, amazon_mp) send 0.
+        for name, head_val, value, ltrs, commission in rows:
             head = str(head_val).strip().upper() if head_val else ""
             if head not in ("PREMIUM", "COMMODITY"):
                 continue
             key = str(name).strip() if name is not None else ""
-            slot = data.setdefault(key, {"PREMIUM": [0.0, 0.0], "COMMODITY": [0.0, 0.0]})
+            slot = data.setdefault(key, {"PREMIUM": [0.0, 0.0, 0.0], "COMMODITY": [0.0, 0.0, 0.0]})
             slot[head][0] += float(value or 0)
             slot[head][1] += float(ltrs or 0)
+            slot[head][2] += float(commission or 0)
 
     def run(label, sql, params):
         try:
@@ -4019,7 +4025,8 @@ def _realise_aggregate(platform, month_num, year, group_by=None, filters=None):
                 sql = f"""
                     SELECT {grp} AS name, UPPER(TRIM(item_head::text)) AS head,
                            COALESCE(SUM(total_delivered_amt_exclusive), 0) AS value,
-                           COALESCE(SUM(total_delivered_liters), 0) AS ltrs
+                           COALESCE(SUM(total_delivered_liters), 0) AS ltrs,
+                           COALESCE(SUM(total_distributor_commission), 0) AS commission
                     FROM public.master_po
                     WHERE UPPER(TRIM(delivery_month::text)) = %s
                       AND delivered_year = %s
@@ -4049,7 +4056,8 @@ def _realise_aggregate(platform, month_num, year, group_by=None, filters=None):
                 sql = f"""
                     SELECT {grp} AS name, UPPER(TRIM(item_head::text)) AS head,
                            COALESCE(SUM(amount), 0) AS value,
-                           COALESCE(SUM(ltr_sold), 0) AS ltrs
+                           COALESCE(SUM(ltr_sold), 0) AS ltrs,
+                           0 AS commission
                     FROM "SecMaster"
                     WHERE UPPER(TRIM(month::text)) = %s
                       AND year::numeric = %s
@@ -4077,7 +4085,8 @@ def _realise_aggregate(platform, month_num, year, group_by=None, filters=None):
                 sql = f"""
                     SELECT {grp} AS name, UPPER(TRIM(item_head::text)) AS head,
                            COALESCE(SUM(tax_exclusive_gross), 0) AS value,
-                           COALESCE(SUM(delivered_ltr), 0) AS ltrs
+                           COALESCE(SUM(delivered_ltr), 0) AS ltrs,
+                           0 AS commission
                     FROM amazon_mp_master
                     WHERE UPPER(TRIM(shipment_month::text)) = %s
                       AND shipment_year = %s
@@ -4103,7 +4112,10 @@ def _realise_aggregate(platform, month_num, year, group_by=None, filters=None):
                     continue
                 # Latest cumulative monthly snapshot (max to_date day) joined to
                 # master_sheet for head/category/brand. value = shipped_revenue,
-                # litres = shipped_units * per_unit_value.
+                # litres = shipped_units * per_unit_value. Distributor commission
+                # mirrors amazon_sec_range_master_view: calculated_shipped_revenue
+                # (= ordered_revenue/ordered_units × shipped_units) × margin_rate,
+                # which equals calculated_shipped_revenue − shipped_revenue_after_margin.
                 sql = f"""
                     WITH ml AS (
                         SELECT DISTINCT ON (format_sku_code)
@@ -4117,6 +4129,8 @@ def _realise_aggregate(platform, month_num, year, group_by=None, filters=None):
                         SELECT r.asin,
                                COALESCE(r.shipped_units, 0) AS units,
                                COALESCE(r.shipped_revenue, 0) AS revenue,
+                               COALESCE(r.ordered_revenue, 0) AS ordered_revenue,
+                               COALESCE(r.ordered_units, 0) AS ordered_units,
                                EXTRACT(DAY FROM r.to_date)::int AS to_day
                         FROM amazon_sec_range r
                         WHERE EXTRACT(YEAR FROM r.from_date) = %s
@@ -4125,10 +4139,15 @@ def _realise_aggregate(platform, month_num, year, group_by=None, filters=None):
                     latest AS (SELECT MAX(to_day) AS md FROM base)
                     SELECT {grp} AS name, UPPER(TRIM(ml.item_head::text)) AS head,
                            COALESCE(SUM(b.revenue), 0) AS value,
-                           COALESCE(SUM(b.units * COALESCE(ml.per_unit_value::numeric, 0)), 0) AS ltrs
+                           COALESCE(SUM(b.units * COALESCE(ml.per_unit_value::numeric, 0)), 0) AS ltrs,
+                           COALESCE(SUM(
+                               (b.ordered_revenue / NULLIF(b.ordered_units, 0)) * b.units
+                               * (COALESCE(mg.margin_pct, 0) / 100.0)
+                           ), 0) AS commission
                     FROM base b
                     CROSS JOIN latest l
                     JOIN ml ON UPPER(TRIM(ml.format_sku_code::text)) = UPPER(TRIM(b.asin::text))
+                    LEFT JOIN amazon_sec_range_margins mg ON mg.asin = b.asin
                     WHERE b.to_day = l.md
                       AND UPPER(TRIM(ml.item_head::text)) IN ('PREMIUM', 'COMMODITY')
                 """
@@ -4234,18 +4253,20 @@ def realise_breakdown(request):
 
     rows = []
     for name, slot in data.items():
-        p_val, p_ltr = slot["PREMIUM"]
-        c_val, c_ltr = slot["COMMODITY"]
+        p_val, p_ltr, p_comm = slot["PREMIUM"]
+        c_val, c_ltr, c_comm = slot["COMMODITY"]
         rows.append({
             "name": name or "Uncategorized",
             "value": round(p_val + c_val, 2),
             "ltrs": round(p_ltr + c_ltr, 2),
+            "commission": round(p_comm + c_comm, 2),
             "premium": {"value": round(p_val, 2), "ltrs": round(p_ltr, 2)},
             "commodity": {"value": round(c_val, 2), "ltrs": round(c_ltr, 2)},
         })
     rows.sort(key=lambda r: r["ltrs"], reverse=True)
     total_ltrs = round(sum(r["ltrs"] for r in rows), 2)
     total_value = round(sum(r["value"] for r in rows), 2)
+    total_commission = round(sum(r["commission"] for r in rows), 2)
 
     return Response({
         "platform": platform,
@@ -4254,7 +4275,7 @@ def realise_breakdown(request):
         "month": month_num,
         "year": year,
         "rows": rows,
-        "total": {"value": total_value, "ltrs": total_ltrs},
+        "total": {"value": total_value, "ltrs": total_ltrs, "commission": total_commission},
         "errors": errors,
     })
 

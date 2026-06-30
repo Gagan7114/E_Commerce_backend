@@ -1791,6 +1791,153 @@ def _execute_batch_insert_rows(
     return results if tracks_upsert_counts else None
 
 
+# Zepto GRN sheets can list the SAME po_number + sku_code more than once — one
+# line per physical GRN receipt, each with its OWN unique GRN id (grn_code).
+# Only Zepto uses this multi-receipt model; every other platform keeps the
+# original update-in-place behaviour, so this is strictly format-scoped.
+ZEPTO_GRN_FORMAT = "ZEPTO"
+
+
+def _zepto_grn_line_match(row: dict, table_columns: set[str]) -> tuple[str | None, str]:
+    """Pick the column that pins a Zepto GRN line to its PO row.
+
+    The Zepto GRN export is PO + location level (no SKU column), so the SKU/rates
+    are pulled from the existing PO row by matching on this discriminator:
+    prefer sku_code when the sheet happens to carry it, else fall back to
+    location (e.g. 'KTPL-KOL-DRY-MH NEW'). Returns (column, value); column is
+    None when neither is available."""
+    sku = str(row.get("sku_code") or "").strip()
+    if sku and "sku_code" in table_columns:
+        return ("sku_code", sku)
+    loc = str(row.get("location") or "").strip()
+    if loc and "location" in table_columns:
+        return ("location", loc)
+    return (None, "")
+
+
+def _is_zepto_grn_code_row(target_table: str, row: dict, table_columns: set[str]) -> bool:
+    """True for a Zepto GRN line that carries its own unique GRN id + a line key.
+
+    These rows are stored one-per-unique-grn_code instead of being merged into
+    the single matching PO row. Requires the grn_code column to exist (migration
+    0061), the row to be Zepto with a grn_code, and a usable line discriminator
+    (sku_code or location)."""
+    if target_table != "total_po_zbs" or "grn_code" not in table_columns:
+        return False
+    if str(row.get("format") or "").strip().upper() != ZEPTO_GRN_FORMAT:
+        return False
+    if not str(row.get("grn_code") or "").strip():
+        return False
+    match_col, _ = _zepto_grn_line_match(row, table_columns)
+    return match_col is not None
+
+
+def _apply_zepto_grn_code_row(cur, target_table, row, column_types, table_columns) -> str:
+    """Upsert ONE Zepto GRN line keyed by (po_number, <line>, grn_code), where
+    <line> is the row's SKU or, for the PO+location level GRN export, its
+    location.
+
+      1) the exact grn_code is already stored -> update its grn_date/status/qty
+         (idempotent re-upload);
+      2) first GRN for this PO line            -> claim the existing grn_code-less
+         PO row so no orphan base row is left;
+      3) another unique grn_code               -> CLONE the PO line row (copying
+         the missing fields: sku_code, sku_name, order_qty, rates, ...) and
+         override only the GRN fields, so the new receipt becomes its own row;
+      4) no matching PO row exists yet         -> insert a minimal standalone row
+         so a GRN uploaded before its Primary PO isn't silently dropped.
+
+    Returns 'updated', 'created', or 'skipped'."""
+    qtable = _quote_ident(target_table)
+    po = str(row.get("po_number") or "").strip()
+    grn = str(row.get("grn_code") or "").strip()
+    match_col, match_val = _zepto_grn_line_match(row, table_columns)
+
+    row_for_write = dict(row)
+    # A GRN means the PO is fulfilled: default the status when the line omits it.
+    if (
+        "status" in table_columns
+        and str(row_for_write.get("grn_date") or "").strip()
+        and not str(row_for_write.get("status") or "").strip()
+    ):
+        row_for_write["status"] = PRIMARY_GRN_COMPLETED_STATUS
+    row_for_write["grn_code"] = grn
+
+    # Columns a GRN line writes onto a row (only those that exist + are present).
+    set_columns = [
+        c
+        for c in ("grn_date", "status", "delivered_qty", "grn_code")
+        if c in table_columns and (c == "grn_code" or c in row_for_write)
+    ]
+    assignments = ", ".join(f"{_quote_ident(c)} = %s" for c in set_columns)
+    set_values = _upload_row_values(row_for_write, set_columns, column_types)
+
+    match_ident = _quote_ident(match_col)
+    base_where = (
+        "LOWER(TRIM(t.po_number::text)) = %s "
+        f"AND LOWER(TRIM(t.{match_ident}::text)) = %s "
+        "AND UPPER(TRIM(t.format::text)) = %s"
+    )
+    base_values = [po.lower(), match_val.lower(), ZEPTO_GRN_FORMAT]
+    sub_where = base_where.replace("t.", "t2.")
+
+    # 1) Same GRN id already stored -> idempotent update.
+    cur.execute(
+        f"UPDATE {qtable} AS t SET {assignments} "
+        f"WHERE {base_where} AND LOWER(TRIM(COALESCE(t.grn_code::text, ''))) = %s",
+        [*set_values, *base_values, grn.lower()],
+    )
+    if cur.rowcount:
+        return "updated"
+
+    # 2) First GRN for this PO+SKU -> claim the existing grn_code-less PO row
+    #    (exactly one, picked by ctid) instead of inserting a duplicate.
+    cur.execute(
+        f"UPDATE {qtable} AS t SET {assignments} WHERE t.ctid = ("
+        f"  SELECT t2.ctid FROM {qtable} t2 "
+        f"  WHERE {sub_where} "
+        f"    AND NULLIF(TRIM(COALESCE(t2.grn_code::text, '')), '') IS NULL "
+        f"  LIMIT 1)",
+        [*set_values, *base_values],
+    )
+    if cur.rowcount:
+        return "updated"
+
+    # 3) Another unique GRN id -> clone a PO+SKU row, override only GRN fields.
+    insert_columns = [c for c in column_types if c != "id"]
+    override = dict(zip(set_columns, set_values))
+    select_exprs, insert_params = [], []
+    for c in insert_columns:
+        if c in override:
+            select_exprs.append("%s")
+            insert_params.append(override[c])
+        else:
+            select_exprs.append(f"t.{_quote_ident(c)}")
+    col_list = ", ".join(_quote_ident(c) for c in insert_columns)
+    cur.execute(
+        f"INSERT INTO {qtable} ({col_list}) "
+        f"SELECT {', '.join(select_exprs)} FROM {qtable} t WHERE t.ctid = ("
+        f"  SELECT t2.ctid FROM {qtable} t2 WHERE {sub_where} LIMIT 1)",
+        [*insert_params, *base_values],
+    )
+    if cur.rowcount:
+        return "created"
+
+    # 4) No matching PO row yet (GRN before its Primary PO) -> minimal row.
+    minimal = {"po_number": po, "grn_code": grn, "format": ZEPTO_GRN_FORMAT, match_col: match_val}
+    for c in ("grn_date", "status", "delivered_qty"):
+        if c in row_for_write:
+            minimal[c] = row_for_write[c]
+    minimal_columns = [c for c in minimal if c in table_columns]
+    placeholders = ", ".join(["%s"] * len(minimal_columns))
+    cur.execute(
+        f"INSERT INTO {qtable} ({', '.join(_quote_ident(c) for c in minimal_columns)}) "
+        f"VALUES ({placeholders})",
+        _upload_row_values(minimal, minimal_columns, column_types),
+    )
+    return "created" if cur.rowcount else "skipped"
+
+
 def _update_total_po_grn_dates(data: list[dict], target_table: str = "total_po") -> Response:
     """Update existing PO rows in a primary PO table from a lean GRN upload.
 
@@ -1830,33 +1977,45 @@ def _update_total_po_grn_dates(data: list[dict], target_table: str = "total_po")
             skipped += 1
             continue
 
-        key = (po_number.lower(), sku_code.lower())
+        # Zepto multi-receipt: a unique grn_code is its own row, so it joins the
+        # key and is NOT merged. Identical grn_code re-listed in one file is a
+        # true duplicate -> first wins. All other platforms keep merging by
+        # (po, sku) as before.
+        zepto_code = _is_zepto_grn_code_row(target_table, row, table_columns)
+        grn_code = str(row.get("grn_code") or "").strip().lower()
+        if zepto_code:
+            _, _disc = _zepto_grn_line_match(row, table_columns)
+            key = (po_number.lower(), _disc.lower(), grn_code)
+        else:
+            key = (po_number.lower(), sku_code.lower())
         existing = prepared.get(key)
         if existing is not None:
-            # The same PO+SKU can legitimately appear on several GRN lines: more
-            # than one lot, or a receipt line plus a debit-note / zero-qty
-            # adjustment line. Received qty is additive across those lines, so
-            # SUM delivered_qty rather than keeping a single line. Previously a
-            # later line overwrote the earlier one, so a 0-qty DN line silently
-            # wiped a real receipt (e.g. MBJPO71303 SKU 240878: 56 received + a
-            # 0-qty DN line -> stored 0, losing 14 L). Keep the first non-empty
-            # grn_date / status.
-            if "delivered_qty" in existing or "delivered_qty" in row:
-                total_qty = _grn_qty(existing.get("delivered_qty")) + _grn_qty(
-                    row.get("delivered_qty")
-                )
-                existing["delivered_qty"] = (
-                    str(int(total_qty)) if total_qty == int(total_qty) else str(total_qty)
-                )
-            for fld in ("grn_date", "status"):
-                if not str(existing.get(fld) or "").strip() and str(row.get(fld) or "").strip():
-                    existing[fld] = row[fld]
+            if not zepto_code:
+                # The same PO+SKU can legitimately appear on several GRN lines:
+                # more than one lot, or a receipt line plus a debit-note /
+                # zero-qty adjustment line. Received qty is additive across those
+                # lines, so SUM delivered_qty rather than keeping a single line.
+                # Previously a later line overwrote the earlier one, so a 0-qty DN
+                # line silently wiped a real receipt (e.g. MBJPO71303 SKU 240878:
+                # 56 received + a 0-qty DN line -> stored 0, losing 14 L). Keep
+                # the first non-empty grn_date / status.
+                if "delivered_qty" in existing or "delivered_qty" in row:
+                    total_qty = _grn_qty(existing.get("delivered_qty")) + _grn_qty(
+                        row.get("delivered_qty")
+                    )
+                    existing["delivered_qty"] = (
+                        str(int(total_qty)) if total_qty == int(total_qty) else str(total_qty)
+                    )
+                for fld in ("grn_date", "status"):
+                    if not str(existing.get(fld) or "").strip() and str(row.get(fld) or "").strip():
+                        existing[fld] = row[fld]
             skipped += 1
             continue
         prepared[key] = row
 
     success = 0
     updated = 0
+    created = 0
     failed = 0
     last_error: str | None = None
 
@@ -1864,6 +2023,21 @@ def _update_total_po_grn_dates(data: list[dict], target_table: str = "total_po")
         try:
             with transaction.atomic(), connection.cursor() as cur:
                 for row in prepared.values():
+                    # Zepto multi-receipt rows take the dedicated keyed upsert
+                    # (update existing grn_code / claim base row / clone-insert).
+                    if _is_zepto_grn_code_row(target_table, row, table_columns):
+                        outcome = _apply_zepto_grn_code_row(
+                            cur, target_table, row, column_types, table_columns
+                        )
+                        if outcome == "created":
+                            created += 1
+                            success += 1
+                        elif outcome == "updated":
+                            updated += 1
+                            success += 1
+                        else:
+                            skipped += 1
+                        continue
                     po_number = str(row.get("po_number") or "").strip()
                     sku_code = str(row.get("sku_code") or "").strip()
                     has_sku = bool(sku_code)
@@ -1961,13 +2135,13 @@ def _update_total_po_grn_dates(data: list[dict], target_table: str = "total_po")
             last_error = str(exc)
 
     skipped += max(0, len(prepared) - success)
-    if updated:
+    if updated or created:
         _clear_upload_dependent_cache(target_table)
 
     return Response(
         {
             "success": success,
-            "created": 0,
+            "created": created,
             "updated": updated,
             "skipped": skipped,
             "failed": failed,

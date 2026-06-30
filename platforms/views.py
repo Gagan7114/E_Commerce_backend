@@ -3708,11 +3708,22 @@ def _ads_dashboard_payload(
     filters: dict,
     allow_date_filter: bool = True,
     summary_max_date_keys: list | None = None,
+    summary_use_max_date: bool = False,
 ) -> dict:
     # Comma-separated "expr AS \"key\"" for the SELECT list.
     metric_select_sql = ", ".join(
         f'{spec["expr"]} AS "{spec["key"]}"' for spec in metric_specs
     )
+
+    # When the source stores cumulative range snapshots (each date is a running
+    # month-to-date total), summing across dates over-counts every metric.
+    # `summary_use_max_date` makes the summary/KPI totals reflect the latest
+    # (max) date only — for EVERY metric, including the ratios: recomputing
+    # e.g. SUM(gmv)/SUM(spend) at `date = max_date` yields the ratio of the
+    # max-date totals, so ROAS/ACOS stay consistent with the spend/GMV shown.
+    # Breakdown + trend are intentionally left as range data.
+    if summary_use_max_date:
+        summary_max_date_keys = [spec["key"] for spec in metric_specs]
 
     # Inline the unmapped-placeholder literal so we don't have to manage
     # param ordering with the GROUP BY.
@@ -3928,6 +3939,7 @@ def amazon_ads_dashboard(request, slug: str):
     where_sql, params, trend_where_sql, trend_params, filters = _ads_build_where(request, allow_date=True)
     return Response(_ads_dashboard_payload(
         source="amazon_ads_master",
+        summary_use_max_date=True,
         title="AMS ADS Dashboard",
         dimension_key=dimension_key,
         dimension_label=dimension_label,
@@ -4016,6 +4028,7 @@ def swiggy_ads_dashboard(request, slug: str):
     where_sql, params, trend_where_sql, trend_params, filters = _ads_build_where(request, allow_date=True)
     return Response(_ads_dashboard_payload(
         source="swiggy_ads_master",
+        summary_use_max_date=True,
         title="Swiggy ADS Dashboard",
         dimension_key="item",
         dimension_label="Items",
@@ -4058,9 +4071,10 @@ def zepto_ads_dashboard(request, slug: str):
         trend_where_sql=trend_where_sql,
         trend_params=trend_params,
         filters=filters,
-        # zepto_ads_master holds cumulative range snapshots — the Ad spent KPI
-        # must reflect the latest date only, not the sum across snapshots.
-        summary_max_date_keys=["ad_spent"],
+        # zepto_ads_master holds cumulative range snapshots — the summary/KPI
+        # totals reflect the latest date only across ALL additive metrics, not
+        # the sum across snapshots.
+        summary_use_max_date=True,
     ))
 
 
@@ -4074,6 +4088,7 @@ def bigbasket_ads_dashboard(request, slug: str):
     where_sql, params, trend_where_sql, trend_params, filters = _ads_build_where(request, allow_date=True)
     return Response(_ads_dashboard_payload(
         source="bigbasket_ads_master",
+        summary_use_max_date=True,
         title="BigBasket ADS Dashboard",
         dimension_key="item",
         dimension_label="Items",
@@ -4187,6 +4202,7 @@ def blinkit_ads_dashboard(request, slug: str):
     where_sql, params, trend_where_sql, trend_params, filters = _ads_build_where(request, allow_date=True)
     return Response(_ads_dashboard_payload(
         source="blinkit_ads_master",
+        summary_use_max_date=True,
         title="Blinkit ADS Dashboard",
         dimension_key="item",
         dimension_label="Items",
@@ -4203,6 +4219,140 @@ def blinkit_ads_dashboard(request, slug: str):
         trend_params=trend_params,
         filters=filters,
     ))
+
+
+# ─── Marketing Ads Summary (cross-platform) ──────────────────────────────────
+# Combines every platform's RANGE ads view into one normalised set so the
+# Marketing → Ads → Summary dashboard can show grand totals plus a breakdown
+# that regroups by item head / category / sub category / item / platform.
+#
+# Per-platform quirks folded in here so callers see one uniform shape:
+#   * Swiggy has no indirect_qty_sold — only direct counts toward qty.
+#   * Amazon uses units_sold / total_cost and has no `item`.
+#   * Flipkart uses total_converted_units / ad_spend / views and has no
+#     item_head / category / sub_category / item.
+# Every source view carries year / month / date, so the shared _ads_build_where
+# filter applies uniformly to the union.
+_ADS_SUMMARY_UNION = """
+    SELECT 'Blinkit'::text AS platform, item_head, category, sub_category, item,
+           (COALESCE(direct_qty_sold, 0) + COALESCE(indirect_qty_sold, 0))::numeric AS qty,
+           COALESCE(impressions, 0)::numeric AS impressions,
+           COALESCE(ad_spent, 0)::numeric AS ad_spent, year, month, date
+      FROM blinkit_ads_master
+    UNION ALL
+    SELECT 'Zepto', item_head, category, sub_category, item,
+           (COALESCE(direct_qty_sold, 0) + COALESCE(indirect_qty_sold, 0))::numeric,
+           COALESCE(impressions, 0)::numeric, COALESCE(ad_spent, 0)::numeric, year, month, date
+      FROM zepto_ads_master
+    UNION ALL
+    SELECT 'BigBasket', item_head, category, sub_category, item,
+           (COALESCE(direct_qty_sold, 0) + COALESCE(indirect_qty_sold, 0))::numeric,
+           COALESCE(impressions, 0)::numeric, COALESCE(ad_spent, 0)::numeric, year, month, date
+      FROM bigbasket_ads_master
+    UNION ALL
+    SELECT 'Swiggy', item_head, category, sub_category, item,
+           COALESCE(direct_qty_sold, 0)::numeric,
+           COALESCE(impressions, 0)::numeric, COALESCE(ad_spent, 0)::numeric, year, month, date
+      FROM swiggy_ads_master
+    UNION ALL
+    SELECT 'Amazon', item_head, category, sub_category, NULL::text,
+           COALESCE(units_sold, 0)::numeric,
+           COALESCE(impressions, 0)::numeric, COALESCE(total_cost, 0)::numeric, year, month, date
+      FROM amazon_ads_master
+    UNION ALL
+    SELECT 'Flipkart', NULL::text, NULL::text, NULL::text, NULL::text,
+           COALESCE(total_converted_units, 0)::numeric,
+           COALESCE(views, 0)::numeric, COALESCE(ad_spend, 0)::numeric, year, month, date
+      FROM flipkart_ads_master
+"""
+
+# group_by key -> (column expression, display label). 'platform' groups by the
+# union's synthetic platform label; the rest group by the named dimension column.
+_ADS_SUMMARY_DIMENSIONS = [
+    ("item_head", "Item Head"),
+    ("category", "Category"),
+    ("sub_category", "Sub Category"),
+    ("item", "Item"),
+    ("platform", "Platform"),
+]
+_ADS_SUMMARY_DIMENSION_KEYS = {key for key, _ in _ADS_SUMMARY_DIMENSIONS}
+
+
+@api_view(["GET"])
+@permission_classes([require("platform.stats.view")])
+@cached_get(timeout=60, prefix="plat.ads_summary")
+def marketing_ads_summary(request):
+    """Cross-platform ads summary over the range ads views.
+
+    Returns KPI grand totals (qty sold, impressions, ad spent) plus a breakdown
+    table grouped by the `group_by` dimension (item_head | category |
+    sub_category | item | platform), filtered by the shared year/month/date
+    params. qty sold already folds direct + indirect per platform.
+    """
+    group_by = (request.query_params.get("group_by") or "item_head").strip().lower()
+    if group_by not in _ADS_SUMMARY_DIMENSION_KEYS:
+        raise ValidationError(
+            f"Invalid group_by: {group_by!r} (expected one of "
+            f"{sorted(_ADS_SUMMARY_DIMENSION_KEYS)})"
+        )
+    where_sql, params, _t_sql, _t_params, filters = _ads_build_where(request, allow_date=True)
+    params = list(params)
+
+    # Optional platform filter. The frontend sends a platform slug (e.g.
+    # 'bigbasket'); the union exposes a synthetic label ('BigBasket'). Compare on
+    # a normalized form (lowercase, alphanumerics only) so 'bigbasket' matches
+    # 'BigBasket' and 'big basket' alike. Unknown / empty → no platform filter
+    # (all platforms combined, the default).
+    platform_param = (request.query_params.get("platform") or "").strip()
+    if platform_param:
+        norm = re.sub(r"[^a-z0-9]+", "", platform_param.lower())
+        clause = "REGEXP_REPLACE(LOWER(platform), '[^a-z0-9]+', '', 'g') = %s"
+        where_sql = f"{where_sql} AND {clause}" if where_sql else f"WHERE {clause}"
+        params.append(norm)
+    filters["platform"] = platform_param or None
+
+    base = f"({_ADS_SUMMARY_UNION}) ads"
+    group_expr = (
+        "platform"
+        if group_by == "platform"
+        else f"COALESCE(NULLIF(TRIM({group_by}::text), ''), '(Unmapped)')"
+    )
+
+    with connection.cursor() as cur:
+        cur.execute(
+            "SELECT COALESCE(SUM(qty), 0), COALESCE(SUM(impressions), 0), "
+            f"COALESCE(SUM(ad_spent), 0) FROM {base} {where_sql}",
+            list(params),
+        )
+        totals_row = cur.fetchone()
+        cur.execute(
+            f"SELECT {group_expr} AS grp, COALESCE(SUM(qty), 0), "
+            f"COALESCE(SUM(impressions), 0), COALESCE(SUM(ad_spent), 0) "
+            f"FROM {base} {where_sql} GROUP BY grp "
+            "ORDER BY SUM(ad_spent) DESC NULLS LAST, SUM(qty) DESC NULLS LAST",
+            list(params),
+        )
+        rows = [
+            {
+                "group": r[0],
+                "qty_sold": float(r[1]),
+                "impressions": float(r[2]),
+                "ad_spent": float(r[3]),
+            }
+            for r in cur.fetchall()
+        ]
+
+    return Response({
+        "totals": {
+            "qty_sold": float(totals_row[0]),
+            "impressions": float(totals_row[1]),
+            "ad_spent": float(totals_row[2]),
+        },
+        "group_by": group_by,
+        "dimensions": [{"key": k, "label": l} for k, l in _ADS_SUMMARY_DIMENSIONS],
+        "rows": rows,
+        "filters": filters,
+    })
 
 
 # ─── Flipkart ────────────────────────────────────────────────────────────────
@@ -4255,6 +4405,7 @@ def flipkart_ads_dashboard(request, slug: str):
     where_sql, params, trend_where_sql, trend_params, filters = _ads_build_where(request, allow_date=True)
     return Response(_ads_dashboard_payload(
         source="flipkart_ads_master",
+        summary_use_max_date=True,
         title="Flipkart ADS Dashboard",
         dimension_key="campaign_name",
         dimension_label="Campaigns",
