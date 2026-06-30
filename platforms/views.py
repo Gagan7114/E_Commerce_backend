@@ -4234,36 +4234,112 @@ def blinkit_ads_dashboard(request, slug: str):
 # Every source view carries year / month / date, so the shared _ads_build_where
 # filter applies uniformly to the union.
 _ADS_SUMMARY_UNION = """
-    SELECT 'Blinkit'::text AS platform, item_head, category, sub_category, item,
-           (COALESCE(direct_qty_sold, 0) + COALESCE(indirect_qty_sold, 0))::numeric AS qty,
-           COALESCE(impressions, 0)::numeric AS impressions,
-           COALESCE(ad_spent, 0)::numeric AS ad_spent, year, month, date
-      FROM blinkit_ads_master
+    -- Ads sale = ads qty × the SKU's basic_rate from monthly_landing_rate
+    -- (matched on platform format + sku_code + the row's month). The landing
+    -- table has at most one rate per (format, sku, month) so the LEFT JOIN can't
+    -- fan out; a missing rate → ads_sale 0.
+    SELECT 'Blinkit'::text AS platform, b.item_head, b.category, b.sub_category, b.item,
+           (COALESCE(b.direct_qty_sold, 0) + COALESCE(b.indirect_qty_sold, 0))::numeric AS qty,
+           COALESCE(b.impressions, 0)::numeric AS impressions,
+           COALESCE(b.ad_spent, 0)::numeric AS ad_spent,
+           0::numeric AS brand_fund, 0::numeric AS sec_qty, 0::numeric AS sec_value,
+           ((COALESCE(b.direct_qty_sold, 0) + COALESCE(b.indirect_qty_sold, 0))
+             * COALESCE(lr.basic_rate, 0))::numeric AS ads_sale,
+           b.year, b.month, b.date
+      FROM blinkit_ads_master b
+      LEFT JOIN monthly_landing_rate lr
+        ON REGEXP_REPLACE(LOWER(lr.format), '[^a-z0-9]+', '', 'g') = 'blinkit'
+       AND UPPER(TRIM(lr.sku_code)) = UPPER(TRIM(b.format_sku_code))
+       AND lr.month = to_char(date_trunc('month', b.date::date), 'YYYY-MM-DD')
     UNION ALL
-    SELECT 'Zepto', item_head, category, sub_category, item,
-           (COALESCE(direct_qty_sold, 0) + COALESCE(indirect_qty_sold, 0))::numeric,
-           COALESCE(impressions, 0)::numeric, COALESCE(ad_spent, 0)::numeric, year, month, date
-      FROM zepto_ads_master
+    SELECT 'Zepto', z.item_head, z.category, z.sub_category, z.item,
+           (COALESCE(z.direct_qty_sold, 0) + COALESCE(z.indirect_qty_sold, 0))::numeric,
+           COALESCE(z.impressions, 0)::numeric, COALESCE(z.ad_spent, 0)::numeric,
+           0::numeric, 0::numeric, 0::numeric,
+           ((COALESCE(z.direct_qty_sold, 0) + COALESCE(z.indirect_qty_sold, 0))
+             * COALESCE(lr.basic_rate, 0))::numeric,
+           z.year, z.month, z.date
+      FROM zepto_ads_master z
+      LEFT JOIN monthly_landing_rate lr
+        ON REGEXP_REPLACE(LOWER(lr.format), '[^a-z0-9]+', '', 'g') = 'zepto'
+       AND UPPER(TRIM(lr.sku_code)) = UPPER(TRIM(z.sku_id))
+       AND lr.month = to_char(date_trunc('month', z.date::date), 'YYYY-MM-DD')
     UNION ALL
-    SELECT 'BigBasket', item_head, category, sub_category, item,
-           (COALESCE(direct_qty_sold, 0) + COALESCE(indirect_qty_sold, 0))::numeric,
-           COALESCE(impressions, 0)::numeric, COALESCE(ad_spent, 0)::numeric, year, month, date
-      FROM bigbasket_ads_master
+    SELECT 'BigBasket', bb.item_head, bb.category, bb.sub_category, bb.item,
+           (COALESCE(bb.direct_qty_sold, 0) + COALESCE(bb.indirect_qty_sold, 0))::numeric,
+           COALESCE(bb.impressions, 0)::numeric, COALESCE(bb.ad_spent, 0)::numeric,
+           0::numeric, 0::numeric, 0::numeric,
+           ((COALESCE(bb.direct_qty_sold, 0) + COALESCE(bb.indirect_qty_sold, 0))
+             * COALESCE(lr.basic_rate, 0))::numeric,
+           bb.year, bb.month, bb.date
+      FROM bigbasket_ads_master bb
+      LEFT JOIN monthly_landing_rate lr
+        ON REGEXP_REPLACE(LOWER(lr.format), '[^a-z0-9]+', '', 'g') = 'bigbasket'
+       AND UPPER(TRIM(lr.sku_code)) = UPPER(TRIM(bb.sku_id))
+       AND lr.month = to_char(date_trunc('month', bb.date::date), 'YYYY-MM-DD')
     UNION ALL
-    SELECT 'Swiggy', item_head, category, sub_category, item,
-           COALESCE(direct_qty_sold, 0)::numeric,
-           COALESCE(impressions, 0)::numeric, COALESCE(ad_spent, 0)::numeric, year, month, date
-      FROM swiggy_ads_master
+    SELECT 'Swiggy', s.item_head, s.category, s.sub_category, s.item,
+           COALESCE(s.direct_qty_sold, 0)::numeric,
+           COALESCE(s.impressions, 0)::numeric, COALESCE(s.ad_spent, 0)::numeric,
+           0::numeric, 0::numeric, 0::numeric,
+           (COALESCE(s.direct_qty_sold, 0) * COALESCE(lr.basic_rate, 0))::numeric,
+           s.year, s.month, s.date
+      FROM swiggy_ads_master s
+      LEFT JOIN monthly_landing_rate lr
+        ON REGEXP_REPLACE(LOWER(lr.format), '[^a-z0-9]+', '', 'g') = 'swiggy'
+       AND UPPER(TRIM(lr.sku_code)) = UPPER(TRIM(s.format_sku_code))
+       AND lr.month = to_char(date_trunc('month', s.date::date), 'YYYY-MM-DD')
     UNION ALL
     SELECT 'Amazon', item_head, category, sub_category, NULL::text,
            COALESCE(units_sold, 0)::numeric,
-           COALESCE(impressions, 0)::numeric, COALESCE(total_cost, 0)::numeric, year, month, date
+           COALESCE(impressions, 0)::numeric, COALESCE(total_cost, 0)::numeric,
+           0::numeric, 0::numeric, 0::numeric, 0::numeric, year, month, date
       FROM amazon_ads_master
     UNION ALL
     SELECT 'Flipkart', NULL::text, NULL::text, NULL::text, NULL::text,
            COALESCE(total_converted_units, 0)::numeric,
-           COALESCE(views, 0)::numeric, COALESCE(ad_spend, 0)::numeric, year, month, date
+           COALESCE(views, 0)::numeric, COALESCE(ad_spend, 0)::numeric,
+           0::numeric, 0::numeric, 0::numeric, 0::numeric, year, month, date
       FROM flipkart_ads_master
+    UNION ALL
+    -- Brand fund spend (no ad qty / impressions / ad spend) — folded in so the
+    -- breakdown can show a Brand Fund column per dimension.
+    SELECT 'Blinkit', item_head, category, sub_category, item,
+           0::numeric, 0::numeric, 0::numeric,
+           COALESCE(brand_fund_spent, 0)::numeric, 0::numeric, 0::numeric, 0::numeric, year, month, date
+      FROM blinkit_brandfund_master
+    UNION ALL
+    SELECT 'Swiggy', item_head, category, sub_category, item,
+           0::numeric, 0::numeric, 0::numeric,
+           COALESCE(brand_fund_spent, 0)::numeric, 0::numeric, 0::numeric, 0::numeric, year, month, date
+      FROM swiggy_brandfund_master
+    UNION ALL
+    SELECT 'Zepto', item_head, category, sub_category, item,
+           0::numeric, 0::numeric, 0::numeric,
+           COALESCE(brand_fund_spent, 0)::numeric, 0::numeric, 0::numeric, 0::numeric, year, month, date
+      FROM zepto_brandfund_master
+    UNION ALL
+    SELECT 'Amazon', item_head, category, sub_category, NULL::text,
+           0::numeric, 0::numeric, 0::numeric,
+           COALESCE(budget_spent, 0)::numeric, 0::numeric, 0::numeric, 0::numeric, year, month, date
+      FROM amazon_coupon_master
+    UNION ALL
+    -- Secondary sell-out from SecMaster (no ad metrics) — folded in for the
+    -- "Total Qty Delivered" (quantity) and "Total Sale" (amount) columns.
+    -- `format` is mapped to the same platform labels so Platform group-by lines up.
+    SELECT CASE UPPER(TRIM(format::text))
+                WHEN 'BLINKIT' THEN 'Blinkit'
+                WHEN 'ZEPTO' THEN 'Zepto'
+                WHEN 'BIG BASKET' THEN 'BigBasket'
+                WHEN 'SWIGGY' THEN 'Swiggy'
+                WHEN 'FLIPKART' THEN 'Flipkart'
+                WHEN 'JIO MART' THEN 'Jio Mart'
+                ELSE INITCAP(TRIM(format::text))
+           END,
+           item_head, category, sub_category, item,
+           0::numeric, 0::numeric, 0::numeric, 0::numeric,
+           COALESCE(quantity, 0)::numeric, COALESCE(amount, 0)::numeric, 0::numeric, year, month, date
+      FROM secmaster_mv
 """
 
 # group_by key -> (column expression, display label). 'platform' groups by the
@@ -4321,13 +4397,17 @@ def marketing_ads_summary(request):
     with connection.cursor() as cur:
         cur.execute(
             "SELECT COALESCE(SUM(qty), 0), COALESCE(SUM(impressions), 0), "
-            f"COALESCE(SUM(ad_spent), 0) FROM {base} {where_sql}",
+            f"COALESCE(SUM(ad_spent), 0), COALESCE(SUM(brand_fund), 0), "
+            f"COALESCE(SUM(sec_qty), 0), COALESCE(SUM(sec_value), 0), "
+            f"COALESCE(SUM(ads_sale), 0) FROM {base} {where_sql}",
             list(params),
         )
         totals_row = cur.fetchone()
         cur.execute(
             f"SELECT {group_expr} AS grp, COALESCE(SUM(qty), 0), "
-            f"COALESCE(SUM(impressions), 0), COALESCE(SUM(ad_spent), 0) "
+            f"COALESCE(SUM(impressions), 0), COALESCE(SUM(ad_spent), 0), "
+            f"COALESCE(SUM(brand_fund), 0), COALESCE(SUM(sec_qty), 0), "
+            f"COALESCE(SUM(sec_value), 0), COALESCE(SUM(ads_sale), 0) "
             f"FROM {base} {where_sql} GROUP BY grp "
             "ORDER BY SUM(ad_spent) DESC NULLS LAST, SUM(qty) DESC NULLS LAST",
             list(params),
@@ -4338,6 +4418,10 @@ def marketing_ads_summary(request):
                 "qty_sold": float(r[1]),
                 "impressions": float(r[2]),
                 "ad_spent": float(r[3]),
+                "brand_fund": float(r[4]),
+                "sec_qty": float(r[5]),
+                "sec_value": float(r[6]),
+                "ads_sale": float(r[7]),
             }
             for r in cur.fetchall()
         ]
@@ -4347,6 +4431,10 @@ def marketing_ads_summary(request):
             "qty_sold": float(totals_row[0]),
             "impressions": float(totals_row[1]),
             "ad_spent": float(totals_row[2]),
+            "brand_fund": float(totals_row[3]),
+            "sec_qty": float(totals_row[4]),
+            "sec_value": float(totals_row[5]),
+            "ads_sale": float(totals_row[6]),
         },
         "group_by": group_by,
         "dimensions": [{"key": k, "label": l} for k, l in _ADS_SUMMARY_DIMENSIONS],
