@@ -120,15 +120,41 @@ def refresh_master_po_mv() -> bool:
 # two can refresh independently without blocking each other).
 _SECMASTER_REFRESH_LOCK = threading.Lock()
 
+# Cluster-wide (cross-process) advisory-lock key for the secmaster_mv refresh.
+# The threading.Lock above only serializes refreshes WITHIN one Python process;
+# with several gunicorn workers (and an OS-cron `refresh_secmaster`) each has its
+# own lock, so triggers from different processes still stacked full REFRESHes at
+# the DB. A plain REFRESH takes an AccessExclusiveLock, so a pile-up locks every
+# reader of secmaster_mv out continuously -> the whole dashboard reads 0. This
+# Postgres advisory lock is shared by every process, so at most one refresh runs
+# cluster-wide and any overlapping trigger is dropped instead of queued.
+_SECMASTER_ADVISORY_KEY = 728301
 
-def refresh_secmaster_mv() -> bool:
-    """Refresh public.secmaster_mv if it exists. Best-effort; never raises.
+# Skip a refresh if secmaster_mv was already refreshed within this many seconds.
+# Collapses a burst of triggers (uploads + schedule + multiple workers) into a
+# single rebuild so the exclusive-lock window can't dominate the dashboard.
+# Tunable via SECMASTER_REFRESH_MIN_INTERVAL_S (env read by callers if needed).
+_SECMASTER_MIN_INTERVAL_S = 120
+
+
+def refresh_secmaster_mv(min_interval_s: int = _SECMASTER_MIN_INTERVAL_S) -> bool:
+    """Refresh public.secmaster_mv, coalescing concurrent/near-simultaneous
+    triggers cluster-wide. Best-effort; never raises.
 
     Plain (non-CONCURRENTLY) refresh: a full rebuild takes ~10s and locks reads
-    of secmaster_mv for that window — the same trade-off as master_po_mv. (We
-    measured CONCURRENTLY at ~46s here because the matview has no stable key, so
-    its row-by-row diff is useless; the plain rebuild is ~4x faster.) Returns
-    False if the matview is absent or the refresh failed.
+    of secmaster_mv for that window. Because that lock blocks every reader, we
+    must never let refreshes stack:
+
+    * A non-blocking ``pg_try_advisory_lock`` guard means only ONE refresh runs
+      across all workers/processes at a time — a trigger that arrives while a
+      refresh is in flight is dropped (returns False), not queued behind an
+      exclusive lock.
+    * A ``min_interval_s`` debounce (tracked in ``matview_refresh_state``) skips
+      a refresh that ran within the window, so a burst of uploads/schedule ticks
+      rebuilds the view once instead of back-to-back.
+
+    Returns True only if a refresh actually ran; False if it was skipped
+    (coalesced/debounced), the matview is absent, or the refresh failed.
     """
     try:
         with connection.cursor() as cur:
@@ -136,8 +162,48 @@ def refresh_secmaster_mv() -> bool:
             if cur.fetchone()[0] is None:
                 # Migration 0042 not applied yet -> nothing to refresh.
                 return False
-            cur.execute("REFRESH MATERIALIZED VIEW public.secmaster_mv")
-        return True
+
+            # Cross-process guard: if another process holds it, a refresh is
+            # already running/queued there — coalesce (skip) instead of stacking.
+            cur.execute("SELECT pg_try_advisory_lock(%s)", [_SECMASTER_ADVISORY_KEY])
+            if not cur.fetchone()[0]:
+                return False
+            try:
+                # Debounce is best-effort: if the state table can't be used we
+                # still refresh (correctness over optimisation), we just don't
+                # get the "skip if recent" saving.
+                try:
+                    cur.execute(
+                        "CREATE TABLE IF NOT EXISTS matview_refresh_state ("
+                        "name text PRIMARY KEY, "
+                        "last_refreshed timestamptz NOT NULL DEFAULT now())"
+                    )
+                    cur.execute(
+                        "SELECT now() - last_refreshed < make_interval(secs => %s) "
+                        "FROM matview_refresh_state WHERE name = 'secmaster_mv'",
+                        [min_interval_s],
+                    )
+                    row = cur.fetchone()
+                    if row and row[0]:
+                        return False  # refreshed within the window -> skip
+                except Exception:  # noqa: BLE001 - debounce is optional
+                    logger.exception(
+                        "secmaster_mv debounce check failed; refreshing anyway"
+                    )
+
+                cur.execute("REFRESH MATERIALIZED VIEW public.secmaster_mv")
+
+                try:
+                    cur.execute(
+                        "INSERT INTO matview_refresh_state (name, last_refreshed) "
+                        "VALUES ('secmaster_mv', now()) "
+                        "ON CONFLICT (name) DO UPDATE SET last_refreshed = now()"
+                    )
+                except Exception:  # noqa: BLE001 - stamp is optional
+                    logger.exception("secmaster_mv debounce stamp failed")
+                return True
+            finally:
+                cur.execute("SELECT pg_advisory_unlock(%s)", [_SECMASTER_ADVISORY_KEY])
     except Exception:  # noqa: BLE001 - a refresh failure must not break callers
         logger.exception("Failed to refresh secmaster_mv")
         return False

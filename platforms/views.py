@@ -3940,7 +3940,8 @@ def amazon_ads_dashboard(request, slug: str):
     where_sql, params, trend_where_sql, trend_params, filters = _ads_build_where(request, allow_date=True)
     return Response(_ads_dashboard_payload(
         source="amazon_ads_master",
-        summary_use_max_date=True,
+        # Range summary (sum across the selected period), not max-date snapshot.
+        summary_use_max_date=False,
         title="AMS ADS Dashboard",
         dimension_key=dimension_key,
         dimension_label=dimension_label,
@@ -4203,7 +4204,8 @@ def blinkit_ads_dashboard(request, slug: str):
     where_sql, params, trend_where_sql, trend_params, filters = _ads_build_where(request, allow_date=True)
     return Response(_ads_dashboard_payload(
         source="blinkit_ads_master",
-        summary_use_max_date=True,
+        # Range summary (sum across the selected period), not max-date snapshot.
+        summary_use_max_date=False,
         title="Blinkit ADS Dashboard",
         dimension_key="item",
         dimension_label="Items",
@@ -4239,6 +4241,11 @@ _ADS_SUMMARY_UNION = """
     -- (matched on platform format + sku_code + the row's month). The landing
     -- table has at most one rate per (format, sku, month) so the LEFT JOIN can't
     -- fan out; a missing rate → ads_sale 0.
+    -- `use_max_date` mirrors each platform ads dashboard's summary method:
+    -- TRUE  → cumulative month-to-date snapshot (Swiggy/Zepto/BigBasket/Flipkart)
+    --         so the summary keeps ONLY the latest (max) date's rows;
+    -- FALSE → per-day/range (Amazon/Blinkit) + brand fund + SecMaster → summed.
+    -- Keep this in sync with summary_use_max_date on the per-platform dashboards.
     SELECT 'Blinkit'::text AS platform, b.item_head, b.category, b.sub_category, b.item,
            (COALESCE(b.direct_qty_sold, 0) + COALESCE(b.indirect_qty_sold, 0))::numeric AS qty,
            COALESCE(b.impressions, 0)::numeric AS impressions,
@@ -4246,7 +4253,7 @@ _ADS_SUMMARY_UNION = """
            0::numeric AS brand_fund, 0::numeric AS sec_qty, 0::numeric AS sec_value,
            ((COALESCE(b.direct_qty_sold, 0) + COALESCE(b.indirect_qty_sold, 0))
              * COALESCE(lr.basic_rate, 0))::numeric AS ads_sale,
-           b.year, b.month, b.date
+           b.year, b.month, b.date, FALSE AS use_max_date
       FROM blinkit_ads_master b
       LEFT JOIN monthly_landing_rate lr
         ON REGEXP_REPLACE(LOWER(lr.format), '[^a-z0-9]+', '', 'g') = 'blinkit'
@@ -4259,7 +4266,7 @@ _ADS_SUMMARY_UNION = """
            0::numeric, 0::numeric, 0::numeric,
            ((COALESCE(z.direct_qty_sold, 0) + COALESCE(z.indirect_qty_sold, 0))
              * COALESCE(lr.basic_rate, 0))::numeric,
-           z.year, z.month, z.date
+           z.year, z.month, z.date, TRUE
       FROM zepto_ads_master z
       LEFT JOIN monthly_landing_rate lr
         ON REGEXP_REPLACE(LOWER(lr.format), '[^a-z0-9]+', '', 'g') = 'zepto'
@@ -4272,7 +4279,7 @@ _ADS_SUMMARY_UNION = """
            0::numeric, 0::numeric, 0::numeric,
            ((COALESCE(bb.direct_qty_sold, 0) + COALESCE(bb.indirect_qty_sold, 0))
              * COALESCE(lr.basic_rate, 0))::numeric,
-           bb.year, bb.month, bb.date
+           bb.year, bb.month, bb.date, TRUE
       FROM bigbasket_ads_master bb
       LEFT JOIN monthly_landing_rate lr
         ON REGEXP_REPLACE(LOWER(lr.format), '[^a-z0-9]+', '', 'g') = 'bigbasket'
@@ -4284,7 +4291,7 @@ _ADS_SUMMARY_UNION = """
            COALESCE(s.impressions, 0)::numeric, COALESCE(s.ad_spent, 0)::numeric,
            0::numeric, 0::numeric, 0::numeric,
            (COALESCE(s.direct_qty_sold, 0) * COALESCE(lr.basic_rate, 0))::numeric,
-           s.year, s.month, s.date
+           s.year, s.month, s.date, TRUE
       FROM swiggy_ads_master s
       LEFT JOIN monthly_landing_rate lr
         ON REGEXP_REPLACE(LOWER(lr.format), '[^a-z0-9]+', '', 'g') = 'swiggy'
@@ -4294,35 +4301,35 @@ _ADS_SUMMARY_UNION = """
     SELECT 'Amazon', item_head, category, sub_category, NULL::text,
            COALESCE(units_sold, 0)::numeric,
            COALESCE(impressions, 0)::numeric, COALESCE(total_cost, 0)::numeric,
-           0::numeric, 0::numeric, 0::numeric, 0::numeric, year, month, date
+           0::numeric, 0::numeric, 0::numeric, 0::numeric, year, month, date, FALSE
       FROM amazon_ads_master
     UNION ALL
     SELECT 'Flipkart', NULL::text, NULL::text, NULL::text, NULL::text,
            COALESCE(total_converted_units, 0)::numeric,
            COALESCE(views, 0)::numeric, COALESCE(ad_spend, 0)::numeric,
-           0::numeric, 0::numeric, 0::numeric, 0::numeric, year, month, date
+           0::numeric, 0::numeric, 0::numeric, 0::numeric, year, month, date, FALSE
       FROM flipkart_ads_master
     UNION ALL
     -- Brand fund spend (no ad qty / impressions / ad spend) — folded in so the
     -- breakdown can show a Brand Fund column per dimension.
     SELECT 'Blinkit', item_head, category, sub_category, item,
            0::numeric, 0::numeric, 0::numeric,
-           COALESCE(brand_fund_spent, 0)::numeric, 0::numeric, 0::numeric, 0::numeric, year, month, date
+           COALESCE(brand_fund_spent, 0)::numeric, 0::numeric, 0::numeric, 0::numeric, year, month, date, FALSE
       FROM blinkit_brandfund_master
     UNION ALL
     SELECT 'Swiggy', item_head, category, sub_category, item,
            0::numeric, 0::numeric, 0::numeric,
-           COALESCE(brand_fund_spent, 0)::numeric, 0::numeric, 0::numeric, 0::numeric, year, month, date
+           COALESCE(brand_fund_spent, 0)::numeric, 0::numeric, 0::numeric, 0::numeric, year, month, date, FALSE
       FROM swiggy_brandfund_master
     UNION ALL
     SELECT 'Zepto', item_head, category, sub_category, item,
            0::numeric, 0::numeric, 0::numeric,
-           COALESCE(brand_fund_spent, 0)::numeric, 0::numeric, 0::numeric, 0::numeric, year, month, date
+           COALESCE(brand_fund_spent, 0)::numeric, 0::numeric, 0::numeric, 0::numeric, year, month, date, FALSE
       FROM zepto_brandfund_master
     UNION ALL
     SELECT 'Amazon', item_head, category, sub_category, NULL::text,
            0::numeric, 0::numeric, 0::numeric,
-           COALESCE(budget_spent, 0)::numeric, 0::numeric, 0::numeric, 0::numeric, year, month, date
+           COALESCE(budget_spent, 0)::numeric, 0::numeric, 0::numeric, 0::numeric, year, month, date, FALSE
       FROM amazon_coupon_master
     UNION ALL
     -- Secondary sell-out from SecMaster (no ad metrics) — folded in for the
@@ -4339,7 +4346,7 @@ _ADS_SUMMARY_UNION = """
            END,
            item_head, category, sub_category, item,
            0::numeric, 0::numeric, 0::numeric, 0::numeric,
-           COALESCE(quantity, 0)::numeric, COALESCE(amount, 0)::numeric, 0::numeric, year, month, date
+           COALESCE(quantity, 0)::numeric, COALESCE(amount, 0)::numeric, 0::numeric, year, month, date, FALSE
       FROM secmaster_mv
 """
 
@@ -4413,12 +4420,21 @@ def marketing_ads_summary(request):
     # dimensions) inside the CTE. This collapses secmaster's unused city/date
     # grain (~830k rows → a few hundred) ONCE, so the 5 per-dimension GROUP BYs
     # below run over a tiny set instead of re-scanning the full union 5×.
+    # `scoped` keeps each platform's summary grain: the max-date platforms
+    # (use_max_date=TRUE — cumulative month-to-date snapshots) contribute ONLY
+    # their latest date's rows, matching those platforms' ads dashboards; the
+    # range platforms + brand fund + SecMaster keep every row and are summed.
     sql = (
-        f"WITH adscte AS MATERIALIZED (SELECT platform, item_head, category, "
+        f"WITH scoped AS (SELECT u.*, "
+        f"MAX(CASE WHEN u.use_max_date THEN u.date END) "
+        f"OVER (PARTITION BY u.platform) AS __pmd "
+        f"FROM ({_ADS_SUMMARY_UNION}) u {where_sql}), "
+        f"adscte AS MATERIALIZED (SELECT platform, item_head, category, "
         f"sub_category, item, SUM(qty) AS qty, SUM(impressions) AS impressions, "
         f"SUM(ad_spent) AS ad_spent, SUM(brand_fund) AS brand_fund, "
         f"SUM(sec_qty) AS sec_qty, SUM(sec_value) AS sec_value, "
-        f"SUM(ads_sale) AS ads_sale FROM ({_ADS_SUMMARY_UNION}) u {where_sql} "
+        f"SUM(ads_sale) AS ads_sale FROM scoped "
+        f"WHERE NOT use_max_date OR date = __pmd "
         f"GROUP BY platform, item_head, category, sub_category, item) "
         + " UNION ALL ".join(dim_selects)
     )
@@ -4511,7 +4527,8 @@ def flipkart_ads_dashboard(request, slug: str):
     where_sql, params, trend_where_sql, trend_params, filters = _ads_build_where(request, allow_date=True)
     return Response(_ads_dashboard_payload(
         source="flipkart_ads_master",
-        summary_use_max_date=True,
+        # Range summary (sum across the selected period), not max-date snapshot.
+        summary_use_max_date=False,
         title="Flipkart ADS Dashboard",
         dimension_key="campaign_name",
         dimension_label="Campaigns",

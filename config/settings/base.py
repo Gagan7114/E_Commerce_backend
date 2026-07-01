@@ -93,6 +93,10 @@ DATABASES = {
         # restore the Postgres default).
         "OPTIONS": {
             "options": f"-c work_mem={env('DJANGO_DB_WORK_MEM', default='64MB')}",
+            # Cap the initial connect handshake so a stalled/overloaded DB fails
+            # fast instead of hanging the worker (and piling up requests) on the
+            # OS default (~a couple of minutes). Tune via DJANGO_DB_CONNECT_TIMEOUT.
+            "connect_timeout": env.int("DJANGO_DB_CONNECT_TIMEOUT", default=5),
         },
     },
 }
