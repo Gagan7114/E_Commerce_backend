@@ -224,6 +224,7 @@ def table_columns(request, table_name: str):
 
 @api_view(["GET"])
 @permission_classes([require("dashboard.table.view")])
+@cached_get(timeout=120, prefix="dash.table_distinct")
 def table_distinct_values(request, table_name: str, column_name: str):
     if table_name not in ALLOWED_TABLES or not _IDENT.match(column_name):
         return Response({"error": "Table or column not allowed", "values": []})
@@ -3662,6 +3663,7 @@ def platform_expiry_alerts(request):
 # ─── /platform-expiry-alerts/<slug>/pos ───
 @api_view(["GET"])
 @permission_classes([require("dashboard.view")])
+@cached_get(timeout=60, prefix="dash.expiry_pos")
 def platform_expiry_alert_pos(request, slug: str):
     """Distinct POs (1 <= days_to_expiry <= 5) for a platform in the current month."""
     today = date.today()
@@ -3753,6 +3755,7 @@ def platform_expiry_alert_pos(request, slug: str):
 # ─── /platform-expiry-alerts/<slug>/pos/<po_number>/items ───
 @api_view(["GET"])
 @permission_classes([require("dashboard.view")])
+@cached_get(timeout=60, prefix="dash.expiry_po_items")
 def platform_expiry_alert_po_items(request, slug: str, po_number: str):
     """Individual line items for a single PO within the 1–5 day expiry window."""
 
@@ -4478,7 +4481,7 @@ def _realise_aggregate(platform, month_num, year, group_by=None, filters=None):
                            COALESCE(SUM(amount), 0) AS value,
                            COALESCE(SUM(ltr_sold), 0) AS ltrs,
                            0 AS commission
-                    FROM "SecMaster"
+                    FROM secmaster_mv
                     WHERE UPPER(TRIM(month::text)) = %s
                       AND year::numeric = %s
                       AND UPPER(TRIM(format::text)) = 'FLIPKART'
@@ -4788,15 +4791,19 @@ def realise_trend(request):
     n_months = max(1, min(n_months, 24))
 
     window = _trailing_months(end_month, end_year, n_months)
-    # Each month is an independent aggregation across the same heavy sources;
-    # run them concurrently so a 12-month window isn't 12× the single-month cost.
-    month_results = _parallel_db([
-        (lambda m=m, y=y: _realise_aggregate(platform, m, y, None, filters))
-        for (m, y, _name) in window
-    ])
+    cat = (filters.get("category") or "").strip().upper() or None
+    # Each month is independent — fan out the aggregate AND its ads/brand-fund
+    # totals concurrently (so the client can compute net realise per month).
+    tasks = []
+    for (m, y, _name) in window:
+        tasks.append((lambda m=m, y=y: _realise_aggregate(platform, m, y, None, filters)))
+        tasks.append((lambda m=m, y=y: _realise_ads_brandfund_totals(platform, m, y, cat)))
+    results = _parallel_db(tasks)
     series = []
     errors = []
-    for (m, y, _name), (data, err) in zip(window, month_results):
+    for idx, (m, y, _name) in enumerate(window):
+        data, err = results[idx * 2]
+        ads, fund = results[idx * 2 + 1]
         errors.extend(err)
         t = _realise_totals(data)
         series.append({
@@ -4805,6 +4812,9 @@ def realise_trend(request):
             "label": f"{calendar.month_abbr[m]} '{str(y)[2:]}",
             "value": t["value"],
             "ltrs": t["ltrs"],
+            "commission": t["commission"],
+            "ads_spent": ads,
+            "brand_fund": fund,
             "premium": t["premium"],
             "commodity": t["commodity"],
         })

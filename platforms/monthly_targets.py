@@ -241,7 +241,7 @@ def _read_secmaster(fmt: str, item_head: str, month: int, year: int) -> dict:
                 0
             )                                                                AS done_value,
             MAX("date")                                                      AS latest_date
-        FROM "SecMaster"
+        FROM secmaster_mv
         WHERE LOWER(TRIM("format"::text))    = LOWER(TRIM(%s))
           AND UPPER(TRIM("item_head"::text)) = UPPER(TRIM(%s))
           AND UPPER(TRIM("month"::text))     = %s

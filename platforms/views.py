@@ -480,6 +480,7 @@ def _bigbasket_primary_period_bounds(month_name: str, year: int) -> tuple[date, 
 
 @api_view(["GET"])
 @permission_classes([require("platform.po.view")])
+@cached_get(timeout=60, prefix="plat.bigbasket_primary")
 def bigbasket_primary_dashboard(request, slug: str):
     return _bigbasket_primary_dashboard_response(request, slug)
 
@@ -4356,7 +4357,7 @@ _ADS_SUMMARY_DIMENSION_KEYS = {key for key, _ in _ADS_SUMMARY_DIMENSIONS}
 
 @api_view(["GET"])
 @permission_classes([require("platform.stats.view")])
-@cached_get(timeout=60, prefix="plat.ads_summary")
+@cached_get(timeout=600, prefix="plat.ads_summary")
 def marketing_ads_summary(request):
     """Cross-platform ads summary over the range ads views.
 
@@ -4387,58 +4388,75 @@ def marketing_ads_summary(request):
         params.append(norm)
     filters["platform"] = platform_param or None
 
-    base = f"({_ADS_SUMMARY_UNION}) ads"
-    group_expr = (
-        "platform"
-        if group_by == "platform"
-        else f"COALESCE(NULLIF(TRIM({group_by}::text), ''), '(Unmapped)')"
+    # Compute the breakdown for EVERY dimension in ONE request so the frontend
+    # can switch group-by tabs instantly (client-side, no refetch). The 11-view
+    # union is the only expensive part, so it runs ONCE via a MATERIALIZED CTE;
+    # each dimension is then a cheap GROUP BY over the cached CTE rows.
+    metric_sums = (
+        "COALESCE(SUM(qty), 0), COALESCE(SUM(impressions), 0), "
+        "COALESCE(SUM(ad_spent), 0), COALESCE(SUM(brand_fund), 0), "
+        "COALESCE(SUM(sec_qty), 0), COALESCE(SUM(sec_value), 0), "
+        "COALESCE(SUM(ads_sale), 0)"
+    )
+    dim_selects = []
+    for key, _label in _ADS_SUMMARY_DIMENSIONS:
+        grp = (
+            "platform"
+            if key == "platform"
+            else f"COALESCE(NULLIF(TRIM({key}::text), ''), '(Unmapped)')"
+        )
+        dim_selects.append(
+            f"SELECT '{key}' AS dim, {grp} AS grp, {metric_sums} "
+            f"FROM adscte GROUP BY {grp}"
+        )
+    # Pre-aggregate the union to the dashboard's grain (platform + the 4 SKU
+    # dimensions) inside the CTE. This collapses secmaster's unused city/date
+    # grain (~830k rows → a few hundred) ONCE, so the 5 per-dimension GROUP BYs
+    # below run over a tiny set instead of re-scanning the full union 5×.
+    sql = (
+        f"WITH adscte AS MATERIALIZED (SELECT platform, item_head, category, "
+        f"sub_category, item, SUM(qty) AS qty, SUM(impressions) AS impressions, "
+        f"SUM(ad_spent) AS ad_spent, SUM(brand_fund) AS brand_fund, "
+        f"SUM(sec_qty) AS sec_qty, SUM(sec_value) AS sec_value, "
+        f"SUM(ads_sale) AS ads_sale FROM ({_ADS_SUMMARY_UNION}) u {where_sql} "
+        f"GROUP BY platform, item_head, category, sub_category, item) "
+        + " UNION ALL ".join(dim_selects)
     )
 
+    breakdowns = {key: [] for key, _ in _ADS_SUMMARY_DIMENSIONS}
     with connection.cursor() as cur:
-        cur.execute(
-            "SELECT COALESCE(SUM(qty), 0), COALESCE(SUM(impressions), 0), "
-            f"COALESCE(SUM(ad_spent), 0), COALESCE(SUM(brand_fund), 0), "
-            f"COALESCE(SUM(sec_qty), 0), COALESCE(SUM(sec_value), 0), "
-            f"COALESCE(SUM(ads_sale), 0) FROM {base} {where_sql}",
-            list(params),
-        )
-        totals_row = cur.fetchone()
-        cur.execute(
-            f"SELECT {group_expr} AS grp, COALESCE(SUM(qty), 0), "
-            f"COALESCE(SUM(impressions), 0), COALESCE(SUM(ad_spent), 0), "
-            f"COALESCE(SUM(brand_fund), 0), COALESCE(SUM(sec_qty), 0), "
-            f"COALESCE(SUM(sec_value), 0), COALESCE(SUM(ads_sale), 0) "
-            f"FROM {base} {where_sql} GROUP BY grp "
-            "ORDER BY SUM(ad_spent) DESC NULLS LAST, SUM(qty) DESC NULLS LAST",
-            list(params),
-        )
-        rows = [
-            {
-                "group": r[0],
-                "qty_sold": float(r[1]),
-                "impressions": float(r[2]),
-                "ad_spent": float(r[3]),
-                "brand_fund": float(r[4]),
-                "sec_qty": float(r[5]),
-                "sec_value": float(r[6]),
-                "ads_sale": float(r[7]),
-            }
-            for r in cur.fetchall()
-        ]
+        cur.execute(sql, list(params))
+        for r in cur.fetchall():
+            breakdowns[r[0]].append({
+                "group": r[1],
+                "qty_sold": float(r[2]),
+                "impressions": float(r[3]),
+                "ad_spent": float(r[4]),
+                "brand_fund": float(r[5]),
+                "sec_qty": float(r[6]),
+                "sec_value": float(r[7]),
+                "ads_sale": float(r[8]),
+            })
+
+    # Default display order: highest ad spend first (the table re-sorts on click).
+    for lst in breakdowns.values():
+        lst.sort(key=lambda d: (d["ad_spent"], d["qty_sold"]), reverse=True)
+
+    metric_keys = (
+        "qty_sold", "impressions", "ad_spent",
+        "brand_fund", "sec_qty", "sec_value", "ads_sale",
+    )
+    # Grand totals are identical across dimensions (every row maps to one group
+    # in each), so sum any one breakdown.
+    any_rows = breakdowns[_ADS_SUMMARY_DIMENSIONS[0][0]]
+    totals = {k: sum(r[k] for r in any_rows) for k in metric_keys}
 
     return Response({
-        "totals": {
-            "qty_sold": float(totals_row[0]),
-            "impressions": float(totals_row[1]),
-            "ad_spent": float(totals_row[2]),
-            "brand_fund": float(totals_row[3]),
-            "sec_qty": float(totals_row[4]),
-            "sec_value": float(totals_row[5]),
-            "ads_sale": float(totals_row[6]),
-        },
+        "totals": totals,
         "group_by": group_by,
         "dimensions": [{"key": k, "label": l} for k, l in _ADS_SUMMARY_DIMENSIONS],
-        "rows": rows,
+        "breakdowns": breakdowns,
+        "rows": breakdowns.get(group_by, any_rows),
         "filters": filters,
     })
 
