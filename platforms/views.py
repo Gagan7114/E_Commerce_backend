@@ -4253,7 +4253,7 @@ _ADS_SUMMARY_UNION = """
            0::numeric AS brand_fund, 0::numeric AS sec_qty, 0::numeric AS sec_value,
            ((COALESCE(b.direct_qty_sold, 0) + COALESCE(b.indirect_qty_sold, 0))
              * COALESCE(lr.basic_rate, 0))::numeric AS ads_sale,
-           b.year, b.month, b.date, FALSE AS use_max_date
+           b.year, b.month, b.date, FALSE AS use_max_date, 'other'::text AS src
       FROM blinkit_ads_master b
       LEFT JOIN monthly_landing_rate lr
         ON REGEXP_REPLACE(LOWER(lr.format), '[^a-z0-9]+', '', 'g') = 'blinkit'
@@ -4266,7 +4266,7 @@ _ADS_SUMMARY_UNION = """
            0::numeric, 0::numeric, 0::numeric,
            ((COALESCE(z.direct_qty_sold, 0) + COALESCE(z.indirect_qty_sold, 0))
              * COALESCE(lr.basic_rate, 0))::numeric,
-           z.year, z.month, z.date, TRUE
+           z.year, z.month, z.date, TRUE, 'other'::text
       FROM zepto_ads_master z
       LEFT JOIN monthly_landing_rate lr
         ON REGEXP_REPLACE(LOWER(lr.format), '[^a-z0-9]+', '', 'g') = 'zepto'
@@ -4279,7 +4279,7 @@ _ADS_SUMMARY_UNION = """
            0::numeric, 0::numeric, 0::numeric,
            ((COALESCE(bb.direct_qty_sold, 0) + COALESCE(bb.indirect_qty_sold, 0))
              * COALESCE(lr.basic_rate, 0))::numeric,
-           bb.year, bb.month, bb.date, TRUE
+           bb.year, bb.month, bb.date, TRUE, 'other'::text
       FROM bigbasket_ads_master bb
       LEFT JOIN monthly_landing_rate lr
         ON REGEXP_REPLACE(LOWER(lr.format), '[^a-z0-9]+', '', 'g') = 'bigbasket'
@@ -4291,7 +4291,7 @@ _ADS_SUMMARY_UNION = """
            COALESCE(s.impressions, 0)::numeric, COALESCE(s.ad_spent, 0)::numeric,
            0::numeric, 0::numeric, 0::numeric,
            (COALESCE(s.direct_qty_sold, 0) * COALESCE(lr.basic_rate, 0))::numeric,
-           s.year, s.month, s.date, TRUE
+           s.year, s.month, s.date, TRUE, 'other'::text
       FROM swiggy_ads_master s
       LEFT JOIN monthly_landing_rate lr
         ON REGEXP_REPLACE(LOWER(lr.format), '[^a-z0-9]+', '', 'g') = 'swiggy'
@@ -4301,36 +4301,71 @@ _ADS_SUMMARY_UNION = """
     SELECT 'Amazon', item_head, category, sub_category, NULL::text,
            COALESCE(units_sold, 0)::numeric,
            COALESCE(impressions, 0)::numeric, COALESCE(total_cost, 0)::numeric,
-           0::numeric, 0::numeric, 0::numeric, 0::numeric, year, month, date, FALSE
+           -- Ads Sale for Amazon = the ads `sales` figure (Ads Dashboard "Sales" KPI).
+           0::numeric, 0::numeric, 0::numeric, COALESCE(sales, 0)::numeric, year, month, date, FALSE, 'other'::text
       FROM amazon_ads_master
     UNION ALL
     SELECT 'Flipkart', NULL::text, NULL::text, NULL::text, NULL::text,
            COALESCE(total_converted_units, 0)::numeric,
            COALESCE(views, 0)::numeric, COALESCE(ad_spend, 0)::numeric,
-           0::numeric, 0::numeric, 0::numeric, 0::numeric, year, month, date, FALSE
+           0::numeric, 0::numeric, 0::numeric,
+           -- Flipkart has no SKU for the landing-rate ads_sale, but it reports a
+           -- real revenue figure — use it directly as the Ads Sale value.
+           COALESCE(total_revenue, 0)::numeric, year, month, date, FALSE, 'flipkart_ads'::text
       FROM flipkart_ads_master
+    UNION ALL
+    -- Flipkart SKU-level ads from the FSN report — carries the item_head /
+    -- category / sub_category / item mapping that flipkart_ads_master lacks.
+    -- Tagged src='fsn' so it feeds ONLY the item/category/sub_category/item
+    -- breakdowns; the Platform section keeps using flipkart_ads_master
+    -- (src='flipkart_ads'). The FSN report has no period column, so it is
+    -- attributed to the LATEST flipkart_ads period (single row → no fan-out) so
+    -- it responds to the month filter in step with the Flipkart ads data.
+    SELECT 'Flipkart', f.item_head, f.category, f.sub_category, f.item,
+           (COALESCE(f.direct_units_sold, 0) + COALESCE(f.indirect_units_sold, 0))::numeric,
+           COALESCE(f.views, 0)::numeric, COALESCE(f.ad_spend, 0)::numeric,
+           0::numeric, 0::numeric, 0::numeric,
+           COALESCE(f.total_revenue, 0)::numeric,
+           fp.year, fp.month, fp.date, FALSE, 'fsn'::text
+      FROM consolidated_fsn_report f
+      CROSS JOIN (SELECT year, month, MAX(date) AS date
+                    FROM flipkart_ads_master
+                   GROUP BY year, month
+                   ORDER BY MAX(date) DESC
+                   LIMIT 1) fp
     UNION ALL
     -- Brand fund spend (no ad qty / impressions / ad spend) — folded in so the
     -- breakdown can show a Brand Fund column per dimension.
     SELECT 'Blinkit', item_head, category, sub_category, item,
            0::numeric, 0::numeric, 0::numeric,
-           COALESCE(brand_fund_spent, 0)::numeric, 0::numeric, 0::numeric, 0::numeric, year, month, date, FALSE
+           COALESCE(brand_fund_spent, 0)::numeric, 0::numeric, 0::numeric, 0::numeric, year, month, date, FALSE, 'other'::text
       FROM blinkit_brandfund_master
     UNION ALL
     SELECT 'Swiggy', item_head, category, sub_category, item,
            0::numeric, 0::numeric, 0::numeric,
-           COALESCE(brand_fund_spent, 0)::numeric, 0::numeric, 0::numeric, 0::numeric, year, month, date, FALSE
+           COALESCE(brand_fund_spent, 0)::numeric, 0::numeric, 0::numeric, 0::numeric, year, month, date, FALSE, 'other'::text
       FROM swiggy_brandfund_master
     UNION ALL
     SELECT 'Zepto', item_head, category, sub_category, item,
            0::numeric, 0::numeric, 0::numeric,
-           COALESCE(brand_fund_spent, 0)::numeric, 0::numeric, 0::numeric, 0::numeric, year, month, date, FALSE
+           COALESCE(brand_fund_spent, 0)::numeric, 0::numeric, 0::numeric, 0::numeric, year, month, date, FALSE, 'other'::text
       FROM zepto_brandfund_master
     UNION ALL
     SELECT 'Amazon', item_head, category, sub_category, NULL::text,
            0::numeric, 0::numeric, 0::numeric,
-           COALESCE(budget_spent, 0)::numeric, 0::numeric, 0::numeric, 0::numeric, year, month, date, FALSE
+           COALESCE(budget_spent, 0)::numeric, 0::numeric, 0::numeric, 0::numeric, year, month, date, FALSE, 'other'::text
       FROM amazon_coupon_master
+    UNION ALL
+    -- Amazon delivered quantity + delivered sale from the DAILY master view
+    -- (per-day rows → summed across the range). sec_qty = shipped_units (matches
+    -- the Secondary Dashboard's "Deliver Quantity"); sec_value = shipped_revenue_2
+    -- feeds the Total Sale column.
+    SELECT 'Amazon', item_head, category, sub_category, item,
+           0::numeric, 0::numeric, 0::numeric, 0::numeric,
+           COALESCE(shipped_units, 0)::numeric,
+           COALESCE(shipped_revenue_2, 0)::numeric, 0::numeric,
+           year, month, to_date::date, FALSE, 'other'::text
+      FROM amazon_sec_daily_master_view
     UNION ALL
     -- Secondary sell-out from SecMaster (no ad metrics) — folded in for the
     -- "Total Qty Delivered" (quantity) and "Total Sale" (amount) columns.
@@ -4346,7 +4381,14 @@ _ADS_SUMMARY_UNION = """
            END,
            item_head, category, sub_category, item,
            0::numeric, 0::numeric, 0::numeric, 0::numeric,
-           COALESCE(quantity, 0)::numeric, COALESCE(amount, 0)::numeric, 0::numeric, year, month, date, FALSE
+           -- Total Qty Delivered = quantity. Total Sale = sales_amt_exc
+           -- (tax-exclusive) for every QC platform EXCEPT Flipkart, which uses
+           -- `amount` (its sales_amt_exc is 0 in SecMaster).
+           COALESCE(quantity, 0)::numeric,
+           CASE WHEN UPPER(TRIM(format::text)) = 'FLIPKART'
+                THEN COALESCE(amount, 0)
+                ELSE COALESCE(sales_amt_exc, 0) END::numeric,
+           0::numeric, year, month, date, FALSE, 'other'::text
       FROM secmaster_mv
 """
 
@@ -4412,9 +4454,15 @@ def marketing_ads_summary(request):
             if key == "platform"
             else f"COALESCE(NULLIF(TRIM({key}::text), ''), '(Unmapped)')"
         )
+        # Flipkart source split: the Platform section keeps the campaign-level
+        # flipkart_ads_master rows (exclude the FSN rows); the item/category/etc.
+        # breakdowns use the SKU-mapped FSN rows instead (exclude the dimensionless
+        # flipkart_ads rows). All non-Flipkart sources are tagged 'other' and pass
+        # both filters unchanged.
+        src_filter = "src <> 'fsn'" if key == "platform" else "src <> 'flipkart_ads'"
         dim_selects.append(
             f"SELECT '{key}' AS dim, {grp} AS grp, {metric_sums} "
-            f"FROM adscte GROUP BY {grp}"
+            f"FROM adscte WHERE {src_filter} GROUP BY {grp}"
         )
     # Pre-aggregate the union to the dashboard's grain (platform + the 4 SKU
     # dimensions) inside the CTE. This collapses secmaster's unused city/date
@@ -4430,12 +4478,12 @@ def marketing_ads_summary(request):
         f"OVER (PARTITION BY u.platform) AS __pmd "
         f"FROM ({_ADS_SUMMARY_UNION}) u {where_sql}), "
         f"adscte AS MATERIALIZED (SELECT platform, item_head, category, "
-        f"sub_category, item, SUM(qty) AS qty, SUM(impressions) AS impressions, "
+        f"sub_category, item, src, SUM(qty) AS qty, SUM(impressions) AS impressions, "
         f"SUM(ad_spent) AS ad_spent, SUM(brand_fund) AS brand_fund, "
         f"SUM(sec_qty) AS sec_qty, SUM(sec_value) AS sec_value, "
         f"SUM(ads_sale) AS ads_sale FROM scoped "
         f"WHERE NOT use_max_date OR date = __pmd "
-        f"GROUP BY platform, item_head, category, sub_category, item) "
+        f"GROUP BY platform, item_head, category, sub_category, item, src) "
         + " UNION ALL ".join(dim_selects)
     )
 
@@ -4462,9 +4510,11 @@ def marketing_ads_summary(request):
         "qty_sold", "impressions", "ad_spent",
         "brand_fund", "sec_qty", "sec_value", "ads_sale",
     )
-    # Grand totals are identical across dimensions (every row maps to one group
-    # in each), so sum any one breakdown.
-    any_rows = breakdowns[_ADS_SUMMARY_DIMENSIONS[0][0]]
+    # Grand totals: sum the Platform breakdown. It keeps Flipkart on the
+    # campaign-level flipkart_ads_master rows (the item/category/etc. breakdowns
+    # swap Flipkart to the FSN source, which has different totals), so the KPI
+    # cards stay in step with the Platform section and the per-platform dashboards.
+    any_rows = breakdowns["platform"]
     totals = {k: sum(r[k] for r in any_rows) for k in metric_keys}
 
     return Response({
