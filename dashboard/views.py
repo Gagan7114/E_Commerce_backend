@@ -1727,102 +1727,15 @@ def state_sales_detail_cities(request):
                     except Exception as e:
                         errors.append({"source": "state_detail_cities", "error": str(e)})
 
-                # 'All platforms' must reconcile with the map tooltip, which
-                # counts Amazon + Flipkart at the STATE level too. Those two carry
-                # no city, so the QC-only city rollup above silently dropped them
-                # (e.g. UP showed 27k L instead of the map's 2.27L L). Add each as
-                # a single platform-level row so the drawer total lines up with the
-                # map. Only for the 'all' view — a specific platform is unaffected.
-                if platform is None:
-                    az_mf, az_mp = _az_month_filter(periods, alias="")
-                    az_raws = []
-                    try:
-                        cur.execute(
-                            "SELECT DISTINCT COALESCE(state::text, '') "
-                            "FROM public.amazon_sec_state WHERE 1 = 1" + az_mf,
-                            list(az_mp),
-                        )
-                        az_raws = [r[0] for r in cur.fetchall() if _norm_state(r[0]) == canon]
-                    except Exception as e:
-                        errors.append({"source": "amazon_states", "error": str(e)})
-                    if az_raws:
-                        az_mf2, az_mp2 = _az_month_filter(periods)
-                        sql = """
-                            SELECT COALESCE(SUM(CASE WHEN UPPER(TRIM(m.is_litre::text)) = 'Y'
-                                        THEN COALESCE(a.shipped_units, 0)::numeric * COALESCE(m.per_unit_value, 0)
-                                        ELSE 0 END), 0),
-                                   COALESCE(SUM(a.shipped_units), 0),
-                                   COALESCE(SUM(a.shipped_revenue), 0),
-                                   COUNT(*)
-                            FROM public.amazon_sec_state a
-                            LEFT JOIN public.master_sheet m
-                              ON UPPER(TRIM(m.format_sku_code::text)) = UPPER(TRIM(a.asin))
-                             AND UPPER(TRIM(m.format::text)) = 'AMAZON'
-                            WHERE 1 = 1
-                        """ + az_mf2
-                        params = list(az_mp2)
-                        if brands:
-                            sql += " AND UPPER(TRIM(m.brand::text)) = ANY(%s)"; params.append(brands)
-                        if cats:
-                            sql += " AND UPPER(TRIM(m.category::text)) = ANY(%s)"; params.append(cats)
-                        if subs:
-                            sql += " AND UPPER(TRIM(m.sub_category::text)) = ANY(%s)"; params.append(subs)
-                        if heads:
-                            sql += " AND UPPER(TRIM(m.item_head::text)) = ANY(%s)"; params.append(heads)
-                        sql += " AND COALESCE(a.state::text, '') = ANY(%s)"; params.append(az_raws)
-                        try:
-                            cur.execute(sql, params)
-                            row = cur.fetchone()
-                            if row and (row[0] or row[1] or row[2]):
-                                push("Amazon", row[0], row[1], row[2], row[3])
-                        except Exception as e:
-                            errors.append({"source": "amazon_state_total", "error": str(e)})
+                # NOTE: Amazon & Flipkart are intentionally NOT added to this
+                # city drill-down. They carry no city, so adding them here showed
+                # up as fake "Amazon" / "Flipkart" city rows (with ₹0 sales for
+                # Amazon, whose state feed has no revenue) inside what is meant to
+                # be a city-only list. This view now shows real cities only; to see
+                # Amazon / Flipkart sales, select that platform filter — the drawer
+                # then rolls up by item for them (dimension = 'item').
 
-                    fk_states = []
-                    try:
-                        cur.execute(
-                            "SELECT DISTINCT COALESCE(customer_delivery_state::text, '') "
-                            "FROM public.flipkart_state_sales_master "
-                            "WHERE left(order_date, 7) = ANY(%s) AND UPPER(TRIM(event_type::text)) = 'SALE'",
-                            [_fk_yms(periods)],
-                        )
-                        fk_states = [r[0] for r in cur.fetchall() if _norm_state(r[0]) == canon]
-                    except Exception as e:
-                        errors.append({"source": "flipkart_states", "error": str(e)})
-                    if fk_states:
-                        _fk_q = "NULLIF(regexp_replace(f.item_quantity, '[^0-9.-]', '', 'g'), '')::numeric"
-                        sql = f"""
-                            SELECT COALESCE(SUM(CASE WHEN UPPER(TRIM(f.is_litre::text)) = 'Y'
-                                        THEN COALESCE({_fk_q}, 0) * COALESCE(f.per_unit_value, 0)
-                                        ELSE 0 END), 0),
-                                   COALESCE(SUM(COALESCE({_fk_q}, 0)), 0),
-                                   COALESCE(SUM(COALESCE(NULLIF(regexp_replace(f.final_invoice_amount,
-                                        '[^0-9.-]', '', 'g'), '')::numeric, 0)), 0),
-                                   COUNT(*)
-                            FROM public.flipkart_state_sales_master f
-                            WHERE left(f.order_date, 7) = ANY(%s)
-                              AND UPPER(TRIM(f.event_type::text)) = 'SALE'
-                        """
-                        params = [_fk_yms(periods)]
-                        if brands:
-                            sql += " AND UPPER(TRIM(f.brand::text)) = ANY(%s)"; params.append(brands)
-                        if cats:
-                            sql += " AND UPPER(TRIM(f.category::text)) = ANY(%s)"; params.append(cats)
-                        if subs:
-                            sql += " AND UPPER(TRIM(f.sub_category::text)) = ANY(%s)"; params.append(subs)
-                        if heads:
-                            sql += " AND UPPER(TRIM(f.item_head::text)) = ANY(%s)"; params.append(heads)
-                        sql += " AND COALESCE(f.customer_delivery_state::text, '') = ANY(%s)"; params.append(fk_states)
-                        try:
-                            cur.execute(sql, params)
-                            row = cur.fetchone()
-                            if row and (row[0] or row[1] or row[2]):
-                                push("Flipkart", row[0], row[1], row[2], row[3])
-                        except Exception as e:
-                            errors.append({"source": "flipkart_state_total", "error": str(e)})
-
-    # Default order: biggest first by the active metric (Amazon/Flipkart platform
-    # rows added above slot in by size rather than always trailing the cities).
+    # Default order: biggest first by the active metric.
     rows.sort(key=lambda r: r.get(order_col, 0) or 0, reverse=True)
 
     total = {
@@ -4543,9 +4456,18 @@ def _realise_aggregate(platform, month_num, year, group_by=None, filters=None):
                 errors.append({"source": "master_po", "error": f"group_by '{group_by}' unsupported"})
             else:
                 fmt_ph = ", ".join(["%s"] * len(primary_formats))
+                # Delivered value must match the platform's Primary dashboard
+                # "Deliver Value" KPI card, which is what users compare against.
+                # That KPI uses the tax-INCLUSIVE delivered amount
+                # (total_deliver_amt_inclusive; see
+                # _primary_master_po_order_minus_deliver_kpi_total →
+                # metric_delivered_value in platforms/views.py) for EVERY platform.
+                # (Note: the Primary dashboard's per-head summary table uses a
+                # different, per-platform column, but the headline KPI — the number
+                # on the card — is always inclusive.)
                 sql = f"""
                     SELECT {grp} AS name, UPPER(TRIM(item_head::text)) AS head,
-                           COALESCE(SUM(total_delivered_amt_exclusive), 0) AS value,
+                           COALESCE(SUM(total_deliver_amt_inclusive), 0) AS value,
                            COALESCE(SUM(total_delivered_liters), 0) AS ltrs,
                            COALESCE(SUM(total_distributor_commission), 0) AS commission
                     FROM public.master_po

@@ -21,7 +21,7 @@ import re
 import threading
 
 from django.core.cache import cache
-from django.db import connection, transaction
+from django.db import IntegrityError, connection, transaction
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.response import Response
 
@@ -896,6 +896,414 @@ def master_sheet_delete(request):
             "product_name": deleted[1],
             "format": deleted[2],
         },
+    })
+
+
+# ─── pincode_mapping ───
+# City -> State -> PIN code reference table with just those three columns (plus
+# the id PK). One row per city; `pincode` is filled in by ops. Seeded
+# (city, state) from city_state_mapping. Managed by the same Master-Sheet-style
+# UI (search / edit / bulk paste-upsert). Not consumed by any view yet.
+#
+# There's no stored key/source/updated_at column: uniqueness is enforced by a
+# functional UNIQUE index on the normalised city (uq_pincode_mapping_city), and
+# upsert matches on that same expression so re-uploads update instead of
+# duplicating.
+PINCODE_MAPPING_COLUMNS = ["city", "state", "pincode"]
+PINCODE_MAPPING_SEARCH_COLUMNS = ["city", "state", "pincode"]
+
+# Normalised-city SQL expression; MUST match both _pincode_city_key (below) and
+# the uq_pincode_mapping_city index expression (uploads migration 0066).
+_PINCODE_CITY_KEY_SQL = "btrim(regexp_replace(upper(city), '[^A-Z0-9]+', ' ', 'g'))"
+
+
+def _pincode_city_key(value) -> str:
+    """Normalise a city the same way _PINCODE_CITY_KEY_SQL / the unique index do:
+    UPPER, every run of non-alphanumerics collapsed to a single space, trimmed."""
+    return re.sub(r"[^A-Z0-9]+", " ", str(value or "").upper()).strip()
+
+
+def _pincode_mapping_select_columns() -> str:
+    quoted = ", ".join(_quote_ident(col) for col in PINCODE_MAPPING_COLUMNS)
+    return f'id::text AS "row_id", {quoted}'
+
+
+def _pincode_mapping_payload(data) -> dict:
+    if not isinstance(data, dict):
+        raise ValueError("Row data is required.")
+    row = {}
+    for column in PINCODE_MAPPING_COLUMNS:
+        if column not in data:
+            continue
+        value = data.get(column)
+        if value is None:
+            row[column] = None
+        else:
+            text = str(value).strip()
+            row[column] = text if text else None
+    return row
+
+
+def _pincode_mapping_existing_by_key(city_keys: list[str]) -> dict[str, dict]:
+    keys = sorted({key for key in city_keys if key})
+    if not keys:
+        return {}
+    with connection.cursor() as cur:
+        cur.execute(
+            f"""
+            SELECT DISTINCT ON ({_PINCODE_CITY_KEY_SQL})
+                   {_pincode_mapping_select_columns()}, {_PINCODE_CITY_KEY_SQL} AS ckey
+            FROM pincode_mapping
+            WHERE {_PINCODE_CITY_KEY_SQL} = ANY(%s)
+            ORDER BY {_PINCODE_CITY_KEY_SQL}, id
+            """,
+            [keys],
+        )
+        cols = [c[0] for c in cur.description]
+        result = {}
+        for values in cur.fetchall():
+            row = dict(zip(cols, values))
+            key = row.pop("ckey")
+            result[key] = row
+    return result
+
+
+def _pincode_mapping_bulk_rows(data) -> list[dict]:
+    rows = (data or {}).get("rows") if isinstance(data, dict) else None
+    if not isinstance(rows, list):
+        raise ValueError("rows must be a list.")
+
+    parsed = []
+    for index, raw in enumerate(rows, start=1):
+        if not isinstance(raw, dict):
+            parsed.append({
+                "index": index, "city": "", "city_key": "", "row": {},
+                "valid": False, "reason": "Row must be an object.",
+            })
+            continue
+
+        try:
+            payload = _pincode_mapping_payload(raw)
+        except ValueError as exc:
+            parsed.append({
+                "index": index,
+                "city": str(raw.get("city") or "").strip(),
+                "city_key": _pincode_city_key(raw.get("city")),
+                "row": raw, "valid": False, "reason": str(exc),
+            })
+            continue
+
+        city = str(payload.get("city") or "").strip()
+        if not city:
+            parsed.append({
+                "index": index, "city": "", "city_key": "", "row": payload,
+                "valid": False, "reason": "city is required.",
+            })
+            continue
+        if not str(payload.get("state") or "").strip():
+            parsed.append({
+                "index": index, "city": city, "city_key": _pincode_city_key(city),
+                "row": payload, "valid": False, "reason": "state is required.",
+            })
+            continue
+
+        payload["city"] = city
+        parsed.append({
+            "index": index, "city": city, "city_key": _pincode_city_key(city),
+            "row": payload, "valid": True, "reason": "",
+        })
+    return parsed
+
+
+def _pincode_mapping_bulk_preview_payload(parsed_rows: list[dict]) -> dict:
+    existing = _pincode_mapping_existing_by_key(
+        [row["city_key"] for row in parsed_rows if row.get("valid")]
+    )
+    seen_new = set()
+    preview_rows = []
+    summary = {"insert": 0, "update": 0, "invalid": 0, "total": len(parsed_rows)}
+
+    for row in parsed_rows:
+        if not row.get("valid"):
+            summary["invalid"] += 1
+            preview_rows.append({
+                "index": row["index"], "action": "invalid",
+                "city": row.get("city", ""),
+                "reason": row.get("reason", "Invalid row."),
+                "row": row.get("row", {}),
+            })
+            continue
+
+        key = row["city_key"]
+        action = "update" if key in existing or key in seen_new else "insert"
+        if action == "insert":
+            seen_new.add(key)
+        summary[action] += 1
+        preview_rows.append({
+            "index": row["index"], "action": action, "city": row["city"],
+            "reason": "", "row": row["row"], "existing": existing.get(key),
+        })
+
+    return {
+        "columns": PINCODE_MAPPING_COLUMNS,
+        "summary": summary,
+        "rows": preview_rows,
+    }
+
+
+@api_view(["GET"])
+@permission_classes([require("upload.use")])
+def pincode_mapping_list(request):
+    query = str(request.query_params.get("search") or "").strip()
+    try:
+        page = max(0, int(request.query_params.get("page", 0)))
+        page_size = min(200, max(1, int(request.query_params.get("page_size", 50))))
+    except ValueError:
+        page, page_size = 0, 50
+
+    where = []
+    params = []
+    if query:
+        like = f"%{query}%"
+        where.append(
+            "("
+            + " OR ".join(
+                f"CAST({_quote_ident(col)} AS text) ILIKE %s"
+                for col in PINCODE_MAPPING_SEARCH_COLUMNS
+            )
+            + ")"
+        )
+        params.extend([like] * len(PINCODE_MAPPING_SEARCH_COLUMNS))
+
+    where_sql = f"WHERE {' AND '.join(where)}" if where else ""
+    offset = page * page_size
+
+    with connection.cursor() as cur:
+        cur.execute(f"SELECT COUNT(*) FROM pincode_mapping {where_sql}", list(params))
+        total = cur.fetchone()[0]
+
+        cur.execute(
+            f"""
+            SELECT {_pincode_mapping_select_columns()}
+            FROM pincode_mapping
+            {where_sql}
+            ORDER BY COALESCE(state, ''), COALESCE(city, '')
+            LIMIT %s OFFSET %s
+            """,
+            [*params, page_size, offset],
+        )
+        cols = [c[0] for c in cur.description]
+        rows = [dict(zip(cols, row)) for row in cur.fetchall()]
+
+    return Response({
+        "columns": PINCODE_MAPPING_COLUMNS,
+        "rows": rows,
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+    })
+
+
+@api_view(["POST"])
+@permission_classes([require("upload.use")])
+def pincode_mapping_bulk_preview(request):
+    try:
+        parsed_rows = _pincode_mapping_bulk_rows(request.data or {})
+    except ValueError as exc:
+        return Response({"detail": str(exc)}, status=400)
+    return Response(_pincode_mapping_bulk_preview_payload(parsed_rows))
+
+
+@api_view(["POST"])
+@permission_classes([require("upload.use")])
+def pincode_mapping_bulk_upsert(request):
+    try:
+        parsed_rows = _pincode_mapping_bulk_rows(request.data or {})
+    except ValueError as exc:
+        return Response({"detail": str(exc)}, status=400)
+
+    existing = _pincode_mapping_existing_by_key(
+        [row["city_key"] for row in parsed_rows if row.get("valid")]
+    )
+    result_rows = []
+    summary = {"inserted": 0, "updated": 0, "invalid": 0, "total": len(parsed_rows)}
+
+    with transaction.atomic(), connection.cursor() as cur:
+        for parsed in parsed_rows:
+            if not parsed.get("valid"):
+                summary["invalid"] += 1
+                result_rows.append({
+                    "index": parsed["index"], "action": "invalid",
+                    "city": parsed.get("city", ""),
+                    "reason": parsed.get("reason", "Invalid row."),
+                    "row": parsed.get("row", {}),
+                })
+                continue
+
+            key = parsed["city_key"]
+            row = parsed["row"]
+            existing_row = existing.get(key)
+
+            if existing_row:
+                # Only overwrite state/pincode with the pasted non-null values.
+                update_columns = [
+                    col for col in PINCODE_MAPPING_COLUMNS
+                    if col != "city" and col in row and row[col] is not None
+                ]
+                if update_columns:
+                    assignments = ", ".join(
+                        f"{_quote_ident(col)} = %s" for col in update_columns
+                    )
+                    values = [row[col] for col in update_columns]
+                    cur.execute(
+                        f"""
+                        UPDATE pincode_mapping
+                        SET {assignments}
+                        WHERE id = %s::bigint
+                        RETURNING {_pincode_mapping_select_columns()}
+                        """,
+                        [*values, existing_row["row_id"]],
+                    )
+                    cols = [c[0] for c in cur.description]
+                    saved_row = dict(zip(cols, cur.fetchone()))
+                else:
+                    saved_row = existing_row
+
+                existing[key] = saved_row
+                summary["updated"] += 1
+                result_rows.append({
+                    "index": parsed["index"], "action": "update",
+                    "city": parsed["city"], "reason": "", "row": saved_row,
+                })
+                continue
+
+            insert_columns = ["city", "state"]
+            if row.get("pincode") is not None:
+                insert_columns.append("pincode")
+            insert_data = {**row, "city": parsed["city"]}
+            placeholders = ", ".join(["%s"] * len(insert_columns))
+            cur.execute(
+                f"""
+                INSERT INTO pincode_mapping ({", ".join(_quote_ident(col) for col in insert_columns)})
+                VALUES ({placeholders})
+                RETURNING {_pincode_mapping_select_columns()}
+                """,
+                [insert_data[col] for col in insert_columns],
+            )
+            cols = [c[0] for c in cur.description]
+            saved_row = dict(zip(cols, cur.fetchone()))
+            existing[key] = saved_row
+            summary["inserted"] += 1
+            result_rows.append({
+                "index": parsed["index"], "action": "insert",
+                "city": parsed["city"], "reason": "", "row": saved_row,
+            })
+
+    return Response({
+        "ok": True,
+        "columns": PINCODE_MAPPING_COLUMNS,
+        "summary": summary,
+        "rows": result_rows,
+    })
+
+
+@api_view(["POST"])
+@permission_classes([require("upload.use")])
+def pincode_mapping_create(request):
+    try:
+        row = _pincode_mapping_payload(request.data or {})
+    except ValueError as exc:
+        return Response({"detail": str(exc)}, status=400)
+
+    city = str(row.get("city") or "").strip()
+    if not city:
+        return Response({"detail": "city is required."}, status=400)
+    if not str(row.get("state") or "").strip():
+        return Response({"detail": "state is required."}, status=400)
+
+    columns = ["city", "state"]
+    if row.get("pincode") is not None:
+        columns.append("pincode")
+    insert_data = {**row, "city": city}
+    placeholders = ", ".join(["%s"] * len(columns))
+
+    try:
+        with transaction.atomic(), connection.cursor() as cur:
+            cur.execute(
+                f"""
+                INSERT INTO pincode_mapping ({", ".join(_quote_ident(col) for col in columns)})
+                VALUES ({placeholders})
+                RETURNING {_pincode_mapping_select_columns()}
+                """,
+                [insert_data[col] for col in columns],
+            )
+            cols = [c[0] for c in cur.description]
+            created = dict(zip(cols, cur.fetchone()))
+    except IntegrityError:
+        return Response({"detail": f"A row for '{city}' already exists."}, status=409)
+
+    return Response({"ok": True, "row": created})
+
+
+@api_view(["POST"])
+@permission_classes([require("upload.use")])
+def pincode_mapping_update(request):
+    row_id = str((request.data or {}).get("row_id") or "").strip()
+    if not row_id:
+        return Response({"detail": "row_id is required."}, status=400)
+    try:
+        row = _pincode_mapping_payload((request.data or {}).get("row") or {})
+    except ValueError as exc:
+        return Response({"detail": str(exc)}, status=400)
+    if not row:
+        return Response({"detail": "No fields to update."}, status=400)
+
+    assignments = ", ".join(f"{_quote_ident(col)} = %s" for col in row)
+    values = [row[col] for col in row]
+
+    try:
+        with transaction.atomic(), connection.cursor() as cur:
+            cur.execute(
+                f"""
+                UPDATE pincode_mapping
+                SET {assignments}
+                WHERE id = %s::bigint
+                RETURNING {_pincode_mapping_select_columns()}
+                """,
+                [*values, row_id],
+            )
+            updated_row = cur.fetchone()
+            if not updated_row:
+                return Response({"detail": "Row was not found. Please search again."}, status=404)
+            cols = [c[0] for c in cur.description]
+    except IntegrityError:
+        return Response({"detail": "Another row already uses that city."}, status=409)
+
+    return Response({"ok": True, "row": dict(zip(cols, updated_row))})
+
+
+@api_view(["POST"])
+@permission_classes([require("upload.use")])
+def pincode_mapping_delete(request):
+    row_id = str((request.data or {}).get("row_id") or "").strip()
+    if not row_id:
+        return Response({"detail": "row_id is required."}, status=400)
+    with transaction.atomic(), connection.cursor() as cur:
+        cur.execute(
+            """
+            DELETE FROM pincode_mapping
+            WHERE id = %s::bigint
+            RETURNING city, state, pincode
+            """,
+            [row_id],
+        )
+        deleted = cur.fetchone()
+        if not deleted:
+            return Response({"detail": "Row was not found. Please search again."}, status=404)
+
+    return Response({
+        "ok": True,
+        "deleted": {"city": deleted[0], "state": deleted[1], "pincode": deleted[2]},
     })
 
 
