@@ -40,6 +40,7 @@ INSTALLED_APPS = [
     "dashboard",
     "uploads",
     "shipment",
+    "chatbot",
 ]
 
 MIDDLEWARE = [
@@ -167,6 +168,17 @@ GOOGLE_SHEETS_SPREADSHEET_ID = env(
     "GOOGLE_SHEETS_SPREADSHEET_ID",
     default="10-P_ZBVGaIKz87PTByk8rMb_c1J0VT0mfZo_84qwjQU",
 )
+
+# --- AI Chatbot -------------------------------------------------------------
+# The chatbot runs fully offline on a built-in natural-language rules engine
+# (no external AI, no cost). If you later paste an Anthropic API key here it
+# transparently upgrades to Claude tool-use; leave it blank to stay on the
+# built-in engine. Install the optional `anthropic` package to enable that path.
+ANTHROPIC_API_KEY = env("ANTHROPIC_API_KEY", default="")
+CHATBOT_CLAUDE_MODEL = env("CHATBOT_CLAUDE_MODEL", default="claude-opus-4-8")
+# Guardrails for the chatbot's read-only SQL layer.
+CHATBOT_MAX_ROWS = env.int("CHATBOT_MAX_ROWS", default=5000)
+CHATBOT_SQL_TIMEOUT_MS = env.int("CHATBOT_SQL_TIMEOUT_MS", default=8000)
 
 DATABASE_ROUTERS = ["sap.router.SAPReadOnlyRouter"]
 

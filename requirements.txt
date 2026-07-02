@@ -14,3 +14,7 @@ google-auth>=2.35.0,<3
 # Optional: only used when REDIS_URL is set (shared cross-worker cache backend).
 # Harmless to install when unset — the LocMemCache default never imports it.
 redis>=5.0.0,<6
+# Optional: only used when ANTHROPIC_API_KEY is set. The AI chatbot works fully
+# offline on its built-in rules engine without this; installing it + setting the
+# key upgrades the bot to Claude tool-use. Uncomment to enable.
+# anthropic>=0.40.0,<1
