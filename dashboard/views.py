@@ -4580,8 +4580,16 @@ def _realise_aggregate(platform, month_num, year, group_by=None, filters=None):
                           AND UPPER(to_char(r.from_date, 'FMMonth')) = %s
                     ),
                     latest AS MATERIALIZED (SELECT MAX(to_day) AS md FROM base)
+                    -- Delivered value = calculated_shipped_revenue
+                    -- (ordered_revenue/ordered_units × shipped_units), NOT the raw
+                    -- shipped_revenue column — the latter is a tiny/unreliable
+                    -- figure. This matches the Amazon Secondary dashboard's
+                    -- amazon_sec_range_master_view.calculated_shipped_revenue, and
+                    -- keeps value − commission = shipped_revenue_after_margin.
                     SELECT {grp} AS name, UPPER(TRIM(ml.item_head::text)) AS head,
-                           COALESCE(SUM(b.revenue), 0) AS value,
+                           COALESCE(SUM(
+                               (b.ordered_revenue / NULLIF(b.ordered_units, 0)) * b.units
+                           ), 0) AS value,
                            COALESCE(SUM(b.units * COALESCE(ml.per_unit_value::numeric, 0)), 0) AS ltrs,
                            COALESCE(SUM(
                                (b.ordered_revenue / NULLIF(b.ordered_units, 0)) * b.units
