@@ -1751,6 +1751,212 @@ def state_sales_detail_cities(request):
     })
 
 
+# ─── /state-sales/detail/city-skus ───
+@api_view(["GET"])
+@permission_classes([require("dashboard.view")])
+@cached_get(timeout=120, prefix="dash.state_sales_detail_city_skus", shared=True)
+def state_sales_detail_city_skus(request):
+    """Top SKUs running in ONE city within one state — the second-level drill-down
+    behind the city list. City exists only for the QC platforms (secmaster_mv);
+    Amazon & Flipkart carry no city, so this returns nothing for them. Honours the
+    same platform / brand / category / sub-category / item-head / period filters
+    and orders by the active metric. `limit` (default 10) caps the SKU count."""
+    today = date.today()
+    metric = _state_metric(request)
+    _mode, periods, month_echo = _state_periods(request, today)
+
+    canon = _norm_state(request.GET.get("state"))
+    city = (request.GET.get("city") or "").strip()
+    platform = (request.GET.get("platform") or "").strip().lower() or None
+    brands = [b.strip().upper() for b in request.GET.getlist("brand")
+              if b.strip() and b.strip().lower() != "all"]
+    cats = [c.strip().upper() for c in request.GET.getlist("category") if c.strip()]
+    subs = [s.strip().upper() for s in request.GET.getlist("sub_category") if s.strip()]
+    heads = [h.strip().upper() for h in request.GET.getlist("item_head")
+             if h.strip() and h.strip().lower() != "all"]
+
+    order_col = {"litres": "litres", "units": "units", "value": "value"}.get(metric, "litres")
+    try:
+        limit = min(50, max(1, int(request.GET.get("limit") or 10)))
+    except (TypeError, ValueError):
+        limit = 10
+
+    rows, errors = [], []
+
+    def push(label, code, plats, lt, un, vl, od):
+        rows.append({
+            "label": label,
+            "sku_code": code or "",
+            "platforms": plats or "",
+            "litres": round(float(lt or 0), 2),
+            "units": round(float(un or 0), 2),
+            "value": round(float(vl or 0), 2),
+            "orders": int(od or 0),
+        })
+
+    # QC-only: Amazon / Flipkart have no city, so skip them entirely.
+    if canon is not None and city and platform not in ("amazon", "flipkart"):
+        with connection.cursor() as cur:
+            sec_fmt = (_SEC_SLUG_TO_FORMAT.get(platform, platform.replace("_", " ").upper())
+                       if platform else None)
+            sec_mf, sec_mp = _sec_month_filter(periods)
+            ds = ("SELECT DISTINCT COALESCE(state::text, '') FROM secmaster_mv "
+                  "WHERE UPPER(TRIM(format::text)) NOT IN ('AMAZON', 'FLIPKART')")
+            ds += sec_mf
+            dp = list(sec_mp)
+            if sec_fmt:
+                ds += " AND LOWER(TRIM(format::text)) = LOWER(%s)"; dp.append(sec_fmt)
+            sec_raws = []
+            try:
+                cur.execute(ds, dp)
+                sec_raws = [r[0] for r in cur.fetchall() if _norm_state(r[0]) == canon]
+            except Exception as e:
+                errors.append({"source": "secmaster_states", "error": str(e)})
+            if sec_raws:
+                # SKU label: clean catalogue item, then sku_name, then the raw code.
+                name_expr = ("COALESCE(NULLIF(TRIM(item::text), ''), "
+                             "NULLIF(TRIM(sku_name::text), ''), "
+                             "NULLIF(TRIM(sku_code::text), ''), 'Unknown')")
+                sql = f"""
+                    SELECT {name_expr} AS label,
+                           MAX(NULLIF(TRIM(sku_code::text), '')) AS sku_code,
+                           STRING_AGG(DISTINCT INITCAP(TRIM(format::text)), ', ') AS platforms,
+                           COALESCE(SUM(ltr_sold), 0) AS litres,
+                           COALESCE(SUM(quantity), 0) AS units,
+                           COALESCE(SUM(amount), 0) AS value,
+                           COUNT(*) AS orders
+                    FROM secmaster_mv
+                    WHERE UPPER(TRIM(format::text)) NOT IN ('AMAZON', 'FLIPKART')
+                      AND NULLIF(TRIM(city::text), '') IS NOT NULL
+                """
+                sql += sec_mf
+                params = list(sec_mp)
+                if sec_fmt:
+                    sql += " AND LOWER(TRIM(format::text)) = LOWER(%s)"; params.append(sec_fmt)
+                if brands:
+                    sql += " AND UPPER(TRIM(brand::text)) = ANY(%s)"; params.append(brands)
+                if cats:
+                    sql += " AND UPPER(TRIM(category::text)) = ANY(%s)"; params.append(cats)
+                if subs:
+                    sql += " AND UPPER(TRIM(sub_category::text)) = ANY(%s)"; params.append(subs)
+                if heads:
+                    sql += " AND UPPER(TRIM(item_head::text)) = ANY(%s)"; params.append(heads)
+                # Match the same city label the city list showed (INITCAP(TRIM(city))).
+                sql += " AND INITCAP(TRIM(city::text)) = %s"; params.append(city)
+                sql += " AND COALESCE(state::text, '') = ANY(%s)"; params.append(sec_raws)
+                sql += f" GROUP BY 1 ORDER BY {order_col} DESC NULLS LAST LIMIT %s"
+                params.append(limit)
+                try:
+                    cur.execute(sql, params)
+                    for lb, code, plats, lt, un, vl, od in cur.fetchall():
+                        push(lb, code, plats, lt, un, vl, od)
+                except Exception as e:
+                    errors.append({"source": "city_skus", "error": str(e)})
+
+    total = {
+        "litres": round(sum(r["litres"] for r in rows), 2),
+        "units": round(sum(r["units"] for r in rows), 2),
+        "value": round(sum(r["value"] for r in rows), 2),
+        "orders": sum(r["orders"] for r in rows),
+        "rows": len(rows),
+    }
+    return Response({
+        "state": canon, "city": city, "metric": metric, **month_echo,
+        "platform": platform, "rows": rows, "total": total, "errors": errors,
+    })
+
+
+# ─── /state-sales/export ───
+@api_view(["GET"])
+@permission_classes([require("dashboard.view")])
+@cached_get(timeout=120, prefix="dash.state_sales_export", shared=True)
+def state_sales_export(request):
+    """Flat, single-sheet export for State-wise Sales: one row per
+    state × city × SKU × platform from the QC secondary data (secmaster_mv), with
+    ordered / delivered litres, litres sold and sales. Amazon & Flipkart are
+    excluded — they carry no city (nor ordered / delivered litres). Honours the
+    same platform / brand / category / sub-category / item-head / period filters."""
+    today = date.today()
+    _mode, periods, month_echo = _state_periods(request, today)
+
+    platform = (request.GET.get("platform") or "").strip().lower() or None
+    brands = [b.strip().upper() for b in request.GET.getlist("brand")
+              if b.strip() and b.strip().lower() != "all"]
+    cats = [c.strip().upper() for c in request.GET.getlist("category") if c.strip()]
+    subs = [s.strip().upper() for s in request.GET.getlist("sub_category") if s.strip()]
+    heads = [h.strip().upper() for h in request.GET.getlist("item_head")
+             if h.strip() and h.strip().lower() != "all"]
+
+    rows, errors = [], []
+    # QC-only: Amazon / Flipkart have no city, so a specific Amazon/Flipkart filter
+    # yields nothing here.
+    if platform not in ("amazon", "flipkart"):
+        with connection.cursor() as cur:
+            sec_fmt = (_SEC_SLUG_TO_FORMAT.get(platform, platform.replace("_", " ").upper())
+                       if platform else None)
+            sec_mf, sec_mp = _sec_month_filter(periods)
+            name_expr = ("COALESCE(NULLIF(TRIM(item::text), ''), "
+                         "NULLIF(TRIM(sku_name::text), ''), '')")
+            # Secondary sell-out (secmaster_mv) has a SINGLE litres measure —
+            # `ltr_sold` (litres sold / delivered to the consumer). There is no
+            # separate ordered-vs-delivered litres at the city×SKU grain (that's a
+            # primary-PO concept), so Order Ltrs and Deliver Ltrs both surface the
+            # litres sold.
+            sql = f"""
+                SELECT INITCAP(TRIM(state::text)) AS state,
+                       INITCAP(TRIM(city::text)) AS city,
+                       COALESCE(NULLIF(TRIM(sku_code::text), ''), '') AS sku_code,
+                       {name_expr} AS item,
+                       INITCAP(TRIM(format::text)) AS format,
+                       COALESCE(SUM(ltr_sold), 0) AS order_ltrs,
+                       COALESCE(SUM(ltr_sold), 0) AS deliver_ltrs,
+                       COALESCE(SUM(amount), 0) AS sales,
+                       COALESCE(SUM(ltr_sold), 0) AS ltr_sold,
+                       COALESCE(SUM(quantity), 0) AS units,
+                       COUNT(*) AS orders
+                FROM secmaster_mv
+                WHERE UPPER(TRIM(format::text)) NOT IN ('AMAZON', 'FLIPKART')
+                  AND NULLIF(TRIM(city::text), '') IS NOT NULL
+            """
+            sql += sec_mf
+            params = list(sec_mp)
+            if sec_fmt:
+                sql += " AND LOWER(TRIM(format::text)) = LOWER(%s)"; params.append(sec_fmt)
+            if brands:
+                sql += " AND UPPER(TRIM(brand::text)) = ANY(%s)"; params.append(brands)
+            if cats:
+                sql += " AND UPPER(TRIM(category::text)) = ANY(%s)"; params.append(cats)
+            if subs:
+                sql += " AND UPPER(TRIM(sub_category::text)) = ANY(%s)"; params.append(subs)
+            if heads:
+                sql += " AND UPPER(TRIM(item_head::text)) = ANY(%s)"; params.append(heads)
+            sql += (" GROUP BY 1, 2, 3, 4, 5 "
+                    "ORDER BY sales DESC NULLS LAST LIMIT 100000")
+            try:
+                cur.execute(sql, params)
+                for st, city, code, item, fmt, ol, dl, sales, ls, un, od in cur.fetchall():
+                    rows.append({
+                        "state": st or "",
+                        "city": city or "",
+                        "sku_code": code or "",
+                        "item": item or "",
+                        "format": fmt or "",
+                        "order_ltrs": round(float(ol or 0), 2),
+                        "deliver_ltrs": round(float(dl or 0), 2),
+                        "sales": round(float(sales or 0), 2),
+                        "ltr_sold": round(float(ls or 0), 2),
+                        "units": round(float(un or 0), 2),
+                        "orders": int(od or 0),
+                    })
+            except Exception as e:
+                errors.append({"source": "state_sales_export", "error": str(e)})
+
+    return Response({
+        "rows": rows, "count": len(rows), **month_echo,
+        "platform": platform, "errors": errors,
+    })
+
+
 # ─── /category-breakdown ───
 @api_view(["GET"])
 @permission_classes([require("dashboard.view")])
@@ -4502,9 +4708,13 @@ def _realise_aggregate(platform, month_num, year, group_by=None, filters=None):
                            COALESCE(SUM(ltr_sold), 0) AS ltrs,
                            0 AS commission
                     FROM secmaster_mv
-                    WHERE UPPER(TRIM(month::text)) = %s
+                    -- Match idx_secmaster_mv_fmt_month_year exactly (normalized
+                    -- format + upper(month) + year) so this hits the index instead
+                    -- of scanning all ~780k rows. UPPER(TRIM(format))='FLIPKART'
+                    -- does NOT match the index expression and was ~25x slower.
+                    WHERE regexp_replace(lower(TRIM(format)), '[^a-z0-9]+', '', 'g') = 'flipkart'
+                      AND UPPER(TRIM(month::text)) = %s
                       AND year::numeric = %s
-                      AND UPPER(TRIM(format::text)) = 'FLIPKART'
                       AND UPPER(TRIM(item_head::text)) IN ('PREMIUM', 'COMMODITY')
                 """
                 params = [month_name, year]
