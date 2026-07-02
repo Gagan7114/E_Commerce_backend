@@ -195,7 +195,7 @@ def parse(message: str, db_platforms: list[dict] | None = None) -> ParsedQuery:
     q.date_from, q.date_to, q.date_label = parse_date_range(low)
     q.wants_excel = _has(low, _EXCEL_WORDS)
 
-    if re.search(r"\bliters?\b|\blitres?\b|\bltr\b|\bvolume\b", low):
+    if re.search(r"\bliters?\b|\blitres?\b|\bltrs?\b|\bvolume\b", low):
         q.metric = "liters"
     elif re.search(r"\bunits?\b|\bqty\b|\bquantit|\bpcs\b|\bpieces?\b", low):
         q.metric = "units"

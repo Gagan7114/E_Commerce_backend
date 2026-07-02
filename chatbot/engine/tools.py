@@ -20,7 +20,7 @@ from django.db.models.functions import Coalesce
 
 from accounts.models import InventoryDohNotification
 from platforms.models import PlatformConfig
-from shipment.models import AsinDohDaily, Shipment
+from shipment.models import Shipment
 
 from . import safe_sql
 from .nlu import ParsedQuery
@@ -127,85 +127,73 @@ def alerts(q: ParsedQuery) -> DataResult:
 
 
 def liters(q: ParsedQuery) -> DataResult:
-    """Answer liters questions from the most appropriate available source, and
-    always state which source the number came from."""
-    is_delivered = q.movement == "delivered" or "deliver" in q.text.lower() or "dispatch" in q.text.lower()
+    """Order / delivered liters (and quantities) for a platform, from the
+    master PO table — the authoritative per-platform source. `master_po` carries
+    total_order_liters / total_delivered_liters / filled_ltrs / missed_ltrs per
+    PO line, keyed by `format` (platform) and `po_date`."""
+    table = "master_po"
+    if not safe_sql.table_exists(table):
+        return DataResult(summary=f"I couldn't find the '{table}' table.", ok=False, source=table)
 
-    # 1) Delivered/dispatched liters -> shipment planner (Amazon dispatch).
-    if is_delivered:
-        statuses = ["delivered"]
-        if "dispatch" in q.text.lower():
-            statuses = ["dispatched", "in_transit", "delivered"]
-        sq = Shipment.objects.filter(status__in=statuses)
-        if q.date_from and q.date_to:
-            sq = sq.filter(
-                Q(dispatch_date_planned__range=(q.date_from, q.date_to))
-                | Q(created_at__date__range=(q.date_from, q.date_to))
-            )
-        agg = sq.aggregate(
-            liters=Coalesce(Sum("planned_liters"), Value(0), output_field=_DEC),
-            n=Count("id"),
-        )
-        by_status = list(
-            sq.values("status").annotate(
-                liters=Coalesce(Sum("planned_liters"), Value(0), output_field=_DEC),
-                n=Count("id"),
-            ).order_by("-liters")
-        )
-        cols = ["status", "shipments", "planned_liters"]
-        rows = [[r["status"], r["n"], r["liters"]] for r in by_status]
-        span = f" from {q.date_label}" if q.date_label else ""
-        summary = (
-            f"{_fmt(agg['liters'])} liters across {_fmt(agg['n'])} "
-            f"{'/'.join(statuses)} shipment(s){span}. "
-            "Source: shipment planner (planned_liters on sp_shipments)."
-        )
-        return DataResult(summary=summary, columns=cols, rows=rows,
-                          source="shipment.Shipment", meta=[("statuses", ",".join(statuses))],
-                          excel_title="Delivered Liters")
-
-    # 2) Amazon liters sold -> AsinDohDaily (asin-level daily ltr_sold).
-    slugs = q.platform_slugs
-    if (not slugs or slugs == ["amazon"]) and q.metric == "liters":
-        aq = AsinDohDaily.objects.all()
-        if q.date_from and q.date_to:
-            aq = aq.filter(date__range=(q.date_from, q.date_to))
-        agg = aq.aggregate(
-            ltr=Coalesce(Sum("ltr_sold"), Value(0), output_field=_DEC),
-            units=Coalesce(Sum("units_sold"), Value(0), output_field=_DEC),
-        )
-        cols = ["metric", "value"]
-        rows = [["liters_sold", agg["ltr"]], ["units_sold", agg["units"]]]
-        span = f" ({q.date_label})" if q.date_label else ""
-        summary = (f"Amazon sold {_fmt(agg['ltr'])} liters{span}. "
-                   "Source: sp_asin_doh_daily (Amazon ASIN daily).")
-        return DataResult(summary=summary, columns=cols, rows=rows,
-                          source="shipment.AsinDohDaily", excel_title="Amazon Liters")
-
-    # 3) Per-platform liters -> inventory DOH snapshots (ltr_sold / soh_ltr).
-    dq = InventoryDohNotification.objects.all()
-    if slugs:
-        dq = dq.filter(platform_slug__in=slugs)
+    where, params = [], []
+    scope = "all platforms"
+    if q.primary_platform:
+        where.append("format ILIKE %s")
+        params.append(f"%{q.primary_platform['slug']}%")
+        scope = q.primary_platform["name"]
     if q.date_from and q.date_to:
-        dq = dq.filter(inventory_date__range=(q.date_from, q.date_to))
-    by_fmt = list(
-        dq.values("format").annotate(
-            ltr_sold=Coalesce(Sum("ltr_sold"), Value(0), output_field=_DEC),
-            soh_ltr=Coalesce(Sum("soh_ltr"), Value(0), output_field=_DEC),
-            skus=Count("id"),
-        ).order_by("-ltr_sold")
-    )
-    cols = ["format", "ltr_sold", "soh_ltr", "skus"]
-    rows = [[r["format"], r["ltr_sold"], r["soh_ltr"], r["skus"]] for r in by_fmt]
-    total_ltr = sum((r[1] for r in rows), Decimal(0))
-    where = f" for {q.platforms[0]['name']}" if slugs else " across platforms"
+        where.append("po_date BETWEEN %s AND %s")
+        params.extend([q.date_from, q.date_to])
+    where_sql = (" WHERE " + " AND ".join(where)) if where else ""
+
+    sql = f"""
+        SELECT
+            COUNT(*) AS pos,
+            COALESCE(SUM(total_order_liters), 0) AS order_ltrs,
+            COALESCE(SUM(total_delivered_liters), 0) AS delivered_ltrs,
+            COALESCE(SUM(filled_ltrs), 0) AS filled_ltrs,
+            COALESCE(SUM(missed_ltrs), 0) AS missed_ltrs,
+            COALESCE(SUM(order_qty), 0) AS order_qty,
+            COALESCE(SUM(delivered_qty), 0) AS delivered_qty
+        FROM {table}{where_sql}
+    """
+    try:
+        _cols, rows, _t = safe_sql.run_select(sql, params, max_rows=1)
+    except Exception as exc:
+        logger.warning("liters query failed: %s", exc)
+        return DataResult(summary=f"I couldn't total the liters: {exc}", ok=False, source=table)
+
+    r = rows[0] if rows else [0, 0, 0, 0, 0, 0, 0]
+    pos, order_ltrs, delivered_ltrs, filled_ltrs, missed_ltrs, order_qty, delivered_qty = r
+    span = f" in {q.date_label}" if q.date_label else ""
+    text = q.text.lower()
+
+    if "deliver" in text or q.movement == "delivered":
+        headline = f"{scope}: {_fmt(delivered_ltrs)} liters delivered{span}"
+    elif "order" in text:
+        headline = f"{scope}: {_fmt(order_ltrs)} liters ordered{span}"
+    else:
+        headline = f"{scope}{span}: {_fmt(order_ltrs)} L ordered, {_fmt(delivered_ltrs)} L delivered"
+
+    fill = (float(delivered_ltrs) / float(order_ltrs) * 100.0) if float(order_ltrs or 0) else 0.0
     summary = (
-        f"{_fmt(total_ltr)} liters sold{where} in the inventory DOH snapshots. "
-        "Note: this covers SKUs tracked in DOH alerts, not full secondary sales — "
-        "ask for 'secondary sales' or a platform PO report for order-level totals."
+        f"{headline}. Across {_fmt(pos)} PO line(s): ordered {_fmt(order_ltrs)} L, "
+        f"delivered {_fmt(delivered_ltrs)} L (fill {fill:.1f}%), missed {_fmt(missed_ltrs)} L. "
+        "Source: master_po."
     )
-    return DataResult(summary=summary, columns=cols, rows=rows,
-                      source="InventoryDohNotification (snapshot)", excel_title="Liters")
+    cols = ["metric", "value"]
+    data_rows = [
+        ["PO lines", pos],
+        ["Order liters", order_ltrs],
+        ["Delivered liters", delivered_ltrs],
+        ["Filled liters", filled_ltrs],
+        ["Missed liters", missed_ltrs],
+        ["Order qty", order_qty],
+        ["Delivered qty", delivered_qty],
+    ]
+    return DataResult(summary=summary, columns=cols, rows=data_rows, source="master_po",
+                      meta=[("scope", scope), ("range", q.date_label or "all")],
+                      excel_title="Liters")
 
 
 def shipments(q: ParsedQuery) -> DataResult:
