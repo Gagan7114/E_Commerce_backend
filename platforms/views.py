@@ -4311,7 +4311,11 @@ _ADS_SUMMARY_UNION = """
            0::numeric, 0::numeric, 0::numeric,
            -- Flipkart has no SKU for the landing-rate ads_sale, but it reports a
            -- real revenue figure — use it directly as the Ads Sale value.
-           COALESCE(total_revenue, 0)::numeric, year, month, date, FALSE, 'flipkart_ads'::text
+           -- use_max_date=TRUE: flipkart_ads_master is a CUMULATIVE month-to-date
+           -- snapshot (each date is a running total), so summing across dates
+           -- over-counts ~N×. Keep only the latest (max) date — the true month
+           -- total — matching the Flipkart Ads Dashboard (summary_use_max_date).
+           COALESCE(total_revenue, 0)::numeric, year, month, date, TRUE, 'flipkart_ads'::text
       FROM flipkart_ads_master
     UNION ALL
     -- Flipkart SKU-level ads from the FSN report — carries the item_head /
@@ -4689,6 +4693,30 @@ def flipkart_fsn_dashboard(request, slug: str):
         [],
     )
 
+    # The FSN report now carries a user-entered `date` (captured at upload —
+    # the file itself has no date). Surface it as MONTH / YEAR / MAX DATE so the
+    # dashboard shows which period the report is for. FSN is a single consolidated
+    # snapshot (the uploader wipes + reloads), so all rows share one date; take
+    # the latest.
+    try:
+        fsn_period_rows = _dict_rows(
+            "SELECT to_char(date, 'YYYY-MM-DD') AS date, "
+            "UPPER(TO_CHAR(date, 'FMMonth')) AS month, "
+            "EXTRACT(YEAR FROM date)::int AS year "
+            "FROM consolidated_fsn_report "
+            "WHERE UPPER(TRIM(format::text)) = 'FLIPKART' AND date IS NOT NULL "
+            "ORDER BY date DESC LIMIT 1",
+            [],
+        )
+    except Exception:
+        # `date` column may not exist yet (migration 0068 not applied) — degrade
+        # gracefully to "no period" instead of failing the whole dashboard.
+        fsn_period_rows = []
+    fsn_period = fsn_period_rows[0] if fsn_period_rows else {}
+    fsn_date = fsn_period.get("date")
+    fsn_month = str(fsn_period["month"]).upper() if fsn_period.get("month") else None
+    fsn_year = str(fsn_period["year"]) if fsn_period.get("year") is not None else None
+
     default_visible = {
         "ad_spend", "revenue", "roi", "views", "clicks",
         "ctr", "cpc", "units_sold", "cvr",
@@ -4715,9 +4743,15 @@ def flipkart_fsn_dashboard(request, slug: str):
             for s in _FSN_METRIC_SPECS
         ],
         "breakdown_rows": breakdown_rows,
-        "max_date": None,
-        "filter_options": {"years": [], "months": [], "dates": []},
-        "filters": {},
+        "max_date": fsn_date,
+        "filter_options": {
+            "years": [fsn_year] if fsn_year else [],
+            "months": [fsn_month] if fsn_month else [],
+            "dates": [fsn_date] if fsn_date else [],
+        },
+        "filters": (
+            {"month": fsn_month, "year": fsn_year} if fsn_month and fsn_year else {}
+        ),
     })
 
 
@@ -7861,13 +7895,20 @@ def _amazon_mp_dashboard_response(request):
             COALESCE(SUM(tax_exclusive_gross), 0) AS exclusive,
             COALESCE(SUM(ABS(delivered_ltr)), 0) AS ltrs,
             COALESCE(SUM(ABS(quantity)), 0) AS quantity,
-            COUNT(*) AS row_count
+            COUNT(*) AS row_count,
+            -- Latest shipment date in the selected month. shipment_date is text
+            -- ('DD/MM/YY HH:MM'), so parse the DD/MM/YY prefix; only rows matching
+            -- that shape are parsed to avoid errors on stray values.
+            MAX(CASE WHEN TRIM(shipment_date) ~ '^[0-9]{{2}}/[0-9]{{2}}/[0-9]{{2}}'
+                     THEN TO_DATE(LEFT(TRIM(shipment_date), 8), 'DD/MM/YY') END) AS max_date
         FROM amazon_mp_master
         {where}
         """,
         params,
     )
     kpi_row = kpi_rows[0] if kpi_rows else {}
+    _max_date = kpi_row.get("max_date")
+    max_date_iso = _max_date.isoformat() if hasattr(_max_date, "isoformat") else (str(_max_date) if _max_date else None)
 
     def _group(col_expr: str, *, limit: int | None = None) -> list[dict]:
         sql = f"""
@@ -7969,6 +8010,7 @@ def _amazon_mp_dashboard_response(request):
             "month": month,
             "month_name": month_name,
             "year": year,
+            "max_date": max_date_iso,
             "row_count": int(_num(kpi_row.get("row_count"))),
             "kpi": {
                 "inclusive": _num(kpi_row.get("inclusive")),
