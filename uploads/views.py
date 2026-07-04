@@ -903,7 +903,10 @@ def master_sheet_delete(request):
 # City -> State -> PIN code reference table with just those three columns (plus
 # the id PK). One row per city; `pincode` is filled in by ops. Seeded
 # (city, state) from city_state_mapping. Managed by the same Master-Sheet-style
-# UI (search / edit / bulk paste-upsert). Not consumed by any view yet.
+# UI (search / edit / bulk paste-upsert). Consumed by the dashboard's State-wise
+# Sales map to resolve Amazon's city-wise feed to states, and grown
+# automatically with each Amazon city-wise upload (see
+# _sync_amazon_cities_to_pincode_mapping).
 #
 # There's no stored key/source/updated_at column: uniqueness is enforced by a
 # functional UNIQUE index on the normalised city (uq_pincode_mapping_city), and
@@ -2614,6 +2617,74 @@ def _propagate_swiggy_po_grn_dates(po_numbers: list[str]) -> int:
 # `INSERT ... ON CONFLICT` path in `_batch_upload`.
 
 
+# City spellings that are junk, not real cities — never worth a mapping row.
+_PINCODE_SYNC_JUNK = {
+    "NA", "N A", "NULL", "NONE", "UNKNOWN", "UNK", "OTHER", "OTHERS", "CITY",
+}
+
+
+def _sync_amazon_cities_to_pincode_mapping(rows):
+    """After an amazon_sec_state (city-wise Amazon Secondary) upload, grow
+    pincode_mapping with any city it doesn't know yet.
+
+    Only usable rows are added: the city must look like a real name (not
+    blank / junk / purely numeric) AND its state must be resolvable from
+    city_state_mapping — pincode_mapping.state is NOT NULL, and a city without
+    a state is dead weight for the map. Cities whose state can't be resolved
+    are returned in `unmapped` so ops can add them (with their state) through
+    the Pincode Mapping manager. The dashboard's Amazon state resolution reads
+    pincode_mapping, so a city added here shows on the map immediately.
+    Failures are reported, never raised — the upload itself already succeeded."""
+    cities = {}  # normalised key -> display spelling (first seen in the file)
+    for row in rows:
+        city = str((row or {}).get("city") or "").strip()
+        key = _pincode_city_key(city)
+        if not key or len(key) < 2 or key in _PINCODE_SYNC_JUNK:
+            continue
+        if key.replace(" ", "").isdigit():
+            continue
+        cities.setdefault(key, city)
+    if not cities:
+        return {"added": 0, "unmapped": []}
+
+    keys = sorted(cities)
+    added, unmapped = 0, []
+    try:
+        with connection.cursor() as cur:
+            cur.execute(
+                f"SELECT {_PINCODE_CITY_KEY_SQL} FROM pincode_mapping "
+                f"WHERE {_PINCODE_CITY_KEY_SQL} = ANY(%s)",
+                [keys],
+            )
+            known = {r[0] for r in cur.fetchall()}
+            missing = [k for k in keys if k not in known]
+            if not missing:
+                return {"added": 0, "unmapped": []}
+            cur.execute(
+                "SELECT city_key, state FROM city_state_mapping WHERE city_key = ANY(%s)",
+                [missing],
+            )
+            states = dict(cur.fetchall())
+            for key in missing:
+                state = str(states.get(key) or "").strip().upper()
+                if not state:
+                    unmapped.append(cities[key])
+                    continue
+                cur.execute(
+                    "INSERT INTO pincode_mapping (city, state) VALUES (%s, %s) "
+                    "ON CONFLICT ((btrim(regexp_replace(upper(city), "
+                    "'[^A-Z0-9]+', ' ', 'g')))) DO NOTHING",
+                    [cities[key], state],
+                )
+                added += cur.rowcount
+    except Exception as exc:
+        logger.warning(
+            "pincode_mapping sync after amazon_sec_state upload failed: %s", exc
+        )
+        return {"added": added, "unmapped": sorted(unmapped), "error": str(exc)}
+    return {"added": added, "unmapped": sorted(unmapped)}
+
+
 def _batch_upload(body, *, forced_table: str | None = None):
     body = body or {}
     table = forced_table or body.get("table")
@@ -2894,6 +2965,12 @@ def _batch_upload(body, *, forced_table: str | None = None):
         except Exception as exc:
             notification_result = {"error": str(exc)}
 
+    # City-wise Amazon Secondary: teach pincode_mapping any city it hasn't seen
+    # yet (state auto-resolved; junk / unresolvable cities skipped — see helper).
+    pincode_sync = None
+    if success and table == "amazon_sec_state":
+        pincode_sync = _sync_amazon_cities_to_pincode_mapping(data)
+
     if success:
         # Swiggy-only: a partially-delivered PO leaves its undelivered SKU rows
         # with a NULL delivery date. Fill those from the PO's delivered rows so
@@ -2924,8 +3001,12 @@ def _batch_upload(body, *, forced_table: str | None = None):
         "warnings": [
             f"Landing rate missing for {r['item']}, {r['month_label']} ({r['rows']} rows)"
             for r in missing_rates
-        ],
+        ] + ([
+            "New cities without a known state (add them in Pincode Mapping to "
+            "show on the map): " + ", ".join(pincode_sync["unmapped"])
+        ] if pincode_sync and pincode_sync.get("unmapped") else []),
         "missing_rates": missing_rates,
+        "pincode_sync": pincode_sync,
         "inventory_doh_notifications": notification_result,
     })
 

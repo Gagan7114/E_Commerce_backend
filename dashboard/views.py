@@ -681,8 +681,9 @@ def category_litres(request):
 
 # ─── /state-sales ───
 # Canonical India state/UT names + common aliases seen across master_po
-# (fulfilment state) and amazon_sec_state (consumer ship-to state). Anything not
-# resolvable to a canonical name is counted in the total but left off the map.
+# (fulfilment state) and the mapped sources (Amazon ship-to city resolved via
+# pincode_mapping, Flipkart delivery state). Anything not resolvable to a
+# canonical name is counted in the total but left off the map.
 _INDIA_STATE_ALIASES = {
     "ORISSA": "ODISHA",
     "PONDICHERRY": "PUDUCHERRY",
@@ -764,6 +765,51 @@ def _norm_state(raw):
     if compact in _INDIA_STATES_COMPACT:     # "ANDHRAPRADESH", "WESTBENGAL"
         return _INDIA_STATES_COMPACT[compact]
     return None
+
+
+# Known duplicate / renamed city spellings → one canonical label, keyed by the
+# INITCAP (Title Case) form of the raw value. Unlike states, cities aren't a
+# closed set, so this only folds the well-known renames and common variants that
+# would otherwise split a single city's totals across two rows in the rankings
+# (e.g. Bengaluru vs Bangalore, Gurugram vs Gurgaon).
+_CITY_ALIASES = {
+    "Bangalore": "Bengaluru",
+    "Bengalooru": "Bengaluru",
+    "Gurgaon": "Gurugram",
+    "Bombay": "Mumbai",
+    "Calcutta": "Kolkata",
+    "Madras": "Chennai",
+    "Poona": "Pune",
+    "Trivandrum": "Thiruvananthapuram",
+    "Pondicherry": "Puducherry",
+    "Baroda": "Vadodara",
+    "Mysore": "Mysuru",
+    "Mangalore": "Mangaluru",
+    "Cochin": "Kochi",
+    "Vizag": "Visakhapatnam",
+    "Gauhati": "Guwahati",
+    "Benares": "Varanasi",
+    "Banaras": "Varanasi",
+}
+
+
+def _city_canon_sql(col):
+    """SQL expression folding a raw city column to a canonical display label.
+
+    INITCAP(TRIM(col)) normalises the messy casing/spacing (ranchi/Ranchi/RANCHI),
+    then a CASE maps the known duplicate spellings in `_CITY_ALIASES` to one
+    canonical name so a single city isn't split into two rows. The alias values
+    are hardcoded module constants (never request input), so inlining them into
+    the SQL is safe. Used everywhere cities are grouped or filtered so the map
+    list, the drill-down lists and the click-through filters all agree."""
+    base = f"INITCAP(TRIM({col}::text))"
+    if not _CITY_ALIASES:
+        return base
+    cases = " ".join(
+        f"WHEN {base} = '{raw}' THEN '{canon}'"
+        for raw, canon in _CITY_ALIASES.items()
+    )
+    return f"(CASE {cases} ELSE {base} END)"
 
 
 # Frontend platform slug → "SecMaster".format value (secondary source). BigBasket
@@ -853,6 +899,21 @@ _AZ_METRIC_SQL = {
         "THEN a.shipped_units::numeric * m.per_unit_value ELSE 0 END), 0)"
     ),
 }
+# amazon_sec_state now carries the consumer ship-to CITY (View By=[City] export;
+# uploads migration 0069 renamed the column). State is resolved by joining the
+# ops-managed pincode_mapping table on the normalised city: UPPER, every
+# non-alphanumeric run collapsed to one space, trimmed — the same recipe as its
+# uq_pincode_mapping_city unique index, so the join is indexed. New cities are
+# auto-added to pincode_mapping on each Amazon city-wise upload (uploads app);
+# anything still missing can be added through the Pincode Mapping manager and
+# shows on the map immediately. (Alias stays `csm` from the previous
+# city_state_mapping join so every query below reads the same.)
+_AZ_CITY_KEY_SQL = "btrim(regexp_replace(upper(a.city::text), '[^A-Z0-9]+', ' ', 'g'))"
+_AZ_STATE_JOIN = (
+    "LEFT JOIN public.pincode_mapping csm ON "
+    "btrim(regexp_replace(upper(csm.city::text), '[^A-Z0-9]+', ' ', 'g')) = "
+    + _AZ_CITY_KEY_SQL
+)
 _FK_QTY_SQL = "NULLIF(regexp_replace(item_quantity, '[^0-9.-]', '', 'g'), '')::numeric"
 _FK_METRIC_SQL = {
     "units": "COALESCE(SUM(%s), 0)" % _FK_QTY_SQL,
@@ -904,7 +965,7 @@ def _fk_yms(periods):
 # only on master_sheet (the catalog), not on the chosen filters or period, so we
 # cache them globally for a few minutes instead of re-running two DISTINCT scans
 # on every filter toggle (e.g. Jivo/Sano), which added latency to each change.
-_STATE_FILTER_OPTS_KEY = "dash.state_sales.filter_options.v1"
+_STATE_FILTER_OPTS_KEY = "dash.state_sales.filter_options.v2"
 _STATE_FILTER_OPTS_TTL = 600  # 10 min; new master_sheet uploads show within that
 
 
@@ -917,7 +978,8 @@ def state_sales(request):
     QC platforms come from the "SecMaster" view: SUM(quantity) grouped on the
     view's already-resolved `state` (Jio Mart ships a DELIVERY_STATE directly; the
     QC platforms get state from city_state_mapping inside the view). Amazon →
-    amazon_sec_state (shipped_units, joined to master_sheet on ASIN). Flipkart →
+    amazon_sec_state (city-wise feed; ship-to city resolved to a state via
+    pincode_mapping, metrics joined to master_sheet on ASIN). Flipkart →
     flipkart_state_sales_master (SUM(item_quantity) for Sale events, grouped on
     customer_delivery_state).
 
@@ -941,6 +1003,7 @@ def state_sales(request):
     # we accept a list for symmetry with the other multi-value filters.
     heads = [h.strip().upper() for h in request.GET.getlist("item_head")
              if h.strip() and h.strip().lower() != "all"]
+    items = [i.strip().upper() for i in request.GET.getlist("item") if i.strip()]
 
     use_other = platform not in ("amazon", "flipkart")   # SecMaster QC platforms
     use_amazon = platform is None or platform == "amazon"
@@ -989,6 +1052,8 @@ def state_sales(request):
             sql += " AND UPPER(TRIM(sub_category::text)) = ANY(%s)"; params.append(subs)
         if heads:
             sql += " AND UPPER(TRIM(item_head::text)) = ANY(%s)"; params.append(heads)
+        if items:
+            sql += " AND UPPER(TRIM(item::text)) = ANY(%s)"; params.append(items)
         sql += " GROUP BY 1, 2"
         try:
             with connection.cursor() as cur:
@@ -1001,15 +1066,19 @@ def state_sales(request):
         if not use_amazon:
             return [], []
         az_month_sql, az_month_params = _az_month_filter(periods)
-        sql_a = """
-            SELECT COALESCE(a.state::text, '') AS state,
-                   %s AS units
+        # City-wise feed: resolve each ship-to city to its state through
+        # pincode_mapping; unmapped cities land in '' (counted in the total,
+        # left off the map — same contract as a raw unparseable state before).
+        sql_a = f"""
+            SELECT COALESCE(csm.state::text, '') AS state,
+                   {_AZ_METRIC_SQL[metric]} AS units
             FROM public.amazon_sec_state a
+            {_AZ_STATE_JOIN}
             LEFT JOIN public.master_sheet m
               ON UPPER(TRIM(m.format_sku_code::text)) = UPPER(TRIM(a.asin))
              AND UPPER(TRIM(m.format::text)) = 'AMAZON'
             WHERE 1 = 1
-        """ % _AZ_METRIC_SQL[metric]
+        """
         sql_a += az_month_sql
         pa = list(az_month_params)
         if brands:
@@ -1020,6 +1089,8 @@ def state_sales(request):
             sql_a += " AND UPPER(TRIM(m.sub_category::text)) = ANY(%s)"; pa.append(subs)
         if heads:
             sql_a += " AND UPPER(TRIM(m.item_head::text)) = ANY(%s)"; pa.append(heads)
+        if items:
+            sql_a += " AND UPPER(TRIM(m.item::text)) = ANY(%s)"; pa.append(items)
         sql_a += " GROUP BY 1"
         try:
             with connection.cursor() as cur:
@@ -1049,6 +1120,8 @@ def state_sales(request):
             sql_f += " AND UPPER(TRIM(sub_category::text)) = ANY(%s)"; pf.append(subs)
         if heads:
             sql_f += " AND UPPER(TRIM(item_head::text)) = ANY(%s)"; pf.append(heads)
+        if items:
+            sql_f += " AND UPPER(TRIM(item::text)) = ANY(%s)"; pf.append(items)
         sql_f += " GROUP BY 1"
         try:
             with connection.cursor() as cur:
@@ -1058,37 +1131,76 @@ def state_sales(request):
             return [], [{"source": "flipkart_state_sales_master", "error": str(e)}]
 
     def fetch_cities():
-        # Top cities by the metric — only the QC platforms carry a city.
-        # INITCAP(TRIM(city)) folds the messy raw spellings (ranchi/Ranchi/RANCHI).
-        if not use_other:
-            return [], []
-        sec_month_sql, sec_month_params = _sec_month_filter(periods)
-        sql = """
-            SELECT INITCAP(TRIM(city)) AS city, %s AS units
-            FROM secmaster_mv
-            WHERE UPPER(TRIM(format::text)) NOT IN ('AMAZON', 'FLIPKART')
-              AND NULLIF(TRIM(city::text), '') IS NOT NULL
-        """ % _SEC_METRIC_SQL[metric]
-        sql += sec_month_sql
-        params = list(sec_month_params)
-        if platform:
-            fmt = _SEC_SLUG_TO_FORMAT.get(platform, platform.replace("_", " ").upper())
-            sql += " AND LOWER(TRIM(format::text)) = LOWER(%s)"; params.append(fmt)
-        if brands:
-            sql += " AND UPPER(TRIM(brand::text)) = ANY(%s)"; params.append(brands)
-        if cats:
-            sql += " AND UPPER(TRIM(category::text)) = ANY(%s)"; params.append(cats)
-        if subs:
-            sql += " AND UPPER(TRIM(sub_category::text)) = ANY(%s)"; params.append(subs)
-        if heads:
-            sql += " AND UPPER(TRIM(item_head::text)) = ANY(%s)"; params.append(heads)
-        sql += " GROUP BY 1 ORDER BY 2 DESC NULLS LAST LIMIT 10"
-        try:
-            with connection.cursor() as cur:
-                cur.execute(sql, params)
-                return [(c, float(v or 0)) for c, v in cur.fetchall()], []
-        except Exception as e:
-            return [], [{"source": "secmaster_cities", "error": str(e)}]
+        # Top cities by the metric — the QC platforms and Amazon (city-wise
+        # feed) carry a city; Flipkart doesn't. _city_canon_sql folds the messy
+        # raw spellings (ranchi/Ranchi/RANCHI) and the known duplicate names
+        # (Bangalore/Bengaluru) into one canonical row; the two sources are
+        # merged on that label before taking the top 10.
+        totals, errs = {}, []
+        if use_other:
+            sec_month_sql, sec_month_params = _sec_month_filter(periods)
+            sql = f"""
+                SELECT {_city_canon_sql("city")} AS city, %s AS units
+                FROM secmaster_mv
+                WHERE UPPER(TRIM(format::text)) NOT IN ('AMAZON', 'FLIPKART')
+                  AND NULLIF(TRIM(city::text), '') IS NOT NULL
+            """ % _SEC_METRIC_SQL[metric]
+            sql += sec_month_sql
+            params = list(sec_month_params)
+            if platform:
+                fmt = _SEC_SLUG_TO_FORMAT.get(platform, platform.replace("_", " ").upper())
+                sql += " AND LOWER(TRIM(format::text)) = LOWER(%s)"; params.append(fmt)
+            if brands:
+                sql += " AND UPPER(TRIM(brand::text)) = ANY(%s)"; params.append(brands)
+            if cats:
+                sql += " AND UPPER(TRIM(category::text)) = ANY(%s)"; params.append(cats)
+            if subs:
+                sql += " AND UPPER(TRIM(sub_category::text)) = ANY(%s)"; params.append(subs)
+            if heads:
+                sql += " AND UPPER(TRIM(item_head::text)) = ANY(%s)"; params.append(heads)
+            if items:
+                sql += " AND UPPER(TRIM(item::text)) = ANY(%s)"; params.append(items)
+            sql += " GROUP BY 1 ORDER BY 2 DESC NULLS LAST LIMIT 10"
+            try:
+                with connection.cursor() as cur:
+                    cur.execute(sql, params)
+                    for c, v in cur.fetchall():
+                        totals[c] = totals.get(c, 0.0) + float(v or 0)
+            except Exception as e:
+                errs.append({"source": "secmaster_cities", "error": str(e)})
+        if use_amazon:
+            az_month_sql, az_month_params = _az_month_filter(periods)
+            sql_a = f"""
+                SELECT {_city_canon_sql("a.city")} AS city,
+                       {_AZ_METRIC_SQL[metric]} AS units
+                FROM public.amazon_sec_state a
+                LEFT JOIN public.master_sheet m
+                  ON UPPER(TRIM(m.format_sku_code::text)) = UPPER(TRIM(a.asin))
+                 AND UPPER(TRIM(m.format::text)) = 'AMAZON'
+                WHERE NULLIF(TRIM(a.city::text), '') IS NOT NULL
+            """
+            sql_a += az_month_sql
+            pa = list(az_month_params)
+            if brands:
+                sql_a += " AND UPPER(TRIM(m.brand::text)) = ANY(%s)"; pa.append(brands)
+            if cats:
+                sql_a += " AND UPPER(TRIM(m.category::text)) = ANY(%s)"; pa.append(cats)
+            if subs:
+                sql_a += " AND UPPER(TRIM(m.sub_category::text)) = ANY(%s)"; pa.append(subs)
+            if heads:
+                sql_a += " AND UPPER(TRIM(m.item_head::text)) = ANY(%s)"; pa.append(heads)
+            if items:
+                sql_a += " AND UPPER(TRIM(m.item::text)) = ANY(%s)"; pa.append(items)
+            sql_a += " GROUP BY 1 ORDER BY 2 DESC NULLS LAST LIMIT 10"
+            try:
+                with connection.cursor() as cur:
+                    cur.execute(sql_a, pa)
+                    for c, v in cur.fetchall():
+                        totals[c] = totals.get(c, 0.0) + float(v or 0)
+            except Exception as e:
+                errs.append({"source": "amazon_cities", "error": str(e)})
+        top = sorted(totals.items(), key=lambda kv: kv[1], reverse=True)[:10]
+        return top, errs
 
     sec_res, amz_res, fk_res, city_res = _parallel_db(
         [fetch_sec, fetch_amazon, fetch_flipkart, fetch_cities]
@@ -1108,7 +1220,7 @@ def state_sales(request):
         # cache miss scans once and every later filter change reuses it.
         filter_options = cache.get(_STATE_FILTER_OPTS_KEY)
         if filter_options is None:
-            categories_all, sub_categories_all = [], []
+            categories_all, sub_categories_all, items_all = [], [], []
             try:
                 cur.execute(
                     "SELECT DISTINCT UPPER(TRIM(category::text)) FROM master_sheet "
@@ -1123,10 +1235,22 @@ def state_sales(request):
                 sub_categories_all = [
                     {"category": r[0], "sub_category": r[1]} for r in cur.fetchall()
                 ]
+                # Items carry their category / sub_category so the UI can cascade
+                # the Item picker under the Category / Sub-category selections.
+                cur.execute(
+                    "SELECT DISTINCT UPPER(TRIM(category::text)), UPPER(TRIM(sub_category::text)), "
+                    "UPPER(TRIM(item::text)) FROM master_sheet "
+                    "WHERE NULLIF(TRIM(item::text), '') IS NOT NULL ORDER BY 3"
+                )
+                items_all = [
+                    {"category": r[0], "sub_category": r[1], "item": r[2]}
+                    for r in cur.fetchall()
+                ]
                 filter_options = {
                     "brands": ["JIVO", "SANO"],
                     "categories": categories_all,
                     "sub_categories": sub_categories_all,
+                    "items": items_all,
                 }
                 cache.set(_STATE_FILTER_OPTS_KEY, filter_options, _STATE_FILTER_OPTS_TTL)
             except Exception as e:
@@ -1136,6 +1260,7 @@ def state_sales(request):
                     "brands": ["JIVO", "SANO"],
                     "categories": categories_all,
                     "sub_categories": sub_categories_all,
+                    "items": items_all,
                 }
 
     states = sorted(
@@ -1214,9 +1339,10 @@ def _state_detail_union(cur, request, periods, row_exprs, *, apply_item_filters=
     use_other = (not platforms) or any(p not in ("amazon", "flipkart") for p in platforms)
     use_amazon = (not platforms) or ("amazon" in platforms)
     use_flipkart = (not platforms) or ("flipkart" in platforms)
-    # Amazon / Flipkart line items carry no city, so a city filter excludes them.
+    # Flipkart line items carry no city, so a city filter excludes it. Amazon's
+    # city-wise feed matches on its ship-to city like the QC platforms do.
     if apply_item_filters and cities:
-        use_amazon = use_flipkart = False
+        use_flipkart = False
 
     if canon is None:
         return canon, None, [], [], parsed
@@ -1246,11 +1372,15 @@ def _state_detail_union(cur, request, periods, row_exprs, *, apply_item_filters=
         except Exception as e:
             errors.append({"source": "secmaster_states", "error": str(e)})
     if use_amazon:
-        az_mf, az_mp = _az_month_filter(periods, alias="")
+        # City-wise feed: the "raw spellings" for Amazon are the mapped states
+        # from pincode_mapping (already canonical, so the _norm_state check
+        # is a pass-through equality).
+        az_mf, az_mp = _az_month_filter(periods)
         try:
             cur.execute(
-                "SELECT DISTINCT COALESCE(state::text, '') FROM public.amazon_sec_state "
-                "WHERE 1 = 1" + az_mf,
+                "SELECT DISTINCT COALESCE(csm.state::text, '') "
+                "FROM public.amazon_sec_state a " + _AZ_STATE_JOIN +
+                " WHERE 1 = 1" + az_mf,
                 list(az_mp),
             )
             az_raws = [r[0] for r in cur.fetchall() if _norm_state(r[0]) == canon]
@@ -1297,7 +1427,9 @@ def _state_detail_union(cur, request, periods, row_exprs, *, apply_item_filters=
         if apply_item_filters and skus:
             b += f" AND UPPER(TRIM({_SEC_NAME_EXPR})) = ANY(%s)"; p.append(skus)
         if apply_item_filters and cities:
-            b += " AND UPPER(TRIM(s.city::text)) = ANY(%s)"; p.append(cities)
+            # Canonicalise before matching so a pick of "Bengaluru" also catches
+            # rows stored as "Bangalore" (city params come in UPPER-cased).
+            b += f" AND UPPER({_city_canon_sql('s.city')}) = ANY(%s)"; p.append(cities)
         b += " AND COALESCE(s.state::text, '') = ANY(%s)"; p.append(sec_raws)
         branches.append(b); params += p
     if use_amazon and az_raws:
@@ -1310,8 +1442,9 @@ def _state_detail_union(cur, request, periods, row_exprs, *, apply_item_filters=
                    a.asin::text AS sku, {az_name} AS name,
                    UPPER(TRIM(m.brand::text)) AS brand, m.category::text AS category,
                    m.sub_category::text AS sub_category,
-                   {az_row} AS units, NULL::text AS city
+                   {az_row} AS units, a.city::text AS city
             FROM public.amazon_sec_state a
+            {_AZ_STATE_JOIN}
             LEFT JOIN public.master_sheet m
               ON UPPER(TRIM(m.format_sku_code::text)) = UPPER(TRIM(a.asin))
              AND UPPER(TRIM(m.format::text)) = 'AMAZON'
@@ -1329,7 +1462,9 @@ def _state_detail_union(cur, request, periods, row_exprs, *, apply_item_filters=
             b += " AND UPPER(TRIM(m.item_head::text)) = ANY(%s)"; p.append(heads)
         if apply_item_filters and skus:
             b += f" AND UPPER(TRIM({az_name})) = ANY(%s)"; p.append(skus)
-        b += " AND COALESCE(a.state::text, '') = ANY(%s)"; p.append(az_raws)
+        if apply_item_filters and cities:
+            b += f" AND UPPER({_city_canon_sql('a.city')}) = ANY(%s)"; p.append(cities)
+        b += " AND COALESCE(csm.state::text, '') = ANY(%s)"; p.append(az_raws)
         branches.append(b); params += p
     if use_flipkart and fk_states:
         # Same as Amazon: prefer the clean catalogue `item` over the long title.
@@ -1380,13 +1515,20 @@ def state_sales_detail(request):
     month filters, paginated.
 
     State matching mirrors the map's aggregation exactly: because the raw `state`
-    spellings are messy (Jio Mart mixed-case, Amazon codes/misspellings), we pull
-    each source's small set of distinct spellings, keep those that _norm_state to
-    the requested canonical state, then fetch rows matching those exact spellings
-    — so the page totals reconcile with the number the user clicked."""
+    spellings are messy (Jio Mart mixed-case; Amazon's come pre-resolved from
+    pincode_mapping), we pull each source's small set of distinct spellings,
+    keep those that _norm_state to the requested canonical state, then fetch rows
+    matching those exact spellings — so the page totals reconcile with the number
+    the user clicked."""
     today = date.today()
     metric = _state_metric(request)
     mode, periods, month_echo = _state_periods(request, today)
+
+    # This is a per-state drill-down: without a state it can only ever return an
+    # empty page, which reads like "no data" rather than "you called it wrong".
+    # Reject the missing/blank case explicitly so callers get a clear 400.
+    if not (request.GET.get("state") or "").strip():
+        return Response({"detail": "state is required."}, status=400)
 
     # Row-level metric expression per source (no SUM — one value per line item).
     sec_row = {
@@ -1438,9 +1580,12 @@ def state_sales_detail(request):
             # restrict the rows to them.
             where_extra, extra_params = "", []
             if top_cities:
+                # Canonical city key so a city's variant spellings count as one
+                # when picking the top N (and when filtering rows back to them).
+                city_key = f"UPPER({_city_canon_sql('city')})"
                 try:
                     cur.execute(
-                        f"SELECT UPPER(TRIM(city)) AS c, COALESCE(SUM(units), 0) AS s "
+                        f"SELECT {city_key} AS c, COALESCE(SUM(units), 0) AS s "
                         f"FROM ( {union} ) u WHERE NULLIF(TRIM(city), '') IS NOT NULL "
                         "GROUP BY 1 ORDER BY s DESC LIMIT %s",
                         [*params, top_cities],
@@ -1449,7 +1594,7 @@ def state_sales_detail(request):
                 except Exception as e:
                     errors.append({"source": "top_cities", "error": str(e)})
                     top_keys = []
-                where_extra = " WHERE UPPER(TRIM(u.city)) = ANY(%s)"
+                where_extra = f" WHERE {city_key} = ANY(%s)"
                 extra_params = [top_keys]
             final = f"""
                 SELECT d, platform, sku, name, brand, category, sub_category, units, city,
@@ -1531,10 +1676,13 @@ def state_sales_detail_options(request):
             except Exception as e:
                 errors.append({"source": "state_detail_sku_options", "error": str(e)})
             try:
+                # Canonical labels so the picker lists one entry per real city
+                # (Bengaluru, not Bengaluru + Bangalore).
+                city_c = _city_canon_sql("city")
                 cur.execute(
-                    f"SELECT DISTINCT ON (UPPER(TRIM(city))) INITCAP(TRIM(city)) "
+                    f"SELECT DISTINCT ON ({city_c}) {city_c} "
                     f"FROM ( {union} ) u WHERE NULLIF(TRIM(city), '') IS NOT NULL "
-                    "ORDER BY UPPER(TRIM(city))",
+                    f"ORDER BY {city_c}",
                     params,
                 )
                 cities = [r[0] for r in cur.fetchall()]
@@ -1550,11 +1698,12 @@ def state_sales_detail_options(request):
 @cached_get(timeout=120, prefix="dash.state_sales_detail_cities", shared=True)
 def state_sales_detail_cities(request):
     """Drill-down rollup for one state. The QC platforms (secmaster_mv) carry a
-    city, so they roll up BY CITY. Amazon & Flipkart have no city but do have
-    state-level data, so when one of those is selected we roll up BY ITEM instead
-    (their finest dimension for the state). Each row carries litres / units /
-    sales value / orders, honouring the same brand / category / sub-category /
-    item-head / period filters. `dimension` tells the UI which it is."""
+    city, so they roll up BY CITY. Amazon (city-wise feed, state resolved via
+    pincode_mapping) & Flipkart (state-only) roll up BY ITEM when selected —
+    the drawer keeps one consistent shape for them. Each row carries litres /
+    units / sales value / orders, honouring the same brand / category /
+    sub-category / item-head / period filters. `dimension` tells the UI which
+    it is."""
     today = date.today()
     metric = _state_metric(request)
     _mode, periods, month_echo = _state_periods(request, today)
@@ -1567,9 +1716,12 @@ def state_sales_detail_cities(request):
     subs = [s.strip().upper() for s in request.GET.getlist("sub_category") if s.strip()]
     heads = [h.strip().upper() for h in request.GET.getlist("item_head")
              if h.strip() and h.strip().lower() != "all"]
+    items = [i.strip().upper() for i in request.GET.getlist("item") if i.strip()]
 
-    # Amazon / Flipkart → break down by ITEM; everyone else → by CITY.
-    dimension = "item" if platform in ("amazon", "flipkart") else "city"
+    # Flipkart (no city) → break down by ITEM. Amazon now carries a city (resolved
+    # via pincode_mapping), so it rolls up BY CITY like the QC platforms, and each
+    # city drills into its top SKUs. Everyone else → by CITY.
+    dimension = "item" if platform == "flipkart" else "city"
     order_col = {"litres": "litres", "units": "units", "value": "value"}.get(metric, "litres")
     rows, errors = [], []
 
@@ -1585,12 +1737,14 @@ def state_sales_detail_cities(request):
     if canon is not None:
         with connection.cursor() as cur:
             if platform == "amazon":
-                az_mf, az_mp = _az_month_filter(periods, alias="")
+                # City-wise feed: states come from pincode_mapping (canonical).
+                az_mf, az_mp = _az_month_filter(periods)
                 az_raws = []
                 try:
                     cur.execute(
-                        "SELECT DISTINCT COALESCE(state::text, '') FROM public.amazon_sec_state "
-                        "WHERE 1 = 1" + az_mf,
+                        "SELECT DISTINCT COALESCE(csm.state::text, '') "
+                        "FROM public.amazon_sec_state a " + _AZ_STATE_JOIN +
+                        " WHERE 1 = 1" + az_mf,
                         list(az_mp),
                     )
                     az_raws = [r[0] for r in cur.fetchall() if _norm_state(r[0]) == canon]
@@ -1598,23 +1752,42 @@ def state_sales_detail_cities(request):
                     errors.append({"source": "amazon_states", "error": str(e)})
                 if az_raws:
                     az_mf2, az_mp2 = _az_month_filter(periods)
-                    sql = """
-                        SELECT COALESCE(NULLIF(TRIM(m.item::text), ''),
-                                        NULLIF(TRIM(m.product_name::text), ''), 'Unknown') AS label,
+                    # Per-ASIN revenue rate from the range master view
+                    # (calculated_shipped_revenue ÷ shipped_units). The rate is
+                    # preserved even across the view's cumulative snapshots (both
+                    # scale together), so no max-date logic is needed. Applied to
+                    # the state's shipped_units below because the raw
+                    # amazon_sec_state.shipped_revenue is unreliable/~0.
+                    rng_mf, rng_mp = _az_month_filter(periods, alias="")
+                    # Roll up BY CITY (like the QC platforms) so each city drills
+                    # into its top SKUs. value = shipped_units × per-ASIN revenue
+                    # rate (raw shipped_revenue in amazon_sec_state is ~0).
+                    sql = f"""
+                        SELECT INITCAP(TRIM(a.city)) AS label,
                                COALESCE(SUM(CASE WHEN UPPER(TRIM(m.is_litre::text)) = 'Y'
                                     THEN COALESCE(a.shipped_units, 0)::numeric * COALESCE(m.per_unit_value, 0)
                                     ELSE 0 END), 0) AS litres,
                                COALESCE(SUM(a.shipped_units), 0) AS units,
-                               COALESCE(SUM(a.shipped_revenue), 0) AS value,
+                               COALESCE(SUM(COALESCE(a.shipped_units, 0)::numeric
+                                    * COALESCE(pr.rate, 0)), 0) AS value,
                                COUNT(*) AS orders
                         FROM public.amazon_sec_state a
+                        {_AZ_STATE_JOIN}
                         LEFT JOIN public.master_sheet m
                           ON UPPER(TRIM(m.format_sku_code::text)) = UPPER(TRIM(a.asin))
                          AND UPPER(TRIM(m.format::text)) = 'AMAZON'
-                        WHERE 1 = 1
+                        LEFT JOIN (
+                            SELECT UPPER(TRIM(asin)) AS asin,
+                                   COALESCE(SUM(calculated_shipped_revenue), 0)
+                                     / NULLIF(SUM(shipped_units), 0) AS rate
+                            FROM public.amazon_sec_range_master_view
+                            WHERE 1 = 1{rng_mf}
+                            GROUP BY UPPER(TRIM(asin))
+                        ) pr ON pr.asin = UPPER(TRIM(a.asin))
+                        WHERE NULLIF(TRIM(a.city::text), '') IS NOT NULL
                     """
                     sql += az_mf2
-                    params = list(az_mp2)
+                    params = list(rng_mp) + list(az_mp2)
                     if brands:
                         sql += " AND UPPER(TRIM(m.brand::text)) = ANY(%s)"; params.append(brands)
                     if cats:
@@ -1623,8 +1796,10 @@ def state_sales_detail_cities(request):
                         sql += " AND UPPER(TRIM(m.sub_category::text)) = ANY(%s)"; params.append(subs)
                     if heads:
                         sql += " AND UPPER(TRIM(m.item_head::text)) = ANY(%s)"; params.append(heads)
-                    sql += " AND COALESCE(a.state::text, '') = ANY(%s)"; params.append(az_raws)
-                    sql += f" GROUP BY 1 ORDER BY {order_col} DESC NULLS LAST"
+                    if items:
+                        sql += " AND UPPER(TRIM(m.item::text)) = ANY(%s)"; params.append(items)
+                    sql += " AND COALESCE(csm.state::text, '') = ANY(%s)"; params.append(az_raws)
+                    sql += f" GROUP BY INITCAP(TRIM(a.city)) ORDER BY {order_col} DESC NULLS LAST"
                     try:
                         cur.execute(sql, params)
                         for lb, lt, un, vl, od in cur.fetchall():
@@ -1669,8 +1844,11 @@ def state_sales_detail_cities(request):
                         sql += " AND UPPER(TRIM(f.sub_category::text)) = ANY(%s)"; params.append(subs)
                     if heads:
                         sql += " AND UPPER(TRIM(f.item_head::text)) = ANY(%s)"; params.append(heads)
+                    if items:
+                        sql += " AND UPPER(TRIM(f.item::text)) = ANY(%s)"; params.append(items)
                     sql += " AND COALESCE(f.customer_delivery_state::text, '') = ANY(%s)"; params.append(fk_states)
-                    sql += f" GROUP BY 1 ORDER BY {order_col} DESC NULLS LAST"
+                    # Top 10 items only (matches the QC city→SKU drill's top-10 cap).
+                    sql += f" GROUP BY 1 ORDER BY {order_col} DESC NULLS LAST LIMIT 10"
                     try:
                         cur.execute(sql, params)
                         for lb, lt, un, vl, od in cur.fetchall():
@@ -1679,7 +1857,17 @@ def state_sales_detail_cities(request):
                         errors.append({"source": "flipkart_item_summary", "error": str(e)})
 
             else:
-                # QC platforms (or 'all') → roll up by city from secmaster_mv.
+                # QC platforms (or 'all') → roll up by city from secmaster_mv,
+                # plus Amazon's city-wise feed when no specific QC platform is
+                # selected. Both sources group on the same canonical city label,
+                # so a city served by both merges into one row.
+                agg = {}  # canonical city label -> [litres, units, value, orders]
+
+                def acc(label, lt, un, vl, od):
+                    e = agg.setdefault(label, [0.0, 0.0, 0.0, 0])
+                    e[0] += float(lt or 0); e[1] += float(un or 0)
+                    e[2] += float(vl or 0); e[3] += int(od or 0)
+
                 sec_fmt = (_SEC_SLUG_TO_FORMAT.get(platform, platform.replace("_", " ").upper())
                            if platform else None)
                 sec_mf, sec_mp = _sec_month_filter(periods)
@@ -1696,8 +1884,8 @@ def state_sales_detail_cities(request):
                 except Exception as e:
                     errors.append({"source": "secmaster_states", "error": str(e)})
                 if sec_raws:
-                    sql = """
-                        SELECT INITCAP(TRIM(city)) AS label,
+                    sql = f"""
+                        SELECT {_city_canon_sql("city")} AS label,
                                COALESCE(SUM(ltr_sold), 0) AS litres,
                                COALESCE(SUM(quantity), 0) AS units,
                                COALESCE(SUM(amount), 0) AS value,
@@ -1718,22 +1906,79 @@ def state_sales_detail_cities(request):
                         sql += " AND UPPER(TRIM(sub_category::text)) = ANY(%s)"; params.append(subs)
                     if heads:
                         sql += " AND UPPER(TRIM(item_head::text)) = ANY(%s)"; params.append(heads)
+                    if items:
+                        sql += " AND UPPER(TRIM(item::text)) = ANY(%s)"; params.append(items)
                     sql += " AND COALESCE(state::text, '') = ANY(%s)"; params.append(sec_raws)
-                    sql += f" GROUP BY 1 ORDER BY {order_col} DESC NULLS LAST"
+                    sql += " GROUP BY 1"
                     try:
                         cur.execute(sql, params)
                         for lb, lt, un, vl, od in cur.fetchall():
-                            push(lb, lt, un, vl, od)
+                            acc(lb, lt, un, vl, od)
                     except Exception as e:
                         errors.append({"source": "state_detail_cities", "error": str(e)})
 
-                # NOTE: Amazon & Flipkart are intentionally NOT added to this
-                # city drill-down. They carry no city, so adding them here showed
-                # up as fake "Amazon" / "Flipkart" city rows (with ₹0 sales for
-                # Amazon, whose state feed has no revenue) inside what is meant to
-                # be a city-only list. This view now shows real cities only; to see
-                # Amazon / Flipkart sales, select that platform filter — the drawer
-                # then rolls up by item for them (dimension = 'item').
+                # Amazon's city-wise rows for this state (platform = 'all' only —
+                # a specific QC platform pick stays QC-only). Flipkart is still
+                # excluded: it carries no city at all.
+                if platform is None:
+                    az_mf, az_mp = _az_month_filter(periods)
+                    az_raws = []
+                    try:
+                        cur.execute(
+                            "SELECT DISTINCT COALESCE(csm.state::text, '') "
+                            "FROM public.amazon_sec_state a " + _AZ_STATE_JOIN +
+                            " WHERE 1 = 1" + az_mf,
+                            list(az_mp),
+                        )
+                        az_raws = [r[0] for r in cur.fetchall() if _norm_state(r[0]) == canon]
+                    except Exception as e:
+                        errors.append({"source": "amazon_states", "error": str(e)})
+                    if az_raws:
+                        sql = f"""
+                            SELECT {_city_canon_sql("a.city")} AS label,
+                                   COALESCE(SUM(CASE WHEN UPPER(TRIM(m.is_litre::text)) = 'Y'
+                                        THEN COALESCE(a.shipped_units, 0)::numeric * COALESCE(m.per_unit_value, 0)
+                                        ELSE 0 END), 0) AS litres,
+                                   COALESCE(SUM(a.shipped_units), 0) AS units,
+                                   COALESCE(SUM(a.shipped_revenue), 0) AS value,
+                                   COUNT(*) AS orders
+                            FROM public.amazon_sec_state a
+                            {_AZ_STATE_JOIN}
+                            LEFT JOIN public.master_sheet m
+                              ON UPPER(TRIM(m.format_sku_code::text)) = UPPER(TRIM(a.asin))
+                             AND UPPER(TRIM(m.format::text)) = 'AMAZON'
+                            WHERE NULLIF(TRIM(a.city::text), '') IS NOT NULL
+                        """
+                        sql += az_mf
+                        params = list(az_mp)
+                        if brands:
+                            sql += " AND UPPER(TRIM(m.brand::text)) = ANY(%s)"; params.append(brands)
+                        if cats:
+                            sql += " AND UPPER(TRIM(m.category::text)) = ANY(%s)"; params.append(cats)
+                        if subs:
+                            sql += " AND UPPER(TRIM(m.sub_category::text)) = ANY(%s)"; params.append(subs)
+                        if heads:
+                            sql += " AND UPPER(TRIM(m.item_head::text)) = ANY(%s)"; params.append(heads)
+                        if items:
+                            sql += " AND UPPER(TRIM(m.item::text)) = ANY(%s)"; params.append(items)
+                        sql += " AND COALESCE(csm.state::text, '') = ANY(%s)"; params.append(az_raws)
+                        sql += " GROUP BY 1"
+                        try:
+                            cur.execute(sql, params)
+                            for lb, lt, un, vl, od in cur.fetchall():
+                                acc(lb, lt, un, vl, od)
+                        except Exception as e:
+                            errors.append({"source": "amazon_city_summary", "error": str(e)})
+
+                for lb, (lt, un, vl, od) in agg.items():
+                    push(lb, lt, un, vl, od)
+
+                # NOTE: Flipkart is intentionally NOT in this city drill-down —
+                # its feed carries no city, so it used to show up as one fake
+                # "Flipkart" row inside a city-only list. To see Flipkart sales,
+                # select that platform filter — the drawer then rolls up by item
+                # (dimension = 'item'). Amazon's city-wise feed IS included when
+                # the platform filter is 'all'.
 
     # Default order: biggest first by the active metric.
     rows.sort(key=lambda r: r.get(order_col, 0) or 0, reverse=True)
@@ -1757,10 +2002,11 @@ def state_sales_detail_cities(request):
 @cached_get(timeout=120, prefix="dash.state_sales_detail_city_skus", shared=True)
 def state_sales_detail_city_skus(request):
     """Top SKUs running in ONE city within one state — the second-level drill-down
-    behind the city list. City exists only for the QC platforms (secmaster_mv);
-    Amazon & Flipkart carry no city, so this returns nothing for them. Honours the
-    same platform / brand / category / sub-category / item-head / period filters
-    and orders by the active metric. `limit` (default 10) caps the SKU count."""
+    behind the city list. QC platforms (secmaster_mv) only: Flipkart carries no
+    city, and Amazon's city-wise feed isn't wired into this per-city SKU list yet.
+    Honours the same platform / brand / category / sub-category / item-head /
+    period filters and orders by the active metric. `limit` (default 10) caps the
+    SKU count."""
     today = date.today()
     metric = _state_metric(request)
     _mode, periods, month_echo = _state_periods(request, today)
@@ -1774,6 +2020,7 @@ def state_sales_detail_city_skus(request):
     subs = [s.strip().upper() for s in request.GET.getlist("sub_category") if s.strip()]
     heads = [h.strip().upper() for h in request.GET.getlist("item_head")
              if h.strip() and h.strip().lower() != "all"]
+    items = [i.strip().upper() for i in request.GET.getlist("item") if i.strip()]
 
     order_col = {"litres": "litres", "units": "units", "value": "value"}.get(metric, "litres")
     try:
@@ -1794,7 +2041,7 @@ def state_sales_detail_city_skus(request):
             "orders": int(od or 0),
         })
 
-    # QC-only: Amazon / Flipkart have no city, so skip them entirely.
+    # QC-only (see docstring): skip Amazon / Flipkart entirely.
     if canon is not None and city and platform not in ("amazon", "flipkart"):
         with connection.cursor() as cur:
             sec_fmt = (_SEC_SLUG_TO_FORMAT.get(platform, platform.replace("_", " ").upper())
@@ -1841,8 +2088,9 @@ def state_sales_detail_city_skus(request):
                     sql += " AND UPPER(TRIM(sub_category::text)) = ANY(%s)"; params.append(subs)
                 if heads:
                     sql += " AND UPPER(TRIM(item_head::text)) = ANY(%s)"; params.append(heads)
-                # Match the same city label the city list showed (INITCAP(TRIM(city))).
-                sql += " AND INITCAP(TRIM(city::text)) = %s"; params.append(city)
+                # Match the same canonical city label the city list showed, so a
+                # click on "Bengaluru" also pulls rows stored as "Bangalore".
+                sql += f" AND {_city_canon_sql('city')} = %s"; params.append(city)
                 sql += " AND COALESCE(state::text, '') = ANY(%s)"; params.append(sec_raws)
                 sql += f" GROUP BY 1 ORDER BY {order_col} DESC NULLS LAST LIMIT %s"
                 params.append(limit)
@@ -1852,6 +2100,75 @@ def state_sales_detail_city_skus(request):
                         push(lb, code, plats, lt, un, vl, od)
                 except Exception as e:
                     errors.append({"source": "city_skus", "error": str(e)})
+
+    # Amazon: top SKUs in ONE city of a state. Amazon carries a real city (state
+    # resolved via pincode_mapping); value = shipped_units × the per-ASIN revenue
+    # rate from the range master view (raw shipped_revenue is unreliable/~0).
+    elif platform == "amazon" and canon is not None and city:
+        with connection.cursor() as cur:
+            az_mf, az_mp = _az_month_filter(periods)
+            az_raws = []
+            try:
+                cur.execute(
+                    "SELECT DISTINCT COALESCE(csm.state::text, '') "
+                    "FROM public.amazon_sec_state a " + _AZ_STATE_JOIN +
+                    " WHERE 1 = 1" + az_mf,
+                    list(az_mp),
+                )
+                az_raws = [r[0] for r in cur.fetchall() if _norm_state(r[0]) == canon]
+            except Exception as e:
+                errors.append({"source": "amazon_states", "error": str(e)})
+            if az_raws:
+                az_mf2, az_mp2 = _az_month_filter(periods)
+                rng_mf, rng_mp = _az_month_filter(periods, alias="")
+                sql = f"""
+                    SELECT COALESCE(NULLIF(TRIM(m.item::text), ''),
+                                    NULLIF(TRIM(m.product_name::text), ''), 'Unknown') AS label,
+                           MAX(NULLIF(TRIM(m.format_sku_code::text), '')) AS sku_code,
+                           'Amazon' AS platforms,
+                           COALESCE(SUM(CASE WHEN UPPER(TRIM(m.is_litre::text)) = 'Y'
+                                THEN COALESCE(a.shipped_units, 0)::numeric * COALESCE(m.per_unit_value, 0)
+                                ELSE 0 END), 0) AS litres,
+                           COALESCE(SUM(a.shipped_units), 0) AS units,
+                           COALESCE(SUM(COALESCE(a.shipped_units, 0)::numeric
+                                * COALESCE(pr.rate, 0)), 0) AS value,
+                           COUNT(*) AS orders
+                    FROM public.amazon_sec_state a
+                    {_AZ_STATE_JOIN}
+                    LEFT JOIN public.master_sheet m
+                      ON UPPER(TRIM(m.format_sku_code::text)) = UPPER(TRIM(a.asin))
+                     AND UPPER(TRIM(m.format::text)) = 'AMAZON'
+                    LEFT JOIN (
+                        SELECT UPPER(TRIM(asin)) AS asin,
+                               COALESCE(SUM(calculated_shipped_revenue), 0)
+                                 / NULLIF(SUM(shipped_units), 0) AS rate
+                        FROM public.amazon_sec_range_master_view
+                        WHERE 1 = 1{rng_mf}
+                        GROUP BY UPPER(TRIM(asin))
+                    ) pr ON pr.asin = UPPER(TRIM(a.asin))
+                    WHERE UPPER(TRIM(a.city::text)) = UPPER(TRIM(%s))
+                """
+                sql += az_mf2
+                params = list(rng_mp) + [city] + list(az_mp2)
+                if brands:
+                    sql += " AND UPPER(TRIM(m.brand::text)) = ANY(%s)"; params.append(brands)
+                if cats:
+                    sql += " AND UPPER(TRIM(m.category::text)) = ANY(%s)"; params.append(cats)
+                if subs:
+                    sql += " AND UPPER(TRIM(m.sub_category::text)) = ANY(%s)"; params.append(subs)
+                if heads:
+                    sql += " AND UPPER(TRIM(m.item_head::text)) = ANY(%s)"; params.append(heads)
+                if items:
+                    sql += " AND UPPER(TRIM(m.item::text)) = ANY(%s)"; params.append(items)
+                sql += " AND COALESCE(csm.state::text, '') = ANY(%s)"; params.append(az_raws)
+                sql += f" GROUP BY 1 ORDER BY {order_col} DESC NULLS LAST LIMIT %s"
+                params.append(limit)
+                try:
+                    cur.execute(sql, params)
+                    for lb, code, plats, lt, un, vl, od in cur.fetchall():
+                        push(lb, code, plats, lt, un, vl, od)
+                except Exception as e:
+                    errors.append({"source": "amazon_city_skus", "error": str(e)})
 
     total = {
         "litres": round(sum(r["litres"] for r in rows), 2),
@@ -1874,8 +2191,9 @@ def state_sales_export(request):
     """Flat, single-sheet export for State-wise Sales: one row per
     state × city × SKU × platform from the QC secondary data (secmaster_mv), with
     ordered / delivered litres, litres sold and sales. Amazon & Flipkart are
-    excluded — they carry no city (nor ordered / delivered litres). Honours the
-    same platform / brand / category / sub-category / item-head / period filters."""
+    excluded — neither carries the ordered / delivered litres this sheet reports
+    (Flipkart also has no city). Honours the same platform / brand / category /
+    sub-category / item-head / period filters."""
     today = date.today()
     _mode, periods, month_echo = _state_periods(request, today)
 
@@ -1888,8 +2206,7 @@ def state_sales_export(request):
              if h.strip() and h.strip().lower() != "all"]
 
     rows, errors = [], []
-    # QC-only: Amazon / Flipkart have no city, so a specific Amazon/Flipkart filter
-    # yields nothing here.
+    # QC-only (see docstring): a specific Amazon/Flipkart filter yields nothing.
     if platform not in ("amazon", "flipkart"):
         with connection.cursor() as cur:
             sec_fmt = (_SEC_SLUG_TO_FORMAT.get(platform, platform.replace("_", " ").upper())
@@ -1904,7 +2221,7 @@ def state_sales_export(request):
             # litres sold.
             sql = f"""
                 SELECT INITCAP(TRIM(state::text)) AS state,
-                       INITCAP(TRIM(city::text)) AS city,
+                       {_city_canon_sql("city")} AS city,
                        COALESCE(NULLIF(TRIM(sku_code::text), ''), '') AS sku_code,
                        {name_expr} AS item,
                        INITCAP(TRIM(format::text)) AS format,
@@ -2163,6 +2480,13 @@ def category_platform_breakdown(request):
     dimension = "category" if (request.GET.get("dimension") or "").strip().lower() == "category" else "sub_category"
     dim_col = dimension  # column name in every source table
 
+    # This is a drill-down for one picked (sub)category. A wholly missing `name`
+    # param would silently match the blank/"Uncategorized" bucket and return a
+    # near-empty split that looks like "no data" — reject it so the caller knows
+    # a name is required. An explicit empty value still means the Uncategorized
+    # row (the UI sends name="Uncategorized" for it).
+    if request.GET.get("name") is None:
+        return Response({"detail": "name is required."}, status=400)
     name = (request.GET.get("name") or "").strip()
     # /category-breakdown surfaces null/blank (sub)categories as "Uncategorized";
     # mirror that so a click on that row matches the same rows here.
@@ -2472,6 +2796,11 @@ def category_sku_breakdown(request):
     dimension = "category" if (request.GET.get("dimension") or "").strip().lower() == "category" else "sub_category"
     dim_col = dimension
 
+    # Like /category-platform-breakdown, this drill-down needs the picked
+    # (sub)category. A missing `name` param would quietly match the blank bucket
+    # and return skus: [] — reject it rather than look like an empty result.
+    if request.GET.get("name") is None:
+        return Response({"detail": "name is required."}, status=400)
     name = (request.GET.get("name") or "").strip()
     is_uncat = name == "" or name.upper() == "UNCATEGORIZED"
     name_u = name.upper()
