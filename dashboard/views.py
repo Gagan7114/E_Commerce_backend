@@ -26,7 +26,7 @@ ALLOWED_TABLES = {
     "master_po", "prim_master_po", "test_master_po",
     "total_po", "total_po_zbs",
     "amazon_price_data", "amazon_sec_daily", "amazon_sec_daily_master_view", "amazon_sec_range",
-    "amazon_sec_range_margins", "amazon_sec_range_master_view",
+    "amazon_sec_range_margins", "amazon_sec_range_master_view", "amazon_sec_city",
     "bigbasketSec", "blinkitSec", "flipkart_grocery_master", "fk_grocery", "flipkartSec", "flipkart_secondary_all",
     "jiomartSec", "swiggySec", "zeptoSec",
     "zomatoSec", "citymallSec",
@@ -899,7 +899,7 @@ _AZ_METRIC_SQL = {
         "THEN a.shipped_units::numeric * m.per_unit_value ELSE 0 END), 0)"
     ),
 }
-# amazon_sec_state now carries the consumer ship-to CITY (View By=[City] export;
+# amazon_sec_city now carries the consumer ship-to CITY (View By=[City] export;
 # uploads migration 0069 renamed the column). State is resolved by joining the
 # ops-managed pincode_mapping table on the normalised city: UPPER, every
 # non-alphanumeric run collapsed to one space, trimmed — the same recipe as its
@@ -944,7 +944,7 @@ def _sec_month_filter(periods, alias=""):
 
 
 def _az_month_filter(periods, alias="a."):
-    """(sql, params) matching amazon_sec_state.from_date against any of `periods`."""
+    """(sql, params) matching amazon_sec_city.from_date against any of `periods`."""
     col = f"{alias}from_date"
     sql = " AND (" + " OR ".join(
         [f"(EXTRACT(MONTH FROM {col}) = %s AND EXTRACT(YEAR FROM {col}) = %s)"]
@@ -978,7 +978,7 @@ def state_sales(request):
     QC platforms come from the "SecMaster" view: SUM(quantity) grouped on the
     view's already-resolved `state` (Jio Mart ships a DELIVERY_STATE directly; the
     QC platforms get state from city_state_mapping inside the view). Amazon →
-    amazon_sec_state (city-wise feed; ship-to city resolved to a state via
+    amazon_sec_city (city-wise feed; ship-to city resolved to a state via
     pincode_mapping, metrics joined to master_sheet on ASIN). Flipkart →
     flipkart_state_sales_master (SUM(item_quantity) for Sale events, grouped on
     customer_delivery_state).
@@ -1072,7 +1072,7 @@ def state_sales(request):
         sql_a = f"""
             SELECT COALESCE(csm.state::text, '') AS state,
                    {_AZ_METRIC_SQL[metric]} AS units
-            FROM public.amazon_sec_state a
+            FROM public.amazon_sec_city a
             {_AZ_STATE_JOIN}
             LEFT JOIN public.master_sheet m
               ON UPPER(TRIM(m.format_sku_code::text)) = UPPER(TRIM(a.asin))
@@ -1097,7 +1097,7 @@ def state_sales(request):
                 cur.execute(sql_a, pa)
                 return [(st, "AMAZON", units) for st, units in cur.fetchall()], []
         except Exception as e:
-            return [], [{"source": "amazon_sec_state", "error": str(e)}]
+            return [], [{"source": "amazon_sec_city", "error": str(e)}]
 
     def fetch_flipkart():
         if not use_flipkart:
@@ -1173,7 +1173,7 @@ def state_sales(request):
             sql_a = f"""
                 SELECT {_city_canon_sql("a.city")} AS city,
                        {_AZ_METRIC_SQL[metric]} AS units
-                FROM public.amazon_sec_state a
+                FROM public.amazon_sec_city a
                 LEFT JOIN public.master_sheet m
                   ON UPPER(TRIM(m.format_sku_code::text)) = UPPER(TRIM(a.asin))
                  AND UPPER(TRIM(m.format::text)) = 'AMAZON'
@@ -1379,7 +1379,7 @@ def _state_detail_union(cur, request, periods, row_exprs, *, apply_item_filters=
         try:
             cur.execute(
                 "SELECT DISTINCT COALESCE(csm.state::text, '') "
-                "FROM public.amazon_sec_state a " + _AZ_STATE_JOIN +
+                "FROM public.amazon_sec_city a " + _AZ_STATE_JOIN +
                 " WHERE 1 = 1" + az_mf,
                 list(az_mp),
             )
@@ -1443,7 +1443,7 @@ def _state_detail_union(cur, request, periods, row_exprs, *, apply_item_filters=
                    UPPER(TRIM(m.brand::text)) AS brand, m.category::text AS category,
                    m.sub_category::text AS sub_category,
                    {az_row} AS units, a.city::text AS city
-            FROM public.amazon_sec_state a
+            FROM public.amazon_sec_city a
             {_AZ_STATE_JOIN}
             LEFT JOIN public.master_sheet m
               ON UPPER(TRIM(m.format_sku_code::text)) = UPPER(TRIM(a.asin))
@@ -1510,7 +1510,7 @@ def state_sales_detail(request):
 
     Drill-down for a click on the State-wise Sales map. Returns the underlying
     rows for `state` from the same sources as /state-sales — "SecMaster" for the
-    QC platforms, amazon_sec_state for Amazon, flipkart_state_sales_master for
+    QC platforms, amazon_sec_city for Amazon, flipkart_state_sales_master for
     Flipkart — honouring the same platform / brand / category / sub_category /
     month filters, paginated.
 
@@ -1743,7 +1743,7 @@ def state_sales_detail_cities(request):
                 try:
                     cur.execute(
                         "SELECT DISTINCT COALESCE(csm.state::text, '') "
-                        "FROM public.amazon_sec_state a " + _AZ_STATE_JOIN +
+                        "FROM public.amazon_sec_city a " + _AZ_STATE_JOIN +
                         " WHERE 1 = 1" + az_mf,
                         list(az_mp),
                     )
@@ -1757,11 +1757,11 @@ def state_sales_detail_cities(request):
                     # preserved even across the view's cumulative snapshots (both
                     # scale together), so no max-date logic is needed. Applied to
                     # the state's shipped_units below because the raw
-                    # amazon_sec_state.shipped_revenue is unreliable/~0.
+                    # amazon_sec_city.shipped_revenue is unreliable/~0.
                     rng_mf, rng_mp = _az_month_filter(periods, alias="")
                     # Roll up BY CITY (like the QC platforms) so each city drills
                     # into its top SKUs. value = shipped_units × per-ASIN revenue
-                    # rate (raw shipped_revenue in amazon_sec_state is ~0).
+                    # rate (raw shipped_revenue in amazon_sec_city is ~0).
                     sql = f"""
                         SELECT INITCAP(TRIM(a.city)) AS label,
                                COALESCE(SUM(CASE WHEN UPPER(TRIM(m.is_litre::text)) = 'Y'
@@ -1771,7 +1771,7 @@ def state_sales_detail_cities(request):
                                COALESCE(SUM(COALESCE(a.shipped_units, 0)::numeric
                                     * COALESCE(pr.rate, 0)), 0) AS value,
                                COUNT(*) AS orders
-                        FROM public.amazon_sec_state a
+                        FROM public.amazon_sec_city a
                         {_AZ_STATE_JOIN}
                         LEFT JOIN public.master_sheet m
                           ON UPPER(TRIM(m.format_sku_code::text)) = UPPER(TRIM(a.asin))
@@ -1926,7 +1926,7 @@ def state_sales_detail_cities(request):
                     try:
                         cur.execute(
                             "SELECT DISTINCT COALESCE(csm.state::text, '') "
-                            "FROM public.amazon_sec_state a " + _AZ_STATE_JOIN +
+                            "FROM public.amazon_sec_city a " + _AZ_STATE_JOIN +
                             " WHERE 1 = 1" + az_mf,
                             list(az_mp),
                         )
@@ -1942,7 +1942,7 @@ def state_sales_detail_cities(request):
                                    COALESCE(SUM(a.shipped_units), 0) AS units,
                                    COALESCE(SUM(a.shipped_revenue), 0) AS value,
                                    COUNT(*) AS orders
-                            FROM public.amazon_sec_state a
+                            FROM public.amazon_sec_city a
                             {_AZ_STATE_JOIN}
                             LEFT JOIN public.master_sheet m
                               ON UPPER(TRIM(m.format_sku_code::text)) = UPPER(TRIM(a.asin))
@@ -2111,7 +2111,7 @@ def state_sales_detail_city_skus(request):
             try:
                 cur.execute(
                     "SELECT DISTINCT COALESCE(csm.state::text, '') "
-                    "FROM public.amazon_sec_state a " + _AZ_STATE_JOIN +
+                    "FROM public.amazon_sec_city a " + _AZ_STATE_JOIN +
                     " WHERE 1 = 1" + az_mf,
                     list(az_mp),
                 )
@@ -2133,7 +2133,7 @@ def state_sales_detail_city_skus(request):
                            COALESCE(SUM(COALESCE(a.shipped_units, 0)::numeric
                                 * COALESCE(pr.rate, 0)), 0) AS value,
                            COUNT(*) AS orders
-                    FROM public.amazon_sec_state a
+                    FROM public.amazon_sec_city a
                     {_AZ_STATE_JOIN}
                     LEFT JOIN public.master_sheet m
                       ON UPPER(TRIM(m.format_sku_code::text)) = UPPER(TRIM(a.asin))

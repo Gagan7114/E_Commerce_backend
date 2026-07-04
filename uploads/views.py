@@ -43,8 +43,9 @@ UPLOAD_ALLOWED_TABLES = {
     "amazon_price_data", "amazon_sec_range_margins",
     "fk_grocery", "flipkart_grocery_master",
     "zomatoSec", "citymallSec",
-    # Amazon Secondary — state-wise variant (View By=[State])
-    "amazon_sec_state",
+    # Amazon Secondary — city-wise variant (View By=[City]); cumulative
+    # month-to-date ranges, only the freshest range per business+month is kept.
+    "amazon_sec_city",
     # Flipkart Secondary — state-wise variant (B2C "Sales Report" GST export)
     "flipkart_state_sales",
     # Amazon Marketplace GST MTR B2B report (raw, stored as-is)
@@ -193,6 +194,7 @@ UPLOAD_DATE_DELETE_TABLES = {
     "amazon_coupon": "date",
     "amazon_sec_daily": "report_date",
     "amazon_sec_range": ("from_date", "to_date"),
+    "amazon_sec_city": ("from_date", "to_date"),
 }
 
 INVENTORY_DOH_UPLOAD_PLATFORMS = {
@@ -2623,8 +2625,77 @@ _PINCODE_SYNC_JUNK = {
 }
 
 
+def _amazon_city_prune_stale_ranges(rows):
+    """Amazon city-wise Secondary files are cumulative month-to-date exports
+    (1-28, then 1-29, then 1-30 ...), so each newer file fully contains the
+    older ones. Keep only the LATEST range per business + month:
+
+    - rows already stored for the same business + month with an OLDER to_date
+      are deleted before this upload's rows go in;
+    - incoming rows that are OLDER than what's stored (or older than another
+      range inside the same upload) are dropped, not inserted.
+
+    Either way the table always holds exactly one — the max-to_date — snapshot
+    per business + month. Returns (rows_to_insert, deleted, skipped_stale)."""
+    def _d(value):
+        try:
+            return date.fromisoformat(str(value or "").strip()[:10])
+        except ValueError:
+            return None
+
+    latest = {}  # (business, year, month) -> max incoming to_date
+    parsed = []  # (row, group_key, to_date)
+    for row in rows:
+        fd, td = _d((row or {}).get("from_date")), _d((row or {}).get("to_date"))
+        if fd is None or td is None:
+            parsed.append((row, None, None))  # let normal validation handle it
+            continue
+        key = (str(row.get("business") or "").strip().upper(), fd.year, fd.month)
+        parsed.append((row, key, td))
+        if key not in latest or td > latest[key]:
+            latest[key] = td
+
+    deleted = 0
+    stale_groups = set()
+    if latest:
+        with connection.cursor() as cur:
+            for (business, year, month), td in latest.items():
+                # Stale upload guard: the table already holds a fresher range
+                # for this business+month — don't let the old file regress it.
+                cur.execute(
+                    "SELECT MAX(to_date) FROM amazon_sec_city "
+                    "WHERE UPPER(TRIM(COALESCE(business, ''))) = %s "
+                    "  AND EXTRACT(YEAR FROM from_date) = %s "
+                    "  AND EXTRACT(MONTH FROM from_date) = %s",
+                    [business, year, month],
+                )
+                existing_max = (cur.fetchone() or [None])[0]
+                if existing_max is not None and existing_max > td:
+                    stale_groups.add((business, year, month))
+                    continue
+                cur.execute(
+                    "DELETE FROM amazon_sec_city "
+                    "WHERE UPPER(TRIM(COALESCE(business, ''))) = %s "
+                    "  AND EXTRACT(YEAR FROM from_date) = %s "
+                    "  AND EXTRACT(MONTH FROM from_date) = %s "
+                    "  AND to_date < %s",
+                    [business, year, month, td],
+                )
+                deleted += cur.rowcount
+
+    keep, skipped = [], 0
+    for row, key, td in parsed:
+        if key is None:
+            keep.append(row)
+        elif key in stale_groups or td < latest[key]:
+            skipped += 1
+        else:
+            keep.append(row)
+    return keep, deleted, skipped
+
+
 def _sync_amazon_cities_to_pincode_mapping(rows):
-    """After an amazon_sec_state (city-wise Amazon Secondary) upload, grow
+    """After an amazon_sec_city (city-wise Amazon Secondary) upload, grow
     pincode_mapping with any city it doesn't know yet.
 
     Only usable rows are added: the city must look like a real name (not
@@ -2679,7 +2750,7 @@ def _sync_amazon_cities_to_pincode_mapping(rows):
                 added += cur.rowcount
     except Exception as exc:
         logger.warning(
-            "pincode_mapping sync after amazon_sec_state upload failed: %s", exc
+            "pincode_mapping sync after amazon_sec_city upload failed: %s", exc
         )
         return {"added": added, "unmapped": sorted(unmapped), "error": str(exc)}
     return {"added": added, "unmapped": sorted(unmapped)}
@@ -2783,6 +2854,24 @@ def _batch_upload(body, *, forced_table: str | None = None):
         unique_key = ""
 
     missing_rates = _collect_zepto_missing_rates(data) if table == "zeptoSec" else []
+
+    # City-wise Amazon Secondary: cumulative ranges — clear this month's older
+    # ranges and drop incoming rows staler than what's stored (see helper).
+    pruned_ranges = 0
+    skipped_stale = 0
+    if table == "amazon_sec_city":
+        data, pruned_ranges, skipped_stale = _amazon_city_prune_stale_ranges(data)
+        if not data:
+            return Response({
+                "success": 0, "created": 0, "updated": 0,
+                "skipped": skipped_stale, "failed": 0,
+                "pruned_ranges": pruned_ranges, "skipped_stale": skipped_stale,
+                "error": None,
+                "warnings": [
+                    "Upload skipped: the table already holds a fresher "
+                    "month-to-date range for this business and month."
+                ] if skipped_stale else [],
+            })
 
     column_types = _upload_table_column_types(table)
     table_columns = set(column_types)
@@ -2968,7 +3057,7 @@ def _batch_upload(body, *, forced_table: str | None = None):
     # City-wise Amazon Secondary: teach pincode_mapping any city it hasn't seen
     # yet (state auto-resolved; junk / unresolvable cities skipped — see helper).
     pincode_sync = None
-    if success and table == "amazon_sec_state":
+    if success and table == "amazon_sec_city":
         pincode_sync = _sync_amazon_cities_to_pincode_mapping(data)
 
     if success:
@@ -3007,6 +3096,8 @@ def _batch_upload(body, *, forced_table: str | None = None):
         ] if pincode_sync and pincode_sync.get("unmapped") else []),
         "missing_rates": missing_rates,
         "pincode_sync": pincode_sync,
+        "pruned_ranges": pruned_ranges,
+        "skipped_stale": skipped_stale,
         "inventory_doh_notifications": notification_result,
     })
 
