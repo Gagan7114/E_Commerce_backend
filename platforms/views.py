@@ -4237,10 +4237,12 @@ def blinkit_ads_dashboard(request, slug: str):
 # Every source view carries year / month / date, so the shared _ads_build_where
 # filter applies uniformly to the union.
 _ADS_SUMMARY_UNION = """
-    -- Ads sale = ads qty × the SKU's basic_rate from monthly_landing_rate
-    -- (matched on platform format + sku_code + the row's month). The landing
-    -- table has at most one rate per (format, sku, month) so the LEFT JOIN can't
-    -- fan out; a missing rate → ads_sale 0.
+    -- Ads sale = DIRECT ads qty × the SKU's basic_rate from monthly_landing_rate
+    -- (matched on platform format + sku_code + the row's month). Indirect/halo
+    -- qty is deliberately excluded from ads_sale for the QC platforms (it still
+    -- counts in the qty column). The landing table has at most one rate per
+    -- (format, sku, month) so the LEFT JOIN can't fan out; a missing rate →
+    -- ads_sale 0.
     -- `use_max_date` mirrors each platform ads dashboard's summary method:
     -- TRUE  → cumulative month-to-date snapshot (Swiggy/Zepto/BigBasket/Flipkart)
     --         so the summary keeps ONLY the latest (max) date's rows;
@@ -4251,7 +4253,7 @@ _ADS_SUMMARY_UNION = """
            COALESCE(b.impressions, 0)::numeric AS impressions,
            COALESCE(b.ad_spent, 0)::numeric AS ad_spent,
            0::numeric AS brand_fund, 0::numeric AS sec_qty, 0::numeric AS sec_value,
-           ((COALESCE(b.direct_qty_sold, 0) + COALESCE(b.indirect_qty_sold, 0))
+           (COALESCE(b.direct_qty_sold, 0)
              * COALESCE(lr.basic_rate, 0))::numeric AS ads_sale,
            b.year, b.month, b.date, FALSE AS use_max_date, 'other'::text AS src
       FROM blinkit_ads_master b
@@ -4264,7 +4266,7 @@ _ADS_SUMMARY_UNION = """
            (COALESCE(z.direct_qty_sold, 0) + COALESCE(z.indirect_qty_sold, 0))::numeric,
            COALESCE(z.impressions, 0)::numeric, COALESCE(z.ad_spent, 0)::numeric,
            0::numeric, 0::numeric, 0::numeric,
-           ((COALESCE(z.direct_qty_sold, 0) + COALESCE(z.indirect_qty_sold, 0))
+           (COALESCE(z.direct_qty_sold, 0)
              * COALESCE(lr.basic_rate, 0))::numeric,
            z.year, z.month, z.date, TRUE, 'other'::text
       FROM zepto_ads_master z
@@ -4277,7 +4279,7 @@ _ADS_SUMMARY_UNION = """
            (COALESCE(bb.direct_qty_sold, 0) + COALESCE(bb.indirect_qty_sold, 0))::numeric,
            COALESCE(bb.impressions, 0)::numeric, COALESCE(bb.ad_spent, 0)::numeric,
            0::numeric, 0::numeric, 0::numeric,
-           ((COALESCE(bb.direct_qty_sold, 0) + COALESCE(bb.indirect_qty_sold, 0))
+           (COALESCE(bb.direct_qty_sold, 0)
              * COALESCE(lr.basic_rate, 0))::numeric,
            bb.year, bb.month, bb.date, TRUE, 'other'::text
       FROM bigbasket_ads_master bb

@@ -2736,6 +2736,23 @@ def _sync_amazon_cities_to_pincode_mapping(rows):
                 [missing],
             )
             states = dict(cur.fetchall())
+            # Second chance for messy spellings ("ADOOR, PATHANAMTHITTA DIST"):
+            # match on the part before the first separator — usually the city.
+            prefixes = {
+                key: _pincode_city_key(re.split(r"[,(/:;-]", cities[key])[0])
+                for key in missing
+                if key not in states
+            }
+            prefix_keys = sorted({p for p in prefixes.values() if p and len(p) >= 3})
+            if prefix_keys:
+                cur.execute(
+                    "SELECT city_key, state FROM city_state_mapping WHERE city_key = ANY(%s)",
+                    [prefix_keys],
+                )
+                by_prefix = dict(cur.fetchall())
+                for key, prefix in prefixes.items():
+                    if prefix in by_prefix:
+                        states[key] = by_prefix[prefix]
             for key in missing:
                 state = str(states.get(key) or "").strip().upper()
                 if not state:
