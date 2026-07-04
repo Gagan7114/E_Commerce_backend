@@ -34,15 +34,17 @@ HELP_TEXT = (
     "• \"How many liters were delivered this month?\"\n"
     "• \"Excel of Zepto alerts\"\n"
     "• \"Blinkit purchase orders this week\"\n"
+    "• \"Top states by order liters\"\n"
+    "• \"Top 10 brands in Zepto\"\n"
     "• \"List all platforms\"\n"
     "• \"Amazon shipments last 7 days\"\n\n"
     "Add the word \"excel\" (or \"download\") to any question and I'll build a spreadsheet."
 )
 
 SUGGESTIONS = [
+    "Top states by order liters",
     "Critical DOH alerts for Blinkit",
-    "Liters delivered this month",
-    "Excel of Zepto alerts",
+    "Top 10 brands in Zepto",
     "List all platforms",
 ]
 
@@ -133,6 +135,7 @@ _ROUTES = {
     "inventory": tools.inventory,
     "sales": tools.secondary_sales,
     "master_sheet": tools.master_po_sheet,
+    "ranking": tools.ranking,
 }
 
 

@@ -344,3 +344,87 @@ def master_po_sheet(q: ParsedQuery) -> DataResult:
         columns=columns, rows=rows, source="Google Sheet: MASTER PO",
         excel_title="Master PO Sheet",
     )
+
+
+# Logical ranking dimension -> real master_po column.
+_DIMENSION_COLS = {
+    "state": "state",
+    "city": "city",
+    "location": "location",
+    "sku": "sku_code",
+    "brand": "brand",
+    "category": "category",
+    "item": "item",
+    "vendor": "vendor_name",
+    "platform": "format",
+}
+
+
+def _metric_expr(q: ParsedQuery) -> tuple[str, str]:
+    """Pick the metric to rank by, from the question text. Defaults to order liters."""
+    t = q.text.lower()
+    if any(w in t for w in ("amount", "amt", "value", "revenue", "sales", "worth", "₹", " rs")):
+        return "COALESCE(SUM(total_order_amt_inclusive), 0)", "order amount"
+    if q.movement == "delivered" or "deliver" in t:
+        return "COALESCE(SUM(total_delivered_liters), 0)", "delivered liters"
+    if q.metric == "units" or any(w in t for w in ("qty", "quantity", "unit")):
+        return "COALESCE(SUM(order_qty), 0)", "order qty"
+    if ("order" in t or "po" in t) and any(w in t for w in ("count", "number", "how many", "no of")):
+        return "COUNT(*)", "PO lines"
+    return "COALESCE(SUM(total_order_liters), 0)", "order liters"
+
+
+def ranking(q: ParsedQuery) -> DataResult:
+    """Top-N ranking by a dimension (state / city / brand / sku / category /
+    vendor / platform) over master_po — works for any platform + date range."""
+    table = "master_po"
+    if not safe_sql.table_exists(table):
+        return DataResult(summary=f"I couldn't find the '{table}' table.", ok=False, source=table)
+
+    dim = q.dimension or "state"
+    dim_col = _DIMENSION_COLS.get(dim, "state")
+    metric_sql, metric_label = _metric_expr(q)
+
+    where, params = [], []
+    scope = ""
+    if q.primary_platform and dim != "platform":
+        where.append("format ILIKE %s")
+        params.append(f"%{q.primary_platform['slug']}%")
+        scope = f" for {q.primary_platform['name']}"
+    if q.date_from and q.date_to:
+        where.append("po_date BETWEEN %s AND %s")
+        params.extend([q.date_from, q.date_to])
+    where.append(f"{dim_col} IS NOT NULL")
+    where.append(f"{dim_col}::text <> ''")
+    where_sql = " WHERE " + " AND ".join(where)
+
+    limit = q.top_n or 10
+    sql = f"""
+        SELECT {dim_col} AS label, {metric_sql} AS value
+        FROM {table}{where_sql}
+        GROUP BY {dim_col}
+        ORDER BY value DESC
+        LIMIT {int(limit)}
+    """
+    try:
+        _c, rows, _t = safe_sql.run_select(sql, params, max_rows=limit)
+    except Exception as exc:
+        logger.warning("ranking query failed: %s", exc)
+        return DataResult(summary=f"I couldn't rank by {dim}: {exc}", ok=False, source=table)
+
+    if not rows:
+        return DataResult(summary=f"No {dim} data found{scope}.", ok=False, source=table)
+
+    label = dim.title()
+    span = f" ({q.date_label})" if q.date_label else ""
+    lines = [f"{i + 1}. {r[0]} — {_fmt(r[1])}" for i, r in enumerate(rows)]
+    summary = (
+        f"Top {len(rows)} {label.lower()}(s) by {metric_label}{scope}{span}:\n"
+        + "\n".join(lines)
+        + "\nSource: master_po."
+    )
+    return DataResult(
+        summary=summary, columns=[label, metric_label], rows=[[r[0], r[1]] for r in rows],
+        source="master_po", meta=[("dimension", dim), ("metric", metric_label)],
+        excel_title=f"Top {label}",
+    )

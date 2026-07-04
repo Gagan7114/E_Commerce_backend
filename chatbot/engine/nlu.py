@@ -43,6 +43,7 @@ class ParsedQuery:
     date_label: str = ""
     metric: str = ""          # "liters" | "units" | ""
     movement: str = ""        # "delivered" | "sold" | ""
+    dimension: str = ""       # "state" | "city" | "sku" | "brand" | ... (ranking)
     severity: str = ""        # "critical" | "warning" | ""
     active_only: bool | None = None
     wants_excel: bool = False
@@ -181,6 +182,21 @@ _PLATFORM_LIST_WORDS = ("list platforms", "which platforms", "what platforms", "
 _HELP_WORDS = ("help", "what can you do", "how do you work", "who are you", "what do you do")
 _GREETING_WORDS = ("hi", "hello", "hey", "hii", "namaste", "yo")
 
+# Dimensions the bot can rank ("top states", "best brands", ...). Maps a logical
+# dimension to the words that trigger it; the tool maps it to a master_po column.
+_DIMENSION_WORDS = {
+    "state": ["state", "states"],
+    "city": ["city", "cities"],
+    "location": ["location", "locations"],
+    "sku": ["sku", "skus"],
+    "brand": ["brand", "brands"],
+    "category": ["category", "categories"],
+    "item": ["item", "items", "product", "products"],
+    "vendor": ["vendor", "vendors", "supplier", "suppliers"],
+    "platform": ["platform", "platforms", "format", "formats"],
+}
+_RANK_RE = re.compile(r"\b(top|best|highest|most|leading|largest|rank|ranking)\b")
+
 
 def _has(text: str, words) -> bool:
     return any(w in text for w in words)
@@ -219,11 +235,18 @@ def parse(message: str, db_platforms: list[dict] | None = None) -> ParsedQuery:
     if m:
         q.top_n = int(m.group(1))
 
+    for dim, words in _DIMENSION_WORDS.items():
+        if any(re.search(r"\b" + re.escape(w) + r"\b", low) for w in words):
+            q.dimension = dim
+            break
+
     # --- Intent (order matters: most specific first) ---
     if _has(low, _PLATFORM_LIST_WORDS):
         q.intent = "list_platforms"
     elif _has(low, _ALERT_WORDS):
         q.intent = "alerts"
+    elif q.dimension and _RANK_RE.search(low):
+        q.intent = "ranking"
     elif q.metric == "liters" or q.movement in ("delivered", "sold"):
         q.intent = "liters"
     elif _has(low, _SHIPMENT_WORDS):
