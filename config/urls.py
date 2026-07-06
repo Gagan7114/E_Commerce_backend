@@ -45,6 +45,7 @@ urlpatterns = [
     path("api/notifications/<int:notification_id>/mark-read", mark_notification_read, name="notification-mark-read"),
     path("api/notifications/inventory-doh/<int:notification_id>", inventory_doh_sku_detail, name="notification-inventory-doh-detail"),
     path("api/shipment/", include("shipment.urls")),
+    path("api/chatbot/", include("chatbot.urls")),
 ]
 
 admin.site.site_header = "ECMS Operations"
