@@ -278,9 +278,10 @@ def _read_amazon_secondary(item_head: str, month: int, year: int) -> dict:
         latest_date = None
     return {
         "done_ltrs": Decimal(row[0] or 0) if row else Decimal(0),
-        # Date follows the Amazon PRIMARY dashboard (product decision); falls back
-        # to the secondary snapshot date when primary has no data for the month.
-        "latest_date": _read_amazon_primary_max_date(month, year) or latest_date,
+        # Date follows the Amazon SECONDARY snapshot (the latest range date in the
+        # month), so the Primary sheet's Amazon-secondary row shows the same date
+        # as the Secondary sheet instead of the Amazon primary dashboard's date.
+        "latest_date": latest_date,
     }
 
 
@@ -434,9 +435,9 @@ def _read_amazon_secondary_many(item_heads: tuple[str, ...], month: int, year: i
         cur.execute(sql, list(item_heads) + [month_day_suffix, year])
         rows = cur.fetchall()
 
-    # Date follows the Amazon PRIMARY dashboard (product decision); computed once
-    # for the month and applied to every item head (Done Ltrs stay secondary).
-    primary_max = _read_amazon_primary_max_date(month, year)
+    # Date follows the Amazon SECONDARY snapshot (the latest range date per item
+    # head), so the Primary sheet's Amazon-secondary row matches the Secondary
+    # sheet's date instead of the Amazon primary dashboard's date.
     result: dict[tuple[str, str], dict] = {}
     for item_head, done_ltrs, max_day in rows:
         try:
@@ -445,7 +446,7 @@ def _read_amazon_secondary_many(item_heads: tuple[str, ...], month: int, year: i
             latest_date = None
         result[("AMAZON SECONDARY", _format_key(item_head))] = {
             "done_ltrs": Decimal(done_ltrs or 0),
-            "latest_date": primary_max or latest_date,
+            "latest_date": latest_date,
         }
     return result
 

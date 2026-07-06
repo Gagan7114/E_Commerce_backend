@@ -83,7 +83,7 @@ def _drop_primary_normalized() -> None:
 _PRIMARY_CTE_STUB = "WITH _stub AS (SELECT 1)"
 
 _PRIMARY_DASHBOARD_CACHE_TTL = 60  # seconds
-_PRIMARY_DASHBOARD_CACHE_VERSION = 21
+_PRIMARY_DASHBOARD_CACHE_VERSION = 22
 
 
 def _get_platform(slug: str) -> PlatformConfig:
@@ -2001,22 +2001,36 @@ def _primary_dashboard_payload(
         item_agg AS (
             SELECT
                 item_key AS item,
+                item_head_key AS item_head,
                 {_PRIMARY_METRIC_SQL}
             FROM normalized
             WHERE {period_filter}
-            GROUP BY item_key
+            GROUP BY item_key, item_head_key
         )
         SELECT *
         FROM item_agg
+        -- Keep an item if it moved on ANY metric. Delivered is the usual signal,
+        -- but a month with orders and no deliveries yet (e.g. the current month
+        -- early on) has done_* = 0 — fall back to ordered so the SKU list is not
+        -- empty. Ordered first in the sort so those months rank sensibly; the
+        -- frontend re-sorts by whichever metric the user has toggled.
         WHERE COALESCE(done_value, 0) <> 0
            OR COALESCE(done_ltrs, 0) <> 0
            OR COALESCE(done_qty, 0) <> 0
-        ORDER BY done_value DESC, done_ltrs DESC, done_qty DESC
+           OR COALESCE(order_value, 0) <> 0
+           OR COALESCE(order_ltrs, 0) <> 0
+           OR COALESCE(order_qty, 0) <> 0
+        ORDER BY done_value DESC, done_ltrs DESC, done_qty DESC,
+                 order_value DESC, order_ltrs DESC, order_qty DESC
         """,
         period_params,
     )
     top_items = [
-        {"item": row.get("item") or "OTHER", **_primary_metrics(row)}
+        {
+            "item": row.get("item") or "OTHER",
+            "item_head": row.get("item_head") or "OTHER",
+            **_primary_metrics(row),
+        }
         for row in top_item_raw
     ]
     open_vendor_pending = _dict_rows(
@@ -6257,7 +6271,7 @@ def _top_ltr_items_from_table(
           AND NULLIF(TRIM({item_column}::text), '') IS NOT NULL
         GROUP BY 1, 2
         ORDER BY COALESCE(SUM({ltr_column}), 0) DESC
-        LIMIT 8
+        LIMIT 10
         """,
         [month_value, year_value, *(date_params or [])],
     )
