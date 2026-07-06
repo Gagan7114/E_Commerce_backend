@@ -178,7 +178,7 @@ ANTHROPIC_API_KEY = env("ANTHROPIC_API_KEY", default="")
 CHATBOT_CLAUDE_MODEL = env("CHATBOT_CLAUDE_MODEL", default="claude-opus-4-8")
 # Guardrails for the chatbot's read-only SQL layer.
 CHATBOT_MAX_ROWS = env.int("CHATBOT_MAX_ROWS", default=5000)
-CHATBOT_SQL_TIMEOUT_MS = env.int("CHATBOT_SQL_TIMEOUT_MS", default=8000)
+CHATBOT_SQL_TIMEOUT_MS = env.int("CHATBOT_SQL_TIMEOUT_MS", default=15000)
 
 DATABASE_ROUTERS = ["sap.router.SAPReadOnlyRouter"]
 

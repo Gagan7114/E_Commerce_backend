@@ -136,6 +136,23 @@ _ROUTES = {
     "sales": tools.secondary_sales,
     "master_sheet": tools.master_po_sheet,
     "ranking": tools.ranking,
+    "movers": tools.movers,
+    "split": tools.premium_commodity_split,
+    "drr": tools.drr,
+    "targets": tools.targets,
+    "landing": tools.landing_rate,
+    "pendency": tools.pendency,
+    "ads": tools.ads,
+    "brand_fund": tools.brand_fund,
+    "coupon": tools.coupon,
+    "expiry": tools.expiry,
+    "appointments": tools.appointments,
+    "amazon_mp": tools.amazon_mp,
+    "lead_time": tools.lead_time,
+    "amazon_po": tools.amazon_po,
+    "state_sales": tools.state_sales,
+    "realise": tools.realise,
+    "sap": tools.sap_info,
 }
 
 
@@ -149,8 +166,13 @@ def _run_builtin(user, conversation: ChatConversation, message: str) -> EngineRe
         q.intent = "master_sheet"
 
     if q.intent in ("help", "greeting", "unknown"):
+        # HELP_TEXT already opens with "Hi!"; for a greeting swap in a warmer
+        # opener instead of prefixing another "Hi!" (which read "Hi! Hi!").
+        text = HELP_TEXT
+        if q.intent == "greeting":
+            text = "Hi there! " + HELP_TEXT.removeprefix("Hi! ")
         return EngineResult(
-            text=HELP_TEXT if q.intent != "greeting" else "Hi! " + HELP_TEXT,
+            text=text,
             intent=q.intent, engine="builtin", suggestions=SUGGESTIONS,
             data={"columns": [], "rows": [], "suggestions": SUGGESTIONS},
         )

@@ -48,6 +48,8 @@ class ParsedQuery:
     active_only: bool | None = None
     wants_excel: bool = False
     top_n: int | None = None
+    group_by_month: bool = False   # "month wise" / "monthly" / "all months" breakdown
+    wants_amount: bool = False     # "order amount" / "value" / "revenue" question
 
     @property
     def platform_slugs(self) -> list[str]:
@@ -173,13 +175,16 @@ def parse_date_range(text: str) -> tuple[date | None, date | None, str]:
 
 
 _EXCEL_WORDS = ("excel", "xlsx", ".xls", "spreadsheet", "workbook", "download", "export", "csv", "sheet file")
-_ALERT_WORDS = ("alert", "notification", "low stock", "low doh", "doh alert", "out of stock", "stockout")
+_ALERT_WORDS = ("alert", "notification", "low stock", "low doh", "doh alert", "out of stock",
+                "stockout", "doh", "days on hand", "days of hand")
 _PO_WORDS = ("purchase order", "po ", " po", "pos", "p.o", "master po", "orders")
-_SHIPMENT_WORDS = ("shipment", "truck", "dispatch", "load", "vehicle", "appointment")
-_INVENTORY_WORDS = ("inventory", "stock on hand", " soh", "on hand", "in stock", "stock level")
+_SHIPMENT_WORDS = ("shipment", "truck", "dispatch", "load", "vehicle")
+_INVENTORY_WORDS = ("inventory", "stock on hand", " soh", "on hand", "in stock", "stock level",
+                    "stock by", "stock across", "stock in ", "soh unit", "soh ltr")
 _SALES_WORDS = ("secondary sales", "sales", "sold", "revenue")
 _PLATFORM_LIST_WORDS = ("list platforms", "which platforms", "what platforms", "all platforms", "platform list")
-_HELP_WORDS = ("help", "what can you do", "how do you work", "who are you", "what do you do")
+_HELP_WORDS = ("help", "what can you do", "how do you work", "who are you", "what do you do",
+               "what data", "what can you show", "what can i ask", "how can you help")
 _GREETING_WORDS = ("hi", "hello", "hey", "hii", "namaste", "yo")
 
 # Dimensions the bot can rank ("top states", "best brands", ...). Maps a logical
@@ -195,7 +200,12 @@ _DIMENSION_WORDS = {
     "vendor": ["vendor", "vendors", "supplier", "suppliers"],
     "platform": ["platform", "platforms", "format", "formats"],
 }
-_RANK_RE = re.compile(r"\b(top|best|highest|most|leading|largest|rank|ranking)\b")
+_RANK_RE = re.compile(r"\b(top|best|highest|most|leading|largest|rank|ranking|compare)\b")
+_STATE_RE = re.compile(
+    r"\b(maharashtra|gujarat|goa|rajasthan|delhi|punjab|haryana|uttar pradesh|uttarakhand|"
+    r"himachal pradesh|jammu and kashmir|chandigarh|karnataka|tamil nadu|kerala|andhra pradesh|"
+    r"telangana|puducherry|west bengal|bihar|odisha|orissa|jharkhand|madhya pradesh|chhattisgarh|"
+    r"chattisgarh|assam|tripura|meghalaya|manipur|nagaland|mizoram|sikkim|arunachal pradesh)\b")
 
 
 def _has(text: str, words) -> bool:
@@ -216,6 +226,17 @@ def parse(message: str, db_platforms: list[dict] | None = None) -> ParsedQuery:
     elif re.search(r"\bunits?\b|\bqty\b|\bquantit|\bpcs\b|\bpieces?\b", low):
         q.metric = "units"
 
+    # "fill rate" / "miss rate" / "fill %" is a liters-table question (the liters
+    # tool reports fill %); route it there even without an explicit "liters" word.
+    if re.search(r"\bfill\s*rate\b|\bfillrate\b|\bmiss\s*rate\b|\bmissrate\b|\bfill\s*%|\bfill percentage\b", low):
+        q.metric = q.metric or "liters"
+
+    # Order/delivered amount ("amount", "value", "revenue", "inclusive"...).
+    q.wants_amount = bool(re.search(
+        r"\bamount\b|\bamt\b|\brevenue\b|\bworth\b|order value|sales value|"
+        r"\binclusive\b|\bexclusive\b", low,
+    ))
+
     if re.search(r"\bdeliver", low) or re.search(r"\bdispatch", low):
         q.movement = "delivered"
     elif re.search(r"\bsold\b|\bselling\b|\bsale", low):
@@ -235,19 +256,109 @@ def parse(message: str, db_platforms: list[dict] | None = None) -> ParsedQuery:
     if m:
         q.top_n = int(m.group(1))
 
+    # Month-wise breakdown ("month wise", "monthly", "by month", "all months",
+    # "month on month"). Deliberately does NOT match "this month" / "last month"
+    # / "june month" — those select a single period, not a breakdown.
+    q.group_by_month = bool(re.search(
+        r"\bmonth[\s\-]?wise\b|\bmonthly\b|\bby\s+month\b|\bper\s+month\b|"
+        r"\beach\s+month\b|\bevery\s+month\b|\bmonth\s+by\s+month\b|"
+        r"\bmonth\s+on\s+month\b|\ball\s+months?\b",
+        low,
+    ))
+
     for dim, words in _DIMENSION_WORDS.items():
         if any(re.search(r"\b" + re.escape(w) + r"\b", low) for w in words):
             q.dimension = dim
             break
 
     # --- Intent (order matters: most specific first) ---
-    if _has(low, _PLATFORM_LIST_WORDS):
+    # "all platforms" only means "list the platforms" when the question isn't
+    # actually asking for data across them ("delivered liters ... all platforms"
+    # is a liters query, not a platform-list request). A bare dimension word like
+    # "platforms" does NOT count — only a real ranking (dimension + rank word).
+    is_ranking = bool(q.dimension and _RANK_RE.search(low))
+    data_signal = bool(q.metric or q.movement or q.group_by_month or q.wants_amount or is_ranking)
+    movers = bool(re.search(r"\brisers?\b|\bfallers?\b|\bmovers?\b|\bgainers?\b|\bdecliners?\b|"
+                            r"biggest\s+(drop|jump|gain|fall|rise)", low))
+    split = bool(re.search(r"premium\s*(vs|versus|and|&|/|\s)\s*commodity|"
+                           r"commodity\s*(vs|versus|and|&|/|\s)\s*premium|"
+                           r"item\s*head\s+(split|wise|breakup|breakdown)", low))
+    drr_flag = bool(re.search(r"\bdrr\b|run\s*rate|day\s*wise|daywise|per\s*day|\bdaily\b|\bops\b", low))
+    secondary_flag = bool(re.search(r"\bsecondary\b|sell\s*out|sellout|sell-out|"
+                                    r"\bsold\b|\bshipped\b|\bshpd\b|\bsec sales\b|\breturns?\b", low))
+    targets_flag = bool("target" in low or "achieved %" in low or "achievement" in low
+                        or "require drr" in low or "req drr" in low or "behind on" in low)
+    landing_flag = bool(re.search(r"landing rate|basic rate|landing price", low))
+    pendency_flag = bool("pendency" in low or ("pending" in low and "approval" not in low
+                                               and "shipment" not in low))
+    coupon_flag = bool("coupon" in low or "clips" in low or "redemption" in low)
+    brandfund_flag = bool("brand fund" in low or "brandfund" in low or "brand-fund" in low)
+    ads_flag = bool(re.search(r"\bads?\b|ad spent|ad spend|\broas\b|\bacos\b|\btacos\b|\bgmv\b|"
+                              r"impressions|\bcpc\b|\bctr\b|\bntb\b|advertis|detail page view", low))
+    is_amazon = any(p.get("slug") == "amazon" for p in q.platforms)
+    expiry_flag = bool("expiring" in low or "expiry" in low or "expire" in low
+                       or "days to expiry" in low or "about to expire" in low)
+    appt_flag = bool("appointment" in low)
+    amazon_mp_flag = bool("amazon mp" in low or "mp sales" in low or "marketplace" in low
+                          or (is_amazon and re.search(r"\bmp\b", low)))
+    leadtime_flag = bool("lead time" in low or "leadtime" in low or "lead-time" in low)
+    amazon_po_flag = bool("mov" in low or "fulfillment center" in low or "fulfilment center" in low
+                          or ("requested" in low and "received" in low)
+                          or (is_amazon and re.search(r"\bpos?\b|pending|new po|\bfc\b|status|fill rate", low)))
+    sap_flag = bool("jm primary" in low or "hana" in low or "wellness billing" in low
+                    or "mart source" in low or "oil source" in low or "below min" in low
+                    or "zero stock" in low or "finished goods" in low or "fifo" in low
+                    or "credit line" in low or "stock value" in low or re.search(r"\bsap\b", low)
+                    or ("distributor" in low and ("balance" in low or "credit" in low or "invoice" in low)))
+    realise_flag = bool("realise" in low or "realize" in low or "realisation" in low or "commission" in low)
+    state_flag = bool("state wise" in low or "statewise" in low or "state-wise" in low
+                      or ("region" in low and any(d in low for d in ("north", "south", "east", "west", "which region")))
+                      or ("jivo" in low and "sano" in low) or bool(_STATE_RE.search(low)))
+    if _has(low, _PLATFORM_LIST_WORDS) and not data_signal:
         q.intent = "list_platforms"
     elif _has(low, _ALERT_WORDS):
         q.intent = "alerts"
+    elif sap_flag:
+        q.intent = "sap"
+    elif movers:
+        q.intent = "movers"
+    elif split and not (coupon_flag or brandfund_flag):
+        q.intent = "split"
+    elif _has(low, _INVENTORY_WORDS):
+        q.intent = "inventory"
+    elif targets_flag:
+        q.intent = "targets"
+    elif landing_flag:
+        q.intent = "landing"
+    elif coupon_flag:
+        q.intent = "coupon"
+    elif brandfund_flag:
+        q.intent = "brand_fund"
+    elif ads_flag:
+        q.intent = "ads"
+    elif realise_flag:
+        q.intent = "realise"
+    elif state_flag:
+        q.intent = "state_sales"
+    elif drr_flag:
+        q.intent = "drr"
+    elif secondary_flag:
+        q.intent = "sales"
+    elif expiry_flag:
+        q.intent = "expiry"
+    elif appt_flag:
+        q.intent = "appointments"
+    elif amazon_mp_flag:
+        q.intent = "amazon_mp"
+    elif leadtime_flag:
+        q.intent = "lead_time"
+    elif amazon_po_flag:
+        q.intent = "amazon_po"
+    elif pendency_flag:
+        q.intent = "pendency"
     elif q.dimension and _RANK_RE.search(low):
         q.intent = "ranking"
-    elif q.metric == "liters" or q.movement in ("delivered", "sold"):
+    elif q.metric == "liters" or q.movement in ("delivered", "sold") or q.group_by_month or q.wants_amount:
         q.intent = "liters"
     elif _has(low, _SHIPMENT_WORDS):
         q.intent = "shipments"
