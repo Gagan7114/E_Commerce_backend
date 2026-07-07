@@ -49,6 +49,7 @@ class ParsedQuery:
     wants_excel: bool = False
     top_n: int | None = None
     group_by_month: bool = False   # "month wise" / "monthly" / "all months" breakdown
+    group_by_platform: bool = False  # "platform wise" breakdown
     wants_amount: bool = False     # "order amount" / "value" / "revenue" question
 
     @property
@@ -314,6 +315,22 @@ def parse(message: str, db_platforms: list[dict] | None = None) -> ParsedQuery:
     state_flag = bool("state wise" in low or "statewise" in low or "state-wise" in low
                       or ("region" in low and any(d in low for d in ("north", "south", "east", "west", "which region")))
                       or ("jivo" in low and "sano" in low) or bool(_STATE_RE.search(low)))
+    q.group_by_platform = bool(re.search(r"platform\s*wise|platformwise|platform-wise|by\s+platform|"
+                                         r"platform\s+break", low))
+    maxdate_flag = bool(re.search(r"\bmax date\b|\blatest date\b|last updated|data date|max updated|"
+                                  r"till which date|up ?to which date|latest data", low))
+    datetime_flag = bool(re.search(r"what.{0,8}\b(day|date|time)\b|\btime now\b|current (time|date)|"
+                                   r"today'?s? date|what day is|what.?s the day|which day (is|it)", low))
+    appcontrol_flag = bool(re.search(r"\blog\s?out\b|\bsign\s?out\b|logout|log me out|"
+                                     r"(refresh|reload).{0,15}(app|page|ecom|dashboard|site)|"
+                                     r"close the app|open the (\w+) (page|dashboard)|navigate to", low))
+    smalltalk_flag = bool(re.search(r"\bhlo+\b|\bhlooo+\b|how are (you|u)\b|how r u\b|how\s?are\s?u\b|"
+                                    r"\bhru\b|hor vi kida|sat sri akal|kiddan|\bthanks?\b|thank you|thankyou|"
+                                    r"\bwhat r u\b|\bwhat are you\b|who (are|r) (you|u)|are you (a )?(bot|ai|ready|there)|"
+                                    r"is (you|u) ready|you ready|ready for deploy|busine\w* mode|"
+                                    r"\bsup\b|what'?s up|\bnice\b|\bgood (job|bot|work)\b|\bcool\b|"
+                                    r"this is (incorrect|wrong)|not correct|that'?s wrong", low))
+    ack_flag = bool(re.fullmatch(r"\s*(ok|okay|k|kk|yes|yep|no|nope|hmm+|great|fine|got it|thx|ty)\s*[.! ]*", low))
     if _has(low, _PLATFORM_LIST_WORDS) and not data_signal:
         q.intent = "list_platforms"
     elif _has(low, _ALERT_WORDS):
@@ -358,7 +375,7 @@ def parse(message: str, db_platforms: list[dict] | None = None) -> ParsedQuery:
         q.intent = "pendency"
     elif q.dimension and _RANK_RE.search(low):
         q.intent = "ranking"
-    elif q.metric == "liters" or q.movement in ("delivered", "sold") or q.group_by_month or q.wants_amount:
+    elif q.metric == "liters" or q.movement in ("delivered", "sold") or q.group_by_month or q.group_by_platform or q.wants_amount:
         q.intent = "liters"
     elif _has(low, _SHIPMENT_WORDS):
         q.intent = "shipments"
@@ -368,9 +385,15 @@ def parse(message: str, db_platforms: list[dict] | None = None) -> ParsedQuery:
         q.intent = "inventory"
     elif _has(low, _SALES_WORDS):
         q.intent = "sales"
+    elif maxdate_flag:
+        q.intent = "maxdate"
+    elif appcontrol_flag:
+        q.intent = "appcontrol"
+    elif datetime_flag:
+        q.intent = "datetime"
     elif _has(low, _HELP_WORDS):
         q.intent = "help"
-    elif text and text.lower().strip(" !.?") in _GREETING_WORDS:
+    elif smalltalk_flag or ack_flag or (text and text.lower().strip(" !.?") in _GREETING_WORDS):
         q.intent = "greeting"
     else:
         q.intent = "unknown"

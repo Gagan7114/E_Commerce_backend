@@ -153,7 +153,84 @@ _ROUTES = {
     "state_sales": tools.state_sales,
     "realise": tools.realise,
     "sap": tools.sap_info,
+    "datetime": tools.datetime_now,
+    "appcontrol": tools.app_control,
+    "maxdate": tools.max_date,
 }
+
+
+def _smalltalk_reply(message: str) -> str:
+    """A warm, varied reply for greetings / thanks / identity / feedback so the
+    bot doesn't feel dull. Falls back to the friendly intro."""
+    t = (message or "").lower()
+    if any(w in t for w in ("thank", "thx", " ty", "nice", "good job", "good bot", "cool", "great work", "well done")):
+        return "You're welcome! Anything else you'd like to pull from your data?"
+    if "incorrect" in t or "wrong" in t or "not correct" in t:
+        return ("Sorry about that. I read the live database — tell me the platform + month you expected "
+                "and I'll recheck, or rephrase and I'll try again.")
+    if re.search(r"how are (you|u)|how r u|how ?are ?u|hor vi kida|sat sri akal|kiddan|how'?s it going", t):
+        return ("Doing great and ready to dig into your data! Ask me about POs, liters, alerts, ads, "
+                "targets, pendency and more.")
+    if re.search(r"busine\w* mode", t):
+        return ("I always read the live database directly, so my numbers aren't affected by the app's "
+                "Business Mode display toggle — you'll get the real figures either way.")
+    if re.search(r"what r u|what are you|who (are|r) (you|u)|are you (a )?(bot|ai)|"
+                 r"is (you|u) ready|are you ready|ready for deploy|are you there", t):
+        return ("I'm JivoBot — your data assistant. I read your live Jivo operations data and answer questions "
+                "about POs, liters, secondary sales, inventory, alerts, ads, targets, pendency, state sales and "
+                "more, and can export any answer to Excel. What would you like to know?")
+    return "Hi there! " + HELP_TEXT.removeprefix("Hi! ")
+
+
+def _previous_user_question(conversation, current_text: str) -> str | None:
+    """The last thing the user asked in this conversation, other than the current
+    message — used to give context to a bare follow-up like 'in june'."""
+    if conversation is None:
+        return None
+    try:
+        from ..models import ChatMessage
+
+        texts = list(
+            ChatMessage.objects.filter(conversation=conversation, role="user")
+            .order_by("-id").values_list("text", flat=True)[:6]
+        )
+    except Exception:
+        return None
+    cur = (current_text or "").strip().lower()
+    for prev in texts:
+        if (prev or "").strip().lower() != cur:
+            return prev
+    return None
+
+
+def _try_continuation(user, conversation, message, db_platforms) -> EngineResult | None:
+    """Combine a bare follow-up with the previous question and answer that, e.g.
+    prev 'total order ltrs in blinkit' + 'in june' -> answered for June."""
+    prev = _previous_user_question(conversation, message)
+    if not prev:
+        return None
+    q2 = nlu.parse(f"{prev} {message}", db_platforms=db_platforms)
+    if q2.intent in ("help", "greeting", "unknown"):
+        return None
+    tool = _ROUTES.get(q2.intent)
+    if tool is None:
+        return None
+    try:
+        result: DataResult = tool(q2)
+    except Exception:
+        logger.exception("continuation tool %s failed", q2.intent)
+        return None
+    text = result.summary
+    file_obj = None
+    if q2.wants_excel and result.ok and result.rows:
+        file_obj = _make_excel(user, conversation, result)
+        if file_obj:
+            text += "\n\n📊 Your Excel file is ready — use the download button below."
+    data = _preview(result)
+    if result.suggestions:
+        data["suggestions"] = result.suggestions
+    return EngineResult(text=text, data=data, intent=q2.intent, engine="builtin",
+                        is_error=not result.ok, file=file_obj, suggestions=result.suggestions)
 
 
 def _run_builtin(user, conversation: ChatConversation, message: str) -> EngineResult:
@@ -165,15 +242,24 @@ def _run_builtin(user, conversation: ChatConversation, message: str) -> EngineRe
     if "google sheet" in low or "master po sheet" in low or "from the sheet" in low:
         q.intent = "master_sheet"
 
-    if q.intent in ("help", "greeting", "unknown"):
-        # HELP_TEXT already opens with "Hi!"; for a greeting swap in a warmer
-        # opener instead of prefixing another "Hi!" (which read "Hi! Hi!").
-        text = HELP_TEXT
-        if q.intent == "greeting":
-            text = "Hi there! " + HELP_TEXT.removeprefix("Hi! ")
+    if q.intent == "greeting":
         return EngineResult(
-            text=text,
-            intent=q.intent, engine="builtin", suggestions=SUGGESTIONS,
+            text=_smalltalk_reply(message), intent="greeting", engine="builtin",
+            suggestions=SUGGESTIONS, data={"columns": [], "rows": [], "suggestions": SUGGESTIONS},
+        )
+    if q.intent == "help":
+        return EngineResult(
+            text=HELP_TEXT, intent="help", engine="builtin", suggestions=SUGGESTIONS,
+            data={"columns": [], "rows": [], "suggestions": SUGGESTIONS},
+        )
+    if q.intent == "unknown":
+        # A bare follow-up ("in june", "platform wise") only makes sense with the
+        # previous question — try combining it with the last thing the user asked.
+        cont = _try_continuation(user, conversation, message, db_platforms)
+        if cont is not None:
+            return cont
+        return EngineResult(
+            text=HELP_TEXT, intent="unknown", engine="builtin", suggestions=SUGGESTIONS,
             data={"columns": [], "rows": [], "suggestions": SUGGESTIONS},
         )
 

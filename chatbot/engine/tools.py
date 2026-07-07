@@ -277,6 +277,50 @@ def _liters_by_month(q: ParsedQuery, source: _PoSource, scope: str, fmt_val: str
     )
 
 
+def _liters_by_platform(q: ParsedQuery) -> DataResult:
+    """Order/delivered liters broken out one row per platform (master_po), plus a
+    grand-total row. Triggered by 'platform wise' / 'by platform' questions."""
+    source = _MASTER_PO_SOURCE
+    where, params = [], []
+    if q.date_from and q.date_to:
+        where.append(f"{source.date_col} BETWEEN %s AND %s")
+        params.extend([q.date_from, q.date_to])
+    where.append("format IS NOT NULL AND format::text <> ''")
+    where_sql = " WHERE " + " AND ".join(where)
+    sql = f"""
+        SELECT format, COUNT(*),
+               COALESCE(SUM({source.order_ltrs}),0), COALESCE(SUM({source.delivered_ltrs}),0),
+               COALESCE(SUM({source.missed_ltrs}),0)
+        FROM {source.table}{where_sql}
+        GROUP BY format ORDER BY 3 DESC
+    """
+    try:
+        _c, rows, _t = safe_sql.run_select(sql, params, max_rows=50)
+    except Exception as exc:
+        return DataResult(summary=f"I couldn't total platform-wise liters: {exc}", ok=False, source=source.label)
+    if not rows:
+        return DataResult(summary="No PO data found.", ok=False, source=source.label)
+
+    cols = ["Platform", "PO lines", "Order L", "Delivered L", "Fill %", "Missed L"]
+    data_rows, t_pos, t_o, t_d, t_m = [], 0, 0.0, 0.0, 0.0
+    for fmt, pos, o, d, m in rows:
+        of, df = float(o or 0), float(d or 0)
+        fill = round(df / of * 100, 1) if of else 0.0
+        data_rows.append([fmt, pos, o, d, fill, m])
+        t_pos += pos or 0
+        t_o += of
+        t_d += df
+        t_m += float(m or 0)
+    gfill = round(t_d / t_o * 100, 1) if t_o else 0.0
+    data_rows.append(["TOTAL", t_pos, t_o, t_d, gfill, t_m])
+    span = q.date_label or "all time"
+    body = "\n".join(f"{r[0]}: {_fmt(r[2])} L ordered, {_fmt(r[3])} L delivered ({r[4]}%)" for r in data_rows[:-1])
+    summary = (f"Order vs delivered liters by platform ({span}):\n{body}\n"
+               f"TOTAL: {_fmt(t_o)} L ordered, {_fmt(t_d)} L delivered (fill {gfill}%). Source: master_po.")
+    return DataResult(summary=summary, columns=cols, rows=data_rows, source=source.label,
+                      meta=[("range", span)], excel_title="Liters by Platform")
+
+
 def liters(q: ParsedQuery) -> DataResult:
     """Order / delivered liters (and quantities) for a platform. Reads the right
     PO table: master_po for quick-commerce platforms (filtered by the real
@@ -286,6 +330,8 @@ def liters(q: ParsedQuery) -> DataResult:
     A 'month wise' / 'monthly' / 'all months' question returns a per-month
     breakdown instead of a single total."""
     source, scope, fmt_val = _resolve_po_source(q)
+    if q.group_by_platform:
+        return _liters_by_platform(q)
     if q.group_by_month:
         return _liters_by_month(q, source, scope, fmt_val)
 
@@ -1569,6 +1615,54 @@ def sap_info(q: ParsedQuery) -> DataResult:
         ok=False, source="SAP HANA (not connected)",
         suggestions=["state wise sales for june", "total distributor commission for june", "blinkit inventory"],
     )
+
+
+def datetime_now(q: ParsedQuery) -> DataResult:
+    """Current date / day / time (server local time)."""
+    now = timezone.localtime()
+    return DataResult(
+        summary=f"Today is {now:%A, %d %B %Y}, and the current time is {now:%I:%M %p}.",
+        columns=["metric", "value"],
+        rows=[["Date", now.strftime("%Y-%m-%d")], ["Day", now.strftime("%A")],
+              ["Time", now.strftime("%I:%M %p")]],
+        source="clock", excel_title="Date & Time")
+
+
+def app_control(q: ParsedQuery) -> DataResult:
+    """Graceful reply for app-control requests the bot can't perform."""
+    return DataResult(
+        summary=("I can read and analyse your Jivo data, but I can't control the app itself "
+                 "(log out, refresh, or navigate pages) — please use the app's own menu for that. "
+                 "Meanwhile I can pull POs, liters, alerts, ads, targets, pendency and more — just ask."),
+        ok=True, source="app")
+
+
+def max_date(q: ParsedQuery) -> DataResult:
+    """Latest data date for a platform — primary (master_po po_date / delivery_date)
+    or secondary (SecMaster date)."""
+    text = q.text.lower()
+    if any(w in text for w in ("secondary", "sec ", "sold", "shipped", "sell out")):
+        table, col, label = '"SecMaster"', "date", "secondary sale"
+    else:
+        col = "delivery_date" if ("del" in text or "deliver" in text) else "po_date"
+        table, label = "master_po", f"primary {col.replace('_', ' ')}"
+    where, params = [], []
+    scope = "all platforms"
+    if q.primary_platform:
+        where.append("format ILIKE %s")
+        params.append(f"%{_platform_format_value(q.primary_platform['slug'])}%")
+        scope = q.primary_platform["name"]
+    wsql = (" WHERE " + " AND ".join(where)) if where else ""
+    try:
+        _c, rows, _t = safe_sql.run_select(f"SELECT MAX({col}) FROM {table}{wsql}", params, max_rows=1)
+    except Exception as exc:
+        return DataResult(summary=f"I couldn't read the latest date: {exc}", ok=False, source=table)
+    md = rows[0][0] if rows else None
+    if md is None:
+        return DataResult(summary=f"No {label} data found for {scope}.", ok=False, source=table)
+    return DataResult(summary=f"Latest {label} for {scope}: {md}. Source: {table}.",
+                      columns=["metric", "value"], rows=[[f"latest {label}", md]],
+                      source=table, excel_title="Latest Date")
 
 
 def master_po_sheet(q: ParsedQuery) -> DataResult:
