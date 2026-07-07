@@ -1790,13 +1790,27 @@ def ranking(q: ParsedQuery) -> DataResult:
     label = dim.title()
     span = f" ({q.date_label})" if q.date_label else ""
     lines = [f"{i + 1}. {r[0]} — {_fmt(r[1])}" for i, r in enumerate(rows)]
+    data_rows = [[r[0], r[1]] for r in rows]
+
+    # Append a TOTAL row for additive metrics (a summed fill-% would be meaningless).
+    total_txt = ""
+    if key != "fill_rate":
+        try:
+            total = sum(float(r[1] or 0) for r in rows)
+            total = int(total) if float(total).is_integer() else round(total, 2)
+            data_rows.append([f"TOTAL ({len(rows)} {label.lower()}s)", total])
+            total_txt = f"\nTotal ({len(rows)} {label.lower()}s): {_fmt(total)}"
+        except Exception:
+            pass
+
     summary = (
         f"Top {len(rows)} {label.lower()}(s) by {metric_label}{scope}{span}:\n"
         + "\n".join(lines)
+        + total_txt
         + f"\nSource: {source.label}."
     )
     return DataResult(
-        summary=summary, columns=[label, metric_label], rows=[[r[0], r[1]] for r in rows],
+        summary=summary, columns=[label, metric_label], rows=data_rows,
         source=source.label, meta=[("dimension", dim), ("metric", metric_label)],
         excel_title=f"Top {label}",
     )
