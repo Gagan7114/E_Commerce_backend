@@ -63,6 +63,15 @@ REPORT_VIEW_CATALOG = {
         "format_column": None,
         "max_rows": 50000,
     },
+    # Amazon MP enriched master VIEW — amazon_mp joined to master_sheet for
+    # item_head / category / brand / delivered litres. What the Reports page now
+    # reads for Amazon MP. Its date columns are mixed free-text formats, so date
+    # filtering stays off (date_column=None); MP-only, so no format column.
+    "amazon_mp_master_view": {
+        "date_column": None,
+        "format_column": None,
+        "max_rows": 50000,
+    },
 }
 
 _IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")

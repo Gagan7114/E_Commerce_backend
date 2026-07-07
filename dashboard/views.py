@@ -12,6 +12,7 @@ from rest_framework.response import Response
 
 from accounts.permissions import require
 from config.perf_cache import cached_get
+from . import feed_health
 from platforms.primary_po_columns import (
     PRIMARY_MASTER_PO_TABLES,
     order_primary_master_po_columns,
@@ -70,43 +71,21 @@ def _table_exists(table: str) -> bool:
 
 
 def _count(table: str) -> int:
-    """Row count for a stat card.
+    """Exact row count for a stat card.
 
-    Fast path: for ordinary/partitioned tables and materialized views, use the
-    `reltuples` estimate Postgres maintains in pg_class via ANALYZE/autovacuum.
-    That is O(1) instead of a full COUNT(*) scan over the whole table.
-
-    Safe fallback: for plain VIEWs (reltuples is not maintained for them) or a
-    table that has never been analyzed (reltuples < 0, or 0 which is ambiguous),
-    fall back to an exact COUNT(*) so the number is never silently wrong. Many
-    ALLOWED_TABLES entries are views, so this fallback matters.
+    Uses COUNT(*) so the number always matches the live table-data view. An
+    earlier version returned the pg_class.reltuples estimate for O(1) speed, but
+    reltuples is only as fresh as the last ANALYZE/autovacuum and drifted badly
+    out of sync with table-data (audit finding #19: counts appeared "frozen" for
+    weeks while the real rows kept changing). At these table sizes (tens of
+    thousands of rows) COUNT(*) is a few milliseconds, and table_counts is cached
+    for 60s, so the estimate's speed edge isn't worth the wrong numbers.
     """
     try:
         with connection.cursor() as cur:
-            cur.execute(
-                """
-                SELECT c.relkind, c.reltuples::bigint
-                FROM pg_class c
-                JOIN pg_namespace n ON n.oid = c.relnamespace
-                WHERE n.nspname = current_schema()
-                  AND c.relname = %s
-                LIMIT 1
-                """,
-                [table],
-            )
-            row = cur.fetchone()
-            if row is not None:
-                relkind, estimate = row[0], row[1]
-                # 'r' table, 'p' partitioned table, 'm' materialized view all
-                # keep a usable estimate. Only trust it when > 0 (a 0/negative
-                # estimate means empty or never-analyzed -> verify exactly).
-                if relkind in ("r", "p", "m") and estimate and estimate > 0:
-                    return int(estimate)
-            # View, missing stats, or never analyzed -> exact (and for empty
-            # tables COUNT(*) is itself instant).
             cur.execute(f"SELECT COUNT(*) FROM {_quoted(table)}")
-            exact = cur.fetchone()
-            return int(exact[0]) if exact else 0
+            row = cur.fetchone()
+            return int(row[0]) if row else 0
     except Exception:
         return 0
 
@@ -154,7 +133,7 @@ def _date_expr(col: str) -> str:
 @permission_classes([require("dashboard.table.view")])
 def table_count(request, table_name: str):
     if table_name not in ALLOWED_TABLES:
-        return Response({"error": "Table not allowed", "count": 0})
+        return Response({"error": "Table not allowed", "count": 0}, status=400)
     return Response({"table": table_name, "count": _count(table_name)})
 
 
@@ -201,12 +180,22 @@ def latest_month(request):
     })
 
 
+@api_view(["GET"])
+@permission_classes([require("dashboard.view")])
+@cached_get(timeout=300, prefix="dash.feed_health", shared=True)
+def feed_health_view(request):
+    """Feed freshness + master-data gaps (audit #8/#10/#18). Read-only: one
+    MAX()/COUNT() per feed. Surfaces silently-dead feeds and null-per-litre SKUs
+    so a stale dashboard is never trusted blindly. Cached 5 min."""
+    return Response(feed_health.data_health())
+
+
 # ─── /table-columns/{table} ───
 @api_view(["GET"])
 @permission_classes([require("dashboard.table.view")])
 def table_columns(request, table_name: str):
     if table_name not in ALLOWED_TABLES:
-        return Response({"error": "Table not allowed", "columns": [], "sample": None})
+        return Response({"error": "Table not allowed", "columns": [], "sample": None}, status=400)
     sample = _sample_row(table_name)
     if not sample:
         return Response({"columns": [], "sample": None})
@@ -227,11 +216,11 @@ def table_columns(request, table_name: str):
 @cached_get(timeout=120, prefix="dash.table_distinct")
 def table_distinct_values(request, table_name: str, column_name: str):
     if table_name not in ALLOWED_TABLES or not _IDENT.match(column_name):
-        return Response({"error": "Table or column not allowed", "values": []})
+        return Response({"error": "Table or column not allowed", "values": []}, status=400)
 
     sample = _sample_row(table_name)
     if not sample or column_name not in sample:
-        return Response({"error": "Column not found", "values": []})
+        return Response({"error": "Column not found", "values": []}, status=404)
 
     qt = _quoted(table_name)
     qc = f'"{column_name}"'
@@ -411,7 +400,23 @@ def inventory_charts(request):
     Python. This is far faster AND more correct: the previous version summed
     only the first 5,000 rows (``LIMIT 5000``), so totals were silently
     truncated on any table larger than that.
+
+    Every `*_inventory` table is a DAILY SNAPSHOT keyed on ``inventory_date``.
+    We scope each table to a SINGLE day — the requested ``date`` param, or the
+    latest snapshot per table — so stock-on-hand reflects one day, not the sum
+    of every snapshot ever ingested (which inflated totals a little more each
+    day; see audit finding #2).
     """
+    # Snapshot-date column shared by every INVENTORY_CONFIG table.
+    DATE_COL = "inventory_date"
+    raw_date = (request.GET.get("date") or "").strip()
+    requested_date = None
+    if raw_date:
+        try:
+            requested_date = date.fromisoformat(raw_date[:10])
+        except ValueError:
+            requested_date = None  # ignore junk; fall back to latest snapshot
+
     platform_totals = []
     city_totals: dict[str, int] = defaultdict(int)
     top_products = []
@@ -430,9 +435,21 @@ def inventory_charts(request):
 
         try:
             qt = _quoted(table)
+            # Scope to one snapshot day: the requested date, else this table's
+            # latest inventory_date. Emitted as a reusable predicate so all three
+            # queries below agree on the same day.
+            if requested_date is not None:
+                date_clause = f'"{DATE_COL}" = %s::date'
+                date_arg = [requested_date.isoformat()]
+            else:
+                date_clause = f'"{DATE_COL}" = (SELECT MAX("{DATE_COL}") FROM {qt})'
+                date_arg = []
             with connection.cursor() as cur:
-                # 1) Whole-table total + SKU count (no row cap).
-                cur.execute(f"SELECT COUNT(*), COALESCE(SUM({num_sql}), 0) FROM {qt}")
+                # 1) Single-day total + SKU count (no row cap).
+                cur.execute(
+                    f"SELECT COUNT(*), COALESCE(SUM({num_sql}), 0) FROM {qt} WHERE {date_clause}",
+                    date_arg,
+                )
                 row = cur.fetchone()
                 sku_count = int(row[0] or 0)
                 total_qty = int(row[1] or 0)
@@ -451,6 +468,7 @@ def inventory_charts(request):
                                             THEN "{name_col}"::text END) AS good_name,
                                    MAX("{name_col}"::text) AS any_name
                             FROM {qt}
+                            WHERE {date_clause}
                             GROUP BY "{id_col}"::text
                         )
                         SELECT COALESCE(good_name, any_name, id) AS product, qty
@@ -458,7 +476,8 @@ def inventory_charts(request):
                         WHERE qty > 0
                         ORDER BY qty DESC
                         LIMIT 5
-                        """
+                        """,
+                        date_arg,
                     )
                 else:
                     cur.execute(
@@ -468,11 +487,13 @@ def inventory_charts(request):
                         FROM {qt}
                         WHERE "{name_col}" IS NOT NULL
                           AND btrim("{name_col}"::text) <> ''
+                          AND {date_clause}
                         GROUP BY "{name_col}"::text
                         HAVING COALESCE(SUM({num_sql}), 0) > 0
                         ORDER BY qty DESC
                         LIMIT 5
-                        """
+                        """,
+                        date_arg,
                     )
                 for prod, qty in cur.fetchall():
                     top_products.append({
@@ -486,14 +507,16 @@ def inventory_charts(request):
                 if city_col:
                     cur.execute(
                         f"""
-                        SELECT UPPER(btrim("{city_col}"::text)) AS city,
+                        SELECT {_city_canon_sql(f'"{city_col}"')} AS city,
                                COALESCE(SUM({num_sql}), 0) AS qty
                         FROM {qt}
                         WHERE "{city_col}" IS NOT NULL
                           AND btrim("{city_col}"::text) <> ''
+                          AND {date_clause}
                         GROUP BY 1
                         HAVING COALESCE(SUM({num_sql}), 0) > 0
-                        """
+                        """,
+                        date_arg,
                     )
                     for city, qty in cur.fetchall():
                         if city:
@@ -558,7 +581,7 @@ def primary_po_litres(request):
                 FROM reporting."Amazon PO"
                 WHERE po_month = %s
                   AND year = %s
-            """, [today.month, year])
+            """, [month_num, year])
             row = cur.fetchone()
             if row:
                 results.append({"format": "AMAZON", "delivered_ltrs": float(row[0] or 0)})
@@ -776,6 +799,8 @@ _CITY_ALIASES = {
     "Bangalore": "Bengaluru",
     "Bengalooru": "Bengaluru",
     "Gurgaon": "Gurugram",
+    "New Delhi": "Delhi",
+    "Newdelhi": "Delhi",
     "Bombay": "Mumbai",
     "Calcutta": "Kolkata",
     "Madras": "Chennai",
@@ -1763,7 +1788,7 @@ def state_sales_detail_cities(request):
                     # into its top SKUs. value = shipped_units × per-ASIN revenue
                     # rate (raw shipped_revenue in amazon_sec_city is ~0).
                     sql = f"""
-                        SELECT INITCAP(TRIM(a.city)) AS label,
+                        SELECT {_city_canon_sql("a.city")} AS label,
                                COALESCE(SUM(CASE WHEN UPPER(TRIM(m.is_litre::text)) = 'Y'
                                     THEN COALESCE(a.shipped_units, 0)::numeric * COALESCE(m.per_unit_value, 0)
                                     ELSE 0 END), 0) AS litres,
@@ -1799,7 +1824,7 @@ def state_sales_detail_cities(request):
                     if items:
                         sql += " AND UPPER(TRIM(m.item::text)) = ANY(%s)"; params.append(items)
                     sql += " AND COALESCE(csm.state::text, '') = ANY(%s)"; params.append(az_raws)
-                    sql += f" GROUP BY INITCAP(TRIM(a.city)) ORDER BY {order_col} DESC NULLS LAST"
+                    sql += f" GROUP BY {_city_canon_sql('a.city')} ORDER BY {order_col} DESC NULLS LAST"
                     try:
                         cur.execute(sql, params)
                         for lb, lt, un, vl, od in cur.fetchall():

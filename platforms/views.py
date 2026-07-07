@@ -118,6 +118,66 @@ def _approx_count(table: str) -> int:
         return 0
 
 
+# ── Real stats-card metrics (audit finding #1) ───────────────────────────────
+# The card previously showed lifetime pg_class row-count estimates for both
+# "Inventory Items" and "Secondary", which are meaningless (and 0 for the 7
+# platforms whose PlatformConfig.secondary_table points at a table that doesn't
+# exist). These compute the real numbers instead.
+
+# Normalised formats that live in secmaster_mv (the unified QC secondary view).
+_STATS_SECMASTER_FORMATS = {
+    "blinkit", "zepto", "swiggy", "bigbasket", "flipkart", "jiomart",
+}
+
+
+def _stats_inventory_items(inv_table: str | None) -> int:
+    """Count of SKUs on the LATEST inventory snapshot day — i.e. items currently
+    in stock, matching the "Inventory Items" card label. Every `*_inventory`
+    table is a daily snapshot keyed on inventory_date; the old code counted every
+    snapshot row ever ingested. Falls back to the approx count if the table has
+    no inventory_date column, and to 0 if there's no inventory feed at all."""
+    if not inv_table:
+        return 0
+    try:
+        val = _scalar(
+            f'SELECT COUNT(*) FROM "{inv_table}" '
+            f'WHERE inventory_date = (SELECT MAX(inventory_date) FROM "{inv_table}")',
+            [],
+        )
+        return int(val or 0)
+    except Exception:
+        return _approx_count(inv_table)
+
+
+def _stats_secondary_units(slug: str) -> int:
+    """Units sold in the current calendar month for the platform's secondary
+    feed. secmaster_mv covers the QC formats + Flipkart marketplace; Amazon has
+    its own daily feed; primary-only platforms (zomato/citymall/flipkart_grocery)
+    have no secondary sales -> 0."""
+    today = date.today()
+    key = re.sub(r"[^a-z0-9]+", "", slug.lower())
+    try:
+        if key in _STATS_SECMASTER_FORMATS:
+            val = _scalar(
+                "SELECT COALESCE(SUM(quantity), 0) FROM secmaster_mv "
+                "WHERE REGEXP_REPLACE(LOWER(TRIM(format::text)), '[^a-z0-9]+', '', 'g') = %s "
+                "  AND UPPER(TRIM(month::text)) = %s AND year::numeric = %s",
+                [key, _month_name(today.month), today.year],
+            )
+            return int(val or 0)
+        if key == "amazon":
+            val = _scalar(
+                "SELECT COALESCE(SUM(shipped_units), 0) FROM amazon_sec_daily "
+                "WHERE EXTRACT(MONTH FROM report_date) = %s "
+                "  AND EXTRACT(YEAR FROM report_date) = %s",
+                [today.month, today.year],
+            )
+            return int(val or 0)
+    except Exception:
+        return 0
+    return 0
+
+
 # ─── /{slug}/stats ───
 _STATS_CACHE_TTL = 60  # seconds
 
@@ -141,8 +201,8 @@ def platform_stats(request, slug: str):
     filter_col = _safe_col(p.po_filter_column or "platform") or "platform"
     filter_val = p.po_filter_value or p.slug
 
-    inventory_count = _approx_count(inv) if inv else 0
-    sells_count = _approx_count(sec) if sec else 0
+    inventory_count = _stats_inventory_items(inv)
+    sells_count = _stats_secondary_units(slug)
 
     try:
         open_pos = _scalar(
@@ -3651,6 +3711,16 @@ def _ads_build_where(request, *, allow_date: bool = True):
         except ValueError:
             raise ValidationError(f"Invalid year value: {year_param!r}")
     if month_param:
+        # The `month` column stores uppercase names ('JUNE'). Also accept a
+        # numeric month (1-12) — the sales/secondary endpoints take numbers, so
+        # a client following that convention would otherwise get silent zeros.
+        if month_param.isdigit():
+            m = int(month_param)
+            if not 1 <= m <= 12:
+                raise ValidationError(
+                    f"Invalid month value: {month_param!r} (expected 1-12 or a month name)"
+                )
+            month_param = _month_name(m)
         base_clauses.append("month = %s")
         base_params.append(month_param)
 
@@ -6720,16 +6790,42 @@ def _amazon_sec_totals(rows: list[dict], *, include_projection: bool = True) -> 
 
 def _amazon_secondary_monthly_dashboard_response(request):
     year, defaulted_to_latest = _parse_amazon_secondary_monthly_year(request.query_params)
+
+    # amazon_sec_range_master_view keys each row by month_day =
+    # TO_CHAR(to_date,'DD') || '-' || <MONTH> — a zero-padded day tied to the
+    # range's latest to_date. For a COMPLETED month that is the last calendar
+    # day; for the CURRENT, in-progress month it is the latest upload day. The
+    # old code keyed every month to monthrange()'s last day, so the current
+    # month never matched its own rows and always read 0 (audit finding #13).
+    # Resolve each month's real latest day from the data instead; months with no
+    # data fall back to the last calendar day (which harmlessly matches nothing).
+    max_day_rows = _dict_rows(
+        """
+        SELECT UPPER(TRIM("month"::text)) AS mon_name,
+               MAX(EXTRACT(DAY FROM "to_date"))::int AS max_day
+        FROM "amazon_sec_range_master_view"
+        WHERE "year" = %s
+        GROUP BY UPPER(TRIM("month"::text))
+        """,
+        [year],
+    )
+    max_day_by_month_name = {
+        _norm_sec_key(r.get("mon_name")): int(r.get("max_day"))
+        for r in max_day_rows
+        if r.get("mon_name") and r.get("max_day") is not None
+    }
+
     months = []
     for month in range(1, 13):
         month_key = _month_name(month)
-        day = monthrange(year, month)[1]
+        day = max_day_by_month_name.get(_norm_sec_key(month_key), monthrange(year, month)[1])
         months.append({
             "month": month,
             "key": month_key,
             "label": "FEBURARY" if month == 2 else month_key,
             "day": day,
-            "month_day": f"{day}-{month_key}",
+            # Zero-padded to match the stored "DD-MONTH" form exactly.
+            "month_day": f"{int(day):02d}-{month_key}",
         })
     month_keys = [month["key"] for month in months]
     month_days = [month["month_day"] for month in months]
@@ -8911,9 +9007,40 @@ def _blinkit_sec_dashboard_response(request):
         for r in detail_raw
     }
 
+    # "Last month" = the FULL previous calendar month's litres per
+    # (sub_category, per_ltr), computed live relative to the SELECTED month —
+    # not the hardcoded snapshot that _BLINKIT_SEC_DETAIL_ROWS used to carry
+    # (audit finding #7: that column was frozen to one month regardless of the
+    # period picked). The prior month is a completed month, so it is NOT scoped
+    # by the intra-month `date_filter`.
+    prev_month, prev_year = (12, year - 1) if month == 1 else (month - 1, year)
+    last_month_raw = _dict_rows(
+        """
+        SELECT
+            UPPER(TRIM("sub_category"::text)) AS sub_category_key,
+            UPPER(TRIM("per_ltr_unit"::text)) AS per_ltr_key,
+            COALESCE(SUM("ltr_sold"), 0) AS last_month_ltr
+        FROM secmaster_mv
+        WHERE REGEXP_REPLACE(LOWER(TRIM("format"::text)), '[^a-z0-9]+', '', 'g') = 'blinkit'
+          AND UPPER(TRIM("month"::text)) = %s
+          AND "year"::numeric = %s
+        GROUP BY
+            UPPER(TRIM("sub_category"::text)),
+            UPPER(TRIM("per_ltr_unit"::text))
+        """,
+        [_month_name(prev_month), prev_year],
+    )
+    last_month_by_key = {
+        (_norm_sec_key(r.get("sub_category_key")), _norm_sec_key(r.get("per_ltr_key"))):
+            _num(r.get("last_month_ltr"))
+        for r in last_month_raw
+    }
+
     details = []
-    for item_head, category, sub_category, per_ltr, last_month in _BLINKIT_SEC_DETAIL_ROWS:
-        row = detail_by_key.get((_norm_sec_key(sub_category), _norm_sec_key(per_ltr)), {})
+    for item_head, category, sub_category, per_ltr, _static_last_month in _BLINKIT_SEC_DETAIL_ROWS:
+        detail_key = (_norm_sec_key(sub_category), _norm_sec_key(per_ltr))
+        row = detail_by_key.get(detail_key, {})
+        last_month = last_month_by_key.get(detail_key, 0)
         shipped_value = _num(row.get("shipped_value"))
         shipped_units = _num(row.get("shipped_units"))
         details.append({
