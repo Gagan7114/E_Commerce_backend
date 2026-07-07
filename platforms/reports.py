@@ -74,6 +74,16 @@ REPORT_VIEW_CATALOG = {
     },
 }
 
+# Some catalog "views" have a faster physical backing to actually query from.
+# `SecMaster` is a LIVE view that recomputes a per-row landing-rate lookup, so a
+# COUNT(*) is ~11s and a full export ~6 min (times out behind the web server).
+# `secmaster_mv` is its materialized twin with identical columns — COUNT is
+# ~0.1s and a full scan ~30s — so we run the report's queries against it while
+# keeping the catalog/columns keyed on `SecMaster`.
+_PHYSICAL_VIEW = {
+    "SecMaster": "secmaster_mv",
+}
+
 _IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
@@ -245,6 +255,7 @@ def report_raw(request):
         })
     view = _safe_view(view_raw)
     catalog = REPORT_VIEW_CATALOG[view]
+    physical = _PHYSICAL_VIEW.get(view, view)
 
     requested_columns = (request.query_params.get("columns") or "").strip()
     columns: list[str] = []
@@ -297,11 +308,11 @@ def report_raw(request):
 
     try:
         with connection.cursor() as cur:
-            cur.execute(f'SELECT COUNT(*) FROM "{view}" {where_clause}', params)
+            cur.execute(f'SELECT COUNT(*) FROM "{physical}" {where_clause}', params)
             count_row = cur.fetchone()
             count = int(count_row[0]) if count_row else 0
             cur.execute(
-                f'SELECT {select_clause} FROM "{view}" {where_clause} LIMIT %s OFFSET %s',
+                f'SELECT {select_clause} FROM "{physical}" {where_clause} LIMIT %s OFFSET %s',
                 params + [page_size, offset],
             )
             description = cur.description or []
@@ -373,13 +384,14 @@ def report_export(request):
     else:
         view = _safe_view(view_raw)
         catalog = REPORT_VIEW_CATALOG[view]
+        physical = _PHYSICAL_VIEW.get(view, view)
         for c in columns:
             _safe_col(c)
         select_clause = ", ".join(f'"{c}"' for c in columns) if columns else "*"
         fmt = (data.get("platform") or data.get("fmt") or "").strip()
         where_clause, params = _build_filters(catalog, fmt, date_from, date_to)
         sql = (
-            f'SELECT {select_clause} FROM "{view}" {where_clause} '
+            f'SELECT {select_clause} FROM "{physical}" {where_clause} '
             f"LIMIT {EXPORT_MAX_ROWS}"
         )
         with connection.cursor() as cur:
