@@ -51,6 +51,8 @@ class ParsedQuery:
     group_by_month: bool = False   # "month wise" / "monthly" / "all months" breakdown
     group_by_platform: bool = False  # "platform wise" breakdown
     wants_amount: bool = False     # "order amount" / "value" / "revenue" question
+    item_head: str = ""            # PREMIUM / COMMODITY filter
+    product: str = ""              # item-family filter, e.g. "extra light", "canola"
 
     @property
     def platform_slugs(self) -> list[str]:
@@ -202,6 +204,23 @@ _DIMENSION_WORDS = {
     "platform": ["platform", "platforms", "format", "formats"],
 }
 _RANK_RE = re.compile(r"\b(top|best|highest|most|leading|largest|rank|ranking|compare)\b")
+
+# Jivo product families -> the text to match against the `item` column. Each
+# tuple is (item-filter, [aliases users type]). Longest/most-specific first.
+_PRODUCTS = [
+    ("extra light", ["extra light", "extralight", "extra-light"]),
+    ("extra virgin", ["extra virgin", "extravirgin"]),
+    ("rice bran", ["rice bran", "ricebran"]),
+    ("cotton seed", ["cotton seed", "cottonseed"]),
+    ("desi ghee", ["desi ghee", "ghee"]),
+    ("black olives", ["black olive", "black olives"]),
+    ("canola", ["canola"]),
+    ("pomace", ["pomace"]),
+    ("groundnut", ["groundnut", "peanut"]),
+    ("mustard", ["mustard", "kachi ghani", "kacchi ghani"]),
+    ("sunflower", ["sunflower"]),
+    ("gold", ["gold"]),
+]
 _STATE_RE = re.compile(
     r"\b(maharashtra|gujarat|goa|rajasthan|delhi|punjab|haryana|uttar pradesh|uttarakhand|"
     r"himachal pradesh|jammu and kashmir|chandigarh|karnataka|tamil nadu|kerala|andhra pradesh|"
@@ -270,6 +289,19 @@ def parse(message: str, db_platforms: list[dict] | None = None) -> ParsedQuery:
     for dim, words in _DIMENSION_WORDS.items():
         if any(re.search(r"\b" + re.escape(w) + r"\b", low) for w in words):
             q.dimension = dim
+            break
+
+    # Item-head filter (premium / commodity). If BOTH appear it's a split, not a
+    # filter — leave blank so the split tool handles it.
+    if "premium" in low and "commodity" not in low:
+        q.item_head = "PREMIUM"
+    elif "commodity" in low and "premium" not in low:
+        q.item_head = "COMMODITY"
+
+    # Product-family filter ("extra light", "canola", ...).
+    for canon, aliases in _PRODUCTS:
+        if any(a in low for a in aliases):
+            q.product = canon
             break
 
     # --- Intent (order matters: most specific first) ---

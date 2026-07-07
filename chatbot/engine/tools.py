@@ -70,6 +70,30 @@ def get_active_platforms() -> list[dict]:
         return []
 
 
+def _item_filters(q: ParsedQuery) -> tuple[list, list]:
+    """Extra WHERE clauses for item-head (PREMIUM/COMMODITY) and product-family
+    ('extra light', 'canola'...) filters. Every data table we query has `item`
+    and `item_head` columns, so this is reused across tools for accurate answers."""
+    clauses, params = [], []
+    if q.item_head:
+        clauses.append("UPPER(item_head) = %s")
+        params.append(q.item_head)
+    if q.product:
+        clauses.append("item ILIKE %s")
+        params.append(f"%{q.product}%")
+    return clauses, params
+
+
+def _scope_suffix(q: ParsedQuery) -> str:
+    """Human label for active item-head / product filters, e.g. ' (premium, extra light)'."""
+    bits = []
+    if q.item_head:
+        bits.append(q.item_head.lower())
+    if q.product:
+        bits.append(q.product)
+    return f" ({', '.join(bits)})" if bits else ""
+
+
 # --- PO data sources ---------------------------------------------------------
 # Liter/ranking answers read purchase-order tables. Most quick-commerce
 # platforms live in `master_po` (one row per PO line, keyed by the `format`
@@ -342,6 +366,10 @@ def liters(q: ParsedQuery) -> DataResult:
     if q.date_from and q.date_to:
         where.append(f"{source.date_col} BETWEEN %s AND %s")
         params.extend([q.date_from, q.date_to])
+    ic, ip = _item_filters(q)
+    where.extend(ic)
+    params.extend(ip)
+    scope += _scope_suffix(q)
     where_sql = (" WHERE " + " AND ".join(where)) if where else ""
 
     sql = f"""
@@ -706,6 +734,10 @@ def secondary_sales(q: ParsedQuery) -> DataResult:
     if q.date_from and q.date_to:
         where.append(f"{source.date_col} BETWEEN %s AND %s")
         params.extend([q.date_from, q.date_to])
+    ic, ip = _item_filters(q)
+    where.extend(ic)
+    params.extend(ip)
+    scope += _scope_suffix(q)
     where_sql = (" WHERE " + " AND ".join(where)) if where else ""
     span = f" ({q.date_label})" if q.date_label else ""
 
@@ -792,6 +824,10 @@ def drr(q: ParsedQuery) -> DataResult:
         params.append(f"%{fmt_val}%")
     where.append(f"{source.date_col} BETWEEN %s AND %s")
     params.extend([dfrom, dto])
+    ic, ip = _item_filters(q)
+    where.extend(ic)
+    params.extend(ip)
+    scope += _scope_suffix(q)
     where_sql = " WHERE " + " AND ".join(where)
 
     if any(p in text for p in ("day wise", "daywise", "day-wise", "per day", "daily", "each day")):
@@ -1789,6 +1825,10 @@ def ranking(q: ParsedQuery) -> DataResult:
     if q.date_from and q.date_to:
         where.append(f"{source.date_col} BETWEEN %s AND %s")
         params.extend([q.date_from, q.date_to])
+    ic, ip = _item_filters(q)
+    where.extend(ic)
+    params.extend(ip)
+    scope += _scope_suffix(q)
     where.append(f"{dim_col} IS NOT NULL")
     where.append(f"{dim_col}::text <> ''")
     where_sql = " WHERE " + " AND ".join(where)
