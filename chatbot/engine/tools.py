@@ -677,6 +677,21 @@ def _rank_words(text: str) -> bool:
     return bool(re.search(r"\b(top|best|highest|most|leading|largest|rank|ranking)\b", text))
 
 
+def _secondary_latest_date(source: _SecSource, fmt_val: str | None):
+    """Most recent date loaded in the secondary source (optionally per platform)."""
+    where, params = [], []
+    if source.format_col and fmt_val:
+        where.append(f"{source.format_col} ILIKE %s")
+        params.append(f"%{fmt_val}%")
+    wsql = (" WHERE " + " AND ".join(where)) if where else ""
+    try:
+        _c, rows, _t = safe_sql.run_select(
+            f"SELECT MAX({source.date_col}) FROM {source.table}{wsql}", params, max_rows=1)
+        return rows[0][0] if rows else None
+    except Exception:
+        return None
+
+
 def secondary_sales(q: ParsedQuery) -> DataResult:
     """Secondary sell-out (SecMaster / Amazon secondary view): shipped liters,
     units and value with per-litre; supports returns, a top-N ranking submode,
@@ -734,6 +749,20 @@ def secondary_sales(q: ParsedQuery) -> DataResult:
     except Exception as exc:
         return DataResult(summary=f"I couldn't total secondary sales: {exc}", ok=False, source=source.table)
     ltr, units, value, n = rows[0]
+
+    # No rows for the requested window — secondary data lags, so tell the user the
+    # latest loaded date instead of a bare "0" that reads like a bug.
+    if not n and q.date_from and q.date_to:
+        latest = _secondary_latest_date(source, fmt_val)
+        note = f" The latest secondary data loaded is up to {latest}." if latest else ""
+        summary = (f"{scope}: no secondary sell-out recorded{span} yet.{note} "
+                   f"Secondary sales are usually uploaded a day or two later — try a past date.")
+        return DataResult(
+            summary=summary, columns=["metric", "value"],
+            rows=[["Ltr sold", 0], ["Units sold", 0], ["Value", 0]],
+            source=source.table, ok=True, meta=[("scope", scope), ("latest", str(latest or ""))],
+            excel_title=f"{scope} Secondary")
+
     per_l = (float(value) / float(ltr)) if float(ltr or 0) else 0.0
     summary = (f"{scope} secondary sell-out{span}: {_fmt(ltr)} liters sold, {_fmt(units)} units, "
                f"₹{_fmt(value)} value (₹{per_l:,.1f}/L) across {_fmt(n)} row(s). Source: {source.table}.")
