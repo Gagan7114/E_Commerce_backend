@@ -2285,42 +2285,73 @@ class ShipmentListCreateView(_SafeAPIView):
             # of the same ASIN+PO rows. Fail fast with details so the UI can
             # guide the user rather than surfacing the conflict later at Submit.
             if loaded_items:
-                pair_keys = {
-                    (
-                        str(it.get('asin') or '').strip().upper(),
-                        str(it.get('po_number') or '').strip().upper(),
-                    )
-                    for it in loaded_items
-                    if it.get('asin') and it.get('po_number')
-                }
-                if pair_keys:
-                    from django.db.models import Q
-                    conflict_q = Q()
-                    for asin_up, po_up in pair_keys:
-                        conflict_q |= Q(asin__iexact=asin_up, po_number__iexact=po_up)
-                    claimed = (
-                        ShipmentItem.objects
-                        .filter(not_loaded=False)
-                        .filter(conflict_q)
-                        .exclude(shipment__status=Shipment.Status.REJECTED)
-                        .select_related('shipment')
-                        .values(
-                            'asin', 'po_number',
-                            'shipment_id', 'shipment__status',
-                            'shipment__appointment_id', 'shipment__destination_fc',
+                # A PO line may legitimately span MULTIPLE shipments — e.g. it is
+                # short-supplied on one appointment's truck and its leftover ships on
+                # a later same-FC appointment. So we do NOT block on mere overlap; we
+                # block only when the COMBINED commitment across all active shipments
+                # would exceed what Amazon ordered (a real over-commit). Serialized by
+                # the advisory lock above, so two concurrent saves can't both slip past.
+                new_by_key = {}
+                for it in loaded_items:
+                    a = str(it.get('asin') or '').strip().upper()
+                    p = str(it.get('po_number') or '').strip().upper()
+                    if a and p:
+                        new_by_key[(a, p)] = new_by_key.get((a, p), 0.0) + float(it.get('planned_qty') or 0)
+                if new_by_key:
+                    po_uppers = list({p for (_a, p) in new_by_key})
+                    committed_map, ordered_map, ship_map = {}, {}, {}
+                    with connection.cursor() as _claim_cur:
+                        # Units already committed to OTHER active shipments (this new
+                        # one isn't inserted yet), per (asin, po).
+                        _claim_cur.execute(
+                            """
+                            SELECT UPPER(TRIM(si.asin)), UPPER(TRIM(si.po_number)),
+                                   COALESCE(SUM(COALESCE(si.planned_qty, 0)), 0),
+                                   MIN(s.id)
+                            FROM sp_items si JOIN sp_shipments s ON s.id = si.shipment_id
+                            WHERE UPPER(TRIM(si.po_number)) = ANY(%s)
+                              AND si.not_loaded = FALSE AND s.status != 'rejected'
+                            GROUP BY UPPER(TRIM(si.asin)), UPPER(TRIM(si.po_number))
+                            """,
+                            [po_uppers],
                         )
-                    )
-                    conflicts = list(claimed)
+                        for a, p, q, sid in _claim_cur.fetchall():
+                            committed_map[(a, p)] = float(q or 0)
+                            ship_map[(a, p)] = sid
+                        # Ordered (Amazon-accepted) qty per (asin, po).
+                        _claim_cur.execute(
+                            """
+                            SELECT UPPER(TRIM(asin)), UPPER(TRIM(po_number)), MAX(accepted_qty)
+                            FROM reporting."Amazon PO"
+                            WHERE UPPER(TRIM(po_number)) = ANY(%s)
+                            GROUP BY UPPER(TRIM(asin)), UPPER(TRIM(po_number))
+                            """,
+                            [po_uppers],
+                        )
+                        for a, p, q in _claim_cur.fetchall():
+                            if q is not None:
+                                ordered_map[(a, p)] = float(q)
+                    conflicts = []
+                    for (a, p), new_qty in new_by_key.items():
+                        existing = committed_map.get((a, p), 0.0)
+                        ordered = ordered_map.get((a, p))
+                        if ordered is not None and (existing + new_qty) > ordered + 1e-6:
+                            conflicts.append({
+                                'asin': a, 'po_number': p,
+                                'shipment_id': ship_map.get((a, p)),
+                                'ordered_qty': ordered,
+                                'already_committed': round(existing, 4),
+                                'this_plan': round(new_qty, 4),
+                            })
                     if conflicts:
-                        # De-dup per (asin, po) so the message is concise
                         return Response(
                             {
-                                'error': 'Some items are already in another active shipment',
+                                'error': 'Some items would exceed the ordered quantity',
                                 'conflicts': conflicts,
                                 'detail': (
-                                    f'{len(conflicts)} row(s) were claimed by another '
-                                    'shipment since this plan was generated. Refresh '
-                                    'the plan and try again.'
+                                    f'{len(conflicts)} line(s) would over-commit the PO — '
+                                    'already-shipped units plus this plan exceed the ordered '
+                                    'quantity. Reduce the quantity and try again.'
                                 ),
                             },
                             status=409,
