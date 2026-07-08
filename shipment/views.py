@@ -3977,66 +3977,47 @@ class PoShipmentLookupView(_SafeAPIView):
 
 class PoShortSupplyView(_SafeAPIView):
     """
-    Global short-supply report: per PO+ASIN line that has been shipped less than
-    ordered. shipped = SUM(planned_qty) across non-rejected shipments (same
-    `committed` definition used in sourcing); ordered = PO original accepted_qty;
-    short = ordered - shipped. Only partially-shipped lines (shipped > 0 AND
-    short > 0) are returned, so a fully-shipped or fully-released line drops off.
+    Short-supply report — PER SHIPMENT EVENT. Every loaded line that shipped fewer
+    units than were orderable on its own truck (planned_qty < accepted_qty) is
+    listed with its short quantity AND the reason it was short (manual or auto),
+    regardless of whether the leftover later ships on another appointment. This
+    records each short-supply as an event, not just the net PO shortfall — so a
+    manual short-supply stays on the report even after the remainder is shipped.
+    Also FC-flip-safe: keyed off the item's own fields, so flipped POs aren't
+    dropped by a sheet-FC vs stored-FC mismatch.
     """
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
         with connection.cursor() as cur:
             cur.execute("""
-                WITH committed AS (
-                    -- Group by (ASIN, PO, FC) so short qty is computed per-FC and
-                    -- a commitment at one FC never appears as short at another FC.
-                    SELECT si.asin,
-                           UPPER(TRIM(si.po_number)) AS po_up,
-                           UPPER(TRIM(COALESCE(si.destination_fc, ''))) AS fc_key,
-                           MAX(si.po_number)        AS po_number,
-                           MAX(si.destination_fc)   AS destination_fc,
-                           MAX(si.product_name)     AS product_name,
-                           MAX(si.internal_sku)     AS internal_sku,
-                           MAX(si.item)             AS item_name,
-                           SUM(COALESCE(si.planned_qty, 0)) AS committed_qty,
-                           -- Appointment(s) this line was committed under, so the report
-                           -- can be grouped appointment-wise. Use the ITEM's appointment
-                           -- (precise for combined trucks); empty => DOH/no-appointment.
-                           STRING_AGG(DISTINCT NULLIF(TRIM(si.appointment_id), ''), ', ') AS appointment_ids,
-                           MAX(s.created_at)        AS last_shipped_at,
-                           MAX(s.appointment_time)  AS appointment_time
-                    FROM sp_items si
-                    JOIN sp_shipments s ON s.id = si.shipment_id
-                    WHERE si.not_loaded = FALSE
-                      AND s.status != 'rejected'
-                    GROUP BY si.asin,
-                             UPPER(TRIM(si.po_number)),
-                             UPPER(TRIM(COALESCE(si.destination_fc, '')))
-                )
-                SELECT c.po_number, c.asin, c.product_name, c.internal_sku, c.item_name,
-                       c.destination_fc, c.appointment_ids, c.last_shipped_at, c.appointment_time,
-                       ch.channel                         AS channel,
-                       po.accepted_qty                    AS ordered_qty,
-                       c.committed_qty                    AS shipped_qty,
-                       (po.accepted_qty - c.committed_qty) AS short_qty
-                FROM committed c
-                JOIN LATERAL (
-                    SELECT p.accepted_qty
-                    FROM reporting."Amazon PO" p
-                    WHERE p.asin = c.asin
-                      AND UPPER(TRIM(p.po_number)) = c.po_up
-                      AND UPPER(TRIM(COALESCE(p.fulfillment_center, ''))) = c.fc_key
-                    ORDER BY p.accepted_qty DESC NULLS LAST
-                    LIMIT 1
-                ) po ON TRUE
-                -- Channel (CORE/FRESH/NOW) for this line's FC, same mapping the
-                -- shipment serializer uses; LEFT JOIN so an unmapped FC just yields NULL.
+                SELECT
+                    s.id                                AS shipment_id,
+                    si.po_number, si.asin,
+                    si.product_name, si.internal_sku,
+                    si.item                             AS item_name,
+                    si.destination_fc,
+                    -- The appointment this line shipped under (single item), named
+                    -- appointment_ids for the report's appointment-wise grouping.
+                    NULLIF(TRIM(si.appointment_id), '') AS appointment_ids,
+                    s.created_at                        AS last_shipped_at,
+                    s.appointment_time,
+                    s.status                            AS shipment_status,
+                    ch.channel                          AS channel,
+                    -- Per-truck: what was orderable on this shipment vs what shipped.
+                    COALESCE(si.accepted_qty, 0)        AS ordered_qty,
+                    COALESCE(si.planned_qty, 0)         AS shipped_qty,
+                    (COALESCE(si.accepted_qty, 0) - COALESCE(si.planned_qty, 0)) AS short_qty,
+                    NULLIF(TRIM(si.short_reason), '')   AS short_reason
+                FROM sp_items si
+                JOIN sp_shipments s ON s.id = si.shipment_id
                 LEFT JOIN public.fc_city_state_channel_master ch
-                       ON UPPER(TRIM(ch.fc::text)) = c.fc_key
-                WHERE c.committed_qty > 0
-                  AND (po.accepted_qty - c.committed_qty) > 0
-                ORDER BY (po.accepted_qty - c.committed_qty) DESC
+                       ON UPPER(TRIM(ch.fc::text)) = UPPER(TRIM(COALESCE(si.destination_fc, '')))
+                WHERE si.not_loaded = FALSE
+                  AND s.status != 'rejected'
+                  AND COALESCE(si.planned_qty, 0) > 0
+                  AND (COALESCE(si.accepted_qty, 0) - COALESCE(si.planned_qty, 0)) > 0
+                ORDER BY (COALESCE(si.accepted_qty, 0) - COALESCE(si.planned_qty, 0)) DESC
             """)
             rows = _row_to_dict(cur, cur.fetchall())
 
