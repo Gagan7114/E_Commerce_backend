@@ -1067,7 +1067,8 @@ def _apply_stock_caps(items, avail_total, avail_remaining, respect, detail, rese
     still AVAILABLE (on-hand − reserved) for that ASIN so the packer plans no
     more than that. ``accepted_qty`` is left untouched so Ordered/Short stay
     correct. Stock is consumed in item order (priority) so one ASIN across rows
-    shares one pool. Unmapped ASINs are never capped. Mutates ``items``.
+    shares one pool. ASINs with no BH-FGM stock record are capped to 0 so they
+    drop to not_loaded rather than shipping unverified. Mutates ``items``.
     """
     for it in items:
         asin = str(it.get('asin') or '').strip().upper()
@@ -1076,7 +1077,18 @@ def _apply_stock_caps(items, avail_total, avail_remaining, respect, detail, rese
         it['sap_on_order'] = d['onorder'] if d else None       # inbound
         it['sap_reserved'] = (reserved.get(asin, 0.0) if d else None)
         it['sap_available'] = (avail_total.get(asin) if d else None)  # on-hand − reserved
-        if not respect or d is None:
+        if not respect:
+            continue
+        if d is None:
+            # Not mapped to BH-FGM stock: availability can't be verified, so don't
+            # ship it blind. Cap to 0 → the packer drops it into not_loaded with
+            # this reason instead of shipping the full ordered qty unverified.
+            it['stock_cap'] = 0.0
+            it['stock_limited'] = True
+            it['stock_unfit'] = (
+                'Not mapped to BH-FGM warehouse stock — availability cannot be '
+                'verified, so it was left out of the plan.'
+            )
             continue
         avail = avail_remaining.get(asin, 0.0)
         orderable = float(it.get('accepted_qty') or 0)
