@@ -2899,11 +2899,25 @@ class POListView(_SafeAPIView):
             total = cur.fetchone()[0]
 
             cur.execute(f"""
+                WITH po_appt AS (
+                    -- A PO's EFFECTIVE FC is the FC of the appointment it's booked on.
+                    -- A "swapped/flipped" PO (its Amazon-sheet FC differs from the FC of
+                    -- the appointment it sits on) physically ships to the appointment FC,
+                    -- so it should be treated as belonging to that FC everywhere — incl.
+                    -- appearing on every appointment at that FC.
+                    SELECT UPPER(TRIM(pv)) AS po_up,
+                           MAX(UPPER(TRIM(a.destination_fc))) AS appt_fc
+                    FROM reporting."appointment" a,
+                         LATERAL unnest(regexp_split_to_array(COALESCE(a.pos, ''), '\s*[,;]\s*')) AS pv
+                    WHERE a.status = 'Confirmed' AND NULLIF(TRIM(pv), '') IS NOT NULL
+                    GROUP BY UPPER(TRIM(pv))
+                )
                 SELECT
                     ap.po_number, ap.asin, ap.merchant_sku, ap.sku_code,
                     ap.sku_name        AS product_name,
                     ap.accepted_qty, ap.cancelled_qty, ap.requested_qty, ap.received_qty,
                     ap.fulfillment_center AS destination_fc,
+                    pa.appt_fc            AS appt_fc,
                     ap.availability_status,
                     ap.status, ap.po_status, ap.item_status,
                     ap.case_pack, ap.per_liter,
@@ -2914,6 +2928,8 @@ class POListView(_SafeAPIView):
                     COALESCE(NULLIF(ap.city,''), fcm.city)   AS city,
                     COALESCE(NULLIF(ap.state,''), fcm.state) AS state
                 FROM reporting."Amazon PO" ap
+                LEFT JOIN po_appt pa
+                    ON pa.po_up = UPPER(TRIM(ap.po_number))
                 LEFT JOIN public.fc_city_state_channel_master fcm
                     ON UPPER(TRIM(fcm.fc::text)) = UPPER(TRIM(ap.fulfillment_center::text))
                 WHERE {where_sql}
