@@ -306,13 +306,25 @@ def report_raw(request):
     page_size = max(1, min(catalog["max_rows"], page_size))
     offset = page * page_size
 
+    # A deterministic ORDER BY is REQUIRED for correct LIMIT/OFFSET pagination.
+    # Without it every page is a fresh, unordered scan of the (materialized) view,
+    # so consecutive OFFSET windows can overlap — and if secmaster_mv is REFRESHed
+    # between page requests the overlap is severe. A paging client (e.g. the
+    # SecMaster Apps Script) then appends those overlapping windows and produces
+    # exact-duplicate rows. Ordering by every selected column is stable across
+    # refreshes (same source data -> same multiset -> same sequence) and works for
+    # any view without per-view configuration.
+    order_clause = ""
+    if columns:
+        order_clause = "ORDER BY " + ", ".join(str(i + 1) for i in range(len(columns)))
+
     try:
         with connection.cursor() as cur:
             cur.execute(f'SELECT COUNT(*) FROM "{physical}" {where_clause}', params)
             count_row = cur.fetchone()
             count = int(count_row[0]) if count_row else 0
             cur.execute(
-                f'SELECT {select_clause} FROM "{physical}" {where_clause} LIMIT %s OFFSET %s',
+                f'SELECT {select_clause} FROM "{physical}" {where_clause} {order_clause} LIMIT %s OFFSET %s',
                 params + [page_size, offset],
             )
             description = cur.description or []
