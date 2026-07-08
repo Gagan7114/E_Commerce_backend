@@ -2196,7 +2196,25 @@ class AppointmentExtraPosView(_SafeAPIView):
                     ROUND(SUM(COALESCE(p.accepted_qty, 0) * COALESCE(p.per_liter, 0))::numeric, 2) AS total_liters,
                     MIN(p.days_to_expiry) AS earliest_days_to_expiry,
                     MAX(p.order_date)     AS order_date,
-                    MAX(p.item_head)      AS item_head
+                    MAX(p.item_head)      AS item_head,
+                    -- Per-SKU breakdown so the picker can expand a PO and show every
+                    -- ASIN with its (short) item name and line detail.
+                    json_agg(
+                        json_build_object(
+                            'asin', p.asin,
+                            'item', p.item,
+                            'product_name', p.sku_name,
+                            'internal_sku', p.merchant_sku,
+                            'item_head', p.item_head,
+                            'accepted_qty', p.accepted_qty,
+                            'case_pack', p.case_pack,
+                            'per_liter', p.per_liter,
+                            'total_liters', ROUND((COALESCE(p.accepted_qty, 0) * COALESCE(p.per_liter, 0))::numeric, 2),
+                            'days_to_expiry', p.days_to_expiry,
+                            'expiry_date', p.expiry_date
+                        )
+                        ORDER BY p.days_to_expiry NULLS LAST, p.asin
+                    ) AS skus
                 FROM reporting."Amazon PO" p
                 WHERE p.fulfillment_center = %s
                   AND p.status = 'Confirmed'
