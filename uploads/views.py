@@ -2336,6 +2336,26 @@ def _apply_zepto_grn_code_row(cur, target_table, row, column_types, table_column
     if cur.rowcount:
         return "created"
 
+    # 4a) Guard against an orphan blank-SKU duplicate. A SKU-less Zepto GRN is
+    #     matched on LOCATION; when the GRN's location is more specific than the
+    #     Primary's (e.g. GRN 'FBD-DRY-MH-BALLABHGARH' vs Primary 'FBD-DRY-MH'),
+    #     steps 1-3 find no row and this branch would insert a standalone blank-SKU
+    #     row — double-counting a delivery the Primary already recorded per SKU.
+    #     If the PO already has per-SKU delivery, that per-SKU total is the source
+    #     of truth (it matches the master sheet), so skip the orphan insert.
+    if match_col != "sku_code":
+        cur.execute(
+            f"SELECT 1 FROM {qtable} t2 "
+            "WHERE LOWER(TRIM(t2.po_number::text)) = %s "
+            "  AND UPPER(TRIM(t2.format::text)) = %s "
+            "  AND t2.sku_code IS NOT NULL AND btrim(t2.sku_code::text) <> '' "
+            "  AND COALESCE(t2.delivered_qty, 0) > 0 "
+            "LIMIT 1",
+            [po.lower(), ZEPTO_GRN_FORMAT],
+        )
+        if cur.fetchone():
+            return "skipped"
+
     # 4) No matching PO row yet (GRN before its Primary PO) -> minimal row.
     minimal = {"po_number": po, "grn_code": grn, "format": ZEPTO_GRN_FORMAT, match_col: match_val}
     for c in ("grn_date", "status", "delivered_qty"):
