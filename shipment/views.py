@@ -434,7 +434,10 @@ def _rolling_window_date_keys(effective_date, days=DRR_WINDOW_DAYS):
         keys.append((
             d.year,
             d.strftime('%B').upper(),
-            f"{d.day:02d}-{d.strftime('%b').upper()}",
+            # month_day in amazon_sec_range_master_view stores the FULL month name
+            # (e.g. "08-JULY"), so use %B not %b — %b ("08-JUL") matches nothing and
+            # collapses DRR/DOH to 0 for every month except May.
+            f"{d.day:02d}-{d.strftime('%B').upper()}",
         ))
     return keys
 
