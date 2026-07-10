@@ -160,6 +160,53 @@ _ROUTES = {
 }
 
 
+def _related_suggestions(q) -> list:
+    """Context-aware follow-up questions shown as chips below each answer. Every
+    suggestion is phrased so the bot can actually answer it when clicked."""
+    p = (q.primary_platform["name"] if q.primary_platform else "") or "Blinkit"
+    intent = q.intent
+    by_intent = {
+        "liters": [f"{p} fill rate", f"{p} order liters month wise",
+                   "Top states by order liters", f"Excel of {p} purchase orders"],
+        "ranking": ["Top 10 brands by order amount", "Top cities by order liters",
+                    "Premium vs commodity by platform", "Top vendors by order qty"],
+        "movers": ["Top states by order liters", "Premium vs commodity by platform",
+                   "Top 10 skus by delivered liters", "Top 10 brands in Zepto"],
+        "split": ["Top states by order liters", "Top 10 brands by order amount",
+                  "Compare platforms by order liters", "Top 10 skus by delivered liters"],
+        "alerts": [f"Excel of {p} alerts", f"Critical DOH alerts for {p}",
+                   "Which skus have the lowest doh", f"{p} inventory"],
+        "inventory": [f"Items with soh units less than 10 in {p}", f"{p} stock by city",
+                      f"Critical DOH alerts for {p}", "Stock by city top 15 across platforms"],
+        "sales": [f"{p} DRR this month", f"{p} secondary sales premium",
+                  "Top 10 skus by ltr sold", f"{p} order liters"],
+        "drr": [f"{p} secondary sales", f"{p} day wise ops and ltr",
+                "Top skus by ltr sold", f"{p} DRR premium"],
+        "ads": [f"{p} roas and acos", f"Total brand fund spent on {p}",
+                "Which platform had highest ad spent", f"Top items by ad spent on {p}"],
+        "brand_fund": [f"Total ad spent on {p}", f"{p} brand fund sub category wise",
+                       "Which platform had highest ad spent", f"Top 5 items by brand fund on {p}"],
+        "coupon": ["Total coupon redemptions and clips on amazon",
+                   "Which coupon has highest budget used", "Amazon roas and acos", "Amazon mp delivered litres"],
+        "targets": [f"{p} done ltrs vs target", "Which platforms are behind on target",
+                    f"{p} pendency", f"{p} drr"],
+        "pendency": [f"{p} pendency by city", "Pos expiring in next 5 days",
+                     f"Top 10 vendors by pending value in {p}", f"{p} fill rate"],
+        "state_sales": ["Top states by order liters", "Which region sold more north or south",
+                        "Jivo vs sano state sales split", "Total distributor commission for june"],
+        "realise": ["Total distributor commission for june", "Top states by order liters",
+                    f"{p} fill rate", "Top 10 brands by order amount"],
+        "list_platforms": ["Total order ltrs in blinkit", "Top states by order liters",
+                            "Critical DOH alerts for Blinkit", "Which platform had highest ad spent"],
+        "landing": [f"{p} skus with no landing rate", "Total order ltrs in blinkit", f"{p} fill rate"],
+    }
+    amazon_bucket = ["How many amazon pos are pending", "Which amazon pos are expiring in 7 days",
+                     "How many appointments today", "Amazon fill rate by fulfillment center"]
+    for k in ("amazon_po", "expiry", "appointments", "amazon_mp", "lead_time"):
+        by_intent[k] = amazon_bucket
+    return by_intent.get(intent, list(SUGGESTIONS))[:4]
+
+
 def _smalltalk_reply(message: str) -> str:
     """A warm, varied reply for greetings / thanks / identity / feedback so the
     bot doesn't feel dull. Falls back to the friendly intro."""
@@ -228,10 +275,11 @@ def _try_continuation(user, conversation, message, db_platforms) -> EngineResult
         if file_obj:
             text += "\n\n📊 Your Excel file is ready — use the download button below."
     data = _preview(result)
-    if result.suggestions:
-        data["suggestions"] = result.suggestions
+    sugg = result.suggestions or (_related_suggestions(q2) if result.ok else [])
+    if sugg:
+        data["suggestions"] = sugg
     return EngineResult(text=text, data=data, intent=q2.intent, engine="builtin",
-                        is_error=not result.ok, file=file_obj, suggestions=result.suggestions)
+                        is_error=not result.ok, file=file_obj, suggestions=sugg)
 
 
 def _run_builtin(user, conversation: ChatConversation, message: str) -> EngineResult:
@@ -288,12 +336,13 @@ def _run_builtin(user, conversation: ChatConversation, message: str) -> EngineRe
             text += "\n\n(I couldn't build an Excel file for this result.)"
 
     data = _preview(result)
-    if result.suggestions:
-        data["suggestions"] = result.suggestions
+    sugg = result.suggestions or (_related_suggestions(q) if result.ok else [])
+    if sugg:
+        data["suggestions"] = sugg
 
     return EngineResult(
         text=text, data=data, intent=q.intent, engine="builtin",
-        is_error=not result.ok, file=file_obj, suggestions=result.suggestions,
+        is_error=not result.ok, file=file_obj, suggestions=sugg,
     )
 
 
