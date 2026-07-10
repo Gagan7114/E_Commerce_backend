@@ -7,7 +7,7 @@ from django.core.cache import cache
 from django.db import connection, transaction
 from django.shortcuts import get_object_or_404
 from rest_framework.decorators import api_view, permission_classes
-from rest_framework.exceptions import PermissionDenied, ValidationError
+from rest_framework.exceptions import NotFound, PermissionDenied, ValidationError
 from rest_framework.response import Response
 
 from accounts.permissions import can_access_platform, require
@@ -86,7 +86,15 @@ _PRIMARY_DASHBOARD_CACHE_TTL = 60  # seconds
 _PRIMARY_DASHBOARD_CACHE_VERSION = 22
 
 
+# Platforms hidden from the whole app. Kept in code/DB (not deleted), but the
+# backend refuses to resolve them so every platform data endpoint 404s for these
+# slugs. Remove a slug here to bring the platform back.
+HIDDEN_PLATFORM_SLUGS = frozenset({"jiomart"})
+
+
 def _get_platform(slug: str) -> PlatformConfig:
+    if slug in HIDDEN_PLATFORM_SLUGS:
+        raise NotFound(f"Platform '{slug}' is not available.")
     return get_object_or_404(PlatformConfig, slug=slug, is_active=True)
 
 

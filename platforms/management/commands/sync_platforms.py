@@ -6,7 +6,8 @@ DEFAULT_PLATFORMS = [
     # slug,       name,        inventory_table,         secondary_table
     ("blinkit",   "Blinkit",   "blinkit_inventory",     "blinkit_secondary"),
     ("zepto",     "Zepto",     "zepto_inventory",       "zepto_secondary"),
-    ("jiomart",   "JioMart",   "jiomart_inventory",     "jiomart_secondary"),
+    # JioMart hidden — omitted from the seed so re-syncing never re-activates it.
+    # ("jiomart",   "JioMart",   "jiomart_inventory",     "jiomart_secondary"),
     ("amazon",    "Amazon",    "amazon_inventory",      "amazon_secondary"),
     ("bigbasket", "BigBasket", "bigbasket_inventory",   "bigbasket_secondary"),
     ("swiggy",    "Swiggy",    "swiggy_inventory",      "swiggy_secondary"),

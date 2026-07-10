@@ -1611,26 +1611,33 @@ def month_targets_update(request, slug: str, row_id: int):
 
 # ─── Endpoints: combined dashboard ───
 
-@api_view(["GET"])
-@permission_classes([require("platform.month_targets.view")])
-@cached_get(timeout=60, prefix="plat.month_targets_dashboard")
-def month_targets_dashboard(request):
-    """GET /api/platform/month-targets/dashboard?month=M&year=Y
+def secondary_dashboard_result(user, month, year, only_slugs=None):
+    """Cross-platform PREMIUM/COMMODITY roll-up for a single month, sourced
+    from the live platform tables via `_dashboard_source_map` (the same numbers
+    shown on the home Secondary KPI card).
 
-    Cross-platform roll-up for a single month. Returns rows grouped into
-    PREMIUM and COMMODITY blocks, each with a Grand Total computed from
-    the sums (percentages re-derived, not averaged).
+    Extracted from `month_targets_dashboard` so other endpoints — notably the
+    home Sales Trend, which needs the identical per-month litres for every
+    month in its window — can reuse this instead of re-reading `month_targets`
+    /`SecMaster_Mat` snapshots that drift from the live figures.
+
+    `only_slugs`, when given, restricts the roll-up to those platform slugs
+    (used by the trend's single-platform filter); `None` = all in scope.
     """
-    month, year = _parse_month_year(request.query_params)
-
     # Scope to platforms the user can see, intersected with the dashboard
     # display order. DASHBOARD_DISPLAY_SLUGS adds Amazon to the front of
     # IN_SCOPE_SLUGS for display only — write paths still use IN_SCOPE_SLUGS.
-    allowed_slugs = set(user_platform_slugs(request.user)) & set(DASHBOARD_DISPLAY_SLUGS)
+    allowed_slugs = set(user_platform_slugs(user)) & set(DASHBOARD_DISPLAY_SLUGS)
+    if only_slugs is not None:
+        allowed_slugs &= set(only_slugs)
+
+    def _empty():
+        return {"premium": {"rows": [], "total": _empty_total()},
+                "commodity": {"rows": [], "total": _empty_total()},
+                "month": month, "year": year}
+
     if not allowed_slugs:
-        return Response({"premium": {"rows": [], "total": _empty_total()},
-                         "commodity": {"rows": [], "total": _empty_total()},
-                         "month": month, "year": year})
+        return _empty()
 
     # Preserve the sheet's display order.
     ordered = [s for s in DASHBOARD_DISPLAY_SLUGS if s in allowed_slugs]
@@ -1646,9 +1653,7 @@ def month_targets_dashboard(request):
     # regardless of stored casing.
     formats = [_format_for(platforms[s]) for s in ordered if s in platforms]
     if not formats:
-        return Response({"premium": {"rows": [], "total": _empty_total()},
-                         "commodity": {"rows": [], "total": _empty_total()},
-                         "month": month, "year": year})
+        return _empty()
 
     # Home dashboard loads must stay fast. Use the indexed/materialized source
     # reads for displayed litres, while explicit refresh endpoints remain the
@@ -1726,7 +1731,21 @@ def month_targets_dashboard(request):
 
     result["month"] = month
     result["year"] = year
-    return Response(result)
+    return result
+
+
+@api_view(["GET"])
+@permission_classes([require("platform.month_targets.view")])
+@cached_get(timeout=60, prefix="plat.month_targets_dashboard")
+def month_targets_dashboard(request):
+    """GET /api/platform/month-targets/dashboard?month=M&year=Y
+
+    Cross-platform roll-up for a single month. Returns rows grouped into
+    PREMIUM and COMMODITY blocks, each with a Grand Total computed from
+    the sums (percentages re-derived, not averaged).
+    """
+    month, year = _parse_month_year(request.query_params)
+    return Response(secondary_dashboard_result(request.user, month, year))
 
 
 def _empty_total() -> dict:

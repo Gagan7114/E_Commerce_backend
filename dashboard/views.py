@@ -49,7 +49,8 @@ INVENTORY_CONFIG = {
     "zepto":     {"table": "zepto_inventory",     "qty_col": "units",                   "name_col": "sku_name",        "city_col": "city",   "color": "#7b2ff7"},
     "swiggy":    {"table": "swiggy_inventory",    "qty_col": "warehouse_qty_available", "name_col": "sku_description", "city_col": "city",   "color": "#fc8019"},
     "bigbasket": {"table": "bigbasket_inventory", "qty_col": "soh",                     "name_col": "sku_name",        "city_col": "city",   "color": "#84c225"},
-    "jiomart":   {"table": "jiomart_inventory",   "qty_col": "total_sellable_inv",      "name_col": "title",           "city_col": None,     "color": "#0078ad"},
+    # JioMart hidden — excluded from the combined /inventory-charts aggregation.
+    # "jiomart":   {"table": "jiomart_inventory",   "qty_col": "total_sellable_inv",      "name_col": "title",           "city_col": None,     "color": "#0078ad"},
     "amazon":    {"table": "amazon_inventory",    "qty_col": "sellable_on_hand_units",  "name_col": "product_title",   "id_col": "asin",     "city_col": None, "color": "#ff9900"},
 }
 
@@ -2974,13 +2975,13 @@ def _month_token_to_num(tok):
 @permission_classes([require("dashboard.view")])
 @cached_get(timeout=120, prefix="dash.category_trend", shared=True)
 def category_trend(request):
-    """Premium / Commodity delivered litres over the trailing N months.
+    """Premium / Commodity litres over the trailing N months.
 
-    Same source semantics as /category-breakdown (primary = master_po + Amazon
-    PO; secondary = SecMaster + amazon_sec_range), but aggregated to a single
-    {premium, commodity} pair per month so the home "Category Trend" line chart
-    can plot the product mix over time. Honours the platform filter; month/year
-    is the END of the window."""
+    Each month is computed with the SAME per-month roll-up the home KPI cards
+    use (primary_dashboard_result / secondary_dashboard_result), so a month's
+    point on the "Sales Trend" line chart equals that month's card total and a
+    month reads the same regardless of where it sits in the window. Honours the
+    platform filter; month/year is the END of the window."""
     today = date.today()
     try:
         end_month = int(request.GET.get("month") or today.month)
@@ -3000,157 +3001,42 @@ def category_trend(request):
 
     source = "secondary" if (request.GET.get("source") or "").strip().lower() == "secondary" else "primary"
     platform = (request.GET.get("platform") or "").strip().lower() or None
-    use_amazon = platform is None or platform == "amazon"
-    use_other = platform != "amazon"
-    fmt = None
-    if platform and platform != "amazon":
-        fmt = _CATEGORY_SLUG_TO_FORMAT.get(platform, platform.replace("_", " ").upper())
-
     window = _trailing_months(end_month, end_year, n_months)
-    # bucket[(year, month_num)] = {"PREMIUM": x, "COMMODITY": y}
-    bucket = {(y, m): {"PREMIUM": 0.0, "COMMODITY": 0.0} for (m, y, _) in window}
-    errors = []
 
-    def absorb(rows):
-        # rows: (year, month_token, head, ltrs)
-        for yr, mon_tok, head_val, ltrs in rows:
-            mnum = _month_token_to_num(mon_tok)
-            key = (int(yr), mnum) if mnum else None
-            if key is None or key not in bucket:
-                continue
-            head = (str(head_val).strip().upper() if head_val else "")
-            if head not in bucket[key]:
-                continue
-            bucket[key][head] += float(ltrs or 0)
+    # Compute every month exactly the way the home KPI cards do, so a month's
+    # Premium/Commodity litres on this trend equal that month's card total. The
+    # card readers pull the live per-platform sources; reusing them (instead of
+    # the month_targets / SecMaster_Mat snapshots this endpoint used before,
+    # which drift from the cards and made a month's value depend on where it sat
+    # in the window) keeps trend and cards in lockstep. Imported lazily to avoid
+    # a circular import at module load.
+    from platforms.monthly_targets import secondary_dashboard_result
+    from platforms.primary_monthly_targets import primary_dashboard_result
 
-    def run(label, sql, params):
+    # The single-platform filter maps to the card's slug scope; no platform →
+    # all platforms in scope (only_slugs=None).
+    only_slugs = {platform} if platform else None
+    dashboard_for = (
+        secondary_dashboard_result if source == "secondary" else primary_dashboard_result
+    )
+
+    def _done(block):
+        total = (block or {}).get("total") or {}
         try:
-            cur.execute(sql, params)
-            absorb(cur.fetchall())
-        except Exception as e:  # noqa: BLE001
-            errors.append({"source": label, "error": str(e)})
-
-    name_year_pairs = [(mon, y) for (_, y, mon) in window]  # (MONTH_NAME, year)
-    num_year_pairs = [(m, y) for (m, y, _) in window]       # (month_num, year)
-
-    with connection.cursor() as cur:
-        if source == "primary":
-            if use_other:
-                ph = ", ".join(["(%s, %s)"] * len(name_year_pairs))
-                sql = f"""
-                    SELECT delivered_year AS yr,
-                           UPPER(TRIM(delivery_month::text)) AS mon,
-                           UPPER(TRIM(item_head::text)) AS head,
-                           COALESCE(SUM(total_delivered_liters), 0) AS ltrs
-                    FROM public.master_po
-                    WHERE (UPPER(TRIM(delivery_month::text)), delivered_year) IN ({ph})
-                      AND UPPER(TRIM(item_head::text)) IN ('PREMIUM', 'COMMODITY')
-                """
-                params = [v for pair in name_year_pairs for v in pair]
-                if fmt:
-                    sql += " AND UPPER(TRIM(format::text)) = %s"
-                    params.append(fmt)
-                else:
-                    sql += " AND UPPER(TRIM(format::text)) <> 'AMAZON'"
-                sql += " GROUP BY 1, 2, 3"
-                run("master_po", sql, params)
-            if use_amazon:
-                ph = ", ".join(["(%s, %s)"] * len(num_year_pairs))
-                run("amazon_po", f"""
-                    SELECT year AS yr, po_month AS mon,
-                           UPPER(TRIM(item_head::text)) AS head,
-                           COALESCE(SUM(total_delivered_liters), 0) AS ltrs
-                    FROM reporting."Amazon PO"
-                    WHERE (po_month, year) IN ({ph})
-                      AND UPPER(TRIM(item_head::text)) IN ('PREMIUM', 'COMMODITY')
-                    GROUP BY 1, 2, 3
-                """, [v for pair in num_year_pairs for v in pair])
-        else:  # secondary
-            if use_other:
-                secmaster_formats = ("BLINKIT", "SWIGGY", "ZEPTO", "BIG BASKET", "FLIPKART")
-                secmaster_fmt = fmt and fmt.upper() in secmaster_formats
-                target_ph = ", ".join(["(%s, %s)"] * len(num_year_pairs))
-                target_sql = f"""
-                    SELECT year::int AS yr, month::int AS mon,
-                           UPPER(TRIM(item_head::text)) AS head,
-                           COALESCE(SUM(done_ltrs), 0) AS ltrs
-                    FROM month_targets
-                    WHERE (month, year) IN ({target_ph})
-                      AND UPPER(TRIM(item_head::text)) IN ('PREMIUM', 'COMMODITY')
-                """
-                target_params = [v for pair in num_year_pairs for v in pair]
-                if fmt:
-                    target_sql += " AND LOWER(TRIM(format::text)) = LOWER(%s)"
-                    target_params.append(fmt)
-                    if secmaster_fmt:
-                        target_sql += " AND month = %s AND year = %s"
-                        target_params.extend([end_month, end_year])
-                else:
-                    excluded_formats = (*secmaster_formats, "AMAZON")
-                    fmt_ph = ", ".join(["%s"] * len(excluded_formats))
-                    target_sql += (
-                        f" AND (UPPER(TRIM(format::text)) NOT IN ({fmt_ph}) "
-                        "OR (month = %s AND year = %s AND UPPER(TRIM(format::text)) <> 'AMAZON'))"
-                    )
-                    target_params.extend([*excluded_formats, end_month, end_year])
-                target_sql += " GROUP BY 1, 2, 3"
-                run("month_targets", target_sql, target_params)
-
-                mat_window = [(m, y, mon) for (m, y, mon) in window if not (m == end_month and y == end_year)]
-                if mat_window and (not fmt or secmaster_fmt):
-                    mat_pairs = [(mon, y) for (m, y, mon) in mat_window]
-                    mat_ph = ", ".join(["(%s, %s)"] * len(mat_pairs))
-                    mat_sql = f"""
-                        SELECT year::int AS yr, UPPER(TRIM(month::text)) AS mon,
-                               UPPER(TRIM(item_head::text)) AS head,
-                               COALESCE(SUM(ltr_sold), 0) AS ltrs
-                        FROM "SecMaster_Mat"
-                        WHERE (UPPER(TRIM(month::text)), year::numeric) IN ({mat_ph})
-                          AND UPPER(TRIM(item_head::text)) IN ('PREMIUM', 'COMMODITY')
-                    """
-                    mat_params = [v for pair in mat_pairs for v in pair]
-                    if fmt:
-                        mat_sql += " AND LOWER(TRIM(format::text)) = LOWER(%s)"
-                        mat_params.append(fmt)
-                    else:
-                        mat_sql += " AND UPPER(TRIM(format::text)) <> 'AMAZON'"
-                    mat_sql += " GROUP BY 1, 2, 3"
-                    run("secmaster_mat", mat_sql, mat_params)
-            if use_amazon:
-                ph = ", ".join(["(%s, %s)"] * len(name_year_pairs))  # (year, MONTH_NAME)
-                run("amazon_sec_range", f"""
-                    WITH ml AS (
-                        SELECT DISTINCT ON (format_sku_code)
-                               format_sku_code, item_head, per_unit_value
-                        FROM master_sheet
-                        WHERE format_sku_code IS NOT NULL AND format_sku_code::text <> ''
-                        ORDER BY format_sku_code
-                    ),
-                    base AS (
-                        SELECT r.asin,
-                               COALESCE(r.shipped_units, 0) AS units,
-                               EXTRACT(YEAR FROM r.from_date)::int AS yr,
-                               UPPER(to_char(r.from_date, 'FMMonth')) AS mon,
-                               EXTRACT(DAY FROM r.to_date)::int AS to_day
-                        FROM amazon_sec_range r
-                        WHERE (EXTRACT(YEAR FROM r.from_date)::int,
-                               UPPER(to_char(r.from_date, 'FMMonth'))) IN ({ph})
-                    ),
-                    latest AS (SELECT yr, mon, MAX(to_day) AS md FROM base GROUP BY yr, mon)
-                    SELECT b.yr, b.mon, UPPER(TRIM(ml.item_head::text)) AS head,
-                           COALESCE(SUM(b.units * COALESCE(ml.per_unit_value::numeric, 0)), 0) AS ltrs
-                    FROM base b
-                    JOIN latest l ON b.yr = l.yr AND b.mon = l.mon AND b.to_day = l.md
-                    JOIN ml ON UPPER(TRIM(ml.format_sku_code::text)) = UPPER(TRIM(b.asin::text))
-                    WHERE UPPER(TRIM(ml.item_head::text)) IN ('PREMIUM', 'COMMODITY')
-                    GROUP BY 1, 2, 3
-                """, [v for (m, y, mon) in window for v in (y, mon)])
+            return round(float(total.get("done_ltrs") or 0), 2)
+        except (TypeError, ValueError):
+            return 0.0
 
     series = []
+    errors = []
     for (m, y, _) in window:
-        b = bucket[(y, m)]
-        prem = round(b["PREMIUM"], 2)
-        comm = round(b["COMMODITY"], 2)
+        try:
+            res = dashboard_for(request.user, m, y, only_slugs)
+            prem = _done(res.get("premium"))
+            comm = _done(res.get("commodity"))
+        except Exception as e:  # noqa: BLE001
+            errors.append({"month": m, "year": y, "error": str(e)})
+            prem = comm = 0.0
         series.append({
             "month": m,
             "year": y,

@@ -1299,19 +1299,27 @@ def _num(v) -> float:
         return 0.0
 
 
-@api_view(["GET"])
-@permission_classes([require("platform.month_targets.view")])
-@cached_get(timeout=60, prefix="plat.primary_month_targets_dashboard")
-def primary_month_targets_dashboard(request):
-    month, year = _parse_month_year(request.query_params)
-    row_defs = _dashboard_row_defs(request.user)
+def primary_dashboard_result(user, month, year, only_slugs=None):
+    """Primary (master_po-backed) PREMIUM/COMMODITY roll-up for one month — the
+    same figures shown on the home Primary KPI card. Extracted from
+    `primary_month_targets_dashboard` so the home Sales Trend can reuse the
+    identical per-month litres for every month in its window instead of reading
+    snapshots that drift. `only_slugs` restricts to those platform slugs; `None`
+    = all in scope."""
+    row_defs = _dashboard_row_defs(user)
+    if only_slugs is not None:
+        only = set(only_slugs)
+        row_defs = [
+            defn for defn in row_defs
+            if str(defn.get("slug") or defn.get("key") or "").lower() in only
+        ]
     if not row_defs:
-        return Response({
+        return {
             "premium": {"rows": [], "total": _primary_empty_total()},
             "commodity": {"rows": [], "total": _primary_empty_total()},
             "month": month,
             "year": year,
-        })
+        }
 
     result: dict[str, dict] = {}
     formats = [d["format"] for d in row_defs]
@@ -1364,7 +1372,15 @@ def primary_month_targets_dashboard(request):
 
     result["month"] = month
     result["year"] = year
-    return Response(result)
+    return result
+
+
+@api_view(["GET"])
+@permission_classes([require("platform.month_targets.view")])
+@cached_get(timeout=60, prefix="plat.primary_month_targets_dashboard")
+def primary_month_targets_dashboard(request):
+    month, year = _parse_month_year(request.query_params)
+    return Response(primary_dashboard_result(request.user, month, year))
 
 
 @api_view(["POST"])

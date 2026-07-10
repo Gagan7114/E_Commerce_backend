@@ -80,7 +80,9 @@ def _secondary_model(platform_slug: str):
     return type(f"{platform_slug.title()}Secondary", (_ReadOnlyBase,), attrs)
 
 
-_PLATFORMS = ["blinkit", "zepto", "jiomart", "amazon", "bigbasket", "swiggy", "flipkart"]
+# JioMart hidden — dropped from the list so its read-only warehouse admin models
+# are no longer generated/registered. Re-add "jiomart" to restore.
+_PLATFORMS = ["blinkit", "zepto", "amazon", "bigbasket", "swiggy", "flipkart"]
 
 for _slug in _PLATFORMS:
     _inv = _inventory_model(_slug)
