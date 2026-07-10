@@ -160,51 +160,121 @@ _ROUTES = {
 }
 
 
-def _related_suggestions(q) -> list:
-    """Context-aware follow-up questions shown as chips below each answer. Every
-    suggestion is phrased so the bot can actually answer it when clicked."""
+# A deep cross-domain set of follow-ups for a specific platform ({p}).
+_PLATFORM_DEEP = [
+    "{p} fill rate", "{p} order liters month wise", "{p} pending ltrs right now",
+    "{p} secondary sales", "{p} drr this month", "{p} ad spent this month",
+    "{p} inventory", "Critical DOH alerts for {p}", "{p} done ltrs vs target",
+    "Top states by order liters for {p}", "Top skus by delivered litres for {p}",
+]
+
+# Same-topic variations when the user ranked/asked by a dimension.
+_DIM_DEEP = {
+    "vendor": ["Top vendors by delivered liters", "Top vendors by order amount",
+               "Top vendors by number of pos", "Top 10 vendors by pending value in {p}",
+               "Average lead time by vendor for {p}"],
+    "state": ["Top states by delivered liters", "Top states by order amount",
+              "State wise secondary sales", "Which region sold more north or south",
+              "Jivo vs sano state sales split"],
+    "city": ["Top cities by delivered liters", "Top cities by order amount",
+             "{p} pendency by city", "{p} stock by city"],
+    "brand": ["Top brands by delivered liters", "Top brands by order amount",
+              "Jivo vs sano state sales split", "Premium vs commodity by platform"],
+    "sku": ["Top skus by delivered litres", "Top skus by order amount",
+            "Top skus by fill rate", "Top skus by ltr sold on {p}"],
+    "item": ["Top items by delivered liters", "Top items by order amount",
+             "Premium vs commodity by platform"],
+    "category": ["Top categories by delivered liters", "Top categories by order amount",
+                 "Premium vs commodity by platform"],
+    "location": ["Top locations by order liters", "{p} pendency by warehouse"],
+    "platform": ["Compare platforms by order liters", "Premium vs commodity by platform",
+                 "Which platform had highest ad spent", "Ad spend by platform"],
+}
+
+_INTENT_FALLBACK = {
+    "coupon": ["Total coupon redemptions and clips on amazon", "Which coupon has highest budget used",
+               "Amazon roas and acos", "Amazon mp delivered litres and top states"],
+    "state_sales": ["Top states by order liters", "Which region sold more north or south",
+                    "Jivo vs sano state sales split", "Total distributor commission for june"],
+    "realise": ["Total distributor commission for june", "Top states by order liters",
+                "Top 10 brands by order amount", "Premium vs commodity by platform"],
+    "list_platforms": ["Total order ltrs in blinkit", "Top states by order liters",
+                       "Critical DOH alerts for Blinkit", "Which platform had highest ad spent"],
+    "explain": ["What is DRR", "What is DOH", "What is fill rate", "What is pendency"],
+}
+_AMAZON_DEEP = ["How many amazon pos are pending", "Which amazon pos are expiring in 7 days",
+                "How many appointments today", "Amazon fill rate by fulfillment center",
+                "Amazon mp delivered litres and top states", "Amazon secondary sales premium"]
+
+
+# Wide, cross-domain variety pool — used to top up context suggestions so that
+# consecutive answers don't show the same chips (already-shown ones are excluded,
+# and the loop simply moves to the next fresh ones in the pool).
+_GLOBAL_POOL = [
+    "Top states by order liters", "Top 10 brands by order amount", "Top cities by order liters",
+    "Top 10 skus by delivered litres", "Compare platforms by order liters",
+    "Premium vs commodity by platform", "Which platform had highest ad spent",
+    "Critical DOH alerts for Blinkit", "Zepto secondary sales", "Swiggy fill rate",
+    "Blinkit pending ltrs right now", "Amazon fill rate by fulfillment center",
+    "Total distributor commission for june", "Which region sold more north or south",
+    "Top states by delivered liters", "Blinkit done ltrs vs target", "Ad spend by platform",
+    "Which skus have the lowest doh", "Top vendors by delivered liters", "Bigbasket order liters month wise",
+]
+
+
+def _norm_q(s: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", (s or "").lower()).strip()
+
+
+def _recent_exclusions(conversation, current_message: str) -> set:
+    """Normalised questions the user already asked AND suggestions already shown in
+    this conversation — so chips never repeat the question or the last answer's chips."""
+    ex = {_norm_q(current_message)}
+    if conversation is None:
+        return ex
+    try:
+        from ..models import ChatMessage
+
+        for m in ChatMessage.objects.filter(conversation=conversation).order_by("-id")[:12]:
+            if m.role == "user":
+                ex.add(_norm_q(m.text))
+            else:
+                for s in ((m.data or {}).get("suggestions") or []):
+                    ex.add(_norm_q(s))
+    except Exception:
+        pass
+    return ex
+
+
+def _related_suggestions(q, exclude: set | None = None) -> list:
+    """Deep, context-aware follow-up chips the bot builds itself. Drills into the
+    platform (across domains) or the ranked dimension (vendor/state/...), tops up
+    with cross-domain variety, and never repeats a question already asked or a chip
+    already shown (``exclude``)."""
     p = (q.primary_platform["name"] if q.primary_platform else "") or "Blinkit"
-    intent = q.intent
-    by_intent = {
-        "liters": [f"{p} fill rate", f"{p} order liters month wise",
-                   "Top states by order liters", f"Excel of {p} purchase orders"],
-        "ranking": ["Top 10 brands by order amount", "Top cities by order liters",
-                    "Premium vs commodity by platform", "Top vendors by order qty"],
-        "movers": ["Top states by order liters", "Premium vs commodity by platform",
-                   "Top 10 skus by delivered liters", "Top 10 brands in Zepto"],
-        "split": ["Top states by order liters", "Top 10 brands by order amount",
-                  "Compare platforms by order liters", "Top 10 skus by delivered liters"],
-        "alerts": [f"Excel of {p} alerts", f"Critical DOH alerts for {p}",
-                   "Which skus have the lowest doh", f"{p} inventory"],
-        "inventory": [f"Items with soh units less than 10 in {p}", f"{p} stock by city",
-                      f"Critical DOH alerts for {p}", "Stock by city top 15 across platforms"],
-        "sales": [f"{p} DRR this month", f"{p} secondary sales premium",
-                  "Top 10 skus by ltr sold", f"{p} order liters"],
-        "drr": [f"{p} secondary sales", f"{p} day wise ops and ltr",
-                "Top skus by ltr sold", f"{p} DRR premium"],
-        "ads": [f"{p} roas and acos", f"Total brand fund spent on {p}",
-                "Which platform had highest ad spent", f"Top items by ad spent on {p}"],
-        "brand_fund": [f"Total ad spent on {p}", f"{p} brand fund sub category wise",
-                       "Which platform had highest ad spent", f"Top 5 items by brand fund on {p}"],
-        "coupon": ["Total coupon redemptions and clips on amazon",
-                   "Which coupon has highest budget used", "Amazon roas and acos", "Amazon mp delivered litres"],
-        "targets": [f"{p} done ltrs vs target", "Which platforms are behind on target",
-                    f"{p} pendency", f"{p} drr"],
-        "pendency": [f"{p} pendency by city", "Pos expiring in next 5 days",
-                     f"Top 10 vendors by pending value in {p}", f"{p} fill rate"],
-        "state_sales": ["Top states by order liters", "Which region sold more north or south",
-                        "Jivo vs sano state sales split", "Total distributor commission for june"],
-        "realise": ["Total distributor commission for june", "Top states by order liters",
-                    f"{p} fill rate", "Top 10 brands by order amount"],
-        "list_platforms": ["Total order ltrs in blinkit", "Top states by order liters",
-                            "Critical DOH alerts for Blinkit", "Which platform had highest ad spent"],
-        "landing": [f"{p} skus with no landing rate", "Total order ltrs in blinkit", f"{p} fill rate"],
-    }
-    amazon_bucket = ["How many amazon pos are pending", "Which amazon pos are expiring in 7 days",
-                     "How many appointments today", "Amazon fill rate by fulfillment center"]
-    for k in ("amazon_po", "expiry", "appointments", "amazon_mp", "lead_time"):
-        by_intent[k] = amazon_bucket
-    return by_intent.get(intent, list(SUGGESTIONS))[:4]
+    slug = q.primary_platform["slug"] if q.primary_platform else ""
+    dim = (getattr(q, "dimension", "") or "").strip()
+    exclude = exclude or set()
+
+    if slug == "amazon":
+        context = _AMAZON_DEEP + _DIM_DEEP.get(dim, [])
+    elif q.primary_platform:
+        context = _PLATFORM_DEEP + _DIM_DEEP.get(dim, [])
+    elif dim in _DIM_DEEP:
+        context = _DIM_DEEP[dim]
+    else:
+        context = _INTENT_FALLBACK.get(q.intent, [])
+
+    seen, out = set(), []
+    for t in context + _GLOBAL_POOL:          # context first, variety fills the rest
+        x = t.format(p=p)
+        k = _norm_q(x)
+        if k and k not in seen and k not in exclude:
+            seen.add(k)
+            out.append(x)
+        if len(out) >= 4:
+            break
+    return out
 
 
 def _smalltalk_reply(message: str) -> str:
@@ -275,7 +345,8 @@ def _try_continuation(user, conversation, message, db_platforms) -> EngineResult
         if file_obj:
             text += "\n\n📊 Your Excel file is ready — use the download button below."
     data = _preview(result)
-    sugg = result.suggestions or (_related_suggestions(q2) if result.ok else [])
+    sugg = result.suggestions or (
+        _related_suggestions(q2, _recent_exclusions(conversation, message)) if result.ok else [])
     if sugg:
         data["suggestions"] = sugg
     return EngineResult(text=text, data=data, intent=q2.intent, engine="builtin",
@@ -336,7 +407,8 @@ def _run_builtin(user, conversation: ChatConversation, message: str) -> EngineRe
             text += "\n\n(I couldn't build an Excel file for this result.)"
 
     data = _preview(result)
-    sugg = result.suggestions or (_related_suggestions(q) if result.ok else [])
+    sugg = result.suggestions or (
+        _related_suggestions(q, _recent_exclusions(conversation, message)) if result.ok else [])
     if sugg:
         data["suggestions"] = sugg
 
