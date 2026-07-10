@@ -349,6 +349,13 @@ def parse(message: str, db_platforms: list[dict] | None = None) -> ParsedQuery:
                       or ("jivo" in low and "sano" in low) or bool(_STATE_RE.search(low)))
     q.group_by_platform = bool(re.search(r"platform\s*wise|platformwise|platform-wise|by\s+platform|"
                                          r"platform\s+break", low))
+    explain_flag = bool(
+        (re.search(r"\b(explain|define|definition|meaning of|what do you mean)\b", low)
+         or re.search(r"^\s*(what is|what's|whats)\b", low))
+        and not q.platforms and not q.date_from
+        and re.search(r"secondary|secandary|secndary|primary|\bdrr\b|\bdoh\b|\bsoh\b|fill rate|"
+                      r"miss rate|pendency|realise|realize|brand fund|item head|\broas\b|\bacos\b|"
+                      r"\btacos\b|lead time|\bmov\b|master po", low))
     maxdate_flag = bool(re.search(r"\bmax date\b|\blatest date\b|last updated|data date|max updated|"
                                   r"till which date|up ?to which date|latest data", low))
     datetime_flag = bool(re.search(r"what.{0,8}\b(day|date|time)\b|\btime now\b|current (time|date)|"
@@ -365,6 +372,8 @@ def parse(message: str, db_platforms: list[dict] | None = None) -> ParsedQuery:
     ack_flag = bool(re.fullmatch(r"\s*(ok|okay|k|kk|yes|yep|no|nope|hmm+|great|fine|got it|thx|ty)\s*[.! ]*", low))
     if _has(low, _PLATFORM_LIST_WORDS) and not data_signal:
         q.intent = "list_platforms"
+    elif explain_flag:
+        q.intent = "explain"
     elif _has(low, _ALERT_WORDS):
         q.intent = "alerts"
     elif sap_flag:
