@@ -5732,10 +5732,28 @@ def _parse_amazon_comparison_params(params) -> tuple[str, int, int, bool]:
     return month_name, year, history_year, defaulted_to_latest
 
 
+def _parse_sec_as_of_date(params) -> date | None:
+    """The `as_of_date` the Ads Dashboard sends to scope the Total Sales / TACOS
+    columns to the picked calendar date. A dedicated param (not `date`) so the
+    standalone SEC dashboard pages — which never send it — are unaffected."""
+    raw = str(params.get("as_of_date") or "").strip()
+    if not raw:
+        return None
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", raw):
+        raise ValidationError("`as_of_date` must be YYYY-MM-DD.")
+    try:
+        return date.fromisoformat(raw)
+    except ValueError:
+        raise ValidationError("`as_of_date` must be a valid calendar date.")
+
+
 def _parse_sec_selected_date(params) -> date | None:
     raw_date = str(params.get("date") or "").strip()
     raw_month = str(params.get("month") or "").strip()
-    candidate = raw_date or (
+    # `as_of_date` (from the Ads Dashboard) narrows the per-day SEC platforms to
+    # the picked day, exactly like an explicit `date` would.
+    raw_as_of = str(params.get("as_of_date") or "").strip()
+    candidate = raw_date or raw_as_of or (
         raw_month if re.fullmatch(r"\d{4}-\d{2}-\d{2}", raw_month) else ""
     )
     if not candidate:
@@ -7270,15 +7288,27 @@ def _amazon_sec_dashboard_response(request):
     month_name = _month_name(month)
     days_in_month = monthrange(year, month)[1]
 
+    # Ads Dashboard: `as_of_date` scopes Total Sales to the picked calendar date.
+    # Amazon SEC rows are cumulative range reports keyed by their to_date, so we
+    # cap the effective max_date at the selected day — the whole downstream
+    # cutoff (cutoff_month_day_keys, elapsed_day, projections) then reflects the
+    # latest report on or before that date, instead of the month's latest.
+    as_of_date = _parse_sec_as_of_date(request.query_params)
+    as_of_filter, as_of_params = ("", [])
+    if as_of_date:
+        as_of_filter = ' AND "to_date" <= %s'
+        as_of_params = [as_of_date]
+
     max_date = _scalar(
-        """
+        f"""
         SELECT MAX("to_date")
         FROM "amazon_sec_range_master_view"
         WHERE UPPER(TRIM("month"::text)) = %s
           AND "year" = %s
           AND "to_date" IS NOT NULL
+          {as_of_filter}
         """,
-        [month_name, year],
+        [month_name, year, *as_of_params],
     )
     elapsed_day = _sec_elapsed_day(max_date)
     cutoff_month_day_keys = _amazon_sec_month_day_keys(max_date, month_name)
@@ -11495,19 +11525,26 @@ def landing_rate_list(request, slug: str):
                 base_params + [page_size, offset],
             )
         else:
-            # Effective view: show the latest row per SKU inside the selected
-            # calendar month only. This keeps May 2026 from showing April 2026
-            # or May rows from any other year.
+            # Effective view: the rate in effect for the selected month = the
+            # newest row per SKU with month <= the selected month. When a SKU has
+            # not been re-set this month, its most recent earlier rate carries
+            # forward and is flagged `carried_over`, so a brand-new month shows
+            # last month's rates instead of an empty sheet. This is display-only —
+            # nothing is stored. Editing a carried row writes a fresh row for the
+            # selected month (landing_rate_update), leaving earlier months intact.
             where = base_where + [
-                '"month"::date >= %s::date',
                 '"month"::date < (%s::date + INTERVAL \'1 month\')',
             ]
-            params = base_params + [month, month]
+            where_params = base_params + [month]
             where_sql = " WHERE " + " AND ".join(where)
+            # First %s flags rows older than the selected calendar month.
             sub = (
-                f'SELECT DISTINCT ON ("sku_code") * FROM "monthly_landing_rate"'
-                f'{where_sql} ORDER BY "sku_code", "month" DESC, "created_at" DESC'
+                'SELECT DISTINCT ON ("sku_code") *, '
+                '("month"::date < %s::date) AS carried_over '
+                f'FROM "monthly_landing_rate"{where_sql} '
+                'ORDER BY "sku_code", "month" DESC, "created_at" DESC'
             )
+            params = [month] + where_params
             total = _scalar(f"SELECT COUNT(*) FROM ({sub}) t", params) or 0
             rows = _dict_rows(
                 f'SELECT * FROM ({sub}) t ORDER BY "sku_code" ASC LIMIT %s OFFSET %s',
@@ -11524,6 +11561,9 @@ def landing_rate_list(request, slug: str):
         "format": fmt,
         "month": month,
         "mode": mode,
+        # True when any row on this page is last month's rate carried forward
+        # (this month not set yet) — the UI shows a preview banner.
+        "carried_over": any(bool(r.get("carried_over")) for r in rows),
     })
 
 
@@ -11754,10 +11794,61 @@ def landing_rate_update(request, slug: str):
             )
             row = cur.fetchone()
             if not row:
-                return Response(
-                    {"ok": False, "error": "No landing rate row found for this SKU and month."},
-                    status=404,
+                # No row for the selected month yet — this happens when the sheet
+                # was showing last month's carried-over rates and the user sets
+                # one for the new month. Insert a FRESH row for THIS month (with a
+                # creation log, old_* = NULL). Earlier months are a different
+                # `month` value and are never touched, so prior data is safe.
+                next_sku_name = sku_name or sku_code
+                cur.execute(
+                    """
+                    INSERT INTO month_landingrate_logs
+                    (sku_code, sku_name, format, month, old_landing_rate, old_basic_rate,
+                     new_landing_rate, new_basic_rate, reason, updated_by_id,
+                     updated_by_email, source_created_at)
+                    VALUES (%s,%s,%s,%s,NULL,NULL,%s,%s,%s,%s,%s,NULL)
+                    RETURNING id, updated_at
+                    """,
+                    [
+                        sku_code,
+                        next_sku_name,
+                        fmt,
+                        month,
+                        landing_rate,
+                        basic_rate,
+                        reason,
+                        updated_by_id,
+                        updated_by_email,
+                    ],
                 )
+                log_id, updated_at = cur.fetchone()
+                cur.execute(
+                    'INSERT INTO "monthly_landing_rate" '
+                    '("sku_code","sku_name","landing_rate","basic_rate","format","month") '
+                    'VALUES (%s,%s,%s,%s,%s,%s) '
+                    'RETURNING "sku_code","sku_name","landing_rate","basic_rate",'
+                    '"format","month","created_at"',
+                    [sku_code, next_sku_name, landing_rate, basic_rate, fmt, month],
+                )
+                created = cur.fetchone()
+                return Response({
+                    "ok": True,
+                    "created": True,
+                    "log": {
+                        "id": log_id,
+                        "updated_at": updated_at.isoformat() if updated_at else None,
+                    },
+                    "row": {
+                        "sku_code": created[0],
+                        "sku_name": created[1],
+                        "landing_rate": created[2],
+                        "basic_rate": created[3],
+                        "format": created[4],
+                        "month": created[5].isoformat()
+                        if hasattr(created[5], "isoformat") else created[5],
+                        "created_at": created[6].isoformat() if created[6] else None,
+                    },
+                })
 
             (
                 row_ctid,
