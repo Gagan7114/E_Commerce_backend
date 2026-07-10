@@ -727,6 +727,15 @@ def secondary_sales(q: ParsedQuery) -> DataResult:
     source, scope, fmt_val = _resolve_sec_source(q)
     text = q.text.lower()
 
+    # SecMaster is a large view; an unbounded scan times out. With no date given,
+    # bound to a recent window ending today (avoids an expensive MAX(date) scan;
+    # tighter for all-platforms, whose view slice is heaviest).
+    if not (q.date_from and q.date_to):
+        _today = timezone.localdate()
+        back = 30 if q.primary_platform else 10
+        q.date_from, q.date_to = _today - timedelta(days=back), _today
+        q.date_label = q.date_label or f"last {back} days"
+
     where, params = [], []
     if source.format_col and fmt_val:
         where.append(f"{source.format_col} ILIKE %s")
@@ -1566,6 +1575,14 @@ def state_sales(q: ParsedQuery) -> DataResult:
     mlabel = "sales value" if metric == "sales_amt" else "liters"
     unit = "₹" if metric == "sales_amt" else ""
 
+    # SecMaster is a large view — bound an undated query to a recent window ending
+    # today (tighter for all-platforms), avoiding an expensive MAX(date) scan.
+    if not (q.date_from and q.date_to):
+        _today = timezone.localdate()
+        back = 30 if q.primary_platform else 10
+        q.date_from, q.date_to = _today - timedelta(days=back), _today
+        q.date_label = q.date_label or f"last {back} days"
+
     where, params = [], []
     if q.primary_platform:
         where.append("format ILIKE %s")
@@ -1680,6 +1697,48 @@ def sap_info(q: ParsedQuery) -> DataResult:
         ok=False, source="SAP HANA (not connected)",
         suggestions=["state wise sales for june", "total distributor commission for june", "blinkit inventory"],
     )
+
+
+_GLOSSARY = [
+    (("secandary", "secndary", "secondary", "sell out", "sellout"),
+     "Secondary sales = sell-out: units/liters actually sold to end customers on the platform "
+     "(from SecMaster). Primary, by contrast, is the purchase orders."),
+    (("primary",),
+     "Primary = purchase orders (master_po): what platforms ordered from us and what we delivered."),
+    (("drr", "run rate"),
+     "DRR (Daily Run Rate) = average quantity/liters sold per day over the period."),
+    (("doh", "days on hand"),
+     "DOH (Days On Hand) = how many days current stock will last = SOH / DRR."),
+    (("soh", "stock on hand"),
+     "SOH (Stock On Hand) = current inventory units/liters available."),
+    (("fill rate", "fillrate"),
+     "Fill rate = delivered / ordered, as a %. How much of a PO was actually supplied."),
+    (("miss rate",), "Miss rate = missed (undelivered) / ordered, as a %."),
+    (("pendency", "pending"),
+     "Pendency = open POs not yet delivered — pending liters, units and value."),
+    (("realise", "realize", "realisation"),
+     "Realise = net Rs per litre after tax, margin and distributor commission."),
+    (("brand fund", "brandfund"),
+     "Brand fund = marketing spend funded by the brand on a platform."),
+    (("item head",), "Item head = product tier: PREMIUM, COMMODITY or OTHER."),
+    (("tacos",), "TACOS = ad spend / total sales, as a %."),
+    (("roas",), "ROAS = Return On Ad Spend = ad sales / ad spend."),
+    (("acos",), "ACOS = Advertising Cost of Sale = ad spend / ad sales, as a %."),
+    (("lead time", "leadtime"), "Lead time = days between the PO date and delivery."),
+    (("mov",), "MOV = Minimum Order Value shortfall status on a PO."),
+]
+
+
+def explain(q: ParsedQuery) -> DataResult:
+    """Plain-language definition of a domain term (secondary, DRR, DOH, ...)."""
+    t = q.text.lower()
+    for keys, definition in _GLOSSARY:
+        if any(k in t for k in keys):
+            return DataResult(summary=definition, ok=True, source="glossary", excel_title="Definition")
+    return DataResult(
+        summary=("I can explain: primary vs secondary, DRR, DOH, SOH, fill/miss rate, pendency, "
+                 "realise, brand fund, item head, ROAS/ACOS/TACOS, lead time. Which term?"),
+        ok=True, source="glossary")
 
 
 def datetime_now(q: ParsedQuery) -> DataResult:

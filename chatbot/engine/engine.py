@@ -156,6 +156,7 @@ _ROUTES = {
     "datetime": tools.datetime_now,
     "appcontrol": tools.app_control,
     "maxdate": tools.max_date,
+    "explain": tools.explain,
 }
 
 
