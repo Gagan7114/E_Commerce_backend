@@ -9185,15 +9185,26 @@ def _swiggy_sec_dashboard_response(request):
 
     aggregate_raw = _dict_rows(
         """
-        WITH rates AS (
-            SELECT DISTINCT ON (UPPER(TRIM(sku_code::text)), month::text)
-                   UPPER(TRIM(sku_code::text)) AS sku_key,
-                   month::text AS month_key,
-                   landing_rate
-              FROM monthly_landing_rate
-             WHERE REGEXP_REPLACE(LOWER(TRIM(format::text)), '[^a-z0-9]+', '', 'g') = 'swiggy'
-               AND month::text IN (%s, %s)
-             ORDER BY UPPER(TRIM(sku_code::text)), month::text, created_at DESC
+        WITH target_months AS (
+            -- The current and previous month buckets the sales below fall into.
+            SELECT %s::date AS target_month
+            UNION ALL SELECT %s::date
+        ),
+        rates AS (
+            -- Effective landing rate per SKU as of each bucket = the newest row
+            -- with month <= that bucket. So a month whose rate isn't set yet
+            -- carries the previous month's rate forward (display/calc only —
+            -- nothing is written), instead of falling to 0.
+            SELECT DISTINCT ON (UPPER(TRIM(lr.sku_code::text)), tm.target_month)
+                   UPPER(TRIM(lr.sku_code::text)) AS sku_key,
+                   tm.target_month AS target_month,
+                   lr.landing_rate
+              FROM target_months tm
+              JOIN monthly_landing_rate lr
+                ON REGEXP_REPLACE(LOWER(TRIM(lr.format::text)), '[^a-z0-9]+', '', 'g') = 'swiggy'
+               AND lr.month::date <= tm.target_month
+             ORDER BY UPPER(TRIM(lr.sku_code::text)), tm.target_month,
+                      lr.month::date DESC, lr.created_at DESC
         ),
         base AS (
             SELECT
@@ -9218,10 +9229,7 @@ def _swiggy_sec_dashboard_response(request):
                    ON m.format_sku_code::text = s."ITEM_CODE"
             LEFT JOIN rates r
                    ON r.sku_key = UPPER(TRIM(s."ITEM_CODE"::text))
-                  AND r.month_key = TO_CHAR(
-                        DATE_TRUNC('month', s."ORDERED_DATE"::timestamp),
-                        'YYYY-MM-DD'
-                  )
+                  AND r.target_month = DATE_TRUNC('month', s."ORDERED_DATE"::timestamp)::date
             WHERE (
                     s."ORDERED_DATE" >= %s
                 AND s."ORDERED_DATE" < %s
@@ -9330,14 +9338,16 @@ def _swiggy_sec_dashboard_response(request):
     top_items = _dict_rows(
         """
         WITH rates AS (
-            SELECT DISTINCT ON (UPPER(TRIM(sku_code::text)), month::text)
+            -- Effective rate per SKU as of the selected month = newest row with
+            -- month <= it, so an unset month carries the previous month's rate
+            -- forward (calc only, nothing stored) instead of dropping to 0.
+            SELECT DISTINCT ON (UPPER(TRIM(sku_code::text)))
                    UPPER(TRIM(sku_code::text)) AS sku_key,
-                   month::text AS month_key,
                    landing_rate
               FROM monthly_landing_rate
              WHERE REGEXP_REPLACE(LOWER(TRIM(format::text)), '[^a-z0-9]+', '', 'g') = 'swiggy'
-               AND month::text = %s
-             ORDER BY UPPER(TRIM(sku_code::text)), month::text, created_at DESC
+               AND month::date <= %s::date
+             ORDER BY UPPER(TRIM(sku_code::text)), month::date DESC, created_at DESC
         )
         SELECT
             COALESCE(
@@ -9371,10 +9381,6 @@ def _swiggy_sec_dashboard_response(request):
                ON m.format_sku_code::text = s."ITEM_CODE"
         LEFT JOIN rates r
                ON r.sku_key = UPPER(TRIM(s."ITEM_CODE"::text))
-              AND r.month_key = TO_CHAR(
-                    DATE_TRUNC('month', s."ORDERED_DATE"::timestamp),
-                    'YYYY-MM-DD'
-              )
         WHERE s."ORDERED_DATE" >= %s
           AND s."ORDERED_DATE" < %s
           AND NULLIF(TRIM(COALESCE(m.item::text, s."PRODUCT_NAME"::text)), '') IS NOT NULL
