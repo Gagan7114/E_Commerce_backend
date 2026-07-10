@@ -20,6 +20,11 @@ PERMISSION_CATALOG: tuple[tuple[str, str], ...] = (
     ("platform.inventory.view", "View platform inventory"),
     ("platform.secondary.view", "View platform secondary sales"),
     ("platform.month_targets.view", "View primary and secondary target sheets"),
+    # NOTE: `amazon.shipment_planning.view` (gates the Amazon Shipment Planner)
+    # is intentionally NOT in this catalog. It's created by an accounts migration
+    # and assigned ONLY directly to selected users — keeping it out of the
+    # catalog keeps it out of the Super Admin "*" (all-catalog-permissions) grant,
+    # so it can't leak to everyone who is in the Super Admin group.
     # Platform — scope codes (which platform slug the user is allowed on)
     ("platform.*.access", "Access every platform (admin wildcard)"),
     ("platform.blinkit.access", "Access Blinkit platform"),

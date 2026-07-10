@@ -19,6 +19,7 @@ from rest_framework.permissions import IsAuthenticated, AllowAny, BasePermission
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from accounts.permissions import has_permission_code
 from .models import Shipment, ShipmentAuditLog, ShipmentItem
 from .serializers import (
     ShipmentAuditLogSerializer,
@@ -59,8 +60,31 @@ def _safe_int(value, default, *, lo=None, hi=None):
 # is unchanged (other apps still use the plain APIView).
 _BaseAPIView = APIView
 
+# Permission code that gates the whole Amazon Shipment Planner section. Granted
+# only to selected users (plus admins) — see accounts/catalog.py.
+SHIPMENT_PLANNING_PERMISSION = "amazon.shipment_planning.view"
+
+
+class CanViewShipmentPlanning(BasePermission):
+    """Every Shipment Planner endpoint requires this permission, so a user who
+    can't see the section can't reach its data either."""
+    message = 'You do not have access to the Amazon Shipment Planner.'
+
+    def has_permission(self, request, view):
+        return has_permission_code(getattr(request, 'user', None), SHIPMENT_PLANNING_PERMISSION)
+
 
 class _SafeAPIView(_BaseAPIView):
+    def get_permissions(self):
+        # Add the Shipment Planner gate to whatever a view already declares
+        # (IsAuthenticated / IsShipmentManager …), so it's enforced in ONE place
+        # across every endpoint. Public shared-secret endpoints opt out with
+        # AllowAny (e.g. the Vendor Central importer) and are left untouched.
+        perms = super().get_permissions()
+        if any(isinstance(p, AllowAny) for p in perms):
+            return perms
+        return perms + [CanViewShipmentPlanning()]
+
     def handle_exception(self, exc):
         if isinstance(exc, (APIException, Http404, PermissionDenied)):
             return super().handle_exception(exc)
