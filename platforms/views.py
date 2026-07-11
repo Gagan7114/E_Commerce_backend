@@ -4174,17 +4174,30 @@ def amazon_ads_dashboard(request, slug: str):
 @cached_get(timeout=60, prefix="plat.amazon_ads_total_sales")
 def amazon_ads_total_sales(request, slug: str):
     """Total Sales for the AMS Ads dashboard, sourced from the PER-DAY view
-    `amazon_sec_daily_master_view` using `ordered_revenue`.
+    `amazon_sec_daily_master_view`.
 
-    Unlike `amazon_sec_range_master_view` (cumulative month-to-date snapshots),
-    this view has one row per calendar day, so a picked date/range shows exactly
-    that day's/range's sales — no cumulative delta, and days the range view was
-    missing (e.g. Jul 4) are present here. Returns the same shape the ads shell
-    already consumes: `summary_total.shipped_value` + `sku_details[]`.
+    `metric` picks the DB column behind the Total Sales column — the dashboard's
+    Ordered/Shipped switch: `ordered` → ordered_revenue (default), `shipped` →
+    shipped_revenue_2. Whitelisted here so nothing user-supplied ever reaches
+    the SQL. Unlike `amazon_sec_range_master_view` (cumulative month-to-date
+    snapshots), this view has one row per calendar day, so a picked date/range
+    shows exactly that day's/range's sales — no cumulative delta, and days the
+    range view was missing (e.g. Jul 4) are present here. Returns the same
+    shape the ads shell already consumes: `summary_total.shipped_value` +
+    `sku_details[]`.
     """
     _ensure_scope(request.user, slug)
     if slug != "amazon":
         raise ValidationError("Only Amazon has this Total Sales source.")
+
+    metric = str(request.query_params.get("metric") or "ordered").strip().lower()
+    metric_columns = {
+        "ordered": "ordered_revenue",
+        "shipped": "shipped_revenue_2",
+    }
+    if metric not in metric_columns:
+        raise ValidationError("`metric` must be `ordered` or `shipped`.")
+    value_col = metric_columns[metric]
 
     month, year, _defaulted = _parse_sec_month_year(
         request.query_params,
@@ -4215,7 +4228,7 @@ def amazon_ads_total_sales(request, slug: str):
     # else: no date picked → whole selected month (sum of every day).
 
     total = _scalar(
-        f'SELECT COALESCE(SUM("ordered_revenue"), 0) '
+        f'SELECT COALESCE(SUM("{value_col}"), 0) '
         f'FROM "amazon_sec_daily_master_view" {where}',
         params,
     ) or 0
@@ -4229,7 +4242,7 @@ def amazon_ads_total_sales(request, slug: str):
             COALESCE(NULLIF(TRIM("per_unit"::text), ''), '-')     AS per_ltr,
             COALESCE(NULLIF(TRIM("item"::text), ''), '')          AS item,
             TRIM("asin"::text)                                    AS asin,
-            COALESCE(SUM("ordered_revenue"), 0)                   AS shipped_value
+            COALESCE(SUM("{value_col}"), 0)                       AS shipped_value
         FROM "amazon_sec_daily_master_view"
         {where}
         GROUP BY
@@ -4258,6 +4271,8 @@ def amazon_ads_total_sales(request, slug: str):
     return Response({
         "summary_total": {"shipped_value": float(total)},
         "sku_details": sku_details,
+        "metric": metric,
+        "metric_column": value_col,
         "month": month,
         "month_name": month_name,
         "year": year,
@@ -10283,6 +10298,10 @@ def bigbasket_drr_dashboard(request):
 def flipkart_grocery_drr_dashboard(request, slug: str):
     _ensure_scope(request.user, slug)
     if slug == "amazon":
+        # Amazon MP rides on Amazon access (it has no PlatformConfig of its
+        # own, mirroring mp-dashboard): ?source=mp switches to the MP builder.
+        if str(request.query_params.get("source") or "").strip().lower() == "mp":
+            return _amazon_mp_drr_dashboard_response(request)
         return _amazon_drr_dashboard_response(request)
     if slug == "blinkit":
         return _blinkit_drr_dashboard_response(request)
@@ -11287,6 +11306,371 @@ def _amazon_drr_dashboard_response(request):
         "sub_category_rows": sub_category_rows,
         "totals": totals,
         "summary_note": "Uses amazon_sec_daily_master_view to match DRR rows 1-20 from AMAZON SHEET.xlsx.",
+    })
+
+
+# amazon_mp_master stores shipment_date as TEXT in three formats seen across
+# upload batches ('DD/MM/YY HH:MM', 'DD-MM-YYYY HH:MM', 'YYYY-MM-DD HH:MM:SS');
+# parse each to a real date, guarded by regex so stray values (e.g. NULL-date
+# Cancel rows) become NULL instead of erroring. Plain string (not f-string) —
+# the regex braces would otherwise need escaping.
+_AMAZON_MP_DRR_DATE_EXPR = """
+    CASE
+        WHEN TRIM(shipment_date::text) ~ '^[0-9]{2}/[0-9]{2}/[0-9]{2}'
+            THEN TO_DATE(LEFT(TRIM(shipment_date::text), 8), 'DD/MM/YY')
+        WHEN TRIM(shipment_date::text) ~ '^[0-9]{2}-[0-9]{2}-[0-9]{4}'
+            THEN TO_DATE(LEFT(TRIM(shipment_date::text), 10), 'DD-MM-YYYY')
+        WHEN TRIM(shipment_date::text) ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}'
+            THEN TO_DATE(LEFT(TRIM(shipment_date::text), 10), 'YYYY-MM-DD')
+    END
+"""
+
+
+def _amazon_mp_drr_dashboard_response(request):
+    """DRR dashboard for Amazon MP (marketplace) — mirrors the AMAZON_DRR shape
+    so the frontend AmazonDrrDashboard renders it unchanged.
+
+    Source: amazon_mp_master. One value stream (invoice_amount as OPS, gross ABS
+    litres/quantity — same conventions as the MP dashboard), so there is no
+    ORDERED/SHIPPED toggle; `sales_mode` is accepted and ignored.
+    """
+    today = date.today()
+    month_raw = request.query_params.get("month")
+    year_raw = request.query_params.get("year")
+    defaulted_to_latest = False
+    if month_raw and year_raw:
+        try:
+            month = int(month_raw)
+            year = int(year_raw)
+        except (TypeError, ValueError):
+            raise ValidationError("`month` and `year` must be integers.")
+        if not 1 <= month <= 12:
+            raise ValidationError("`month` must be between 1 and 12.")
+        if not 2000 <= year <= 2100:
+            raise ValidationError("`year` must be between 2000 and 2100.")
+    else:
+        month, year = _amazon_mp_dashboard_latest(today.month, today.year)
+        defaulted_to_latest = True
+
+    month_name = _month_name(month)
+    days_in_month = monthrange(year, month)[1]
+
+    item_head = str(
+        request.query_params.get("item_head")
+        or request.query_params.get("sales_of")
+        or "ALL"
+    ).strip().upper() or "ALL"
+    if item_head not in _AMAZON_DRR_ITEM_HEADS:
+        raise ValidationError(
+            "`item_head` must be one of ALL, PREMIUM, COMMODITY or OTHER."
+        )
+
+    month_start = date(year, month, 1)
+    month_end = date(year, month, days_in_month)
+
+    def parse_optional_date(value, field_name: str):
+        value = str(value or "").strip()
+        if not value:
+            return None
+        try:
+            return date.fromisoformat(value)
+        except ValueError:
+            raise ValidationError(f"`{field_name}` must be a valid YYYY-MM-DD date.")
+
+    from_date = parse_optional_date(request.query_params.get("from_date"), "from_date")
+    to_date = parse_optional_date(request.query_params.get("to_date"), "to_date")
+    if from_date and to_date and from_date > to_date:
+        raise ValidationError("`from_date` cannot be later than `to_date`.")
+
+    mp_date = _AMAZON_MP_DRR_DATE_EXPR
+    base_where = (
+        "WHERE shipment_year = %s AND UPPER(TRIM(shipment_month)) = %s"
+    )
+    item_head_filter = ""
+    daily_params = [year, month_name]
+    if item_head != "ALL":
+        item_head_filter = (
+            "AND COALESCE(NULLIF(UPPER(TRIM(item_head::text)), ''), 'OTHER') = %s"
+        )
+        daily_params.append(item_head)
+    overall_params = list(daily_params)
+
+    date_filter = ""
+    if from_date:
+        date_filter += f" AND ({mp_date}) >= %s"
+        daily_params.append(from_date)
+    if to_date:
+        date_filter += f" AND ({mp_date}) <= %s"
+        daily_params.append(to_date)
+
+    max_date = _scalar(
+        f"""
+        SELECT MAX({mp_date})
+        FROM amazon_mp_master
+        {base_where}
+          {item_head_filter}
+          {date_filter}
+        """,
+        daily_params,
+    )
+    has_date_range = bool(from_date or to_date)
+    daily_start = max(from_date or month_start, month_start)
+    if has_date_range:
+        daily_end = min(to_date or max_date or month_end, month_end)
+    else:
+        daily_end = month_end
+    if max_date and daily_start <= max_date:
+        elapsed_days = (max_date - daily_start).days + 1
+    else:
+        elapsed_days = 0
+
+    # Litres/quantity are GROSS (ABS) so refunds count as positive volume;
+    # revenue (invoice_amount) stays NET — matching the MP dashboard.
+    daily_raw = _dict_rows(
+        f"""
+        SELECT
+            ({mp_date}) AS sale_date,
+            COALESCE(SUM(invoice_amount), 0) AS ops,
+            COALESCE(SUM(ABS(quantity)), 0) AS units,
+            COALESCE(SUM(ABS(delivered_ltr)), 0) AS ltr
+        FROM amazon_mp_master
+        {base_where}
+          AND ({mp_date}) IS NOT NULL
+          {item_head_filter}
+          {date_filter}
+        GROUP BY ({mp_date})
+        ORDER BY ({mp_date})
+        """,
+        daily_params,
+    )
+    daily_by_date = {row["sale_date"]: row for row in daily_raw}
+
+    daily = []
+    total_ops = 0.0
+    total_units = 0.0
+    total_ltr = 0.0
+    daily_dates = []
+    if daily_start <= daily_end:
+        daily_dates = [
+            daily_start + timedelta(days=offset)
+            for offset in range((daily_end - daily_start).days + 1)
+        ]
+    for current_date in daily_dates:
+        row = daily_by_date.get(current_date, {})
+        ops = _num(row.get("ops"))
+        units = _num(row.get("units"))
+        ltr = _num(row.get("ltr"))
+        if max_date and current_date <= max_date:
+            total_ops += ops
+            total_units += units
+            total_ltr += ltr
+        daily.append({
+            "date": current_date.isoformat(),
+            "display_date": current_date.strftime("%d-%m-%Y"),
+            "day": current_date.day,
+            "ops": ops,
+            "units": units,
+            "ltr": ltr,
+        })
+
+    overall_max_date = _scalar(
+        f"""
+        SELECT MAX({mp_date})
+        FROM amazon_mp_master
+        {base_where}
+          {item_head_filter}
+        """,
+        overall_params,
+    )
+    overall_daily_raw = _dict_rows(
+        f"""
+        SELECT
+            ({mp_date}) AS sale_date,
+            COALESCE(SUM(invoice_amount), 0) AS ops,
+            COALESCE(SUM(ABS(quantity)), 0) AS units,
+            COALESCE(SUM(ABS(delivered_ltr)), 0) AS ltr
+        FROM amazon_mp_master
+        {base_where}
+          AND ({mp_date}) IS NOT NULL
+          {item_head_filter}
+        GROUP BY ({mp_date})
+        ORDER BY ({mp_date})
+        """,
+        overall_params,
+    )
+    overall_daily_by_date = {row["sale_date"]: row for row in overall_daily_raw}
+    overall_daily = []
+    for day in range(1, days_in_month + 1):
+        current_date = date(year, month, day)
+        row = overall_daily_by_date.get(current_date, {})
+        overall_daily.append({
+            "date": current_date.isoformat(),
+            "display_date": current_date.strftime("%d-%m-%Y"),
+            "day": day,
+            "ops": _num(row.get("ops")),
+            "units": _num(row.get("units")),
+            "ltr": _num(row.get("ltr")),
+        })
+
+    def build_mp_drr_row(row: dict) -> dict:
+        ops = _num(row.get("ops"))
+        units = _num(row.get("units"))
+        ltr = _num(row.get("ltr"))
+        drr_ops = _safe_div(ops, elapsed_days)
+        drr_units = _safe_div(units, elapsed_days)
+        drr_ltr = _safe_div(ltr, elapsed_days)
+        enriched = dict(row)
+        enriched.update({
+            "ops": ops,
+            "units": units,
+            "ltr": ltr,
+            "drr_ops": drr_ops,
+            "drr_units": drr_units,
+            "drr_ltr": drr_ltr,
+            "projection_ops": drr_ops * days_in_month,
+            "projection_units": drr_units * days_in_month,
+            "projection_ltr": drr_ltr * days_in_month,
+        })
+        return enriched
+
+    sub_category_rows = [
+        build_mp_drr_row(row)
+        for row in _dict_rows(
+            f"""
+            SELECT
+                COALESCE(NULLIF(UPPER(TRIM(item_head::text)), ''), 'OTHER') AS item_head,
+                COALESCE(NULLIF(UPPER(TRIM(category::text)), ''), 'UNMAPPED') AS category,
+                COALESCE(NULLIF(UPPER(TRIM(sub_category::text)), ''), 'UNMAPPED') AS sub_category,
+                COALESCE(
+                    NULLIF(
+                        STRING_AGG(DISTINCT NULLIF(UPPER(TRIM(brand::text)), ''), ' / '),
+                        ''
+                    ),
+                    '-'
+                ) AS brand,
+                COUNT(DISTINCT NULLIF(TRIM(asin::text), '')) AS sku_count,
+                COALESCE(SUM(invoice_amount), 0) AS ops,
+                COALESCE(SUM(ABS(quantity)), 0) AS units,
+                COALESCE(SUM(ABS(delivered_ltr)), 0) AS ltr
+            FROM amazon_mp_master
+            {base_where}
+              AND ({mp_date}) IS NOT NULL
+              {item_head_filter}
+              {date_filter}
+            GROUP BY
+                COALESCE(NULLIF(UPPER(TRIM(item_head::text)), ''), 'OTHER'),
+                COALESCE(NULLIF(UPPER(TRIM(category::text)), ''), 'UNMAPPED'),
+                COALESCE(NULLIF(UPPER(TRIM(sub_category::text)), ''), 'UNMAPPED')
+            ORDER BY ltr DESC, ops DESC, sub_category ASC
+            """,
+            list(daily_params),
+        )
+    ]
+
+    sku_rows = [
+        build_mp_drr_row(row)
+        for row in _dict_rows(
+            f"""
+            SELECT
+                COALESCE(NULLIF(UPPER(TRIM(item_head::text)), ''), 'OTHER') AS item_head,
+                COALESCE(NULLIF(UPPER(TRIM(category::text)), ''), 'UNMAPPED') AS category,
+                COALESCE(NULLIF(UPPER(TRIM(sub_category::text)), ''), 'UNMAPPED') AS sub_category,
+                COALESCE(NULLIF(TRIM(brand::text), ''), '-') AS brand,
+                COALESCE(NULLIF(TRIM(per_ltr_unit::text), ''), '-') AS per_ltr,
+                COALESCE(NULLIF(TRIM(asin::text), ''), '-') AS sku_code,
+                COALESCE(NULLIF(TRIM(asin::text), ''), '-') AS asin,
+                COALESCE(NULLIF(TRIM(item_description::text), ''), 'UNMAPPED SKU') AS sku_name,
+                COALESCE(NULLIF(TRIM(item_description::text), ''), '-') AS item,
+                COALESCE(SUM(invoice_amount), 0) AS ops,
+                COALESCE(SUM(ABS(quantity)), 0) AS units,
+                COALESCE(SUM(ABS(delivered_ltr)), 0) AS ltr
+            FROM amazon_mp_master
+            {base_where}
+              AND ({mp_date}) IS NOT NULL
+              {item_head_filter}
+              {date_filter}
+            GROUP BY
+                COALESCE(NULLIF(UPPER(TRIM(item_head::text)), ''), 'OTHER'),
+                COALESCE(NULLIF(UPPER(TRIM(category::text)), ''), 'UNMAPPED'),
+                COALESCE(NULLIF(UPPER(TRIM(sub_category::text)), ''), 'UNMAPPED'),
+                COALESCE(NULLIF(TRIM(brand::text), ''), '-'),
+                COALESCE(NULLIF(TRIM(per_ltr_unit::text), ''), '-'),
+                COALESCE(NULLIF(TRIM(asin::text), ''), '-'),
+                COALESCE(NULLIF(TRIM(item_description::text), ''), 'UNMAPPED SKU'),
+                COALESCE(NULLIF(TRIM(item_description::text), ''), '-')
+            ORDER BY ltr DESC, ops DESC, sku_name ASC
+            """,
+            list(daily_params),
+        )
+    ]
+
+    if has_date_range and daily_start <= daily_end:
+        max_date_label = (
+            f"{daily_start.strftime('%d-%m-%Y')} TO {daily_end.strftime('%d-%m-%Y')}"
+        )
+    else:
+        max_date_label = max_date.strftime("%d %B %Y").upper() if max_date else f"{month_name} {year}"
+    overall_max_date_label = (
+        overall_max_date.strftime("%d %B %Y").upper()
+        if overall_max_date
+        else f"{month_name} {year}"
+    )
+    drr_ops = _safe_div(total_ops, elapsed_days)
+    drr_units = _safe_div(total_units, elapsed_days)
+    drr_ltr = _safe_div(total_ltr, elapsed_days)
+    totals = {
+        "ops": total_ops,
+        "units": total_units,
+        "ltr": total_ltr,
+        "avg_value": drr_ops,
+        "avg_units": drr_units,
+        "avg_ltrs": drr_ltr,
+        "drr_ops": drr_ops,
+        "drr_units": drr_units,
+        "drr_ltr": drr_ltr,
+        "projection_ops": drr_ops * days_in_month,
+        "projection_units": drr_units * days_in_month,
+        "projection_ltr": drr_ltr * days_in_month,
+    }
+
+    return Response({
+        "source": "amazon_mp_master",
+        "format": "AMAZON_DRR",
+        "defaulted_to_latest": defaulted_to_latest,
+        "month": month,
+        "month_name": month_name,
+        "year": year,
+        "max_date": max_date.isoformat() if max_date else None,
+        "from_date": from_date.isoformat() if from_date else None,
+        "to_date": to_date.isoformat() if to_date else None,
+        "date_range_start": daily_start.isoformat() if daily_start <= daily_end else None,
+        "date_range_end": daily_end.isoformat() if daily_start <= daily_end else None,
+        "elapsed_days": elapsed_days,
+        "days_in_month": days_in_month,
+        "item_head": item_head,
+        "sales_of": item_head,
+        "item_head_options": list(_AMAZON_DRR_ITEM_HEADS),
+        # Single value stream (marketplace invoices) — no ORDERED/SHIPPED toggle.
+        "sales_mode": "DELIVERED",
+        "sales_mode_options": ["DELIVERED"],
+        "title": f"JIVO AMAZON MP SALE ({max_date_label})",
+        "overall_title": f"JIVO AMAZON MP SALE ({overall_max_date_label})",
+        "daily": daily,
+        "daily_groups": [
+            daily[index:index + 9]
+            for index in range(0, len(daily), 9)
+        ],
+        "overall_daily": overall_daily,
+        "overall_daily_groups": [
+            overall_daily[index:index + 9]
+            for index in range(0, len(overall_daily), 9)
+        ],
+        "rows": sku_rows,
+        "items": sku_rows,
+        "sku_rows": sku_rows,
+        "sub_category_rows": sub_category_rows,
+        "totals": totals,
+        "summary_note": "Uses amazon_mp_master (invoice_amount / ABS litres+qty) grouped by parsed shipment_date.",
     })
 
 
