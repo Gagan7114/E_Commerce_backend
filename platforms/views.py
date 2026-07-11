@@ -4199,22 +4199,29 @@ def amazon_ads_dashboard(request, slug: str):
 @permission_classes([require("platform.stats.view")])
 @cached_get(timeout=60, prefix="plat.amazon_ads_total_sales")
 def amazon_ads_total_sales(request, slug: str):
-    """Total Sales for the AMS Ads dashboard, sourced from the PER-DAY view
-    `amazon_sec_daily_master_view`.
+    """Total Sales for the Ads dashboards, from PER-DAY secondary sources.
 
-    `metric` picks the DB column behind the Total Sales column — the dashboard's
-    Ordered/Shipped switch: `ordered` → ordered_revenue (default), `shipped` →
-    shipped_revenue_2. Whitelisted here so nothing user-supplied ever reaches
-    the SQL. Unlike `amazon_sec_range_master_view` (cumulative month-to-date
-    snapshots), this view has one row per calendar day, so a picked date/range
-    shows exactly that day's/range's sales — no cumulative delta, and days the
-    range view was missing (e.g. Jul 4) are present here. Returns the same
-    shape the ads shell already consumes: `summary_total.shipped_value` +
-    `sku_details[]`.
+    Platforms:
+      • amazon  → amazon_sec_daily_master_view; `metric` picks the column
+        behind the Ordered/Shipped switch (ordered → ordered_revenue default,
+        shipped → shipped_revenue_2), whitelisted so nothing user-supplied
+        reaches the SQL.
+      • blinkit → secmaster_mv (sales_amt_exc per item per day).
+
+    `date_wise=1` additionally returns `daily_details` — per-day per-item
+    values — so the ads table's Date-wise mode can show each row's OWN day's
+    Total Sales / TACOS instead of repeating the range total.
+
+    Returns the shape the ads shell consumes: `summary_total.shipped_value` +
+    `sku_details[]` (+ `daily_details[]` when date_wise).
     """
     _ensure_scope(request.user, slug)
-    if slug != "amazon":
-        raise ValidationError("Only Amazon has this Total Sales source.")
+    if slug not in ("amazon", "blinkit"):
+        raise ValidationError("Total Sales source exists only for Amazon and Blinkit.")
+
+    date_wise = str(
+        request.query_params.get("date_wise") or ""
+    ).strip().lower() in ("1", "true", "yes")
 
     metric = str(request.query_params.get("metric") or "ordered").strip().lower()
     metric_columns = {
@@ -4227,7 +4234,7 @@ def amazon_ads_total_sales(request, slug: str):
 
     month, year, _defaulted = _parse_sec_month_year(
         request.query_params,
-        latest_source="amazon_sec_daily_master_view",
+        latest_source="amazon_sec_daily_master_view" if slug == "amazon" else None,
     )
     month_name = _month_name(month)
 
@@ -4242,61 +4249,118 @@ def amazon_ads_total_sales(request, slug: str):
     from_date = _date_param("from_date")
     to_date = _date_param("to_date")
 
-    where = 'WHERE UPPER(TRIM("month"::text)) = %s AND "year" = %s'
-    params = [month_name, year]
-    # Daily view: from_date == to_date per row, so filter on to_date::date.
-    if from_date and to_date:
-        where += ' AND "to_date"::date BETWEEN %s AND %s'
-        params += [from_date, to_date]
-    elif from_date or to_date:
-        where += ' AND "to_date"::date = %s'
-        params += [from_date or to_date]
-    # else: no date picked → whole selected month (sum of every day).
-
-    total = _scalar(
-        f'SELECT COALESCE(SUM("{value_col}"), 0) '
-        f'FROM "amazon_sec_daily_master_view" {where}',
-        params,
-    ) or 0
-
-    sku_rows = _dict_rows(
-        f"""
-        SELECT
+    if slug == "blinkit":
+        # secmaster_mv: per-day per-item secondary sales for the QC platforms.
+        month_start = date(year, month, 1)
+        month_end = date(year, month, monthrange(year, month)[1])
+        range_start = date.fromisoformat(from_date) if from_date else month_start
+        range_end = date.fromisoformat(to_date) if to_date else (
+            date.fromisoformat(from_date) if from_date else month_end
+        )
+        where = (
+            "WHERE REGEXP_REPLACE(LOWER(TRIM(\"format\"::text)), '[^a-z0-9]+', '', 'g') = 'blinkit'"
+            ' AND "date"::date BETWEEN %s AND %s'
+        )
+        params = [range_start, range_end]
+        value_expr = 'COALESCE(SUM("sales_amt_exc"), 0)'
+        item_expr = "COALESCE(NULLIF(TRIM(\"item\"::text), ''), '')"
+        source = "secmaster_mv"
+        date_expr = '"date"::date'
+        metric = "delivered"
+        value_col = "sales_amt_exc"
+        sku_select = f"{item_expr} AS item, {value_expr} AS shipped_value"
+        sku_group = item_expr
+        daily_select = (
+            f"{date_expr} AS sale_date, {item_expr} AS item, "
+            f"{value_expr} AS shipped_value"
+        )
+        daily_group = f"{date_expr}, {item_expr}"
+    else:
+        where = 'WHERE UPPER(TRIM("month"::text)) = %s AND "year" = %s'
+        params = [month_name, year]
+        # Daily view: from_date == to_date per row, so filter on to_date::date.
+        if from_date and to_date:
+            where += ' AND "to_date"::date BETWEEN %s AND %s'
+            params += [from_date, to_date]
+        elif from_date or to_date:
+            where += ' AND "to_date"::date = %s'
+            params += [from_date or to_date]
+        # else: no date picked → whole selected month (sum of every day).
+        value_expr = f'COALESCE(SUM("{value_col}"), 0)'
+        source = '"amazon_sec_daily_master_view"'
+        date_expr = '"to_date"::date'
+        sku_select = f"""
             UPPER(TRIM("item_head"::text))                        AS item_head,
             UPPER(TRIM("category"::text))                         AS category,
             UPPER(TRIM("sub_category"::text))                     AS sub_category,
             COALESCE(NULLIF(TRIM("per_unit"::text), ''), '-')     AS per_ltr,
             COALESCE(NULLIF(TRIM("item"::text), ''), '')          AS item,
             TRIM("asin"::text)                                    AS asin,
-            COALESCE(SUM("{value_col}"), 0)                       AS shipped_value
-        FROM "amazon_sec_daily_master_view"
-        {where}
-        GROUP BY
+            {value_expr}                                          AS shipped_value
+        """
+        sku_group = """
             UPPER(TRIM("item_head"::text)),
             UPPER(TRIM("category"::text)),
             UPPER(TRIM("sub_category"::text)),
             COALESCE(NULLIF(TRIM("per_unit"::text), ''), '-'),
             COALESCE(NULLIF(TRIM("item"::text), ''), ''),
             TRIM("asin"::text)
-        """,
+        """
+        daily_select = f"""
+            {date_expr} AS sale_date,
+            UPPER(TRIM("sub_category"::text))                     AS sub_category,
+            COALESCE(NULLIF(TRIM("per_unit"::text), ''), '-')     AS per_ltr,
+            COALESCE(NULLIF(TRIM("item"::text), ''), '')          AS item,
+            TRIM("asin"::text)                                    AS asin,
+            {value_expr}                                          AS shipped_value
+        """
+        daily_group = f"""
+            {date_expr},
+            UPPER(TRIM("sub_category"::text)),
+            COALESCE(NULLIF(TRIM("per_unit"::text), ''), '-'),
+            COALESCE(NULLIF(TRIM("item"::text), ''), ''),
+            TRIM("asin"::text)
+        """
+
+    total = _scalar(
+        f"SELECT {value_expr} FROM {source} {where}",
+        params,
+    ) or 0
+
+    sku_rows = _dict_rows(
+        f"SELECT {sku_select} FROM {source} {where} GROUP BY {sku_group}",
         params,
     )
-    sku_details = [
-        {
-            "item_head": r.get("item_head"),
-            "category": r.get("category"),
-            "sub_category": r.get("sub_category"),
-            "per_ltr": r.get("per_ltr"),
-            "item": r.get("item"),
-            "asin": r.get("asin"),
-            "shipped_value": float(r.get("shipped_value") or 0),
-        }
-        for r in sku_rows
-    ]
+    sku_details = []
+    for r in sku_rows:
+        entry = {k: r.get(k) for k in r.keys() if k != "shipped_value"}
+        entry["shipped_value"] = float(r.get("shipped_value") or 0)
+        sku_details.append(entry)
+
+    daily_details = []
+    if date_wise:
+        daily_rows = _dict_rows(
+            f"SELECT {daily_select} FROM {source} {where} GROUP BY {daily_group}",
+            params,
+        )
+        for r in daily_rows:
+            entry = {
+                k: r.get(k)
+                for k in r.keys()
+                if k not in ("shipped_value", "sale_date")
+            }
+            sale_date = r.get("sale_date")
+            entry["date"] = (
+                sale_date.isoformat() if hasattr(sale_date, "isoformat") else sale_date
+            )
+            entry["shipped_value"] = float(r.get("shipped_value") or 0)
+            daily_details.append(entry)
 
     return Response({
         "summary_total": {"shipped_value": float(total)},
         "sku_details": sku_details,
+        "daily_details": daily_details,
+        "date_wise": date_wise,
         "metric": metric,
         "metric_column": value_col,
         "month": month,
