@@ -4169,6 +4169,103 @@ def amazon_ads_dashboard(request, slug: str):
     ))
 
 
+@api_view(["GET"])
+@permission_classes([require("platform.stats.view")])
+@cached_get(timeout=60, prefix="plat.amazon_ads_total_sales")
+def amazon_ads_total_sales(request, slug: str):
+    """Total Sales for the AMS Ads dashboard, sourced from the PER-DAY view
+    `amazon_sec_daily_master_view` using `shipped_revenue_2`.
+
+    Unlike `amazon_sec_range_master_view` (cumulative month-to-date snapshots),
+    this view has one row per calendar day, so a picked date/range shows exactly
+    that day's/range's sales — no cumulative delta, and days the range view was
+    missing (e.g. Jul 4) are present here. Returns the same shape the ads shell
+    already consumes: `summary_total.shipped_value` + `sku_details[]`.
+    """
+    _ensure_scope(request.user, slug)
+    if slug != "amazon":
+        raise ValidationError("Only Amazon has this Total Sales source.")
+
+    month, year, _defaulted = _parse_sec_month_year(
+        request.query_params,
+        latest_source="amazon_sec_daily_master_view",
+    )
+    month_name = _month_name(month)
+
+    def _date_param(key):
+        raw = str(request.query_params.get(key) or "").strip()
+        if not raw:
+            return None
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", raw):
+            raise ValidationError(f"`{key}` must be YYYY-MM-DD.")
+        return raw
+
+    from_date = _date_param("from_date")
+    to_date = _date_param("to_date")
+
+    where = 'WHERE UPPER(TRIM("month"::text)) = %s AND "year" = %s'
+    params = [month_name, year]
+    # Daily view: from_date == to_date per row, so filter on to_date::date.
+    if from_date and to_date:
+        where += ' AND "to_date"::date BETWEEN %s AND %s'
+        params += [from_date, to_date]
+    elif from_date or to_date:
+        where += ' AND "to_date"::date = %s'
+        params += [from_date or to_date]
+    # else: no date picked → whole selected month (sum of every day).
+
+    total = _scalar(
+        f'SELECT COALESCE(SUM("shipped_revenue_2"), 0) '
+        f'FROM "amazon_sec_daily_master_view" {where}',
+        params,
+    ) or 0
+
+    sku_rows = _dict_rows(
+        f"""
+        SELECT
+            UPPER(TRIM("item_head"::text))                        AS item_head,
+            UPPER(TRIM("category"::text))                         AS category,
+            UPPER(TRIM("sub_category"::text))                     AS sub_category,
+            COALESCE(NULLIF(TRIM("per_unit"::text), ''), '-')     AS per_ltr,
+            COALESCE(NULLIF(TRIM("item"::text), ''), '')          AS item,
+            TRIM("asin"::text)                                    AS asin,
+            COALESCE(SUM("shipped_revenue_2"), 0)                 AS shipped_value
+        FROM "amazon_sec_daily_master_view"
+        {where}
+        GROUP BY
+            UPPER(TRIM("item_head"::text)),
+            UPPER(TRIM("category"::text)),
+            UPPER(TRIM("sub_category"::text)),
+            COALESCE(NULLIF(TRIM("per_unit"::text), ''), '-'),
+            COALESCE(NULLIF(TRIM("item"::text), ''), ''),
+            TRIM("asin"::text)
+        """,
+        params,
+    )
+    sku_details = [
+        {
+            "item_head": r.get("item_head"),
+            "category": r.get("category"),
+            "sub_category": r.get("sub_category"),
+            "per_ltr": r.get("per_ltr"),
+            "item": r.get("item"),
+            "asin": r.get("asin"),
+            "shipped_value": float(r.get("shipped_value") or 0),
+        }
+        for r in sku_rows
+    ]
+
+    return Response({
+        "summary_total": {"shipped_value": float(total)},
+        "sku_details": sku_details,
+        "month": month,
+        "month_name": month_name,
+        "year": year,
+        "from_date": from_date,
+        "to_date": to_date,
+    })
+
+
 # ─── Swiggy / Zepto / BigBasket / Blinkit ────────────────────────────────────
 # Source views: swiggy_ads_master / zepto_ads_master / bigbasket_ads_master /
 # blinkit_ads_master. Dimension: item (from master_sheet via the views).

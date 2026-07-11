@@ -74,6 +74,7 @@ urlpatterns = [
     path("<slug:slug>/primary-dashboard", views.primary_dashboard, name="platform-primary-dashboard"),
     path("<slug:slug>/price-dashboard", views.amazon_price_dashboard, name="platform-amazon-price-dashboard"),
     path("<slug:slug>/ads-dashboard", views.amazon_ads_dashboard, name="platform-amazon-ads-dashboard"),
+    path("<slug:slug>/ads-total-sales", views.amazon_ads_total_sales, name="platform-amazon-ads-total-sales"),
     path("<slug:slug>/swiggy-ads-dashboard", views.swiggy_ads_dashboard, name="platform-swiggy-ads-dashboard"),
     path("<slug:slug>/zepto-ads-dashboard", views.zepto_ads_dashboard, name="platform-zepto-ads-dashboard"),
     path("<slug:slug>/bigbasket-ads-dashboard", views.bigbasket_ads_dashboard, name="platform-bigbasket-ads-dashboard"),
