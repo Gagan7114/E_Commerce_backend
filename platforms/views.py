@@ -3806,6 +3806,7 @@ def _ads_dashboard_payload(
     allow_date_filter: bool = True,
     summary_max_date_keys: list | None = None,
     summary_use_max_date: bool = False,
+    date_wise: bool = False,
 ) -> dict:
     # Comma-separated "expr AS \"key\"" for the SELECT list.
     metric_select_sql = ", ".join(
@@ -3859,18 +3860,35 @@ def _ads_dashboard_payload(
                     if s["key"] in md_rows[0]:
                         summary[s["key"]] = md_rows[0][s["key"]]
 
-    # 2) Breakdown by dimension
+    # 2) Breakdown by dimension. `date_wise` splits every dimension row into
+    # per-day rows (date + dimension grain) so a picked range reads as one row
+    # per calendar day instead of one aggregated total.
     spend_alias = f'"{spend_metric}"'
-    breakdown_rows = _dict_rows(
-        f"""
-        SELECT {dim_expr} AS dimension, {metric_select_sql}
-        FROM {source}
-        {where_sql}
-        GROUP BY {dim_expr}
-        ORDER BY {spend_alias} DESC NULLS LAST
-        """,
-        params,
-    )
+    if date_wise:
+        breakdown_rows = _dict_rows(
+            f"""
+            SELECT date AS row_date, {dim_expr} AS dimension, {metric_select_sql}
+            FROM {source}
+            {where_sql}
+            GROUP BY date, {dim_expr}
+            ORDER BY date ASC, {spend_alias} DESC NULLS LAST
+            """,
+            params,
+        )
+        for r in breakdown_rows:
+            if hasattr(r.get("row_date"), "isoformat"):
+                r["row_date"] = r["row_date"].isoformat()
+    else:
+        breakdown_rows = _dict_rows(
+            f"""
+            SELECT {dim_expr} AS dimension, {metric_select_sql}
+            FROM {source}
+            {where_sql}
+            GROUP BY {dim_expr}
+            ORDER BY {spend_alias} DESC NULLS LAST
+            """,
+            params,
+        )
 
     # 3) Trend by date. Includes a value-per-metric column so the frontend can
     # render BOTH the dual-axis spend-vs-revenue chart AND a tiny sparkline
@@ -3958,6 +3976,7 @@ def _ads_dashboard_payload(
             for s in metric_specs
         ],
         "breakdown_rows": breakdown_rows,
+        "date_wise": date_wise,
         "max_date": max_date,
         "filter_options": {"years": years, "months": months, "dates": dates},
         "filters": filters,
@@ -4144,9 +4163,16 @@ def amazon_ads_dashboard(request, slug: str):
     }
     dimension_key, dimension_label = dim_map.get(dimension, dim_map["portfolio"])
 
+    # Date-wise mode: split the breakdown into per-day rows (date + dimension)
+    # so a picked range reads day by day instead of one aggregated total.
+    date_wise = str(
+        request.query_params.get("date_wise") or ""
+    ).strip().lower() in ("1", "true", "yes")
+
     where_sql, params, trend_where_sql, trend_params, filters = _ads_build_where(request, allow_date=True)
     return Response(_ads_dashboard_payload(
         source="amazon_ads_master",
+        date_wise=date_wise,
         # Range summary (sum across the selected period), not max-date snapshot.
         summary_use_max_date=False,
         title="AMS ADS Dashboard",
@@ -4520,9 +4546,15 @@ def blinkit_ads_dashboard(request, slug: str):
     _ensure_scope(request.user, slug)
     if slug != "blinkit":
         raise ValidationError("Blinkit Ads Dashboard is available only for Blinkit.")
+    # Date-wise mode: per-day rows (date + item). Valid here because
+    # blinkit_ads_master is per-day (non-cumulative) like amazon_ads_master.
+    date_wise = str(
+        request.query_params.get("date_wise") or ""
+    ).strip().lower() in ("1", "true", "yes")
     where_sql, params, trend_where_sql, trend_params, filters = _ads_build_where(request, allow_date=True)
     return Response(_ads_dashboard_payload(
         source="blinkit_ads_master",
+        date_wise=date_wise,
         # Range summary (sum across the selected period), not max-date snapshot.
         summary_use_max_date=False,
         title="Blinkit ADS Dashboard",
