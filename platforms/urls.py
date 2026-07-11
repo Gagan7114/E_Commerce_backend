@@ -11,6 +11,11 @@ urlpatterns = [
         name="marketing-ads-summary",
     ),
     path(
+        "meta",
+        views.meta_dashboard,
+        name="marketing-meta",
+    ),
+    path(
         "month-targets/dashboard",
         monthly_targets.month_targets_dashboard,
         name="month-targets-dashboard",

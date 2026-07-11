@@ -3964,6 +3964,117 @@ def _ads_dashboard_payload(
     }
 
 
+# ─── Meta (Facebook / Instagram) ─────────────────────────────────────────────
+# Source: meta_data. `date` is TEXT 'DD-MM-YYYY', so the max-date and month sort
+# use to_date(date,'DD-MM-YYYY'); the year/month filter reuses _ads_build_where
+# with allow_date=False (year/month are generated text columns). CPC/CPR/CPM/CTR
+# are recomputed at the aggregate level (SUM/SUM) rather than summing the per-row
+# generated columns.
+_META_METRICS_SQL = """
+    COALESCE(SUM(reach), 0)          AS reach,
+    COALESCE(SUM(impressions), 0)    AS impressions,
+    COALESCE(SUM(unique_clicks), 0)  AS link_clicks,
+    COALESCE(SUM(amount_spent), 0)   AS amount_spent,
+    CASE WHEN COALESCE(SUM(unique_clicks), 0) > 0
+         THEN SUM(amount_spent)::numeric / SUM(unique_clicks) ELSE 0 END AS cpc,
+    CASE WHEN COALESCE(SUM(reach), 0) > 0
+         THEN SUM(amount_spent)::numeric / SUM(reach) * 1000 ELSE 0 END AS cpr,
+    CASE WHEN COALESCE(SUM(impressions), 0) > 0
+         THEN SUM(amount_spent)::numeric / SUM(impressions) * 1000 ELSE 0 END AS cpm,
+    CASE WHEN COALESCE(SUM(impressions), 0) > 0
+         THEN SUM(unique_clicks)::numeric / SUM(impressions) * 100 ELSE 0 END AS ctr
+"""
+
+
+@api_view(["GET"])
+@permission_classes([require("platform.stats.view")])
+@cached_get(timeout=60, prefix="plat.meta")
+def meta_dashboard(request):
+    """Meta ads campaign dashboard (grand-total KPIs + per-campaign breakdown).
+
+    Filters: ?year= & ?month= (name or 1-12). Returns the same metrics the sheet
+    shows — Reach, Impressions, Link clicks, Amount spent, CPC, CPR, CPM, CTR —
+    plus the max date and the year/month dropdown options.
+    """
+    # meta_data.year / .month are TEXT generated columns, so compare them as text
+    # (the shared _ads_build_where casts year to int, which errors on a text column).
+    _months = [
+        "JANUARY", "FEBRUARY", "MARCH", "APRIL", "MAY", "JUNE",
+        "JULY", "AUGUST", "SEPTEMBER", "OCTOBER", "NOVEMBER", "DECEMBER",
+    ]
+    year_param = (request.query_params.get("year") or "").strip()
+    month_param = (request.query_params.get("month") or "").strip().upper()
+    if month_param.isdigit():
+        m = int(month_param)
+        month_param = _months[m - 1] if 1 <= m <= 12 else ""
+    clauses, params = [], []
+    if year_param:
+        clauses.append("year = %s")
+        params.append(year_param)
+    if month_param:
+        clauses.append("month = %s")
+        params.append(month_param)
+    where_sql = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+    filters = {"year": year_param or None, "month": month_param or None}
+
+    summary_rows = _dict_rows(
+        f"""
+        SELECT {_META_METRICS_SQL},
+               COUNT(DISTINCT campaign_name) AS campaigns,
+               to_char(MAX(to_date(NULLIF(date, ''), 'DD-MM-YYYY')), 'DD-MM-YYYY') AS max_date
+        FROM meta_data
+        {where_sql}
+        """,
+        params,
+    )
+    summary = dict(summary_rows[0]) if summary_rows else {}
+    max_date = summary.pop("max_date", None)
+
+    rows = _dict_rows(
+        f"""
+        SELECT COALESCE(NULLIF(TRIM(campaign_name), ''), '(Unnamed)') AS campaign_name,
+               MAX(campaign_status) AS campaign_status,
+               {_META_METRICS_SQL}
+        FROM meta_data
+        {where_sql}
+        GROUP BY 1
+        ORDER BY amount_spent DESC NULLS LAST
+        """,
+        params,
+    )
+
+    years = [
+        int(r["year"])
+        for r in _dict_rows(
+            "SELECT DISTINCT year FROM meta_data WHERE year ~ '^[0-9]+$' ORDER BY year DESC",
+            [],
+        )
+    ]
+    months = [
+        r["month"]
+        for r in _dict_rows(
+            """
+            SELECT DISTINCT month, MIN(to_date(NULLIF(date, ''), 'DD-MM-YYYY')) AS sort_date
+            FROM meta_data
+            WHERE month IS NOT NULL AND month <> ''
+            GROUP BY month
+            ORDER BY sort_date
+            """,
+            [],
+        )
+    ]
+
+    return Response(
+        {
+            "summary": summary,
+            "rows": rows,
+            "max_date": max_date,
+            "filter_options": {"years": years, "months": months},
+            "filters": filters,
+        }
+    )
+
+
 # ─── Amazon ──────────────────────────────────────────────────────────────────
 # Source: amazon_ads_master (rich column set — total_cost, sales, impressions,
 # clicks, purchases, units_sold, NTB variants, …). Dimension: portfolio_name.

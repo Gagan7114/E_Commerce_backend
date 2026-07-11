@@ -59,6 +59,8 @@ UPLOAD_ALLOWED_TABLES = {
     "zepto_ads",
     "bigbasket_ads",
     "flipkart_ads",
+    # Meta (Facebook/Instagram) ads campaigns
+    "meta_data",
     # Flipkart "Consolidated FSN Report" — raw 14-col upload; the 5 master_sheet
     # columns are joined live in the consolidated_fsn_report_master view.
     "consolidated_fsn_report",
