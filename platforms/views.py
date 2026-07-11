@@ -4174,7 +4174,7 @@ def amazon_ads_dashboard(request, slug: str):
 @cached_get(timeout=60, prefix="plat.amazon_ads_total_sales")
 def amazon_ads_total_sales(request, slug: str):
     """Total Sales for the AMS Ads dashboard, sourced from the PER-DAY view
-    `amazon_sec_daily_master_view` using `shipped_revenue_2`.
+    `amazon_sec_daily_master_view` using `ordered_revenue`.
 
     Unlike `amazon_sec_range_master_view` (cumulative month-to-date snapshots),
     this view has one row per calendar day, so a picked date/range shows exactly
@@ -4215,7 +4215,7 @@ def amazon_ads_total_sales(request, slug: str):
     # else: no date picked → whole selected month (sum of every day).
 
     total = _scalar(
-        f'SELECT COALESCE(SUM("shipped_revenue_2"), 0) '
+        f'SELECT COALESCE(SUM("ordered_revenue"), 0) '
         f'FROM "amazon_sec_daily_master_view" {where}',
         params,
     ) or 0
@@ -4229,7 +4229,7 @@ def amazon_ads_total_sales(request, slug: str):
             COALESCE(NULLIF(TRIM("per_unit"::text), ''), '-')     AS per_ltr,
             COALESCE(NULLIF(TRIM("item"::text), ''), '')          AS item,
             TRIM("asin"::text)                                    AS asin,
-            COALESCE(SUM("shipped_revenue_2"), 0)                 AS shipped_value
+            COALESCE(SUM("ordered_revenue"), 0)                   AS shipped_value
         FROM "amazon_sec_daily_master_view"
         {where}
         GROUP BY
