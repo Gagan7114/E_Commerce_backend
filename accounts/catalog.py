@@ -43,6 +43,14 @@ PERMISSION_CATALOG: tuple[tuple[str, str], ...] = (
     ("distributor.view", "View distributors"),
     ("sap.view", "Query SAP HANA"),
     ("sap.invoice.view", "View SAP invoices"),
+    # JM (SAP) sections — gate the JM Primary / JM Inventory sidebar entries
+    # and pages, so they can be hidden per-user by revoking the code.
+    # NOTE: `business_mode.view` (the Business Mode data lens) is intentionally
+    # NOT in this catalog — like amazon.shipment_planning.view it is seeded by
+    # a migration and granted only to Super Admin by default, keeping it out of
+    # the "*" all-catalog expansion so it can't leak to every admin.
+    ("jm.primary.view", "View JM Primary section"),
+    ("jm.inventory.view", "View JM Inventory section"),
     # Admin
     ("admin.access", "Access admin panel"),
     ("admin.user.view", "View users in admin"),
