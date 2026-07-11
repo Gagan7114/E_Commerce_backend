@@ -2674,6 +2674,7 @@ def blinkit_soh_doh_dashboard(request, slug: str):
             SELECT
                 UPPER(TRIM(COALESCE("item"::text, ''))) AS item_key,
                 MIN(NULLIF(TRIM("item"::text), '')) AS item,
+                MIN(NULLIF(TRIM("sku_code"::text), '')) AS sku_code,
                 COALESCE(SUM("quantity"), 0)::numeric AS quantity,
                 COALESCE(SUM("ltr_sold"), 0)::numeric AS ltr_sold
             FROM secmaster_mv
@@ -2686,6 +2687,7 @@ def blinkit_soh_doh_dashboard(request, slug: str):
             SELECT
                 UPPER(TRIM(COALESCE(item::text, ''))) AS item_key,
                 MIN(NULLIF(TRIM(item::text), '')) AS inventory_item,
+                MIN(NULLIF(TRIM(sku_code::text), '')) AS inv_sku_code,
                 COALESCE(SUM(soh_unit), 0)::numeric AS soh_units,
                 COALESCE(SUM(soh_ltr), 0)::numeric AS soh_ltr
             FROM all_platform_inventory
@@ -2695,6 +2697,7 @@ def blinkit_soh_doh_dashboard(request, slug: str):
         )
         SELECT
             COALESCE(NULLIF(s.item, ''), NULLIF(i.inventory_item, '')) AS item,
+            COALESCE(NULLIF(s.sku_code, ''), NULLIF(i.inv_sku_code, '')) AS sku_code,
             COALESCE(s.quantity, 0) AS quantity,
             COALESCE(s.ltr_sold, 0) AS ltr_sold,
             i.inventory_item,
@@ -2719,6 +2722,7 @@ def blinkit_soh_doh_dashboard(request, slug: str):
         drr_ltr = _safe_div(ltr_sold, elapsed_day)
         normalized_rows.append({
             "item": row.get("item") or row.get("inventory_item") or "",
+            "sku_code": row.get("sku_code") or "",
             "quantity": quantity,
             "ltr_sold": ltr_sold,
             "inventory_item": row.get("inventory_item") or "",
