@@ -2278,6 +2278,38 @@ def _apply_zepto_grn_code_row(cur, target_table, row, column_types, table_column
         row_for_write["status"] = PRIMARY_GRN_COMPLETED_STATUS
     row_for_write["grn_code"] = grn
 
+    # ── SKU-less GRN (matched on LOCATION, no SKU column) ────────────────────
+    # A Zepto GRN export at PO+location level carries a PO-level received qty that
+    # CANNOT be attributed to a specific SKU. Writing it onto (or cloning) an
+    # individual SKU row mis-attributes and inflates delivery — e.g. an 844-unit
+    # GRN booked against a 64-unit SKU line, or an orphan blank-SKU duplicate. The
+    # authoritative per-SKU delivered_qty is owned by the Primary/master upload
+    # (which matches the source sheet); this GRN's only job here is to stamp the
+    # delivery DATE. So fill grn_date/status on the PO's existing rows and NEVER
+    # touch delivered_qty, and never create/clone rows. (SKU-carrying GRN lines
+    # fall through to the per-SKU upsert below, which is safe.)
+    if match_col != "sku_code":
+        grn_date_val = _normalize_upload_value(
+            row_for_write.get("grn_date"), column_types.get("grn_date")
+        )
+        status_val = row_for_write.get("status")
+        stamp = []
+        stamp_params: list = []
+        if "grn_date" in table_columns and str(row_for_write.get("grn_date") or "").strip():
+            stamp.append("grn_date = COALESCE(t.grn_date, %s::date)")
+            stamp_params.append(grn_date_val)
+        if "status" in table_columns and str(status_val or "").strip():
+            stamp.append("status = COALESCE(NULLIF(TRIM(t.status::text), ''), %s)")
+            stamp_params.append(status_val)
+        if not stamp:
+            return "skipped"
+        cur.execute(
+            f"UPDATE {qtable} AS t SET {', '.join(stamp)} "
+            "WHERE LOWER(TRIM(t.po_number::text)) = %s AND UPPER(TRIM(t.format::text)) = %s",
+            [*stamp_params, po.lower(), ZEPTO_GRN_FORMAT],
+        )
+        return "updated" if cur.rowcount else "skipped"
+
     # Columns a GRN line writes onto a row (only those that exist + are present).
     set_columns = [
         c
@@ -2338,27 +2370,9 @@ def _apply_zepto_grn_code_row(cur, target_table, row, column_types, table_column
     if cur.rowcount:
         return "created"
 
-    # 4a) Guard against an orphan blank-SKU duplicate. A SKU-less Zepto GRN is
-    #     matched on LOCATION; when the GRN's location is more specific than the
-    #     Primary's (e.g. GRN 'FBD-DRY-MH-BALLABHGARH' vs Primary 'FBD-DRY-MH'),
-    #     steps 1-3 find no row and this branch would insert a standalone blank-SKU
-    #     row — double-counting a delivery the Primary already recorded per SKU.
-    #     If the PO already has per-SKU delivery, that per-SKU total is the source
-    #     of truth (it matches the master sheet), so skip the orphan insert.
-    if match_col != "sku_code":
-        cur.execute(
-            f"SELECT 1 FROM {qtable} t2 "
-            "WHERE LOWER(TRIM(t2.po_number::text)) = %s "
-            "  AND UPPER(TRIM(t2.format::text)) = %s "
-            "  AND t2.sku_code IS NOT NULL AND btrim(t2.sku_code::text) <> '' "
-            "  AND COALESCE(t2.delivered_qty, 0) > 0 "
-            "LIMIT 1",
-            [po.lower(), ZEPTO_GRN_FORMAT],
-        )
-        if cur.fetchone():
-            return "skipped"
-
     # 4) No matching PO row yet (GRN before its Primary PO) -> minimal row.
+    #    (Only reached for SKU-carrying GRN lines; SKU-less lines return early
+    #    above and never insert an orphan row.)
     minimal = {"po_number": po, "grn_code": grn, "format": ZEPTO_GRN_FORMAT, match_col: match_val}
     for c in ("grn_date", "status", "delivered_qty"):
         if c in row_for_write:
