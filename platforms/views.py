@@ -3807,11 +3807,20 @@ def _ads_dashboard_payload(
     summary_max_date_keys: list | None = None,
     summary_use_max_date: bool = False,
     date_wise: bool = False,
+    month_wise: bool = False,
 ) -> dict:
     # Comma-separated "expr AS \"key\"" for the SELECT list.
     metric_select_sql = ", ".join(
         f'{spec["expr"]} AS "{spec["key"]}"' for spec in metric_specs
     )
+
+    # Month-wise: one row per month for the selected YEAR (all dimensions
+    # combined), ignoring the month filter. A year-only WHERE drives the summary,
+    # breakdown AND trend so the KPI cards, table and chart all reflect the full
+    # year. date_wise and month_wise are mutually exclusive (the caller enforces).
+    mw_year = filters.get("year")
+    mw_where = "WHERE year = %s" if (month_wise and mw_year) else ""
+    mw_params = [int(mw_year)] if (month_wise and mw_year) else []
 
     # When the source stores cumulative range snapshots (each date is a running
     # month-to-date total), summing across dates over-counts every metric.
@@ -3828,14 +3837,17 @@ def _ads_dashboard_payload(
     unmapped_lit = "'" + dimension_unmapped.replace("'", "''") + "'"
     dim_expr = f"COALESCE(NULLIF(TRIM({dimension_key}::text), ''), {unmapped_lit})"
 
-    # 1) Summary (single row of aggregates)
+    # 1) Summary (single row of aggregates). Month-wise sums the whole year.
+    summary_where, summary_params = (
+        (mw_where, mw_params) if month_wise else (where_sql, params)
+    )
     summary_rows = _dict_rows(
         f"""
         SELECT {metric_select_sql}, MAX(date) AS max_date
         FROM {source}
-        {where_sql}
+        {summary_where}
         """,
-        params,
+        summary_params,
     )
     summary = dict(summary_rows[0]) if summary_rows else {s["key"]: 0 for s in metric_specs}
     max_date = summary.pop("max_date", None)
@@ -3846,7 +3858,7 @@ def _ads_dashboard_payload(
     # ads), each date is a cumulative month-to-date snapshot, so SUMming across
     # dates over-counts. For the listed metric keys, replace the period sum with
     # the value from the latest (max) date only. Breakdown/trend are untouched.
-    if summary_max_date_keys and max_date:
+    if summary_max_date_keys and max_date and not month_wise:
         md_specs = [s for s in metric_specs if s["key"] in summary_max_date_keys]
         if md_specs:
             md_select = ", ".join(f'{s["expr"]} AS "{s["key"]}"' for s in md_specs)
@@ -3864,7 +3876,21 @@ def _ads_dashboard_payload(
     # per-day rows (date + dimension grain) so a picked range reads as one row
     # per calendar day instead of one aggregated total.
     spend_alias = f'"{spend_metric}"'
-    if date_wise:
+    if month_wise:
+        # One row per month for the whole year; all dimensions are rolled up, so
+        # there is no dimension grain. `dimension` carries the month name (the
+        # frontend renders it in a Month column and matches Total Sales by month).
+        breakdown_rows = _dict_rows(
+            f"""
+            SELECT month AS dimension, month AS row_month, {metric_select_sql}
+            FROM {source}
+            {mw_where}
+            GROUP BY month
+            ORDER BY MIN(date) ASC
+            """,
+            mw_params,
+        )
+    elif date_wise:
         breakdown_rows = _dict_rows(
             f"""
             SELECT date AS row_date, {dim_expr} AS dimension, {metric_select_sql}
@@ -3902,6 +3928,11 @@ def _ads_dashboard_payload(
     trend_metric_select_sql = ", ".join(
         f'{spec["expr"]} AS "{spec["key"]}"' for spec in metric_specs
     )
+    # Month-wise: the trend spans the whole year (year-only WHERE) so the KPI
+    # sparklines and chart match the year the table now shows.
+    trend_src_where, trend_src_params = (
+        (mw_where, mw_params) if month_wise else (trend_where_sql, trend_params)
+    )
     trend_rows = _dict_rows(
         f"""
         SELECT date,
@@ -3909,11 +3940,11 @@ def _ads_dashboard_payload(
                {revenue_spec["expr"]} AS revenue,
                {trend_metric_select_sql}
         FROM {source}
-        {trend_where_sql}
+        {trend_src_where}
         GROUP BY date
         ORDER BY date
         """,
-        trend_params,
+        trend_src_params,
     )
     for r in trend_rows:
         if hasattr(r.get("date"), "isoformat"):
@@ -3977,6 +4008,7 @@ def _ads_dashboard_payload(
         ],
         "breakdown_rows": breakdown_rows,
         "date_wise": date_wise,
+        "month_wise": month_wise,
         "max_date": max_date,
         "filter_options": {"years": years, "months": months, "dates": dates},
         "filters": filters,
@@ -4168,11 +4200,17 @@ def amazon_ads_dashboard(request, slug: str):
     date_wise = str(
         request.query_params.get("date_wise") or ""
     ).strip().lower() in ("1", "true", "yes")
+    # Month-wise mode: one row per month across the selected year (month filter
+    # ignored). Mutually exclusive with date_wise — date_wise wins if both set.
+    month_wise = (not date_wise) and str(
+        request.query_params.get("month_wise") or ""
+    ).strip().lower() in ("1", "true", "yes")
 
     where_sql, params, trend_where_sql, trend_params, filters = _ads_build_where(request, allow_date=True)
     return Response(_ads_dashboard_payload(
         source="amazon_ads_master",
         date_wise=date_wise,
+        month_wise=month_wise,
         # Range summary (sum across the selected period), not max-date snapshot.
         summary_use_max_date=False,
         title="AMS ADS Dashboard",
@@ -4237,6 +4275,44 @@ def amazon_ads_total_sales(request, slug: str):
         latest_source="amazon_sec_daily_master_view" if slug == "amazon" else None,
     )
     month_name = _month_name(month)
+
+    # Month-wise Total Sales: one total per month across the whole `year`, so the
+    # ads table's Month-wise view shows each month's own secondary sale (matched
+    # by month NAME). The month filter is intentionally ignored.
+    month_wise = str(
+        request.query_params.get("month_wise") or ""
+    ).strip().lower() in ("1", "true", "yes")
+    if month_wise:
+        if slug == "blinkit":
+            mw_src = "secmaster_mv"
+            mw_where = (
+                "WHERE REGEXP_REPLACE(LOWER(TRIM(\"format\"::text)), '[^a-z0-9]+', '', 'g') = 'blinkit' "
+                'AND "year"::numeric = %s'
+            )
+            mw_vexpr = 'COALESCE(SUM("sales_amt_exc"), 0)'
+        else:
+            mw_src = '"amazon_sec_daily_master_view"'
+            mw_where = 'WHERE "year" = %s'
+            mw_vexpr = f'COALESCE(SUM("{value_col}"), 0)'
+        mw_rows = _dict_rows(
+            f'SELECT UPPER(TRIM("month"::text)) AS month, {mw_vexpr} AS shipped_value '
+            f'FROM {mw_src} {mw_where} '
+            f'GROUP BY UPPER(TRIM("month"::text))',
+            [year],
+        )
+        monthly_details = [
+            {"month": r.get("month"), "shipped_value": float(r.get("shipped_value") or 0)}
+            for r in mw_rows
+        ]
+        total = sum(m["shipped_value"] for m in monthly_details)
+        return Response({
+            "summary_total": {"shipped_value": float(total)},
+            "sku_details": [],
+            "monthly_details": monthly_details,
+            "month_wise": True,
+            "metric": metric if slug == "amazon" else "delivered",
+            "year": year,
+        })
 
     def _date_param(key):
         raw = str(request.query_params.get(key) or "").strip()
@@ -4615,10 +4691,16 @@ def blinkit_ads_dashboard(request, slug: str):
     date_wise = str(
         request.query_params.get("date_wise") or ""
     ).strip().lower() in ("1", "true", "yes")
+    # Month-wise mode: one row per month across the selected year (month filter
+    # ignored). Mutually exclusive with date_wise — date_wise wins if both set.
+    month_wise = (not date_wise) and str(
+        request.query_params.get("month_wise") or ""
+    ).strip().lower() in ("1", "true", "yes")
     where_sql, params, trend_where_sql, trend_params, filters = _ads_build_where(request, allow_date=True)
     return Response(_ads_dashboard_payload(
         source="blinkit_ads_master",
         date_wise=date_wise,
+        month_wise=month_wise,
         # Range summary (sum across the selected period), not max-date snapshot.
         summary_use_max_date=False,
         title="Blinkit ADS Dashboard",
