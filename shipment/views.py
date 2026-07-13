@@ -4213,6 +4213,7 @@ class ShipmentRecordView(_SafeAPIView):
                 cur.execute("""
                     SELECT si.shipment_id, si.po_number, si.asin, si.internal_sku,
                            si.product_name, si.item, si.destination_fc, si.item_head,
+                           si.source_warehouse,
                            si.accepted_qty, si.planned_qty, si.planned_liters,
                            si.case_pack, si.not_loaded,
                            si.unfit_reason, si.short_reason,
@@ -4261,6 +4262,8 @@ class ShipmentRecordView(_SafeAPIView):
                     'item': it.get('item') or it.get('product_name'),
                     'internal_sku': it.get('internal_sku'),
                     'item_head': it.get('item_head'),
+                    'source_warehouse': it.get('source_warehouse'),
+                    'source_inventory': _inventory_label(it.get('source_warehouse')),
                     'destination_fc': it.get('destination_fc'),
                     'ordered_qty': ordered,
                     'shipped_qty': planned,

@@ -19,9 +19,20 @@ def _is_stale_draft(obj):
 
 
 class ShipmentItemSerializer(serializers.ModelSerializer):
+    source_inventory = serializers.SerializerMethodField()
+
     class Meta:
         model = ShipmentItem
         fields = '__all__'
+
+    def get_source_inventory(self, obj):
+        """Human inventory name for the saved source_warehouse code (e.g.
+        BH-FGM → 'Jivo Mart'). Lazy import to avoid a views↔serializers cycle."""
+        try:
+            from .views import _inventory_label
+            return _inventory_label(obj.source_warehouse)
+        except Exception:
+            return None
 
 
 class ShipmentAuditLogSerializer(serializers.ModelSerializer):
