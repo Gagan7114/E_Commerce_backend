@@ -28,6 +28,7 @@ ALLOWED_TABLES = {
     "total_po", "total_po_zbs",
     "amazon_price_data", "amazon_sec_daily", "amazon_sec_daily_master_view", "amazon_sec_range",
     "amazon_sec_range_margins", "amazon_sec_range_master_view", "amazon_sec_city",
+    "amazon_mp",
     "bigbasketSec", "blinkitSec", "flipkart_grocery_master", "fk_grocery", "flipkartSec", "flipkart_secondary_all",
     "jiomartSec", "swiggySec", "zeptoSec",
     "zomatoSec", "citymallSec",
