@@ -229,7 +229,10 @@ def _pack_into_capacity(items, capacity_lt):
             # No live stock for this SKU — can't ship it.
             item['planned_qty'] = 0
             item['planned_liters'] = 0
-            item['unfit_reason'] = item.get('stock_unfit') or 'Out of stock at BH-FGM.'
+            item['unfit_reason'] = item.get('stock_unfit') or (
+                f"Out of stock at {item.get('source_warehouse')}." if item.get('source_warehouse')
+                else 'Out of stock.'
+            )
             not_loaded.append(item)
             continue
 
@@ -1010,16 +1013,34 @@ def _lookup_appointment_commit(appointment_id):
     return {'units': units, 'cartons': cartons}
 
 
-# ── Live BH-FGM warehouse stock, bridged to Amazon ASINs ─────────────────────
+# ── Live planner warehouse stock, bridged to Amazon ASINs ────────────────────
+# The planner pools finished-goods stock from these warehouses, in PREFERENCE
+# order: for each ASIN the FIRST warehouse (left→right) that has on-hand > 0 is
+# chosen as the fulfilment source. BH-FGM = Jivo Mart, DL-EC = Jivo Wellness.
+_PLANNER_WAREHOUSES = ('BH-FGM', 'DL-EC')
+_WAREHOUSE_INVENTORY_LABEL = {'BH-FGM': 'Jivo Mart', 'DL-EC': 'Jivo Wellness'}
 _STOCK_CACHE = {'at': 0.0, 'detail': {}}
 _STOCK_TTL = 60  # seconds — avoids hitting HANA on every plan / 30s auto-refresh
 
 
+def _inventory_label(whs_code):
+    """Human inventory name for a warehouse code (e.g. BH-FGM → 'Jivo Mart')."""
+    return _WAREHOUSE_INVENTORY_LABEL.get(str(whs_code or '').strip().upper())
+
+
 def _bh_fgm_stock_detail():
-    """ASIN (upper) → {'onhand': units in BH-FGM now, 'onorder': units inbound}.
+    """ASIN (upper) → {'onhand', 'onorder', 'source_warehouse'}.
+
+    Pools live SAP stock across the planner warehouses (``_PLANNER_WAREHOUSES``)
+    and picks, per ASIN, the FIRST warehouse in preference order (BH-FGM = Jivo
+    Mart, then DL-EC = Jivo Wellness) that has on-hand > 0 as the fulfilment
+    source — ``onhand``/``onorder`` are THAT warehouse's figures and
+    ``source_warehouse`` is its code. If no warehouse has on-hand, the first that
+    carries the item at all is recorded (zero stock) so the ASIN still counts as
+    mapped. If two SAP codes map to one ASIN, the larger on-hand wins.
 
     Bridge: master_sheet (Amazon listing) maps format_sku_code (ASIN) →
-    sku_sap_code; SAP OITW gives OnHand / OnOrder per SAP code at BH-FGM. SAP
+    sku_sap_code; SAP OITW gives OnHand / OnOrder per SAP code per warehouse. SAP
     pieces are the same unit as Amazon sellable units (verified). Cached ~60s.
     Returns the last good map (or {}) if HANA is unreachable so planning never
     breaks.
@@ -1030,16 +1051,36 @@ def _bh_fgm_stock_detail():
     try:
         from sap.service import select, resolve_schema
         _src, schema = resolve_schema('mart')
+        placeholders = ', '.join(['?'] * len(_PLANNER_WAREHOUSES))
         oh_rows = select(
-            'SELECT "ItemCode", "OnHand", "OnOrder" FROM OITW WHERE "WhsCode" = ?',
-            ['BH-FGM'], schema=schema,
+            f'SELECT "ItemCode", "WhsCode", "OnHand", "OnOrder" FROM OITW '
+            f'WHERE "WhsCode" IN ({placeholders})',
+            list(_PLANNER_WAREHOUSES), schema=schema,
         )
-        sap_stock = {
-            str(r['ItemCode']).strip().upper(): (float(r['OnHand'] or 0), float(r['OnOrder'] or 0))
-            for r in oh_rows
-        }
+        # sap_stock[SAP code][WhsCode] = (onhand, onorder)
+        sap_stock = {}
+        for r in oh_rows:
+            code = str(r['ItemCode']).strip().upper()
+            whs = str(r['WhsCode']).strip().upper()
+            sap_stock.setdefault(code, {})[whs] = (
+                float(r['OnHand'] or 0), float(r['OnOrder'] or 0)
+            )
     except Exception:
         return _STOCK_CACHE['detail'] or {}
+
+    def _choose(per_whs):
+        """Pick (whs, onhand, onorder): the first warehouse (preference order)
+        with on-hand > 0; else the first that carries the item at all (0 stock);
+        else None."""
+        for whs in _PLANNER_WAREHOUSES:
+            oh, oo = per_whs.get(whs, (None, None))
+            if oh is not None and oh > 0:
+                return whs, oh, oo
+        for whs in _PLANNER_WAREHOUSES:
+            if whs in per_whs:
+                oh, oo = per_whs[whs]
+                return whs, oh, oo
+        return None
 
     asin_map = {}
     with connection.cursor() as cur:
@@ -1052,12 +1093,17 @@ def _bh_fgm_stock_detail():
               AND sku_sap_code   IS NOT NULL
         """)
         for asin, sap in cur.fetchall():
-            s = sap_stock.get(sap)
-            if s is not None:
-                cur_d = asin_map.get(asin)
-                # If two SAP codes map to one ASIN, keep the larger on-hand.
-                if cur_d is None or s[0] > cur_d['onhand']:
-                    asin_map[asin] = {'onhand': s[0], 'onorder': s[1]}
+            per_whs = sap_stock.get(sap)
+            if not per_whs:
+                continue
+            chosen = _choose(per_whs)
+            if chosen is None:
+                continue
+            whs, oh, oo = chosen
+            cur_d = asin_map.get(asin)
+            # If two SAP codes map to one ASIN, keep the larger on-hand.
+            if cur_d is None or oh > cur_d['onhand']:
+                asin_map[asin] = {'onhand': oh, 'onorder': oo, 'source_warehouse': whs}
 
     _STOCK_CACHE['at'] = now
     _STOCK_CACHE['detail'] = asin_map
@@ -1091,8 +1137,10 @@ def _apply_stock_caps(items, avail_total, avail_remaining, respect, detail, rese
     still AVAILABLE (on-hand − reserved) for that ASIN so the packer plans no
     more than that. ``accepted_qty`` is left untouched so Ordered/Short stay
     correct. Stock is consumed in item order (priority) so one ASIN across rows
-    shares one pool. ASINs with no BH-FGM stock record are capped to 0 so they
-    drop to not_loaded rather than shipping unverified. Mutates ``items``.
+    shares one pool. Each item is tagged with the ``source_warehouse`` it is
+    pooled from (BH-FGM = Jivo Mart, DL-EC = Jivo Wellness). ASINs with no
+    planner-warehouse stock record are capped to 0 so they drop to not_loaded
+    rather than shipping unverified. Mutates ``items``.
     """
     for it in items:
         asin = str(it.get('asin') or '').strip().upper()
@@ -1101,17 +1149,24 @@ def _apply_stock_caps(items, avail_total, avail_remaining, respect, detail, rese
         it['sap_on_order'] = d['onorder'] if d else None       # inbound
         it['sap_reserved'] = (reserved.get(asin, 0.0) if d else None)
         it['sap_available'] = (avail_total.get(asin) if d else None)  # on-hand − reserved
+        # Which inventory this line is auto-pooled from (prefer BH-FGM; see
+        # _bh_fgm_stock_detail). None when the ASIN maps to no planner warehouse.
+        src_whs = d['source_warehouse'] if d else None
+        it['source_warehouse'] = src_whs
+        it['source_inventory'] = _inventory_label(src_whs)
         if not respect:
             continue
         if d is None:
-            # Not mapped to BH-FGM stock: availability can't be verified, so don't
-            # ship it blind. Cap to 0 → the packer drops it into not_loaded with
-            # this reason instead of shipping the full ordered qty unverified.
+            # Not mapped to ANY planner warehouse (BH-FGM / DL-EC): availability
+            # can't be verified, so don't ship it blind. Cap to 0 → the packer
+            # drops it into not_loaded with this reason instead of shipping the
+            # full ordered qty unverified.
             it['stock_cap'] = 0.0
             it['stock_limited'] = True
             it['stock_unfit'] = (
-                'Not mapped to BH-FGM warehouse stock — availability cannot be '
-                'verified, so it was left out of the plan.'
+                'Not mapped to any planner warehouse stock (Jivo Mart / Jivo '
+                'Wellness) — availability cannot be verified, so it was left out '
+                'of the plan.'
             )
             continue
         avail = avail_remaining.get(asin, 0.0)
@@ -1122,9 +1177,10 @@ def _apply_stock_caps(items, avail_total, avail_remaining, respect, detail, rese
         if avail < orderable - 1e-6:
             it['stock_limited'] = True
             short = int(round(orderable - max(0.0, avail)))
+            _where = f'{_inventory_label(src_whs) or src_whs} ({src_whs})' if src_whs else 'the warehouse'
             it['stock_unfit'] = (
-                'No free stock at BH-FGM (0 available).' if avail <= 0
-                else f'Limited to {int(round(avail))} available at BH-FGM ({short} short).'
+                f'No free stock in {_where} (0 available).' if avail <= 0
+                else f'Limited to {int(round(avail))} available in {_where} ({short} short).'
             )
 
 
@@ -2482,6 +2538,11 @@ class ShipmentListCreateView(_SafeAPIView):
                 created_by=request.user,
             )
 
+            # Source-inventory tag for each saved line: prefer the value the
+            # planner already computed (echoed by the client); else re-derive from
+            # live pooled stock by ASIN. Fetched once (cached ~60s).
+            _save_stock_detail = _bh_fgm_stock_detail()
+
             def _make_item(item_data, not_loaded=False):
                 dte = item_data.get('days_to_expiry')
                 try:
@@ -2514,6 +2575,11 @@ class ShipmentListCreateView(_SafeAPIView):
                     brand=item_data.get('brand') or '',
                     item_head=item_data.get('item_head') or '',
                     item=item_data.get('item') or '',
+                    source_warehouse=(
+                        item_data.get('source_warehouse')
+                        or (_save_stock_detail.get(str(item_data.get('asin') or '').strip().upper()) or {}).get('source_warehouse')
+                        or ''
+                    ),
                     availability_status=item_data.get('availability_status') or '',
                     po_status=item_data.get('po_status') or '',
                     status=item_data.get('status') or '',
@@ -3046,8 +3112,11 @@ class POListView(_SafeAPIView):
                 r['sap_on_order'] = d['onorder']
                 r['sap_reserved'] = reserved.get(a, 0.0)
                 r['sap_available'] = max(0.0, d['onhand'] - reserved.get(a, 0.0))
+                r['source_warehouse'] = d['source_warehouse']
+                r['source_inventory'] = _inventory_label(d['source_warehouse'])
             else:
                 r['sap_stock'] = r['sap_on_order'] = r['sap_reserved'] = r['sap_available'] = None
+                r['source_warehouse'] = r['source_inventory'] = None
             live = doh_by_asin.get(a, {}) if doh_by_asin else {}
             r['soh_unit'] = live.get('soh_unit', 0) or 0
             r['soh_ltr']  = live.get('soh_ltr',  0) or 0
@@ -4357,25 +4426,37 @@ class ShipmentKpiView(_SafeAPIView):
         })
 
 
-_SAP_INV_CACHE = {'at': 0.0, 'data': None}
+_SAP_INV_CACHE = {}   # whs_code -> {'at': float, 'data': payload} — cached per warehouse
 _SAP_INV_TTL = 60  # seconds — full-warehouse SAP read; the inventory page
 #                    auto-refreshes, so cache to avoid a live HANA hit each time.
 
 
 class SapInventoryView(_SafeAPIView):
-    """Live SAP HANA finished-goods stock for the BH-FGM (Sonipat) warehouse,
-    surfaced inside the Shipment Planner. Read-only; queried live each request
-    from the JIVO_MART_HANADB schema (OITM × OITW × OWHS × OITB)."""
+    """Live SAP HANA finished-goods stock for a single warehouse, surfaced inside
+    the Shipment Planner. Read-only; queried live each request from the
+    JIVO_MART_HANADB (Mart) schema (OITM × OITW × OWHS × OITB).
+
+    The warehouse is chosen by the ``?warehouse=`` query param, restricted to an
+    allow-list so a caller can't probe arbitrary warehouses:
+      - BH-FGM  → "Jivo Mart Inventory"    (Sonipat)
+      - DL-EC   → "Jivo Wellness Inventory" (Mayapuri E-Commerce)
+    Anything else (or missing) falls back to the default, BH-FGM."""
     permission_classes = [IsAuthenticated]
 
-    WHS_CODE = 'BH-FGM'
+    DEFAULT_WHS = 'BH-FGM'
+    ALLOWED_WHS = ('BH-FGM', 'DL-EC')
+
+    def _resolve_whs(self, request):
+        raw = (request.query_params.get('warehouse') or '').strip().upper()
+        return raw if raw in self.ALLOWED_WHS else self.DEFAULT_WHS
 
     def get(self, request):
+        whs_code = self._resolve_whs(request)
         now = time.time()
-        cached = _SAP_INV_CACHE['data']
-        if cached is not None and (now - _SAP_INV_CACHE['at'] < _SAP_INV_TTL):
-            self._overlay_reserved(cached.get('results') or [])
-            return Response(cached)
+        entry = _SAP_INV_CACHE.get(whs_code)
+        if entry is not None and (now - entry['at'] < _SAP_INV_TTL):
+            self._overlay_reserved(entry['data'].get('results') or [])
+            return Response(entry['data'])
         # Imported lazily so the rest of the shipment app never hard-depends on
         # the HANA driver (hdbcli) being installed. Both the import and the
         # schema resolution can fail (driver missing / SAP config) — guard them.
@@ -4415,7 +4496,7 @@ class SapInventoryView(_SafeAPIView):
             ORDER BY T0."ItemName"
         '''
         try:
-            rows = select(sql, [self.WHS_CODE], schema=schema)
+            rows = select(sql, [whs_code], schema=schema)
         except Exception as e:  # HANA unreachable / VPN down / driver missing
             return Response(
                 {'error': f'Could not reach SAP HANA: {e}', 'results': [], 'summary': {}},
@@ -4452,7 +4533,7 @@ class SapInventoryView(_SafeAPIView):
         total_value = sum(float(r.get('StockValue') or 0) for r in rows)
         zero_stock = sum(1 for r in rows if float(r.get('OnHand') or 0) == 0)
         payload = {
-            'warehouse': self.WHS_CODE,
+            'warehouse': whs_code,
             'schema': schema,
             'results': rows,
             'count': len(rows),
@@ -4463,8 +4544,7 @@ class SapInventoryView(_SafeAPIView):
                 'items_at_zero_stock': zero_stock,
             },
         }
-        _SAP_INV_CACHE['at'] = now
-        _SAP_INV_CACHE['data'] = payload
+        _SAP_INV_CACHE[whs_code] = {'at': now, 'data': payload}
         self._overlay_reserved(payload['results'])
         return Response(payload)
 
