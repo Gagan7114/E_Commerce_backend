@@ -21,9 +21,11 @@ jobs:
           script: |
             cd /home/superadmin/e-commerce
             bash deploy.sh
-            # Apply any new DB migrations. deploy.sh has already pulled the new
-            # code, so the migration files are present. Without this a pushed
-            # migration never reaches the database and the app errors on the new
-            # column/table (e.g. sp_items.source_warehouse -> 503 on save-draft).
-            if [ -f venv/bin/activate ]; then . venv/bin/activate; elif [ -f .venv/bin/activate ]; then . .venv/bin/activate; fi
-            python manage.py migrate --noinput
+            # Best-effort DB migrate — activate the project venv if present, then
+            # try python / python3. NEVER fail the deploy over it (deploy.sh has
+            # already pulled the code and restarted the app); if it can't run,
+            # migrations are applied by hand.
+            if [ -f venv/bin/activate ]; then . venv/bin/activate;
+            elif [ -f .venv/bin/activate ]; then . .venv/bin/activate;
+            elif [ -f env/bin/activate ]; then . env/bin/activate; fi
+            (python manage.py migrate --noinput || python3 manage.py migrate --noinput) || echo "WARNING: migrate did not run — apply pending migrations manually"
