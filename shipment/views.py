@@ -1016,11 +1016,24 @@ def _lookup_appointment_commit(appointment_id):
 # ── Live planner warehouse stock, bridged to Amazon ASINs ────────────────────
 # The planner pools finished-goods stock from these warehouses, in PREFERENCE
 # order: for each ASIN the FIRST warehouse (left→right) that has on-hand > 0 is
-# chosen as the fulfilment source. BH-FGM = Jivo Mart, DL-EC = Jivo Wellness.
-_PLANNER_WAREHOUSES = ('BH-FGM', 'DL-EC')
-_WAREHOUSE_INVENTORY_LABEL = {'BH-FGM': 'Jivo Mart', 'DL-EC': 'Jivo Wellness'}
-_STOCK_CACHE = {'at': 0.0, 'detail': {}}
-_STOCK_TTL = 60  # seconds — avoids hitting HANA on every plan / 30s auto-refresh
+# chosen as the primary fulfilment source. Warehouses: BH-FGM, GP-FG, BH-EC.
+# Planner warehouses and the company DB (schema) each lives in. Stock is pooled
+# across ALL of these. BH-FGM is in the mart book; GP-FG + BH-EC are in oil.
+_PLANNER_WAREHOUSE_SOURCES = (
+    ('BH-FGM', 'mart'),
+    ('GP-FG',  'oil'),
+    ('BH-EC',  'oil'),
+)
+# Preference order (used only to pick a primary source when nothing has on-hand).
+_PLANNER_WAREHOUSES = tuple(code for code, _src in _PLANNER_WAREHOUSE_SOURCES)
+_WAREHOUSE_INVENTORY_LABEL = {
+    'BH-FGM': 'Jivo Mart',
+    'GP-FG':  'Gupta Godown',
+    'BH-EC':  'Bhakharpur E-Commerce',
+}
+_STOCK_CACHE_KEY = 'sp:stock_detail_v2'   # shared snapshot: {'at': epoch, 'detail': {...}}
+_STOCK_TTL = 60          # seconds fresh — avoids hitting HANA on every plan / 30s refresh
+_STOCK_STALE_MAX = 3600  # keep serving a stale snapshot up to 1h if HANA is unreachable
 
 
 def _inventory_label(whs_code):
@@ -1028,65 +1041,79 @@ def _inventory_label(whs_code):
     return _WAREHOUSE_INVENTORY_LABEL.get(str(whs_code or '').strip().upper())
 
 
+def _stock_snapshot_meta():
+    """(at_epoch, is_stale) for the last live-stock snapshot, or (None, True) if we
+    have never fetched one. Lets the plan endpoint surface the snapshot's age so the
+    UI can flag stock that was served from cache because HANA was unreachable."""
+    try:
+        from django.core.cache import cache
+        snap = cache.get(_STOCK_CACHE_KEY)
+    except Exception:
+        snap = None
+    if not snap or not snap.get('detail'):
+        return None, True
+    at = float(snap.get('at') or 0)
+    return at, (time.time() - at) >= _STOCK_TTL
+
+
 def _bh_fgm_stock_detail():
-    """ASIN (upper) → {'onhand', 'onorder', 'source_warehouse'}.
+    """ASIN (upper) → {'onhand', 'onorder', 'source_warehouse', 'sources'}.
 
-    Pools live SAP stock across the planner warehouses (``_PLANNER_WAREHOUSES``)
-    and picks, per ASIN, the FIRST warehouse in preference order (BH-FGM = Jivo
-    Mart, then DL-EC = Jivo Wellness) that has on-hand > 0 as the fulfilment
-    source — ``onhand``/``onorder`` are THAT warehouse's figures and
-    ``source_warehouse`` is its code. If no warehouse has on-hand, the first that
-    carries the item at all is recorded (zero stock) so the ASIN still counts as
-    mapped. If two SAP codes map to one ASIN, the larger on-hand wins.
+    Pools live SAP stock across ALL planner warehouses (``_PLANNER_WAREHOUSE_SOURCES``),
+    which span two company DBs — BH-FGM (mart), GP-FG + BH-EC (oil). ``onhand`` and
+    ``onorder`` are the SUM across every warehouse and every SAP code that maps to the
+    ASIN, so the planner can ship the pooled total. ``source_warehouse`` is the single
+    warehouse holding the most on-hand (the primary pick location); ``sources`` is the
+    full {warehouse: on-hand} breakdown.
 
-    Bridge: master_sheet (Amazon listing) maps format_sku_code (ASIN) →
-    sku_sap_code; SAP OITW gives OnHand / OnOrder per SAP code per warehouse. SAP
-    pieces are the same unit as Amazon sellable units (verified). Cached ~60s.
-    Returns the last good map (or {}) if HANA is unreachable so planning never
-    breaks.
+    Bridge: master_sheet maps format_sku_code (ASIN) → sku_sap_code; SAP OITW gives
+    OnHand / OnOrder per SAP code per warehouse (same unit as Amazon sellable units).
+
+    Resilience (SAP down): the snapshot lives in the shared Django cache (Redis in
+    prod) so all workers agree. On a HANA failure the last good snapshot is returned
+    as-is — never zeroing every item — and a successful-but-EMPTY pull is ignored so a
+    partial outage can't wipe a good snapshot. ``_stock_snapshot_meta()`` exposes its age.
     """
+    from django.core.cache import cache
     now = time.time()
-    if _STOCK_CACHE['detail'] and (now - _STOCK_CACHE['at'] < _STOCK_TTL):
-        return _STOCK_CACHE['detail']
+    try:
+        snap = cache.get(_STOCK_CACHE_KEY)
+    except Exception:
+        snap = None
+    if snap and snap.get('detail') and (now - float(snap.get('at') or 0) < _STOCK_TTL):
+        return snap['detail']
+
     try:
         from sap.service import select, resolve_schema
-        _src, schema = resolve_schema('mart')
-        placeholders = ', '.join(['?'] * len(_PLANNER_WAREHOUSES))
-        oh_rows = select(
-            f'SELECT "ItemCode", "WhsCode", "OnHand", "OnOrder" FROM OITW '
-            f'WHERE "WhsCode" IN ({placeholders})',
-            list(_PLANNER_WAREHOUSES), schema=schema,
-        )
-        # sap_stock[SAP code][WhsCode] = (onhand, onorder)
-        sap_stock = {}
-        for r in oh_rows:
-            code = str(r['ItemCode']).strip().upper()
-            whs = str(r['WhsCode']).strip().upper()
-            sap_stock.setdefault(code, {})[whs] = (
-                float(r['OnHand'] or 0), float(r['OnOrder'] or 0)
+        # Query each schema once for its warehouses, then pool by SAP item code.
+        by_schema = {}
+        for code, src in _PLANNER_WAREHOUSE_SOURCES:
+            by_schema.setdefault(src, []).append(code)
+        sap_stock = {}   # SAP code -> {WhsCode: (onhand, onorder)}
+        for src, whs_list in by_schema.items():
+            _s, schema = resolve_schema(src)
+            ph = ', '.join(['?'] * len(whs_list))
+            oh_rows = select(
+                f'SELECT "ItemCode", "WhsCode", "OnHand", "OnOrder" FROM OITW '
+                f'WHERE "WhsCode" IN ({ph})',
+                whs_list, schema=schema,
             )
+            for r in oh_rows:
+                code = str(r['ItemCode']).strip().upper()
+                whs = str(r['WhsCode']).strip().upper()
+                sap_stock.setdefault(code, {})[whs] = (
+                    float(r['OnHand'] or 0), float(r['OnOrder'] or 0)
+                )
     except Exception:
-        return _STOCK_CACHE['detail'] or {}
-
-    def _choose(per_whs):
-        """Pick (whs, onhand, onorder): the first warehouse (preference order)
-        with on-hand > 0; else the first that carries the item at all (0 stock);
-        else None."""
-        for whs in _PLANNER_WAREHOUSES:
-            oh, oo = per_whs.get(whs, (None, None))
-            if oh is not None and oh > 0:
-                return whs, oh, oo
-        for whs in _PLANNER_WAREHOUSES:
-            if whs in per_whs:
-                oh, oo = per_whs[whs]
-                return whs, oh, oo
-        return None
+        # HANA unreachable → keep serving the last good snapshot (however old)
+        # rather than zeroing every item. {} only if we've never had one.
+        return (snap or {}).get('detail', {})
 
     asin_map = {}
     with connection.cursor() as cur:
         cur.execute("""
-            SELECT UPPER(TRIM(format_sku_code)) AS asin,
-                   UPPER(TRIM(sku_sap_code))    AS sap
+            SELECT DISTINCT UPPER(TRIM(format_sku_code)) AS asin,
+                            UPPER(TRIM(sku_sap_code))    AS sap
             FROM public.master_sheet
             WHERE UPPER(format) = 'AMAZON'
               AND format_sku_code IS NOT NULL
@@ -1096,17 +1123,32 @@ def _bh_fgm_stock_detail():
             per_whs = sap_stock.get(sap)
             if not per_whs:
                 continue
-            chosen = _choose(per_whs)
-            if chosen is None:
-                continue
-            whs, oh, oo = chosen
-            cur_d = asin_map.get(asin)
-            # If two SAP codes map to one ASIN, keep the larger on-hand.
-            if cur_d is None or oh > cur_d['onhand']:
-                asin_map[asin] = {'onhand': oh, 'onorder': oo, 'source_warehouse': whs}
+            d = asin_map.setdefault(asin, {'onhand': 0.0, 'onorder': 0.0, 'sources': {}})
+            # Pool this SAP code's stock across every planner warehouse into the ASIN.
+            for whs, (oh, oo) in per_whs.items():
+                d['onhand'] += oh
+                d['onorder'] += oo
+                d['sources'][whs] = d['sources'].get(whs, 0.0) + oh
+    # Primary source = warehouse with the most pooled on-hand (picklist label);
+    # if nothing has on-hand, keep preference order among the carriers.
+    for d in asin_map.values():
+        srcs = d.get('sources') or {}
+        best = max(srcs.items(), key=lambda kv: kv[1]) if srcs else None
+        if best and best[1] > 0:
+            d['source_warehouse'] = best[0]
+        elif srcs:
+            d['source_warehouse'] = next((w for w in _PLANNER_WAREHOUSES if w in srcs), best[0])
+        else:
+            d['source_warehouse'] = ''
 
-    _STOCK_CACHE['at'] = now
-    _STOCK_CACHE['detail'] = asin_map
+    # A successful-but-empty pull is almost always a partial SAP glitch, not a real
+    # "everything is zero" — don't clobber a good snapshot with it.
+    if not asin_map and snap and snap.get('detail'):
+        return snap['detail']
+    try:
+        cache.set(_STOCK_CACHE_KEY, {'at': now, 'detail': asin_map}, timeout=_STOCK_STALE_MAX)
+    except Exception:
+        pass
     return asin_map
 
 
@@ -1138,7 +1180,7 @@ def _apply_stock_caps(items, avail_total, avail_remaining, respect, detail, rese
     more than that. ``accepted_qty`` is left untouched so Ordered/Short stay
     correct. Stock is consumed in item order (priority) so one ASIN across rows
     shares one pool. Each item is tagged with the ``source_warehouse`` it is
-    pooled from (BH-FGM = Jivo Mart, DL-EC = Jivo Wellness). ASINs with no
+    pooled from (the primary of BH-FGM / GP-FG / BH-EC). ASINs with no
     planner-warehouse stock record are capped to 0 so they drop to not_loaded
     rather than shipping unverified. Mutates ``items``.
     """
@@ -1157,16 +1199,16 @@ def _apply_stock_caps(items, avail_total, avail_remaining, respect, detail, rese
         if not respect:
             continue
         if d is None:
-            # Not mapped to ANY planner warehouse (BH-FGM / DL-EC): availability
-            # can't be verified, so don't ship it blind. Cap to 0 → the packer
-            # drops it into not_loaded with this reason instead of shipping the
-            # full ordered qty unverified.
+            # Not mapped to ANY planner warehouse (BH-FGM / GP-FG / BH-EC):
+            # availability can't be verified, so don't ship it blind. Cap to 0 →
+            # the packer drops it into not_loaded with this reason instead of
+            # shipping the full ordered qty unverified.
             it['stock_cap'] = 0.0
             it['stock_limited'] = True
             it['stock_unfit'] = (
-                'Not mapped to any planner warehouse stock (Jivo Mart / Jivo '
-                'Wellness) — availability cannot be verified, so it was left out '
-                'of the plan.'
+                'Not mapped to any planner warehouse stock (Jivo Mart / Gupta '
+                'Godown / Bhakharpur E-Commerce) — availability cannot be '
+                'verified, so it was left out of the plan.'
             )
             continue
         avail = avail_remaining.get(asin, 0.0)
