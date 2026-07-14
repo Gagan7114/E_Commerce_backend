@@ -4578,13 +4578,12 @@ def amazon_ads_total_sales(request, slug: str):
 def _quick_commerce_metrics(*, gmv_field: str, include_indirect_qty: bool, include_indirect_gmv: bool):
     """Build metric_specs for Swiggy/Zepto/BigBasket/Blinkit. Single source of
     truth so the schema stays in lockstep across the four platforms."""
-    gmv_label = "GMV" if gmv_field == "gmv" else "Direct GMV"
-    # When indirect GMV is tracked separately (Blinkit only), the ROAS
-    # numerator sums direct + indirect — both are attributed revenue and
-    # excluding the halo understates ad efficiency. ACOS still uses
-    # `gmv_field` alone (= direct), so ACOS is no longer the exact inverse
-    # of ROAS for Blinkit — this is intentional. The other QC platforms
-    # don't expose an indirect column, so their ROAS is unchanged.
+    # The Direct/Indirect GMV columns are no longer surfaced in the ads
+    # dashboard — they're replaced by "Sale Basic Rate" (total_sale_basic_rate =
+    # basic_rate × direct_qty_sold, computed in the *_ads_master views). ROAS and
+    # ACOS still derive from the underlying GMV columns (kept in the views): when
+    # indirect GMV is tracked separately (Blinkit only), the ROAS numerator sums
+    # direct + indirect; ACOS uses `gmv_field` (direct) alone.
     roas_numerator = (
         f"(COALESCE(SUM({gmv_field}), 0) + COALESCE(SUM(indirect_gmv), 0))"
         if include_indirect_gmv
@@ -4593,8 +4592,8 @@ def _quick_commerce_metrics(*, gmv_field: str, include_indirect_qty: bool, inclu
     specs = [
         {"key": "ad_spent",        "label": "Ad spent",        "format": "inr",     "agg": "sum",
          "expr": "COALESCE(SUM(ad_spent), 0)"},
-        {"key": "gmv",             "label": gmv_label,         "format": "inr",     "agg": "sum",
-         "expr": f"COALESCE(SUM({gmv_field}), 0)"},
+        {"key": "total_sale_basic_rate", "label": "Sale Basic Rate", "format": "inr", "agg": "sum",
+         "expr": "COALESCE(SUM(total_sale_basic_rate), 0)"},
         {"key": "roas",            "label": "ROAS",            "format": "ratio",   "agg": "avg",
          "expr": f"CASE WHEN COALESCE(SUM(ad_spent), 0) > 0 "
                  f"THEN {roas_numerator}::numeric / SUM(ad_spent) "
@@ -4611,17 +4610,14 @@ def _quick_commerce_metrics(*, gmv_field: str, include_indirect_qty: bool, inclu
     if include_indirect_qty:
         specs.append({"key": "indirect_qty_sold", "label": "Indirect qty sold", "format": "count", "agg": "sum",
                       "expr": "COALESCE(SUM(indirect_qty_sold), 0)"})
-    if include_indirect_gmv:
-        specs.append({"key": "indirect_gmv", "label": "Indirect GMV", "format": "inr", "agg": "sum",
-                      "expr": "COALESCE(SUM(indirect_gmv), 0)"})
     specs.append({"key": "ads_ltr_sold", "label": "Ads litres sold", "format": "litres", "agg": "sum",
                   "expr": "COALESCE(SUM(ads_ltr_sold), 0)"})
     return specs
 
 
-_QC_DEFAULT_METRIC_KEYS = ["ad_spent", "gmv", "roas", "acos"]
+_QC_DEFAULT_METRIC_KEYS = ["ad_spent", "total_sale_basic_rate", "roas", "acos"]
 _QC_DEFAULT_VISIBLE_COLUMNS = [
-    "impressions", "ad_spent", "direct_qty_sold", "gmv", "ads_ltr_sold", "roas", "acos",
+    "impressions", "ad_spent", "direct_qty_sold", "total_sale_basic_rate", "ads_ltr_sold", "roas", "acos",
 ]
 
 
@@ -4645,7 +4641,7 @@ def swiggy_ads_dashboard(request, slug: str):
         default_metric_keys=_QC_DEFAULT_METRIC_KEYS,
         default_visible_columns=_QC_DEFAULT_VISIBLE_COLUMNS,
         spend_metric="ad_spent",
-        revenue_metric="gmv",
+        revenue_metric="total_sale_basic_rate",
         where_sql=where_sql,
         params=params,
         trend_where_sql=trend_where_sql,
@@ -4672,7 +4668,7 @@ def zepto_ads_dashboard(request, slug: str):
         default_metric_keys=_QC_DEFAULT_METRIC_KEYS,
         default_visible_columns=_QC_DEFAULT_VISIBLE_COLUMNS,
         spend_metric="ad_spent",
-        revenue_metric="gmv",
+        revenue_metric="total_sale_basic_rate",
         where_sql=where_sql,
         params=params,
         trend_where_sql=trend_where_sql,
@@ -4704,7 +4700,7 @@ def bigbasket_ads_dashboard(request, slug: str):
         default_metric_keys=_QC_DEFAULT_METRIC_KEYS,
         default_visible_columns=_QC_DEFAULT_VISIBLE_COLUMNS,
         spend_metric="ad_spent",
-        revenue_metric="gmv",
+        revenue_metric="total_sale_basic_rate",
         where_sql=where_sql,
         params=params,
         trend_where_sql=trend_where_sql,
@@ -4736,7 +4732,7 @@ def swiggy_ads_daily_dashboard(request, slug: str):
         default_metric_keys=_QC_DEFAULT_METRIC_KEYS,
         default_visible_columns=_QC_DEFAULT_VISIBLE_COLUMNS,
         spend_metric="ad_spent",
-        revenue_metric="gmv",
+        revenue_metric="total_sale_basic_rate",
         where_sql=where_sql,
         params=params,
         trend_where_sql=trend_where_sql,
@@ -4763,7 +4759,7 @@ def zepto_ads_daily_dashboard(request, slug: str):
         default_metric_keys=_QC_DEFAULT_METRIC_KEYS,
         default_visible_columns=_QC_DEFAULT_VISIBLE_COLUMNS,
         spend_metric="ad_spent",
-        revenue_metric="gmv",
+        revenue_metric="total_sale_basic_rate",
         where_sql=where_sql,
         params=params,
         trend_where_sql=trend_where_sql,
@@ -4790,7 +4786,7 @@ def bigbasket_ads_daily_dashboard(request, slug: str):
         default_metric_keys=_QC_DEFAULT_METRIC_KEYS,
         default_visible_columns=_QC_DEFAULT_VISIBLE_COLUMNS,
         spend_metric="ad_spent",
-        revenue_metric="gmv",
+        revenue_metric="total_sale_basic_rate",
         where_sql=where_sql,
         params=params,
         trend_where_sql=trend_where_sql,
@@ -4830,9 +4826,9 @@ def blinkit_ads_dashboard(request, slug: str):
         # blinkit_ads_master has both `direct_gmv` and `indirect_gmv` — keep them separate.
         metric_specs=_quick_commerce_metrics(gmv_field="direct_gmv", include_indirect_qty=True, include_indirect_gmv=True),
         default_metric_keys=_QC_DEFAULT_METRIC_KEYS,
-        default_visible_columns=[*_QC_DEFAULT_VISIBLE_COLUMNS, "indirect_gmv", "indirect_qty_sold"],
+        default_visible_columns=[*_QC_DEFAULT_VISIBLE_COLUMNS, "indirect_qty_sold"],
         spend_metric="ad_spent",
-        revenue_metric="gmv",
+        revenue_metric="total_sale_basic_rate",
         where_sql=where_sql,
         params=params,
         trend_where_sql=trend_where_sql,
