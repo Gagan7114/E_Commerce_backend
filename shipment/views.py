@@ -2319,6 +2319,23 @@ class AppointmentExtraPosView(_SafeAPIView):
             """, [fc, sorted(own_pos)])
             raw = _row_to_dict(cur, cur.fetchall())
 
+        # Enrich each SKU with live DOH (the same rolling-window snapshot the
+        # planner uses) so the picker can show a DOH column.
+        doh_by_asin, _ = _live_doh_by_asin()
+        for r in raw:
+            skus = r.get('skus')
+            if isinstance(skus, str):
+                try:
+                    skus = json.loads(skus)
+                except (ValueError, TypeError):
+                    skus = []
+                r['skus'] = skus
+            for sk in (skus or []):
+                a = str(sk.get('asin') or '').strip().upper()
+                live = doh_by_asin.get(a) if doh_by_asin else None
+                sk['doh'] = (round(float(live['doh']), 1)
+                             if live and live.get('doh') is not None else None)
+
         return Response({
             'fc': fc,
             'count': len(raw),
