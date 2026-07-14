@@ -4455,14 +4455,14 @@ class SapInventoryView(_SafeAPIView):
     """Live SAP HANA finished-goods stock for the Shipment Planner inventory page.
 
     Two modes, chosen by the ``?warehouse=`` query param:
-      - a specific code (BH-FGM / DL-EC / BH-EC) → just that warehouse
+      - a specific code (BH-FGM / GP-FG / BH-EC) → just that warehouse
       - ``ALL`` → every warehouse below, merged into one sheet. Each row already
         carries its own WhsCode / WhsName, so the UI shows a warehouse column.
 
     The warehouses live in two different company DBs, so each is queried in its
     own schema (see WAREHOUSE_SOURCES):
       - BH-FGM → mart · "Jivo Mart"     (Sonipat finished goods)
-      - DL-EC  → mart · "Jivo Wellness" (Mayapuri E-Commerce)
+      - GP-FG  → oil  · "Gupta Godown Basement Finished Godown"
       - BH-EC  → oil  · "Bhakharpur Finished E-Commerce"
     Read-only; scoped to FINISHED item group + Active items (enforced in SQL).
     Unknown / missing warehouse falls back to the default, BH-FGM."""
@@ -4472,7 +4472,7 @@ class SapInventoryView(_SafeAPIView):
     # for the combined ALL view. Add a warehouse in exactly one place: here.
     WAREHOUSE_SOURCES = (
         ('BH-FGM', 'mart'),
-        ('DL-EC',  'mart'),
+        ('GP-FG',  'oil'),
         ('BH-EC',  'oil'),
     )
     ALLOWED_WHS = tuple(code for code, _src in WAREHOUSE_SOURCES)
