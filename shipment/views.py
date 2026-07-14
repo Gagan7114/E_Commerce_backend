@@ -1056,6 +1056,19 @@ def _stock_snapshot_meta():
     return at, (time.time() - at) >= _STOCK_TTL
 
 
+def _stock_meta_payload(stock_detail):
+    """Response payload describing the live-stock snapshot's freshness, so the UI can
+    flag a plan built on CACHED stock (SAP was briefly unreachable) or on NO stock at
+    all (SAP down before any snapshot). ``stale`` / ``unavailable`` drive the banner."""
+    at, stale = _stock_snapshot_meta()
+    return {
+        'as_of': at,                                    # epoch seconds, or None
+        'age_seconds': (time.time() - at) if at else None,
+        'stale': bool(stale),
+        'unavailable': not stock_detail,                # couldn't verify any stock
+    }
+
+
 def _bh_fgm_stock_detail():
     """ASIN (upper) → {'onhand', 'onorder', 'source_warehouse', 'sources'}.
 
@@ -2250,6 +2263,7 @@ class AppointmentItemsView(_SafeAPIView):
             'appointments_meta': appointments_meta,
             'primary_appointment_id': primary_appt_id,
             'doh_snapshot': doh_meta,
+            'stock_snapshot': _stock_meta_payload(stock_detail),
             'priority_strict': priority_strict,
             'maximize_fill': maximize_fill,
             'filler_count': filler_count,
@@ -3722,6 +3736,7 @@ class ManualPlanView(_SafeAPIView):
             'commit_caps': commit_caps,
             'appointment_commit': appt_cap,
             'respect_stock': respect_stock,
+            'stock_snapshot': _stock_meta_payload(stock_detail),
             'load_summary': {
                 'truck_size': truck_size,
                 'capacity': capacity,
