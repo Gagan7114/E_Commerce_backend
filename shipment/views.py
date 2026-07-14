@@ -2539,6 +2539,53 @@ class ShipmentListCreateView(_SafeAPIView):
                             status=409,
                         )
 
+            # Live-stock re-check (fix #1 — same physical stock double-committed).
+            # The plan was stock-capped when generated, but another plan may have
+            # claimed some of the same stock since. Inside the advisory lock, reject
+            # if any ASIN's total in THIS plan, plus what OTHER active shipments
+            # already reserve, exceeds live pooled on-hand. Skipped only when live
+            # stock is entirely unverifiable (SAP down + no snapshot) so an outage
+            # doesn't block every save — matching the "serve stale, keep working"
+            # policy. Serialized by the lock, so two concurrent saves can't both pass.
+            if loaded_items:
+                _save_stock = _bh_fgm_stock_detail()
+                if _save_stock:
+                    _reserved_other = _reserved_stock_by_asin()   # excludes this unsaved plan
+                    _plan_by_asin = {}
+                    for it in loaded_items:
+                        a = str(it.get('asin') or '').strip().upper()
+                        if a:
+                            _plan_by_asin[a] = _plan_by_asin.get(a, 0.0) + float(it.get('planned_qty') or 0)
+                    stock_conflicts = []
+                    for a, want in _plan_by_asin.items():
+                        if want <= 1e-6:
+                            continue
+                        d = _save_stock.get(a)
+                        onhand = float(d['onhand']) if d else 0.0
+                        reserved = float(_reserved_other.get(a, 0.0))
+                        available = onhand - reserved
+                        if want > available + 1e-6:
+                            stock_conflicts.append({
+                                'asin': a,
+                                'wanted': round(want, 2),
+                                'on_hand': round(onhand, 2),
+                                'reserved_elsewhere': round(reserved, 2),
+                                'available': round(max(0.0, available), 2),
+                            })
+                    if stock_conflicts:
+                        return Response(
+                            {
+                                'error': 'Not enough live stock to save this plan',
+                                'stock_conflicts': stock_conflicts,
+                                'detail': (
+                                    f'{len(stock_conflicts)} item(s) exceed available warehouse '
+                                    'stock — another plan may have claimed it since this plan was '
+                                    'generated. Refresh the plan and try again.'
+                                ),
+                            },
+                            status=409,
+                        )
+
             # Appointment-commitment guard (units + cartons). Aggregate across ALL
             # active shipments for this appointment (this new one included) and reject
             # if the total would breach the Vendor Central commit (+7%). Serialized by
