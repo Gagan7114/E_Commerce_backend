@@ -3089,6 +3089,32 @@ def _check_qty_conflicts(shipment):
                 'locked_shipment_ids': c['ids'],
             })
 
+    # Live-stock re-check (fix #1 at submit / approve — the last gate before dispatch).
+    # For each ASIN this shipment ships, the TOTAL reserved across ALL active shipments
+    # (this one included) must not exceed live pooled on-hand. Catches drafts that each
+    # fit their own PO but together over-commit the same physical stock. Skipped only
+    # when live stock is unverifiable (SAP down), matching the Save-time gate.
+    _stock = _bh_fgm_stock_detail()
+    if _stock and loaded_items:
+        _reserved = _reserved_stock_by_asin()   # every active shipment, incl this one
+        _seen = set()
+        for item in loaded_items:
+            a = (item.asin or '').strip().upper()
+            if not a or a in _seen:
+                continue
+            _seen.add(a)
+            d = _stock.get(a)
+            onhand = float(d['onhand']) if d else 0.0
+            total_reserved = float(_reserved.get(a, 0.0))
+            if total_reserved > onhand + 1e-6:
+                conflicts.append({
+                    'reason': 'stock_over_committed',
+                    'asin': a,
+                    'on_hand': round(onhand, 2),
+                    'total_reserved': round(total_reserved, 2),
+                    'over_by': round(total_reserved - onhand, 2),
+                })
+
     # Appointment-commitment guard: the total committed across all active shipments
     # for this appointment must stay within the Vendor Central commit (+7%). Catches
     # over-commit that per-line (ASIN, PO, FC) checks miss (e.g. two shipments that
