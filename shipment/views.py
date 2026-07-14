@@ -2474,11 +2474,28 @@ class ShipmentListCreateView(_SafeAPIView):
                 # would exceed what Amazon ordered (a real over-commit). Serialized by
                 # the advisory lock above, so two concurrent saves can't both slip past.
                 new_by_key = {}
+                invalid_lines = []   # fix #4: loaded lines with a blank PO / ASIN
                 for it in loaded_items:
+                    q = float(it.get('planned_qty') or 0)
                     a = str(it.get('asin') or '').strip().upper()
                     p = str(it.get('po_number') or '').strip().upper()
+                    if q > 1e-6 and (not a or not p):
+                        invalid_lines.append({'asin': a or None, 'po_number': p or None, 'planned_qty': q})
                     if a and p:
-                        new_by_key[(a, p)] = new_by_key.get((a, p), 0.0) + float(it.get('planned_qty') or 0)
+                        new_by_key[(a, p)] = new_by_key.get((a, p), 0.0) + q
+                if invalid_lines:
+                    return Response(
+                        {
+                            'error': 'Loaded lines with a blank PO or ASIN',
+                            'invalid_lines': invalid_lines,
+                            'detail': (
+                                f'{len(invalid_lines)} loaded line(s) have a blank PO or ASIN and '
+                                'cannot be validated against the Amazon PO list. Refresh the plan '
+                                'and try again.'
+                            ),
+                        },
+                        status=409,
+                    )
                 if new_by_key:
                     po_uppers = list({p for (_a, p) in new_by_key})
                     committed_map, ordered_map, ship_map = {}, {}, {}
@@ -2513,6 +2530,26 @@ class ShipmentListCreateView(_SafeAPIView):
                         for a, p, q in _claim_cur.fetchall():
                             if q is not None:
                                 ordered_map[(a, p)] = float(q)
+                    # fix #4: every loaded line must reference a real Amazon PO, else
+                    # its ordered qty can't be verified and it could bypass the cap.
+                    unknown_po = [
+                        {'asin': a, 'po_number': p}
+                        for (a, p), nq in new_by_key.items()
+                        if nq > 1e-6 and (a, p) not in ordered_map
+                    ]
+                    if unknown_po:
+                        return Response(
+                            {
+                                'error': 'Loaded lines reference an unknown PO',
+                                'unknown_po_lines': unknown_po,
+                                'detail': (
+                                    f'{len(unknown_po)} loaded line(s) reference a (PO, ASIN) not '
+                                    'found in the Amazon PO list, so the ordered quantity cannot be '
+                                    'verified. Refresh the plan and try again.'
+                                ),
+                            },
+                            status=409,
+                        )
                     conflicts = []
                     for (a, p), new_qty in new_by_key.items():
                         existing = committed_map.get((a, p), 0.0)
