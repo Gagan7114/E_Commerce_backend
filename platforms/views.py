@@ -10854,7 +10854,8 @@ def _blinkit_drr_dashboard_response(request):
         SELECT
             "date"::date AS sale_date,
             COALESCE(SUM("sales_amt_exc"), 0) AS ops,
-            COALESCE(SUM("ltr_sold"), 0) AS ltr
+            COALESCE(SUM("ltr_sold"), 0) AS ltr,
+            COALESCE(SUM("quantity"), 0) AS units
         FROM secmaster_mv
         WHERE REGEXP_REPLACE(LOWER(TRIM("format"::text)), '[^a-z0-9]+', '', 'g') = 'blinkit'
           AND UPPER(TRIM("month"::text)) = %s
@@ -10877,6 +10878,7 @@ def _blinkit_drr_dashboard_response(request):
             "day": day,
             "ops": _num(row.get("ops")),
             "ltr": _num(row.get("ltr")),
+            "units": _num(row.get("units")),
         })
 
     item_rows = _dict_rows(
@@ -10900,17 +10902,32 @@ def _blinkit_drr_dashboard_response(request):
                 UPPER(TRIM(COALESCE(item::text, ''))) AS item_key,
                 MIN(NULLIF(TRIM(item::text), '')) AS inventory_item,
                 COALESCE(MIN(NULLIF(UPPER(TRIM(item_head::text)), '')), 'OTHER') AS inventory_item_head,
+                MIN(NULLIF(TRIM(category::text), '')) AS category,
+                MIN(NULLIF(TRIM(sub_category::text), '')) AS sub_category,
                 COALESCE(SUM(soh_unit), 0)::numeric AS cur_day_soh_units,
                 COALESCE(SUM(soh_ltr), 0)::numeric AS cur_day_soh_ltr
             FROM all_platform_inventory
             WHERE format = 'BLINKIT'
               AND inventory_date = %s
             GROUP BY UPPER(TRIM(COALESCE(item::text, '')))
+        ),
+        -- Category / sub-category per item across ALL inventory dates, so items
+        -- that sold but have no stock on the effective date still get grouped.
+        catmap AS (
+            SELECT
+                UPPER(TRIM(COALESCE(item::text, ''))) AS item_key,
+                MIN(NULLIF(TRIM(category::text), '')) AS category,
+                MIN(NULLIF(TRIM(sub_category::text), '')) AS sub_category
+            FROM all_platform_inventory
+            WHERE format = 'BLINKIT'
+            GROUP BY UPPER(TRIM(COALESCE(item::text, '')))
         )
         SELECT
             COALESCE(NULLIF(s.item_head, ''), NULLIF(i.inventory_item_head, ''), 'OTHER') AS item_head,
             COALESCE(NULLIF(s.product, ''), NULLIF(i.inventory_item, '')) AS product,
             i.inventory_item,
+            COALESCE(NULLIF(i.category, ''), NULLIF(cm.category, '')) AS category,
+            COALESCE(NULLIF(i.sub_category, ''), NULLIF(cm.sub_category, '')) AS sub_category,
             COALESCE(s.qty, 0) AS qty,
             COALESCE(s.ltr, 0) AS ltr,
             COALESCE(s.value, 0) AS value,
@@ -10919,6 +10936,8 @@ def _blinkit_drr_dashboard_response(request):
         FROM sales s
         FULL OUTER JOIN inventory i
           ON s.item_key = i.item_key
+        LEFT JOIN catmap cm
+          ON cm.item_key = COALESCE(s.item_key, i.item_key)
         WHERE COALESCE(s.item_key, i.item_key) <> ''
         ORDER BY
             CASE COALESCE(NULLIF(s.item_head, ''), NULLIF(i.inventory_item_head, ''), 'OTHER')
@@ -10953,6 +10972,8 @@ def _blinkit_drr_dashboard_response(request):
             "product": product,
             "item": product,
             "inventory_item": row.get("inventory_item") or "",
+            "category": row.get("category") or "",
+            "sub_category": row.get("sub_category") or "",
             "qty": qty,
             "ltr": ltr,
             "liters": ltr,
@@ -11110,7 +11131,8 @@ def _inventory_drr_dashboard_response(request, slug: str):
         SELECT
             {sale_date_expr} AS sale_date,
             COALESCE(SUM("sales_amt_exc"), 0) AS ops,
-            COALESCE(SUM("ltr_sold"), 0) AS ltr
+            COALESCE(SUM("ltr_sold"), 0) AS ltr,
+            COALESCE(SUM("quantity"), 0) AS units
         FROM secmaster_mv
         WHERE REGEXP_REPLACE(LOWER(TRIM("format"::text)), '[^a-z0-9]+', '', 'g') = %s
           AND UPPER(TRIM("month"::text)) = %s
@@ -11134,6 +11156,7 @@ def _inventory_drr_dashboard_response(request, slug: str):
             "day": day,
             "ops": _num(row.get("ops")),
             "ltr": _num(row.get("ltr")),
+            "units": _num(row.get("units")),
         })
 
     item_rows = _dict_rows(
@@ -11157,17 +11180,32 @@ def _inventory_drr_dashboard_response(request, slug: str):
                 UPPER(TRIM(COALESCE(item::text, ''))) AS item_key,
                 MIN(NULLIF(TRIM(item::text), '')) AS inventory_item,
                 COALESCE(MIN(NULLIF(UPPER(TRIM(item_head::text)), '')), 'OTHER') AS inventory_item_head,
+                MIN(NULLIF(TRIM(category::text), '')) AS category,
+                MIN(NULLIF(TRIM(sub_category::text), '')) AS sub_category,
                 COALESCE(SUM(soh_unit), 0)::numeric AS cur_day_soh_units,
                 COALESCE(SUM(soh_ltr), 0)::numeric AS cur_day_soh_ltr
             FROM all_platform_inventory
             WHERE UPPER(TRIM(format::text)) = %s
               AND inventory_date = %s
             GROUP BY UPPER(TRIM(COALESCE(item::text, '')))
+        ),
+        -- Category / sub-category per item across ALL inventory dates, so items
+        -- that sold but have no stock on the effective date still get grouped.
+        catmap AS (
+            SELECT
+                UPPER(TRIM(COALESCE(item::text, ''))) AS item_key,
+                MIN(NULLIF(TRIM(category::text), '')) AS category,
+                MIN(NULLIF(TRIM(sub_category::text), '')) AS sub_category
+            FROM all_platform_inventory
+            WHERE UPPER(TRIM(format::text)) = %s
+            GROUP BY UPPER(TRIM(COALESCE(item::text, '')))
         )
         SELECT
             COALESCE(NULLIF(s.item_head, ''), NULLIF(i.inventory_item_head, ''), 'OTHER') AS item_head,
             COALESCE(NULLIF(s.product, ''), NULLIF(i.inventory_item, '')) AS product,
             i.inventory_item,
+            COALESCE(NULLIF(i.category, ''), NULLIF(cm.category, '')) AS category,
+            COALESCE(NULLIF(i.sub_category, ''), NULLIF(cm.sub_category, '')) AS sub_category,
             COALESCE(s.qty, 0) AS qty,
             COALESCE(s.ltr, 0) AS ltr,
             COALESCE(s.value, 0) AS value,
@@ -11176,6 +11214,8 @@ def _inventory_drr_dashboard_response(request, slug: str):
         FROM sales s
         FULL OUTER JOIN inventory i
           ON s.item_key = i.item_key
+        LEFT JOIN catmap cm
+          ON cm.item_key = COALESCE(s.item_key, i.item_key)
         WHERE COALESCE(s.item_key, i.item_key) <> ''
         ORDER BY
             CASE COALESCE(NULLIF(s.item_head, ''), NULLIF(i.inventory_item_head, ''), 'OTHER')
@@ -11186,7 +11226,7 @@ def _inventory_drr_dashboard_response(request, slug: str):
             END,
             COALESCE(NULLIF(s.product, ''), NULLIF(i.inventory_item, '')) ASC NULLS LAST
         """,
-        [sales_format, month_start, max_date, inventory_format, inventory_effective_date],
+        [sales_format, month_start, max_date, inventory_format, inventory_effective_date, inventory_format],
     )
 
     items = []
@@ -11210,6 +11250,8 @@ def _inventory_drr_dashboard_response(request, slug: str):
             "product": product,
             "item": product,
             "inventory_item": row.get("inventory_item") or "",
+            "category": row.get("category") or "",
+            "sub_category": row.get("sub_category") or "",
             "qty": qty,
             "ltr": ltr,
             "liters": ltr,
