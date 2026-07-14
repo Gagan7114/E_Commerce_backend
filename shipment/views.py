@@ -2623,17 +2623,30 @@ class ShipmentListCreateView(_SafeAPIView):
                             status=409,
                         )
 
-            # Appointment-commitment guard (units + cartons). Aggregate across ALL
-            # active shipments for this appointment (this new one included) and reject
-            # if the total would breach the Vendor Central commit (+7%). Serialized by
-            # the advisory lock above, so two concurrent saves can't both pass. Applies
-            # to auto + manual alike; no-op when the appointment has no commit on file.
-            if appointment_id and loaded_items:
-                appt_cap = _lookup_appointment_commit(appointment_id)
-                if appt_cap:
-                    new_u = sum(float(it.get('planned_qty') or 0) for it in loaded_items)
-                    new_c = sum(float(it.get('planned_qty') or 0)
-                                / max(float(it.get('case_pack') or 1), 1.0) for it in loaded_items)
+            # Appointment-commitment guard (units + cartons), PER appointment on the
+            # truck (fix #3). Each loaded line is attributed to its SOURCE appointment
+            # (source_appointment_id; fillers / extras with none fall to the primary),
+            # so a combined truck can no longer over-commit a secondary appointment
+            # whose figures were previously invisible. For each appointment that has a
+            # commit, the total across ALL active shipments' items tagged to it (this
+            # plan included) must stay within the Vendor Central commit (+7%).
+            # Serialized by the advisory lock; no-op when an appointment has no commit.
+            if loaded_items:
+                add_by_appt = {}
+                for it in loaded_items:
+                    aid = str(it.get('source_appointment_id') or appointment_id or '').strip()
+                    if not aid:
+                        continue
+                    q = float(it.get('planned_qty') or 0)
+                    cp = max(float(it.get('case_pack') or 1), 1.0)
+                    slot = add_by_appt.setdefault(aid, {'u': 0.0, 'c': 0.0})
+                    slot['u'] += q
+                    slot['c'] += q / cp
+                over_commit = []
+                for aid, add in add_by_appt.items():
+                    cap = _lookup_appointment_commit(aid)
+                    if not cap:
+                        continue
                     with connection.cursor() as _agg_cur:
                         _agg_cur.execute(
                             """
@@ -2644,28 +2657,31 @@ class ShipmentListCreateView(_SafeAPIView):
                             JOIN sp_shipments s ON s.id = si.shipment_id
                             WHERE si.not_loaded = FALSE
                               AND s.status != 'rejected'
-                              AND TRIM(s.appointment_id) = %s
+                              AND TRIM(si.appointment_id) = %s
                             """,
-                            [appointment_id],
+                            [aid],
                         )
                         _row = _agg_cur.fetchone()
                     exist_u = float(_row[0] or 0)
                     exist_c = float(_row[1] or 0)
-                    cap_u = appt_cap['units'] * CAP_TOLERANCE if appt_cap['units'] > 0 else float('inf')
-                    cap_c = appt_cap['cartons'] * CAP_TOLERANCE if appt_cap['cartons'] > 0 else float('inf')
-                    if (exist_u + new_u) > cap_u + 1e-6 or (exist_c + new_c) > cap_c + 1e-6:
-                        return Response(
-                            {
-                                'error': 'Exceeds the appointment commitment',
-                                'detail': (
-                                    f'Appointment {appointment_id} commit is '
-                                    f'{int(appt_cap["units"])} units / {int(appt_cap["cartons"])} cartons (+7% allowed). '
-                                    f'Active shipments already use {int(round(exist_u))} units / {int(round(exist_c))} cartons; '
-                                    f'this plan adds {int(round(new_u))} units / {int(round(new_c))} cartons.'
-                                ),
-                            },
-                            status=409,
+                    cap_u = cap['units'] * CAP_TOLERANCE if cap['units'] > 0 else float('inf')
+                    cap_c = cap['cartons'] * CAP_TOLERANCE if cap['cartons'] > 0 else float('inf')
+                    if (exist_u + add['u']) > cap_u + 1e-6 or (exist_c + add['c']) > cap_c + 1e-6:
+                        over_commit.append(
+                            f'appointment {aid} commit {int(cap["units"])} units / '
+                            f'{int(cap["cartons"])} cartons (+7%): already {int(round(exist_u))} units / '
+                            f'{int(round(exist_c))} cartons, this plan adds {int(round(add["u"]))} units / '
+                            f'{int(round(add["c"]))} cartons'
                         )
+                if over_commit:
+                    return Response(
+                        {
+                            'error': 'Exceeds the appointment commitment',
+                            'detail': ('One or more appointments would exceed their Vendor Central '
+                                       'commit — ' + '; '.join(over_commit) + '.'),
+                        },
+                        status=409,
+                    )
 
             shipment = Shipment.objects.create(
                 appointment_id=appointment_id or '',
@@ -2717,7 +2733,10 @@ class ShipmentListCreateView(_SafeAPIView):
                         expiry_date_val = None
                 return ShipmentItem(
                     shipment=shipment,
-                    appointment_id=appointment_id or '',
+                    # Fix #3: tag each line with its SOURCE appointment (not just the
+                    # truck's primary) so per-appointment commit accounting is correct
+                    # on combined trucks. Fillers/extras with no source fall to primary.
+                    appointment_id=str(item_data.get('source_appointment_id') or appointment_id or ''),
                     po_number=item_data.get('po_number') or '',
                     asin=item_data.get('asin') or '',
                     internal_sku=item_data.get('internal_sku') or item_data.get('merchant_sku') or '',
