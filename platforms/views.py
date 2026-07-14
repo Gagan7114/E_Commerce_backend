@@ -3808,6 +3808,11 @@ def _ads_dashboard_payload(
     summary_use_max_date: bool = False,
     date_wise: bool = False,
     month_wise: bool = False,
+    # Per-row Total Sales (secondary shipped/ordered value attributed to each
+    # dimension value). When provided, injected onto every breakdown row + the
+    # summary so the frontend uses the real number instead of its name-matcher.
+    row_total_sales: dict | None = None,
+    summary_total_sales: float | None = None,
 ) -> dict:
     # Comma-separated "expr AS \"key\"" for the SELECT list.
     metric_select_sql = ", ".join(
@@ -3979,6 +3984,23 @@ def _ads_dashboard_payload(
             [],
         )
     ]
+
+    # Attach per-row Total Sales (only for the plain breakdown — date/month-wise
+    # rows keep the frontend's own per-day/per-month matching).
+    #
+    # Only set the field where the ASIN attribution actually found sales (> 0).
+    # For a row it couldn't attribute (advertised by SKU not ASIN, or ASINs with
+    # no secondary rows), we deliberately LEAVE THE FIELD ABSENT so the frontend
+    # falls back to its own name-matcher — forcing a 0 here would suppress that
+    # fallback and strand a real product at ₹0. Non-product buckets (Testing
+    # Campaign, (Unassigned), …) name-match to 0 too, so they stay 0 either way.
+    if row_total_sales is not None and not date_wise and not month_wise:
+        for r in breakdown_rows:
+            val = float(row_total_sales.get(r.get("dimension"), 0.0) or 0.0)
+            if val > 0:
+                r["total_sales"] = val
+        if summary_total_sales:
+            summary["total_sales"] = float(summary_total_sales)
 
     return {
         "source": source,
@@ -4176,6 +4198,88 @@ _AMAZON_METRIC_SPECS = [
 ]
 
 
+def _amazon_ads_row_total_sales(request, where_sql, params, dimension_key, dimension_unmapped):
+    """Per-dimension **Total Sales** for the Amazon Ads dashboard.
+
+    Attribution is by ASIN, not by name: each portfolio / campaign advertises a
+    set of ASINs (`advertised_product_id` in `amazon_ads_master`); we sum the
+    secondary shipped/ordered value of exactly those ASINs. This is deterministic
+    and fixes the fragile name-matcher's zeros (e.g. "Soyabean Oil" whose name
+    doesn't token-match the secondary spelling).
+
+    Secondary scoping mirrors `amazon_ads_total_sales` (same month/year + optional
+    from/to on `to_date`, same `metric` → ordered_revenue / shipped_revenue_2), so
+    the number stays consistent with the Total Sales metric switch.
+
+    Returns `(by_dimension, platform_total)`, or `(None, None)` when it can't be
+    computed — the caller then omits the field and the frontend falls back to its
+    own matching, so a failure here never makes the dashboard worse.
+    """
+    metric = str(request.query_params.get("metric") or "ordered").strip().lower()
+    value_col = {"ordered": "ordered_revenue", "shipped": "shipped_revenue_2"}.get(
+        metric, "ordered_revenue"
+    )
+    month, year, _defaulted = _parse_sec_month_year(
+        request.query_params, latest_source="amazon_sec_daily_master_view"
+    )
+    month_name = _month_name(month)
+
+    def _date_param(key):
+        raw = str(request.query_params.get(key) or "").strip()
+        return raw if re.fullmatch(r"\d{4}-\d{2}-\d{2}", raw) else None
+
+    from_date = _date_param("from_date")
+    to_date = _date_param("to_date")
+
+    sec_where = 'WHERE UPPER(TRIM("month"::text)) = %s AND "year" = %s'
+    sec_params = [month_name, year]
+    if from_date and to_date:
+        sec_where += ' AND "to_date"::date BETWEEN %s AND %s'
+        sec_params += [from_date, to_date]
+    elif from_date or to_date:
+        sec_where += ' AND "to_date"::date = %s'
+        sec_params += [from_date or to_date]
+
+    # ASIN → secondary sales for the selected period.
+    sec_rows = _dict_rows(
+        f'SELECT UPPER(TRIM("asin"::text)) AS asin, '
+        f'COALESCE(SUM("{value_col}"), 0) AS val '
+        f'FROM "amazon_sec_daily_master_view" {sec_where} '
+        f'GROUP BY UPPER(TRIM("asin"::text))',
+        sec_params,
+    )
+    sales_by_asin = {
+        r["asin"]: float(r.get("val") or 0)
+        for r in sec_rows
+        if r.get("asin")
+    }
+    if not sales_by_asin:
+        return None, None
+    platform_total = float(sum(sales_by_asin.values()))
+
+    # dimension value → the ASINs it advertised in the SAME period as the breakdown
+    # (reuse the ads `where_sql`, and the same unmapped placeholder as the rows).
+    unmapped_lit = "'" + str(dimension_unmapped).replace("'", "''") + "'"
+    dim_expr = f"COALESCE(NULLIF(TRIM({dimension_key}::text), ''), {unmapped_lit})"
+    map_rows = _dict_rows(
+        f'SELECT {dim_expr} AS dimension, '
+        f'UPPER(TRIM("advertised_product_id"::text)) AS asin '
+        f"FROM amazon_ads_master {where_sql} "
+        f'GROUP BY {dim_expr}, UPPER(TRIM("advertised_product_id"::text))',
+        params,
+    )
+    by_dim: dict[str, float] = {}
+    for r in map_rows:
+        dim = r.get("dimension")
+        if dim is None:
+            continue
+        by_dim.setdefault(dim, 0.0)
+        asin = r.get("asin")
+        if asin and asin in sales_by_asin:
+            by_dim[dim] += sales_by_asin[asin]
+    return by_dim, platform_total
+
+
 @api_view(["GET"])
 @permission_classes([require("platform.stats.view")])
 @cached_get(timeout=60, prefix="plat.amazon_ads")
@@ -4207,6 +4311,20 @@ def amazon_ads_dashboard(request, slug: str):
     ).strip().lower() in ("1", "true", "yes")
 
     where_sql, params, trend_where_sql, trend_params, filters = _ads_build_where(request, allow_date=True)
+
+    # Real per-row Total Sales, attributed via each dimension's ASINs → secondary
+    # sales. Only for the plain breakdown; date/month-wise keep the frontend's own
+    # per-day/per-month matching. Best-effort: any failure leaves the field absent
+    # and the frontend falls back to its name-matcher (never worse than before).
+    row_total_sales = summary_total_sales = None
+    if not date_wise and not month_wise:
+        try:
+            row_total_sales, summary_total_sales = _amazon_ads_row_total_sales(
+                request, where_sql, params, dimension_key, "(Unassigned)"
+            )
+        except Exception:
+            row_total_sales = summary_total_sales = None
+
     return Response(_ads_dashboard_payload(
         source="amazon_ads_master",
         date_wise=date_wise,
@@ -4230,6 +4348,8 @@ def amazon_ads_dashboard(request, slug: str):
         trend_where_sql=trend_where_sql,
         trend_params=trend_params,
         filters=filters,
+        row_total_sales=row_total_sales,
+        summary_total_sales=summary_total_sales,
     ))
 
 
