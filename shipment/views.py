@@ -4452,80 +4452,88 @@ _SAP_INV_TTL = 60  # seconds — full-warehouse SAP read; the inventory page
 
 
 class SapInventoryView(_SafeAPIView):
-    """Live SAP HANA finished-goods stock for a single warehouse, surfaced inside
-    the Shipment Planner. Read-only; queried live each request from the
-    JIVO_MART_HANADB (Mart) schema (OITM × OITW × OWHS × OITB).
+    """Live SAP HANA finished-goods stock for the Shipment Planner inventory page.
 
-    The warehouse is chosen by the ``?warehouse=`` query param, restricted to an
-    allow-list so a caller can't probe arbitrary warehouses:
-      - BH-FGM  → "Jivo Mart Inventory"    (Sonipat)
-      - DL-EC   → "Jivo Wellness Inventory" (Mayapuri E-Commerce)
-    Anything else (or missing) falls back to the default, BH-FGM."""
+    Two modes, chosen by the ``?warehouse=`` query param:
+      - a specific code (BH-FGM / DL-EC / BH-EC) → just that warehouse
+      - ``ALL`` → every warehouse below, merged into one sheet. Each row already
+        carries its own WhsCode / WhsName, so the UI shows a warehouse column.
+
+    The warehouses live in two different company DBs, so each is queried in its
+    own schema (see WAREHOUSE_SOURCES):
+      - BH-FGM → mart · "Jivo Mart"     (Sonipat finished goods)
+      - DL-EC  → mart · "Jivo Wellness" (Mayapuri E-Commerce)
+      - BH-EC  → oil  · "Bhakharpur Finished E-Commerce"
+    Read-only; scoped to FINISHED item group + Active items (enforced in SQL).
+    Unknown / missing warehouse falls back to the default, BH-FGM."""
     permission_classes = [IsAuthenticated]
 
+    # (warehouse code, company-DB source key). Order here is the display order
+    # for the combined ALL view. Add a warehouse in exactly one place: here.
+    WAREHOUSE_SOURCES = (
+        ('BH-FGM', 'mart'),
+        ('DL-EC',  'mart'),
+        ('BH-EC',  'oil'),
+    )
+    ALLOWED_WHS = tuple(code for code, _src in WAREHOUSE_SOURCES)
+    _WHS_SOURCE = dict(WAREHOUSE_SOURCES)
     DEFAULT_WHS = 'BH-FGM'
-    ALLOWED_WHS = ('BH-FGM', 'DL-EC')
+
+    # One warehouse's finished-goods stock; `?` binds the WhsCode. The same
+    # unqualified SQL runs against whichever company schema the warehouse maps to.
+    INVENTORY_SQL = '''
+        SELECT
+            T0."ItemCode",
+            T0."ItemName",
+            T3."ItmsGrpNam"  AS "GroupName",
+            T0."SalUnitMsr"  AS "UOM",
+            T0."validFor"    AS "Active",
+            T0."LastPurPrc"  AS "LastPurchasePrice",
+            T1."WhsCode",
+            T2."WhsName",
+            T2."City",
+            T1."OnHand",
+            T1."IsCommited" AS "Committed",
+            T1."OnHand" - T1."IsCommited" AS "Available",
+            T1."OnOrder",
+            T1."MinStock",
+            T1."MaxStock",
+            T1."OnHand" * T0."LastPurPrc" AS "StockValue"
+        FROM OITM T0
+        INNER JOIN OITW T1 ON T1."ItemCode"   = T0."ItemCode"
+        LEFT  JOIN OWHS T2 ON T2."WhsCode"     = T1."WhsCode"
+        LEFT  JOIN OITB T3 ON T3."ItmsGrpCod"  = T0."ItmsGrpCod"
+        WHERE T1."WhsCode" = ?
+          AND T0."validFor" = 'Y'
+          AND T3."ItmsGrpNam" = 'FINISHED'
+        ORDER BY T0."ItemName"
+    '''
 
     def _resolve_whs(self, request):
         raw = (request.query_params.get('warehouse') or '').strip().upper()
         return raw if raw in self.ALLOWED_WHS else self.DEFAULT_WHS
 
     def get(self, request):
-        whs_code = self._resolve_whs(request)
-        now = time.time()
-        entry = _SAP_INV_CACHE.get(whs_code)
-        if entry is not None and (now - entry['at'] < _SAP_INV_TTL):
-            self._overlay_reserved(entry['data'].get('results') or [])
-            return Response(entry['data'])
-        # Imported lazily so the rest of the shipment app never hard-depends on
-        # the HANA driver (hdbcli) being installed. Both the import and the
-        # schema resolution can fail (driver missing / SAP config) — guard them.
-        try:
-            from sap.service import select, resolve_schema
-            _source, schema = resolve_schema('mart')
-        except Exception as e:
-            return Response(
-                {'error': f'Could not reach SAP HANA: {e}', 'results': [], 'summary': {}},
-                status=502,
-            )
-        sql = '''
-            SELECT
-                T0."ItemCode",
-                T0."ItemName",
-                T3."ItmsGrpNam"  AS "GroupName",
-                T0."SalUnitMsr"  AS "UOM",
-                T0."validFor"    AS "Active",
-                T0."LastPurPrc"  AS "LastPurchasePrice",
-                T1."WhsCode",
-                T2."WhsName",
-                T2."City",
-                T1."OnHand",
-                T1."IsCommited" AS "Committed",
-                T1."OnHand" - T1."IsCommited" AS "Available",
-                T1."OnOrder",
-                T1."MinStock",
-                T1."MaxStock",
-                T1."OnHand" * T0."LastPurPrc" AS "StockValue"
-            FROM OITM T0
-            INNER JOIN OITW T1 ON T1."ItemCode"   = T0."ItemCode"
-            LEFT  JOIN OWHS T2 ON T2."WhsCode"     = T1."WhsCode"
-            LEFT  JOIN OITB T3 ON T3."ItmsGrpCod"  = T0."ItmsGrpCod"
-            WHERE T1."WhsCode" = ?
-              AND T0."validFor" = 'Y'
-              AND T3."ItmsGrpNam" = 'FINISHED'
-            ORDER BY T0."ItemName"
-        '''
-        try:
-            rows = select(sql, [whs_code], schema=schema)
-        except Exception as e:  # HANA unreachable / VPN down / driver missing
-            return Response(
-                {'error': f'Could not reach SAP HANA: {e}', 'results': [], 'summary': {}},
-                status=502,
-            )
+        raw = (request.query_params.get('warehouse') or '').strip().upper()
+        if raw == 'ALL':
+            return self._get_combined()
+        return self._get_single(raw if raw in self.ALLOWED_WHS else self.DEFAULT_WHS)
 
-        # Enrich each item from public.master_sheet, keyed by SAP item code
-        # (master_sheet.sku_sap_code = SAP "ItemCode"). Only the AMAZON listing is
-        # used — this is the Amazon planner; items with no Amazon row map to nothing.
+    # ── fetch / enrich / summarize (shared by both modes) ────────────────────
+    @classmethod
+    def _fetch_rows(cls, whs_code):
+        """Run INVENTORY_SQL for one warehouse in its own company DB schema.
+        The HANA driver is imported lazily so the app never hard-depends on
+        hdbcli; raises on driver-missing / HANA-down so the caller surfaces it."""
+        from sap.service import select, resolve_schema
+        _src, schema = resolve_schema(cls._WHS_SOURCE.get(whs_code, 'mart'))
+        return select(cls.INVENTORY_SQL, [whs_code], schema=schema)
+
+    @staticmethod
+    def _enrich(rows):
+        """Attach per_unit + format_sku_code (ASIN) from public.master_sheet,
+        keyed by SAP ItemCode (master_sheet.sku_sap_code). AMAZON listing only —
+        items with no Amazon row map to nothing."""
         codes = list({(r.get('ItemCode') or '').strip().upper() for r in rows if r.get('ItemCode')})
         master = {}
         if codes:
@@ -4540,31 +4548,82 @@ class SapInventoryView(_SafeAPIView):
                     GROUP BY UPPER(TRIM(sku_sap_code))
                 """, [codes])
                 for code, per_unit, fmt_code in cur.fetchall():
-                    master[code] = {
-                        'per_unit': per_unit,
-                        'format_sku_code': fmt_code,
-                    }
+                    master[code] = {'per_unit': per_unit, 'format_sku_code': fmt_code}
         for r in rows:
             m = master.get((r.get('ItemCode') or '').strip().upper()) or {}
             r['per_unit'] = m.get('per_unit')
             r['format_sku_code'] = m.get('format_sku_code')
+        return rows
 
+    @staticmethod
+    def _summarize(rows):
         total_units = sum(float(r.get('OnHand') or 0) for r in rows)
         total_value = sum(float(r.get('StockValue') or 0) for r in rows)
         zero_stock = sum(1 for r in rows if float(r.get('OnHand') or 0) == 0)
+        return {
+            'total_skus': len(rows),
+            'total_units_on_hand': round(total_units, 3),
+            'total_stock_value': round(total_value, 2),
+            'items_at_zero_stock': zero_stock,
+        }
+
+    # ── single-warehouse mode ────────────────────────────────────────────────
+    def _get_single(self, whs_code):
+        now = time.time()
+        entry = _SAP_INV_CACHE.get(whs_code)
+        if entry is not None and (now - entry['at'] < _SAP_INV_TTL):
+            self._overlay_reserved(entry['data'].get('results') or [])
+            return Response(entry['data'])
+        try:
+            rows = self._fetch_rows(whs_code)
+        except Exception as e:  # HANA unreachable / VPN down / driver missing
+            return Response(
+                {'error': f'Could not reach SAP HANA: {e}', 'results': [], 'summary': {}},
+                status=502,
+            )
+        self._enrich(rows)
         payload = {
             'warehouse': whs_code,
-            'schema': schema,
+            'source': self._WHS_SOURCE.get(whs_code, 'mart'),
             'results': rows,
             'count': len(rows),
-            'summary': {
-                'total_skus': len(rows),
-                'total_units_on_hand': round(total_units, 3),
-                'total_stock_value': round(total_value, 2),
-                'items_at_zero_stock': zero_stock,
-            },
+            'summary': self._summarize(rows),
         }
         _SAP_INV_CACHE[whs_code] = {'at': now, 'data': payload}
+        self._overlay_reserved(payload['results'])
+        return Response(payload)
+
+    # ── combined mode: every warehouse merged into one sheet ─────────────────
+    def _get_combined(self):
+        now = time.time()
+        entry = _SAP_INV_CACHE.get('ALL')
+        if entry is not None and (now - entry['at'] < _SAP_INV_TTL):
+            self._overlay_reserved(entry['data'].get('results') or [])
+            return Response(entry['data'])
+        all_rows, warnings = [], []
+        for whs_code, _source in self.WAREHOUSE_SOURCES:
+            try:
+                all_rows.extend(self._fetch_rows(whs_code))
+            except Exception as e:  # one warehouse down shouldn't blank the sheet
+                warnings.append(f'{whs_code}: {e}')
+        # Only 502 if EVERY warehouse failed — otherwise return what we got.
+        if not all_rows and warnings:
+            return Response(
+                {'error': 'Could not reach SAP HANA: ' + '; '.join(warnings),
+                 'results': [], 'summary': {}},
+                status=502,
+            )
+        self._enrich(all_rows)
+        payload = {
+            'warehouse': 'ALL',
+            'warehouses': list(self.ALLOWED_WHS),
+            'results': all_rows,
+            'count': len(all_rows),
+            'summary': self._summarize(all_rows),
+        }
+        if warnings:
+            payload['warnings'] = warnings
+        _SAP_INV_CACHE['ALL'] = {'at': now, 'data': payload}
         self._overlay_reserved(payload['results'])
         return Response(payload)
 
