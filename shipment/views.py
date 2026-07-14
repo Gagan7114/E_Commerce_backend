@@ -1903,29 +1903,26 @@ class AppointmentItemsView(_SafeAPIView):
                       AND NULLIF(TRIM(pv), '') IS NOT NULL
                 ),
                 committed AS (
-                    -- NOTE: this is PO-fulfilment "committed" (units already put on
-                    -- ANY non-rejected shipment, incl. dispatched/delivered — those
-                    -- units are gone from the order). It is DISTINCT from physical
-                    -- stock reservation in _reserved_stock_by_asin(), which counts
-                    -- only not-yet-dispatched shipments. Don't merge the two.
-                    -- Quantity already committed to non-rejected shipments per
-                    -- (ASIN, PO, FC). The remainder (accepted - committed) is what's
-                    -- still shippable, so a partially-shipped line reappears with
-                    -- its leftover. FC is included in the key so commitments at
-                    -- one FC never leak into another FC's availability calculation
-                    -- (defence-in-depth for any data glitch that ever puts the
-                    -- same PO at more than one FC).
+                    -- PO-fulfilment "committed": units already put on ANY
+                    -- non-rejected shipment (incl. dispatched/delivered — gone from
+                    -- the order). DISTINCT from physical stock reservation in
+                    -- _reserved_stock_by_asin() (which counts only not-yet-dispatched
+                    -- shipments). Don't merge the two.
+                    -- Keyed by (ASIN, PO) ONLY, summed across every FC. NOT FC-keyed:
+                    -- a flipped PO ships under the appointment's FC, not its PO-sheet
+                    -- FC, so an FC-keyed match would miss the flip and wrongly
+                    -- re-offer the already-shipped units. A PO has one total ordered
+                    -- qty, so its commitments across all FCs subtract together; the
+                    -- remainder (accepted - committed) is what's still shippable.
                     SELECT si.asin,
                            UPPER(TRIM(si.po_number)) AS po_number,
-                           UPPER(TRIM(COALESCE(si.destination_fc, ''))) AS fc_key,
                            SUM(COALESCE(si.planned_qty, 0)) AS committed_qty
                     FROM sp_items si
                     JOIN sp_shipments s ON s.id = si.shipment_id
                     WHERE si.not_loaded = FALSE
                       AND s.status != 'rejected'
                     GROUP BY si.asin,
-                             UPPER(TRIM(si.po_number)),
-                             UPPER(TRIM(COALESCE(si.destination_fc, '')))
+                             UPPER(TRIM(si.po_number))
                 ),
                 doh_data AS (
                     -- placeholder; DOH joined in Python via _live_doh_by_asin() below
@@ -1979,7 +1976,6 @@ class AppointmentItemsView(_SafeAPIView):
                 LEFT JOIN committed c
                     ON c.asin = p.asin
                     AND c.po_number = UPPER(TRIM(p.po_number))
-                    AND c.fc_key = UPPER(TRIM(COALESCE(p.fulfillment_center, '')))
                 WHERE p.status = 'Confirmed'
                   AND p.availability_status = 'AC - Accepted: In stock'
                   AND p.accepted_qty > 0
