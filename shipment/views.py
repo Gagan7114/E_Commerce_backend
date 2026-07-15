@@ -2967,7 +2967,9 @@ class ShipmentSubmitView(_SafeAPIView):
             return Response({'error': 'Quantity conflicts detected', 'conflicts': conflicts}, status=409)
 
         shipment.status = Shipment.Status.PENDING_APPROVAL
-        shipment.save(update_fields=['status'])
+        # Record when it was put up for approval. auto_now fields are only written
+        # when named in update_fields, so include updated_at explicitly.
+        shipment.save(update_fields=['status', 'updated_at'])
         return Response(ShipmentListSerializer(shipment).data)
 
 
