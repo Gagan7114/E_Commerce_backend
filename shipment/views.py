@@ -2967,7 +2967,9 @@ class ShipmentSubmitView(_SafeAPIView):
             return Response({'error': 'Quantity conflicts detected', 'conflicts': conflicts}, status=409)
 
         shipment.status = Shipment.Status.PENDING_APPROVAL
-        shipment.save(update_fields=['status'])
+        # Record when it was put up for approval. auto_now fields are only written
+        # when named in update_fields, so include updated_at explicitly.
+        shipment.save(update_fields=['status', 'updated_at'])
         return Response(ShipmentListSerializer(shipment).data)
 
 
@@ -4267,11 +4269,13 @@ class PoShipmentLookupView(_SafeAPIView):
             )
         )
 
-        # Per (ASIN, PO, FC) key: the list of shipments holding the line + total
-        # committed qty (sum of planned_qty across non-rejected shipments). FC is
-        # part of the key so commitments at one FC never net against another FC's
-        # availability. The UI keys lookups the same way (see CreateShipment.jsx
-        # loadData / getBlockReason).
+        # Two keys per line: the FC-scoped `asin__po__fc` AND an FC-agnostic
+        # `asin__po`, each listing the holding shipments + summed committed qty.
+        # The UI tries the FC key first (same-FC commitments net per-FC), then
+        # falls back to the FC-agnostic key so a FLIPPED PO committed at its sister
+        # FC (e.g. DED3↔DED5) is still netted/blocked (see CreateShipment.jsx
+        # loadData / getBlockReason) — matching the auto candidate SQL, whose
+        # `committed` CTE is keyed by (asin, po) only for the same flip-safe reason.
         result = {}
         for it in items:
             asin = (it.asin or '').strip()
@@ -4279,7 +4283,6 @@ class PoShipmentLookupView(_SafeAPIView):
             if not asin or not po:
                 continue
             fc_key = (it.destination_fc or '').strip().upper()
-            key = f"{asin}__{po}__{fc_key}"
             s = it.shipment
             entry = {
                 'shipment_id': s.id,
@@ -4300,9 +4303,13 @@ class PoShipmentLookupView(_SafeAPIView):
                 'product_name': it.product_name or '',
                 'internal_sku': it.internal_sku or '',
             }
-            bucket = result.setdefault(key, {'shipments': [], 'committed_qty': 0.0})
-            bucket['shipments'].append(entry)
-            bucket['committed_qty'] += float(it.planned_qty or 0)
+            # Index under BOTH the FC-scoped key and the FC-agnostic (asin, po) key
+            # so the picker's legacy fallback actually resolves — before, this
+            # endpoint only emitted FC keys, silently breaking flip netting.
+            for key in (f"{asin}__{po}__{fc_key}", f"{asin}__{po}"):
+                bucket = result.setdefault(key, {'shipments': [], 'committed_qty': 0.0})
+                bucket['shipments'].append(entry)
+                bucket['committed_qty'] += float(it.planned_qty or 0)
 
         # Sort each list newest-first
         for k in result:
