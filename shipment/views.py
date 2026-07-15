@@ -12,15 +12,16 @@ import logging
 from django.conf import settings
 from django.core.exceptions import PermissionDenied
 from django.db import connection, transaction, DatabaseError
-from django.http import Http404
+from django.http import Http404, HttpResponse
 from rest_framework import status
 from rest_framework.exceptions import APIException
 from rest_framework.permissions import IsAuthenticated, AllowAny, BasePermission
 from rest_framework.response import Response
 from rest_framework.views import APIView
+from rest_framework.parsers import MultiPartParser, FormParser
 
 from accounts.permissions import has_permission_code
-from .models import Shipment, ShipmentAuditLog, ShipmentItem
+from .models import Shipment, ShipmentAuditLog, ShipmentItem, ShipmentPoDocument
 from .serializers import (
     ShipmentAuditLogSerializer,
     ShipmentItemSerializer,
@@ -2969,11 +2970,91 @@ class ShipmentSubmitView(_SafeAPIView):
         if conflicts:
             return Response({'error': 'Quantity conflicts detected', 'conflicts': conflicts}, status=409)
 
+        # Mandatory PO documents: every loaded PO must have an uploaded PDF before
+        # the shipment can go up for approval (the "Upload POs" wizard step).
+        loaded_pos = {
+            str(it.po_number).strip()
+            for it in shipment.items.all()
+            if not it.not_loaded and str(it.po_number or '').strip()
+        }
+        have = {
+            str(p).strip()
+            for p in ShipmentPoDocument.objects.filter(shipment=shipment).values_list('po_number', flat=True)
+        }
+        missing = sorted(loaded_pos - have)
+        if missing:
+            return Response(
+                {'error': 'Upload a PO document (PDF) for every PO before submitting.',
+                 'missing_pos': missing},
+                status=400,
+            )
+
         shipment.status = Shipment.Status.PENDING_APPROVAL
         # Record when it was put up for approval. auto_now fields are only written
         # when named in update_fields, so include updated_at explicitly.
         shipment.save(update_fields=['status', 'updated_at'])
         return Response(ShipmentListSerializer(shipment).data)
+
+
+class ShipmentPoDocumentsView(_SafeAPIView):
+    """List PO documents (metadata only) for a shipment, and upload/replace one
+    PDF per PO. One document per (shipment, PO); re-upload overwrites it."""
+    permission_classes = [IsAuthenticated]
+    parser_classes = [MultiPartParser, FormParser]
+
+    MAX_BYTES = 10 * 1024 * 1024  # 10 MB
+
+    def get(self, request, pk):
+        docs = (
+            ShipmentPoDocument.objects
+            .filter(shipment_id=pk)
+            .values('po_number', 'file_name', 'size', 'content_type', 'uploaded_at')
+        )
+        return Response(list(docs))
+
+    def post(self, request, pk):
+        try:
+            shipment = Shipment.objects.get(pk=pk)
+        except Shipment.DoesNotExist:
+            return Response({'error': 'Not found'}, status=404)
+        po_number = str(request.data.get('po_number') or '').strip()
+        f = request.FILES.get('file')
+        if not po_number or f is None:
+            return Response({'error': 'po_number and file are required'}, status=400)
+        if f.size > self.MAX_BYTES:
+            return Response({'error': 'File exceeds the 10 MB limit'}, status=400)
+        ct = (f.content_type or '').lower()
+        if 'pdf' not in ct and not (f.name or '').lower().endswith('.pdf'):
+            return Response({'error': 'Only PDF files are allowed'}, status=400)
+        ShipmentPoDocument.objects.update_or_create(
+            shipment=shipment, po_number=po_number,
+            defaults={
+                'file_name': (f.name or 'document.pdf')[:255],
+                'content_type': f.content_type or 'application/pdf',
+                'size': f.size,
+                'data': f.read(),
+                'uploaded_by': request.user if getattr(request.user, 'is_authenticated', False) else None,
+            },
+        )
+        return Response({'po_number': po_number, 'file_name': f.name, 'size': f.size}, status=201)
+
+
+class ShipmentPoDocumentFileView(_SafeAPIView):
+    """Download (GET) or delete (DELETE) the PDF for one PO of a shipment."""
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, pk, po_number):
+        try:
+            doc = ShipmentPoDocument.objects.get(shipment_id=pk, po_number=str(po_number).strip())
+        except ShipmentPoDocument.DoesNotExist:
+            return Response({'error': 'Not found'}, status=404)
+        resp = HttpResponse(bytes(doc.data), content_type=doc.content_type or 'application/pdf')
+        resp['Content-Disposition'] = f'inline; filename="{doc.file_name}"'
+        return resp
+
+    def delete(self, request, pk, po_number):
+        ShipmentPoDocument.objects.filter(shipment_id=pk, po_number=str(po_number).strip()).delete()
+        return Response(status=204)
 
 
 class ShipmentApproveView(_SafeAPIView):
