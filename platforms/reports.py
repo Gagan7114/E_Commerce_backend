@@ -32,6 +32,14 @@ REPORT_VIEW_CATALOG = {
         "format_column": "format",
         "max_rows": 50000,
     },
+    # Combined PO sheet across BIG BASKET / CITY MALL / DEAL SHARE / FLIPKART
+    # GROCERY / ZOMATO. po_date is a real DATE, so the date range filters
+    # directly; `format` allows optional per-platform filtering.
+    "total_po": {
+        "date_column": "po_date",
+        "format_column": "format",
+        "max_rows": 50000,
+    },
     "prim_master_po": {
         "date_column": "po_date",
         "date_expr": "public._pm_parse_date(\"po_date\")",

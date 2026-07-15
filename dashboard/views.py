@@ -5385,3 +5385,130 @@ def realise_waterfall(request):
         "realise_exclusive": per(exclusive),
         "errors": errors,
     })
+
+
+# ─── /lead-time-report ───────────────────────────────────────────────────────
+# Vendor-wise lead-time report across ALL platforms (master_po). Delivered
+# liters are bucketed into lead-time slabs — 7-DAYS (<=7), 8-15 DAYS, MORE THAN
+# 15 DAYS (>15) — per vendor. Filters: platform + delivery month (both
+# multi-select) and year. The frontend toggles Liters vs row-percentage.
+_LEAD_TIME_SLABS = [
+    {"key": "d7", "label": "7-DAYS"},
+    {"key": "d8_15", "label": "8-15 DAYS"},
+    {"key": "d15p", "label": "MORE THAN 15 DAYS"},
+]
+
+
+@api_view(["GET"])
+@permission_classes([require("dashboard.view")])
+@cached_get(timeout=120, prefix="dash.lead_time_report", shared=True)
+def lead_time_report(request):
+    # `platform` and `month` accept a comma-separated LIST (multi-select); an
+    # empty list or "ALL" means no filter. NB: the platform param is `platform`,
+    # NOT `format` — DRF reserves `?format=` for content negotiation (would 404).
+    def _multi(name):
+        raw = (request.GET.get(name) or "").strip()
+        vals = [v.strip() for v in raw.split(",") if v.strip()]
+        return [v for v in vals if v.upper() not in ("ALL", "ALL PLATFORMS")]
+
+    platforms = _multi("platform")
+    months = _multi("month")
+    year = (request.GET.get("year") or "").strip()
+
+    where = ["lead_time IS NOT NULL", "delivery_date IS NOT NULL"]
+    params = []
+    if platforms:
+        where.append(
+            "REGEXP_REPLACE(UPPER(TRIM(format::text)), '[^A-Z0-9]+', '', 'g') = ANY(%s)"
+        )
+        params.append([re.sub(r"[^A-Z0-9]", "", p.upper()) for p in platforms])
+    if months:
+        where.append("UPPER(TRIM(delivery_month::text)) = ANY(%s)")
+        params.append([m.upper() for m in months])
+    if year and year.lower() != "all":
+        try:
+            where.append("delivered_year::numeric = %s")
+            params.append(int(year))
+        except ValueError:
+            pass
+    where_sql = "WHERE " + " AND ".join(where)
+
+    def _rows(sql, prm=None):
+        with connection.cursor() as cur:
+            cur.execute(sql, prm or [])
+            cols = [c[0] for c in cur.description]
+            return [dict(zip(cols, r)) for r in cur.fetchall()]
+
+    raw = _rows(
+        f"""
+        SELECT COALESCE(NULLIF(TRIM(vendor_new::text), ''), '(Unknown)') AS vendor,
+          COALESCE(SUM(CASE WHEN lead_time <= 7  THEN total_delivered_liters ELSE 0 END), 0) AS d7,
+          COALESCE(SUM(CASE WHEN lead_time BETWEEN 8 AND 15 THEN total_delivered_liters ELSE 0 END), 0) AS d8_15,
+          COALESCE(SUM(CASE WHEN lead_time > 15 THEN total_delivered_liters ELSE 0 END), 0) AS d15p,
+          COALESCE(SUM(total_delivered_liters), 0) AS total
+        FROM public.master_po
+        {where_sql}
+        GROUP BY vendor
+        ORDER BY total DESC
+        """,
+        params,
+    )
+
+    rows = []
+    grand = {"d7": 0.0, "d8_15": 0.0, "d15p": 0.0, "total": 0.0}
+    for r in raw:
+        row = {
+            "vendor": r["vendor"],
+            "d7": float(r["d7"] or 0),
+            "d8_15": float(r["d8_15"] or 0),
+            "d15p": float(r["d15p"] or 0),
+            "total": float(r["total"] or 0),
+        }
+        if row["total"] <= 0:
+            continue
+        rows.append(row)
+        for k in grand:
+            grand[k] += row[k]
+
+    # Filter options — always global so the dropdowns show every choice. (Named
+    # *_opts so they don't shadow the selected `platforms` / `months` filters.)
+    format_opts = [
+        r["format"]
+        for r in _rows(
+            "SELECT DISTINCT TRIM(format::text) AS format FROM public.master_po "
+            "WHERE format IS NOT NULL AND TRIM(format::text) <> '' ORDER BY 1"
+        )
+    ]
+    month_opts = [
+        r["m"]
+        for r in _rows(
+            "SELECT UPPER(TRIM(delivery_month::text)) AS m, MIN(delivery_date) AS s "
+            "FROM public.master_po WHERE delivery_month IS NOT NULL "
+            "AND TRIM(delivery_month::text) <> '' AND delivery_date IS NOT NULL "
+            "GROUP BY 1 ORDER BY MIN(delivery_date)"
+        )
+    ]
+    year_opts = [
+        int(r["y"])
+        for r in _rows(
+            "SELECT DISTINCT delivered_year::numeric AS y FROM public.master_po "
+            "WHERE delivered_year IS NOT NULL ORDER BY 1 DESC"
+        )
+        if r["y"] is not None
+    ]
+
+    return Response({
+        "rows": rows,
+        "grand_total": grand,
+        "slabs": _LEAD_TIME_SLABS,
+        "filter_options": {
+            "formats": format_opts,
+            "months": month_opts,
+            "years": year_opts,
+        },
+        "filters": {
+            "platform": platforms,
+            "month": months,
+            "year": year or "ALL",
+        },
+    })

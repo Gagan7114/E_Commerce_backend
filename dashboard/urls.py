@@ -24,6 +24,7 @@ urlpatterns = [
     path("realise-breakdown", views.realise_breakdown, name="dashboard-realise-breakdown"),
     path("realise-trend", views.realise_trend, name="dashboard-realise-trend"),
     path("realise-waterfall", views.realise_waterfall, name="dashboard-realise-waterfall"),
+    path("lead-time-report", views.lead_time_report, name="dashboard-lead-time-report"),
     path("state-sales", views.state_sales, name="dashboard-state-sales"),
     path("state-sales/detail", views.state_sales_detail, name="dashboard-state-sales-detail"),
     path("state-sales/detail/options", views.state_sales_detail_options, name="dashboard-state-sales-detail-options"),
