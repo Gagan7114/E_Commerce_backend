@@ -11,7 +11,11 @@ DEFAULT_PLATFORMS = [
     ("amazon",    "Amazon",    "amazon_inventory",      "amazon_secondary"),
     ("bigbasket", "BigBasket", "bigbasket_inventory",   "bigbasket_secondary"),
     ("swiggy",    "Swiggy",    "swiggy_inventory",      "swiggy_secondary"),
-    ("flipkart",  "Flipkart",  "flipkart_inventory",    "flipkart_secondary"),
+    # Flipkart has no inventory feed yet (the flipkart_inventory table doesn't
+    # exist), so leave inventory_table blank rather than pointing at a missing
+    # table — that keeps inventory_match/stats on the clean "no feed" path
+    # instead of an error. See audit #11.
+    ("flipkart",  "Flipkart",  "",                      "flipkart_secondary"),
     ("zomato",    "Zomato",    "zomato_inventory",      "zomatoSec"),
     ("citymall",  "CityMall",  "citymall_inventory",    "citymallSec"),
 ]

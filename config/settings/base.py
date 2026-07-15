@@ -115,6 +115,13 @@ DATABASES = {
 # the single highest-leverage latency fix and requires only a running Redis +
 # the `redis` package (already in requirements). Defaults preserve current
 # behaviour exactly when REDIS_URL is unset.
+# Floor for the per-endpoint cache TTLs applied by config.perf_cache.cached_get.
+# Most dashboards were decorated with 60s, which on the per-worker LocMemCache
+# meant a heavy recompute roughly every minute. Uploads bust the cache and the
+# Refresh button sends ?nocache=1, so a 5-minute floor is safe and cuts cold
+# recomputes ~5x. Set PERFCACHE_TTL_FLOOR=60 to restore the old behaviour.
+PERFCACHE_TTL_FLOOR = env.int("PERFCACHE_TTL_FLOOR", default=300)
+
 REDIS_URL = env("REDIS_URL", default="")
 if REDIS_URL:
     CACHES = {

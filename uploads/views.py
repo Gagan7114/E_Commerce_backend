@@ -233,6 +233,8 @@ _SECMASTER_SOURCE_TABLES = frozenset({
 # category / per-litre enrichment).
 _ADS_MASTER_SOURCE_TABLES = frozenset({
     "blinkit_ads", "swiggy_ads", "ads_master_bs", "master_sheet",
+    # Per-day ads raw tables feeding the Daily Ads matviews (migration 0055).
+    "swiggyads_daily", "zeptoads_daily", "bigbasketads_daily",
 })
 
 # Serializes background refreshes so two near-simultaneous uploads don't run

@@ -1,3 +1,4 @@
+import logging
 import re
 from calendar import monthrange
 from datetime import date, timedelta
@@ -5,6 +6,7 @@ from decimal import Decimal, InvalidOperation
 
 from django.core.cache import cache
 from django.db import connection, transaction
+from django.utils import timezone
 from django.shortcuts import get_object_or_404
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.exceptions import NotFound, PermissionDenied, ValidationError
@@ -19,6 +21,8 @@ from .primary_po_columns import order_primary_master_po_row
 _IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _LANDING_BASIC_DIVISOR = Decimal("1.05")
 PRIMARY_PO_VIEW = "master_po"
+
+logger = logging.getLogger(__name__)
 
 
 def _safe_ident(name: str) -> str:
@@ -153,7 +157,8 @@ def _stats_inventory_items(inv_table: str | None) -> int:
             [],
         )
         return int(val or 0)
-    except Exception:
+    except Exception as exc:
+        logger.warning("_stats_inventory_items fallback for table=%s: %s", inv_table, exc)
         return _approx_count(inv_table)
 
 
@@ -162,7 +167,7 @@ def _stats_secondary_units(slug: str) -> int:
     feed. secmaster_mv covers the QC formats + Flipkart marketplace; Amazon has
     its own daily feed; primary-only platforms (zomato/citymall/flipkart_grocery)
     have no secondary sales -> 0."""
-    today = date.today()
+    today = timezone.localdate()
     key = re.sub(r"[^a-z0-9]+", "", slug.lower())
     try:
         if key in _STATS_SECMASTER_FORMATS:
@@ -181,7 +186,8 @@ def _stats_secondary_units(slug: str) -> int:
                 [today.month, today.year],
             )
             return int(val or 0)
-    except Exception:
+    except Exception as exc:
+        logger.warning("_stats_secondary_units failed for slug=%s: %s", slug, exc)
         return 0
     return 0
 
@@ -203,7 +209,6 @@ def platform_stats(request, slug: str):
 
     p = _get_platform(slug)
     inv = _safe_ident(p.inventory_table) if p.inventory_table else None
-    sec = _safe_ident(p.secondary_table) if p.secondary_table else None
     master = _safe_ident(PRIMARY_PO_VIEW)
 
     filter_col = _safe_col(p.po_filter_column or "platform") or "platform"
@@ -908,7 +913,9 @@ def inventory_match(request, slug: str):
     p = _get_platform(slug)
     sku = request.query_params.get("sku", "").strip()
     if not sku or not p.inventory_table:
-        return Response({"match": None})
+        # No inventory feed configured for this platform → "unavailable", which
+        # is NOT the same as "SKU not found in stock".
+        return Response({"match": None, "inventory_available": bool(p.inventory_table)})
     inv = _safe_ident(p.inventory_table)
     match_col = _safe_col(p.match_column or "sku") or "sku"
     try:
@@ -917,8 +924,15 @@ def inventory_match(request, slug: str):
             [sku],
         )
     except Exception:
-        rows = []
-    return Response({"match": rows[0] if rows else None})
+        # A missing table / query error is NOT "SKU not in stock" — surface it as
+        # feed-unavailable (and log it) so an absent feed (e.g. Flipkart has no
+        # inventory feed, audit #11) is distinguishable from a genuine miss,
+        # instead of silently returning null.
+        logger.exception(
+            "inventory_match failed for slug=%s table=%s", slug, p.inventory_table
+        )
+        return Response({"match": None, "inventory_available": False})
+    return Response({"match": rows[0] if rows else None, "inventory_available": True})
 
 
 _PRIMARY_METRIC_SQL = """
@@ -1081,8 +1095,8 @@ def _parse_amazon_primary_dashboard_params(params) -> tuple[str, int, int, bool]
             raw_year = str(latest[0].get("year") or "")
             defaulted_to_latest = True
 
-    raw_month = raw_month or str(date.today().month)
-    raw_year = raw_year or str(date.today().year)
+    raw_month = raw_month or str(timezone.localdate().month)
+    raw_year = raw_year or str(timezone.localdate().year)
 
     if raw_month.isdigit():
         month = int(raw_month)
@@ -1817,7 +1831,7 @@ def primary_dashboard(request, slug: str):
     month_name = _month_name(month)
     period_end_cap = min(
         date(year, month, monthrange(year, month)[1]),
-        date.today(),
+        timezone.localdate(),
     )
     period_date_col = "po_dt" if mode == "PO MONTH" else "delivery_dt"
     period_filter = f"{_primary_period_filter(mode)} AND {period_date_col} <= %s"
@@ -2324,8 +2338,8 @@ def _primary_dashboard_payload(
 @cached_get(timeout=60, prefix="plat.primary_total")
 def primary_overview_total(request):
     """Fast aggregate used by the home dashboard Primary card."""
-    raw_month = str(request.query_params.get("month") or date.today().month).strip()
-    raw_year = str(request.query_params.get("year") or date.today().year).strip()
+    raw_month = str(request.query_params.get("month") or timezone.localdate().month).strip()
+    raw_year = str(request.query_params.get("year") or timezone.localdate().year).strip()
     try:
         month = int(raw_month)
         year = int(raw_year)
@@ -2346,7 +2360,7 @@ def primary_overview_total(request):
 
     allowed_slugs = [slug for slug in requested_slugs if can_access_platform(request.user, slug)]
     month_name = _month_name(month)
-    period_end_cap = min(date(year, month, monthrange(year, month)[1]), date.today())
+    period_end_cap = min(date(year, month, monthrange(year, month)[1]), timezone.localdate())
     cache_key = (
         f"primary_overview:v{_PRIMARY_DASHBOARD_CACHE_VERSION}:"
         f"{month}:{year}:{period_end_cap.isoformat()}:{','.join(allowed_slugs)}"
@@ -6156,12 +6170,12 @@ def _parse_sec_month_year(params, *, latest_source: str = "flipkart_grocery") ->
         if isinstance(month_value, str) and not month_value.strip().isdigit():
             month = _MONTH_NAME_TO_NUM.get(_norm_sec_key(month_value))
             if month is None:
-                month = date.today().month
+                month = timezone.localdate().month
         else:
             month = int(month_value)
         return month, int(latest[0]["year"]), True
 
-    today = date.today()
+    today = timezone.localdate()
     return today.month, today.year, True
 
 
@@ -6180,7 +6194,7 @@ def _parse_flipkart_secondary_monthly_year(params) -> tuple[int, bool]:
         'SELECT "year" FROM "flipkart_secondary_all" WHERE "year" IS NOT NULL ORDER BY "year" DESC LIMIT 1',
         [],
     )
-    return int(latest_year) if latest_year else date.today().year, True
+    return int(latest_year) if latest_year else timezone.localdate().year, True
 
 
 def _parse_amazon_secondary_monthly_year(params) -> tuple[int, bool]:
@@ -6204,7 +6218,7 @@ def _parse_amazon_secondary_monthly_year(params) -> tuple[int, bool]:
         """,
         [],
     )
-    return int(latest_year) if latest_year else date.today().year, True
+    return int(latest_year) if latest_year else timezone.localdate().year, True
 
 
 def _parse_amazon_comparison_params(params) -> tuple[str, int, int, bool]:
@@ -6414,7 +6428,7 @@ def _parse_bigbasket_primary_period(params, platform_format: str) -> tuple[str, 
                 True,
             )
 
-    today = date.today()
+    today = timezone.localdate()
     return month_type, month_col, date_col, _month_name(today.month), today.year, True
 
 
@@ -6585,7 +6599,7 @@ def _parse_primary_dashboard_params(params, platform_format: str = "ZEPTO") -> t
             ORDER BY {order_date} DESC
             LIMIT 1
             """,
-            [date.today()],
+            [timezone.localdate()],
         )
         if latest:
             period_date = latest[0].get("period_date")
@@ -6594,8 +6608,8 @@ def _parse_primary_dashboard_params(params, platform_format: str = "ZEPTO") -> t
                 raw_year = str(latest[0].get("del_year" if mode == "DEL MONTH" else "po_year") or period_date.year)
                 defaulted_to_latest = True
 
-    raw_month = raw_month or str(date.today().month)
-    raw_year = raw_year or str(date.today().year)
+    raw_month = raw_month or str(timezone.localdate().month)
+    raw_year = raw_year or str(timezone.localdate().year)
 
     if raw_month.isdigit():
         month = int(raw_month)
@@ -8533,7 +8547,7 @@ def _amazon_mp_dashboard_latest(default_month: int, default_year: int):
 
 
 def _amazon_mp_dashboard_response(request):
-    today = date.today()
+    today = timezone.localdate()
     month_raw = request.query_params.get("month")
     year_raw = request.query_params.get("year")
     defaulted_to_latest = False
@@ -11698,7 +11712,7 @@ def _amazon_mp_drr_dashboard_response(request):
     litres/quantity — same conventions as the MP dashboard), so there is no
     ORDERED/SHIPPED toggle; `sales_mode` is accepted and ignored.
     """
-    today = date.today()
+    today = timezone.localdate()
     month_raw = request.query_params.get("month")
     year_raw = request.query_params.get("year")
     defaulted_to_latest = False
@@ -12463,7 +12477,7 @@ def landing_rate_list(request, slug: str):
     fmt = _format_for(p)
 
     mode = (request.query_params.get("mode") or "effective").lower()
-    month = _parse_month(request.query_params.get("month") or "") or date.today().replace(day=1).isoformat()
+    month = _parse_month(request.query_params.get("month") or "") or timezone.localdate().replace(day=1).isoformat()
     search = (request.query_params.get("search") or "").strip()
     page, page_size = _page(request)
     offset = page * page_size
@@ -12544,7 +12558,7 @@ def landing_rate_skus(request, slug: str):
         raise ValidationError(f"Monthly landing rate is only available for {_LANDING_PLATFORM_LABELS}.")
     p = _get_platform(slug)
     fmt = _format_for(p)
-    month = _parse_month(request.query_params.get("month") or "") or date.today().replace(day=1).isoformat()
+    month = _parse_month(request.query_params.get("month") or "") or timezone.localdate().replace(day=1).isoformat()
     format_clause, format_params = _format_match_clause(p)
     try:
         rows = _dict_rows(

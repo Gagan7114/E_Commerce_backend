@@ -20,6 +20,7 @@ from decimal import Decimal
 
 from django.core.management.base import BaseCommand, CommandError
 from django.db import connection
+from django.utils import timezone
 
 from platforms.models import PlatformConfig
 from platforms.monthly_targets import (
@@ -43,7 +44,7 @@ class Command(BaseCommand):
                             help="Print intended updates without writing.")
 
     def handle(self, *args, **opts):
-        today = date.today()
+        today = timezone.localdate()
         month = opts["month"] or today.month
         year = opts["year"] or today.year
         dry = opts["dry_run"]

@@ -24,6 +24,7 @@ from types import SimpleNamespace
 
 from django.db import connection, transaction
 from django.db.utils import IntegrityError
+from django.utils import timezone
 from django.shortcuts import get_object_or_404
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.exceptions import PermissionDenied, ValidationError
@@ -185,7 +186,7 @@ def _parse_month_year_or_current(body_or_params) -> tuple[int, int]:
     if raw_month or raw_year:
         return _parse_month_year(body_or_params)
 
-    today = date.today()
+    today = timezone.localdate()
     return today.month, today.year
 
 
@@ -194,7 +195,7 @@ def _prev_month(month: int, year: int) -> tuple[int, int]:
 
 
 def _is_current_month(month: int, year: int, today: date | None = None) -> bool:
-    t = today or date.today()
+    t = today or timezone.localdate()
     return month == t.month and year == t.year
 
 
@@ -921,7 +922,7 @@ def _day_of_month(d: date | None, month: int, year: int) -> int:
     if d:
         return d.day
     if _is_current_month(month, year):
-        return date.today().day
+        return timezone.localdate().day
     return _days_in_month(month, year)
 
 

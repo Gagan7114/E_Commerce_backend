@@ -244,7 +244,14 @@ def refresh_ads_master_mvs() -> bool:
     making every read a cheap table scan. Best-effort; never raises. Returns True
     if at least one matview was refreshed."""
     refreshed = False
-    for mv in ("public.blinkit_ads_master_mv", "public.swiggy_ads_master_mv"):
+    for mv in (
+        "public.blinkit_ads_master_mv",
+        "public.swiggy_ads_master_mv",
+        # Per-day ads masters (Daily Ads dashboards) — migration 0055.
+        "public.swiggyads_daily_master_mv",
+        "public.zeptoads_daily_master_mv",
+        "public.bigbasketads_daily_master_mv",
+    ):
         try:
             with connection.cursor() as cur:
                 cur.execute("SELECT to_regclass(%s)", [mv])

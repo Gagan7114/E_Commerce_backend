@@ -6,6 +6,7 @@ from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 
 from django.db import connection, transaction
+from django.utils import timezone
 from django.core.cache import cache
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.response import Response
@@ -171,7 +172,7 @@ def _fetch_latest_reporting_date(sql: str, params=None):
 @cached_get(timeout=300, prefix="dash.latest_month", shared=True)
 def latest_month(request):
     """Calendar month used as the default dashboard period."""
-    today = date.today()
+    today = timezone.localdate()
     return Response({
         "month": today.month,
         "year": today.year,
@@ -306,7 +307,7 @@ def expiry_alerts(request, table_name: str):
     if not date_cols:
         return Response({"alerts": []})
 
-    today = date.today()
+    today = timezone.localdate()
     soon = today + timedelta(days=ALERT_DAYS)
     alerts = []
     qt = _quoted(table_name)
@@ -556,7 +557,7 @@ def inventory_charts(request):
 @cached_get(timeout=120, prefix="dash.primary_po_litres", shared=True)
 def primary_po_litres(request):
     """SUM(total_delivered_liters) for the current month from master_po + reporting.Amazon PO."""
-    today = date.today()
+    today = timezone.localdate()
     month_name = calendar.month_name[today.month].upper()  # e.g. 'MAY'
     year = today.year
 
@@ -614,7 +615,7 @@ def category_litres(request):
     Amazon pulls from reporting."Amazon PO"; every other platform pulls from
     master_po. With no platform filter both sources are merged (Amazon rows are
     excluded from master_po so they aren't double counted)."""
-    today = date.today()
+    today = timezone.localdate()
     try:
         month_num = int(request.GET.get("month") or today.month)
     except (TypeError, ValueError):
@@ -1017,7 +1018,7 @@ def state_sales(request):
 
     Filters: platform, brand (Jivo/Sano, multi), category (multi), sub_category
     (multi). Category/sub_category option lists come from master_sheet."""
-    today = date.today()
+    today = timezone.localdate()
     metric = _state_metric(request)
     mode, periods, month_echo = _state_periods(request, today)
 
@@ -1547,7 +1548,7 @@ def state_sales_detail(request):
     keep those that _norm_state to the requested canonical state, then fetch rows
     matching those exact spellings — so the page totals reconcile with the number
     the user clicked."""
-    today = date.today()
+    today = timezone.localdate()
     metric = _state_metric(request)
     mode, periods, month_echo = _state_periods(request, today)
 
@@ -1678,7 +1679,7 @@ def state_sales_detail_options(request):
     filter" multi-selects. Honours the same state / platform / brand / category /
     sub-category / period filters as the rows endpoint, but NOT the SKU/city
     selections — so every available choice is shown regardless of what's ticked."""
-    today = date.today()
+    today = timezone.localdate()
     metric = _state_metric(request)
     _mode, periods, _month_echo = _state_periods(request, today)
     # Metric value isn't used here; pass a constant so the branch SELECTs are valid.
@@ -1731,7 +1732,7 @@ def state_sales_detail_cities(request):
     units / sales value / orders, honouring the same brand / category /
     sub-category / item-head / period filters. `dimension` tells the UI which
     it is."""
-    today = date.today()
+    today = timezone.localdate()
     metric = _state_metric(request)
     _mode, periods, month_echo = _state_periods(request, today)
 
@@ -2034,7 +2035,7 @@ def state_sales_detail_city_skus(request):
     Honours the same platform / brand / category / sub-category / item-head /
     period filters and orders by the active metric. `limit` (default 10) caps the
     SKU count."""
-    today = date.today()
+    today = timezone.localdate()
     metric = _state_metric(request)
     _mode, periods, month_echo = _state_periods(request, today)
 
@@ -2221,7 +2222,7 @@ def state_sales_export(request):
     excluded — neither carries the ordered / delivered litres this sheet reports
     (Flipkart also has no city). Honours the same platform / brand / category /
     sub-category / item-head / period filters."""
-    today = date.today()
+    today = timezone.localdate()
     _mode, periods, month_echo = _state_periods(request, today)
 
     platform = (request.GET.get("platform") or "").strip().lower() or None
@@ -2312,7 +2313,7 @@ def category_breakdown(request):
     source=secondary → "SecMaster" (non-AMZ) + amazon_sec_range_master_view (AMZ,
                        latest cumulative month_day snapshot only).
     Powers the home "Category Split" 2x2 grid in a single call."""
-    today = date.today()
+    today = timezone.localdate()
     try:
         month_num = int(request.GET.get("month") or today.month)
     except (TypeError, ValueError):
@@ -2485,7 +2486,7 @@ def category_platform_breakdown(request):
     Query params: month, year, source (primary|secondary), head (premium|commodity),
     dimension (category|sub_category), name (the clicked label; '' or 'Uncategorized'
     matches rows with a null/blank value)."""
-    today = date.today()
+    today = timezone.localdate()
     try:
         month_num = int(request.GET.get("month") or today.month)
     except (TypeError, ValueError):
@@ -2801,7 +2802,7 @@ def category_sku_breakdown(request):
     months=N (1-6, default 1) returns each SKU's `by_month` map keyed YYYY-MM plus
     a top-level `months` list (oldest→newest); `units`/`ltrs` mirror the latest
     (selected) month so they match the platform-level totals."""
-    today = date.today()
+    today = timezone.localdate()
     try:
         month_num = int(request.GET.get("month") or today.month)
     except (TypeError, ValueError):
@@ -2983,7 +2984,7 @@ def category_trend(request):
     point on the "Sales Trend" line chart equals that month's card total and a
     month reads the same regardless of where it sits in the window. Honours the
     platform filter; month/year is the END of the window."""
-    today = date.today()
+    today = timezone.localdate()
     try:
         end_month = int(request.GET.get("month") or today.month)
     except (TypeError, ValueError):
@@ -3124,7 +3125,7 @@ def _secondary_yoy_pick_platforms(raw_platform: str | None):
 
 def _secondary_yoy_month_year(params) -> tuple[int, int, bool, list[dict]]:
     errors: list[dict] = []
-    today = date.today()
+    today = timezone.localdate()
     raw_month = str(params.get("month") or "").strip()
     raw_year = str(params.get("year") or "").strip()
 
@@ -3528,7 +3529,7 @@ def fulfilment_health(request):
         fill_rate = SUM(filled_ltrs) / SUM(order_ltrs_cl) * 100
         miss_rate = SUM(missed_ltrs) / SUM(order_ltrs_cl) * 100
     Honours the platform filter."""
-    today = date.today()
+    today = timezone.localdate()
     try:
         lag_days = int(request.GET.get("lag_days") or 7)
     except (TypeError, ValueError):
@@ -3659,7 +3660,7 @@ def top_skus(request):
     Honours the platform filter. compare_months selects a 1/3/6/12-month
     window ending at the selected month end (or today for the current month),
     compared with the previous same-length month window."""
-    today = date.today()
+    today = timezone.localdate()
     try:
         month_num = int(request.GET.get("month") or today.month)
     except (TypeError, ValueError):
@@ -4040,7 +4041,7 @@ def top_skus(request):
 @cached_get(timeout=120, prefix="dash.platform_expiry_alerts", shared=True)
 def platform_expiry_alerts(request):
     """Unique POs with 1 <= days_to_expiry <= 5 in the current month, per platform."""
-    today = date.today()
+    today = timezone.localdate()
     month_name = calendar.month_name[today.month].upper()  # e.g. 'MAY'
     year = today.year
 
@@ -4124,7 +4125,7 @@ def platform_expiry_alerts(request):
 @cached_get(timeout=60, prefix="dash.expiry_pos")
 def platform_expiry_alert_pos(request, slug: str):
     """Distinct POs (1 <= days_to_expiry <= 5) for a platform in the current month."""
-    today = date.today()
+    today = timezone.localdate()
     month_name = calendar.month_name[today.month].upper()
     year = today.year
 
@@ -5125,7 +5126,7 @@ def _realise_prev_month(month_num, year):
 
 
 def _realise_month_year(request):
-    today = date.today()
+    today = timezone.localdate()
     try:
         month_num = int(request.GET.get("month") or today.month)
     except (TypeError, ValueError):

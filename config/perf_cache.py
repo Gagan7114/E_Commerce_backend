@@ -33,8 +33,24 @@ from __future__ import annotations
 import hashlib
 from functools import wraps
 
+from django.conf import settings
 from django.core.cache import cache
 from rest_framework.response import Response
+
+
+def _effective_timeout(timeout: int) -> int:
+    """Raise short per-endpoint TTLs to a configurable floor.
+
+    Most dashboard endpoints were decorated with a 60s TTL, so on the per-worker
+    LocMemCache each worker re-ran the heavy SQL roughly every minute. The data
+    only changes on upload, and uploads already bust the relevant cache keys (and
+    the Refresh button sends ?nocache=1), so a longer floor is safe and cuts cold
+    recomputes ~5x. Tune or revert via PERFCACHE_TTL_FLOOR (set it to 60 to
+    restore the old behaviour). Endpoints that already ask for MORE than the floor
+    keep their longer TTL.
+    """
+    floor = getattr(settings, "PERFCACHE_TTL_FLOOR", 300)
+    return max(int(timeout), int(floor))
 
 
 # A request carrying `?nocache=1` skips the cached copy and recomputes live (used
@@ -99,7 +115,7 @@ def cached_get(timeout: int = 60, prefix: str = "view", shared: bool = False):
             try:
                 status_code = getattr(response, "status_code", 200)
                 if 200 <= status_code < 300 and hasattr(response, "data"):
-                    cache.set(key, response.data, timeout=timeout)
+                    cache.set(key, response.data, timeout=_effective_timeout(timeout))
             except Exception:
                 # Caching is a best-effort optimization; never break the response.
                 pass

@@ -16,6 +16,7 @@ enough to run on a schedule. The endpoint that serves this is cached.
 from datetime import date
 
 from django.db import connection
+from django.utils import timezone
 
 
 # (label, table, date_col, max_age_days, category). Thresholds reflect each
@@ -84,7 +85,7 @@ def _status_row(label, category, max_date, max_age, today):
 def feed_freshness(today=None):
     """One status row per feed: {feed, category, max_date, age_days,
     threshold_days, status in fresh|stale|no_data}. Stale feeds sort first."""
-    today = today or date.today()
+    today = today or timezone.localdate()
     rows = []
     for label, table, col, max_age, cat in _TABLE_FEEDS:
         try:
@@ -140,7 +141,7 @@ def null_per_litre_skus(limit: int = 50):
 
 
 def data_health(today=None):
-    today = today or date.today()
+    today = today or timezone.localdate()
     feeds = feed_freshness(today)
     return {
         "generated_for": today.isoformat(),

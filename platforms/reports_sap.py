@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import logging
 from datetime import date, timedelta
+
+from django.utils import timezone
 from decimal import Decimal
 from typing import Any
 
@@ -178,7 +180,7 @@ def jm_primary_columns(source: str) -> list[tuple[str, str]]:
     process (procedure column shape doesn't change at runtime)."""
     if source in _JM_PRIMARY_COLUMN_CACHE:
         return _JM_PRIMARY_COLUMN_CACHE[source]
-    today = date.today()
+    today = timezone.localdate()
     week_ago = today - timedelta(days=7)
     sample: list[dict] = []
     try:
