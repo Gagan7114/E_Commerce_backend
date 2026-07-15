@@ -8709,6 +8709,34 @@ def amazon_mp_dashboard(request, slug: str):
     return _amazon_mp_dashboard_response(request)
 
 
+@api_view(["GET"])
+@permission_classes([require("platform.secondary.view")])
+def amazon_mp_dashboard_version(request, slug: str):
+    """Cheap freshness beacon for near-real-time updates.
+
+    Returns the last time amazon_mp_master was refreshed (stamped by
+    refresh_amazon_mp_master). The frontend polls this every ~1.5s and, when the
+    value changes, refetches the (heavier) dashboard bypassing the cache — so an
+    upload / master-sheet edit shows on screen within a poll interval instead of
+    waiting out the 60s response cache. Deliberately NOT wrapped in @cached_get:
+    it must always read live, and it's a single indexed 1-row lookup (~1ms).
+    """
+    _ensure_scope(request.user, slug)
+    if slug != "amazon":
+        raise ValidationError("MP Dashboard is available only for Amazon.")
+    with connection.cursor() as cur:
+        cur.execute("SELECT to_regclass('public.matview_refresh_state')")
+        if cur.fetchone()[0] is None:
+            return Response({"version": None})
+        cur.execute(
+            "SELECT last_refreshed FROM matview_refresh_state "
+            "WHERE name = 'amazon_mp_master'"
+        )
+        row = cur.fetchone()
+    ts = row[0] if row else None
+    return Response({"version": ts.isoformat() if ts is not None else None})
+
+
 # ── Amazon Coupon Dashboard ──────────────────────────────────────────────────
 # Sourced from amazon_coupon_master. KPIs are grand-total columns; the table is
 # coupon-name-wise; the item_head split powers a Premium/Commodity donut.

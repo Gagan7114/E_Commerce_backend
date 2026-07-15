@@ -262,22 +262,28 @@ def _refresh_matviews_async(
         )
         with _MATVIEW_REFRESH_LOCK:
             try:
+                # Refresh CHEAP matviews first and bust the cache after EACH one,
+                # not once at the end. A master_sheet edit triggers all four
+                # refreshes, and the ~10s secmaster rebuild used to gate the single
+                # trailing cache.clear() — so a 0.4s amazon_mp refresh wasn't
+                # visible on the dashboard until secmaster finished (the 5-10s lag).
+                # Clearing after each refresh lets every dashboard go live the
+                # moment its own matview is ready.
+                if do_amazon_mp:
+                    refresh_amazon_mp_master()   # ~0.4s
+                    cache.clear()
                 if do_master_po:
                     refresh_master_po_mv()
-                if do_amazon_mp:
-                    refresh_amazon_mp_master()
-                if do_secmaster:
-                    # ~10s rebuild for DRR / Secondary / Summary dashboards.
-                    refresh_secmaster_mv()
+                    cache.clear()
                 if do_ads_master:
                     # Blinkit / Swiggy ADS dashboards.
                     refresh_ads_master_mvs()
-                # The matviews are now fresh. Clear the cache AGAIN: a dashboard
-                # read that raced in before this refresh finished would have
-                # cached a stale response (TTL 60s) — drop it so the next read
-                # serves fresh data and the dashboard updates without waiting out
-                # the cache or a manual refresh.
-                cache.clear()
+                    cache.clear()
+                if do_secmaster:
+                    # ~10s rebuild for DRR / Secondary / Summary dashboards — run
+                    # LAST so it never delays the faster dashboards' freshness.
+                    refresh_secmaster_mv()
+                    cache.clear()
             except Exception:  # noqa: BLE001 - a refresh failure must not crash
                 logger.exception("Background matview refresh failed")
             finally:

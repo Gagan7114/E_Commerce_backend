@@ -278,6 +278,23 @@ def refresh_amazon_mp_master() -> bool:
             if not row or row[0] != "m":
                 return False
             cur.execute("REFRESH MATERIALIZED VIEW public.amazon_mp_master")
+            # Stamp the refresh time so the dashboard's cheap /version endpoint can
+            # tell open clients that fresh data is ready — they refetch within one
+            # poll interval (~1.5s) instead of waiting out the 60s cache. Best
+            # effort: a stamp failure must not fail the refresh itself.
+            try:
+                cur.execute(
+                    "CREATE TABLE IF NOT EXISTS matview_refresh_state ("
+                    "name text PRIMARY KEY, "
+                    "last_refreshed timestamptz NOT NULL DEFAULT now())"
+                )
+                cur.execute(
+                    "INSERT INTO matview_refresh_state (name, last_refreshed) "
+                    "VALUES ('amazon_mp_master', now()) "
+                    "ON CONFLICT (name) DO UPDATE SET last_refreshed = now()"
+                )
+            except Exception:  # noqa: BLE001 - stamp is optional
+                logger.exception("amazon_mp_master refresh stamp failed")
         return True
     except Exception:  # noqa: BLE001 - a refresh failure must not break callers
         logger.exception("Failed to refresh amazon_mp_master")
