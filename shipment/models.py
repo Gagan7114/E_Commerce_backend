@@ -171,3 +171,23 @@ class ShipmentAuditLog(models.Model):
     class Meta:
         db_table = 'sp_audit_log'
         ordering = ['-changed_at']
+
+
+class ShipmentPoDocument(models.Model):
+    """One uploaded PO document (PDF) per (shipment, PO).
+
+    Stored inline in the DB as bytes — the project has no external file storage.
+    Replaceable: re-uploading a PO overwrites its row (unique on shipment + po)."""
+    shipment = models.ForeignKey(Shipment, on_delete=models.CASCADE, related_name='po_documents')
+    po_number = models.CharField(max_length=64)
+    file_name = models.CharField(max_length=255)
+    content_type = models.CharField(max_length=100, default='application/pdf')
+    size = models.IntegerField(default=0)
+    data = models.BinaryField()
+    uploaded_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True)
+    uploaded_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = 'sp_po_document'
+        unique_together = ('shipment', 'po_number')
+        ordering = ['po_number']
