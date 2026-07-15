@@ -1845,6 +1845,18 @@ class AppointmentItemsView(_SafeAPIView):
         ]
         all_appt_ids = [appointment_id] + extra_ids
 
+        # Authoritative commit caps: public.appointment_commit is the single source
+        # of truth (see _lookup_appointment_commit) — never trust the client-sent
+        # commit_caps_json above, which can be stale (e.g. the appointment was loaded
+        # before its commit changed in Vendor Central). Rebuild from the live DB so
+        # the auto plan uses the SAME cap the save guard and the manual planner
+        # enforce — a plan that generates can always be saved.
+        commit_caps = {
+            str(_aid).strip(): _live
+            for _aid in all_appt_ids
+            if (_live := _lookup_appointment_commit(_aid))
+        }
+
         # Optional explicit PO selection: when provided, the candidate pool is
         # built from this list (still scoped to the appointment's FC, still
         # PENDING+in-stock) instead of the appointment's own PO list. Lets the
