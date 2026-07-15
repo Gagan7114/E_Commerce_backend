@@ -122,16 +122,18 @@ class ShipmentListSerializer(serializers.ModelSerializer):
     created_by_email = serializers.SerializerMethodField()
     item_count = serializers.SerializerMethodField()
     is_stale_draft = serializers.SerializerMethodField()
+    channel = serializers.SerializerMethodField()
+    summary = serializers.SerializerMethodField()
 
     class Meta:
         model = Shipment
         fields = [
-            'id', 'appointment_id', 'appointment_time', 'destination_fc',
+            'id', 'appointment_id', 'appointment_time', 'destination_fc', 'channel',
             'pro', 'truck_size', 'truck_capacity_liters', 'planned_liters',
             'load_percentage', 'auto_planned', 'planning_mode', 'status',
             'created_by_email', 'item_count', 'created_at', 'updated_at',
             'vehicle_type', 'vehicle_number', 'driver_name', 'driver_phone',
-            'dispatch_date_planned', 'notes', 'is_stale_draft',
+            'dispatch_date_planned', 'notes', 'is_stale_draft', 'summary',
         ]
 
     def get_created_by_email(self, obj):
@@ -148,3 +150,64 @@ class ShipmentListSerializer(serializers.ModelSerializer):
 
     def get_is_stale_draft(self, obj):
         return _is_stale_draft(obj)
+
+    def get_channel(self, obj):
+        """Channel (CORE / FRESH / NOW) mapped to this shipment's FC, via the
+        cached FC→channel map (near-static master, no per-object query)."""
+        fc = (obj.destination_fc or '').strip()
+        if not fc:
+            return None
+        try:
+            from .views import _fc_channel_map
+            return _fc_channel_map().get(fc.upper()) or None
+        except Exception:
+            return None
+
+    def get_summary(self, obj):
+        """Compact rollup for the list card: category tonnes (Premium / Commodity /
+        Other), distinct PO / SKU counts, total units & cartons (from the prefetched
+        loaded items) and the Vendor-Central committed/filled totals (from
+        commitment_snapshot). Mirrors the ShipmentDetail summary header."""
+        items = getattr(obj, 'loaded_items_pref', None)
+        if items is None:
+            items = list(obj.items.filter(not_loaded=False))
+        prem = comm = other = 0.0
+        units = cartons = 0.0
+        pos, skus = set(), set()
+        for it in items:
+            liters = float(it.planned_liters or 0)
+            head = (it.item_head or '').lower()
+            if 'premium' in head:
+                prem += liters
+            elif 'commodity' in head:
+                comm += liters
+            else:
+                other += liters
+            q = float(it.planned_qty or 0)
+            cp = max(float(it.case_pack or 1), 1.0)
+            units += q
+            cartons += q / cp
+            if it.po_number:
+                pos.add(it.po_number.strip().upper())
+            key = it.asin or it.internal_sku
+            if key:
+                skus.add(str(key).strip().upper())
+        snap = obj.commitment_snapshot if isinstance(obj.commitment_snapshot, list) else []
+        cu = sum(float(r.get('committed_units') or 0) for r in snap)
+        fu = sum(float(r.get('filled_units') or 0) for r in snap)
+        cc = sum(float(r.get('committed_cartons') or 0) for r in snap)
+        fcar = sum(float(r.get('filled_cartons') or 0) for r in snap)
+        return {
+            'po_count': len(pos),
+            'sku_count': len(skus),
+            'total_units': int(round(units)),
+            'total_cartons': int(round(cartons)),
+            'total_tonnes': round((prem + comm + other) / 1000, 2),
+            'premium_tonnes': round(prem / 1000, 2),
+            'commodity_tonnes': round(comm / 1000, 2),
+            'other_tonnes': round(other / 1000, 2),
+            'committed_units': int(round(cu)),
+            'filled_units': int(round(fu)),
+            'committed_cartons': int(round(cc)),
+            'filled_cartons': int(round(fcar)),
+        }
