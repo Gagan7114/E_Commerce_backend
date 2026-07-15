@@ -1987,6 +1987,7 @@ class AppointmentItemsView(_SafeAPIView):
                     p.po_number,
                     p.asin,
                     p.merchant_sku        AS internal_sku,
+                    p.sap_sku_code,
                     p.sku_name            AS product_name,
                     -- Orderable amount this plan = leftover after prior commitments.
                     (p.accepted_qty - COALESCE(c.committed_qty, 0)) AS accepted_qty,
@@ -3278,7 +3279,7 @@ class POListView(_SafeAPIView):
                     GROUP BY UPPER(TRIM(pv))
                 )
                 SELECT
-                    ap.po_number, ap.asin, ap.merchant_sku, ap.sku_code,
+                    ap.po_number, ap.asin, ap.merchant_sku, ap.sku_code, ap.sap_sku_code,
                     ap.sku_name        AS product_name,
                     ap.accepted_qty, ap.cancelled_qty, ap.requested_qty, ap.received_qty,
                     ap.fulfillment_center AS destination_fc,
