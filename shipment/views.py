@@ -3381,6 +3381,7 @@ class POListView(_SafeAPIView):
                     pa.appt_fc            AS appt_fc,
                     ap.availability_status,
                     ap.status, ap.po_status, ap.item_status,
+                    ap.remaining_qty, ap.remaining_ltrs,
                     ap.case_pack, ap.per_liter,
                     ap.total_accepted_liters, ap.total_order_liters, ap.days_to_expiry,
                     ap.expiry_date, ap.category, ap.sub_category, ap.brand,

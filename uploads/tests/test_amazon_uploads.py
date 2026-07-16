@@ -877,6 +877,51 @@ class AmazonUploadTests(TransactionTestCase):
         self.assertEqual(rows["ASIN-NOTSUP"], "NOT SUPPLIED")
         self.assertEqual(rows["ASIN-CANC"], "NOT SUPPLIED")
 
+    def test_amazon_remaining_qty_ltrs(self):
+        with connection.cursor() as cur:
+            cur.execute(
+                "INSERT INTO master.fc_master (fc_code, fc_name, city, state) VALUES (%s, %s, %s, %s)",
+                ["FC1", "FC One", "Delhi", "Delhi"],
+            )
+
+        content = (
+            "PO,Order date,Status,ASIN,Availability,Requested quantity,Accepted quantity,"
+            "Received quantity,Cancelled quantity,Ship-to location,Cancellation deadline\n"
+            # PENDING + SHORT SUPPLIED (partial receipt) -> Remaining QTY = accepted - received = 3
+            "PO-REM,2026-05-01,Confirmed,ASIN-PARTIAL,AC - Accepted: In stock,10,5,2,0,FC1,2099-01-01\n"
+            # COMPLETED -> Remaining QTY = 0
+            "PO-REM,2026-05-01,Confirmed,ASIN-DONE,AC - Accepted: In stock,10,10,10,0,FC1,2099-01-01\n"
+            # CANCELLED -> Remaining QTY = 0
+            "PO-REM,2026-05-01,Closed,ASIN-CANC,OS - Cancelled: Out of stock,10,0,0,0,FC1,2099-01-01\n"
+        )
+        response = self.client.post(
+            "/api/uploads",
+            {"report_type": "AMAZON_PO", "file": csv_file("po-rem.csv", content)},
+            format="multipart",
+        )
+        self.assertEqual(response.status_code, 200, response.data)
+
+        with connection.cursor() as cur:
+            cur.execute(
+                """
+                SELECT asin, remaining_qty, remaining_ltrs
+                  FROM reporting."Amazon PO"
+                 WHERE po_number = %s
+                 ORDER BY asin
+                """,
+                ["PO-REM"],
+            )
+            rows = {r[0]: (r[1], r[2]) for r in cur.fetchall()}
+
+        # Only the still-open partial line carries an outstanding balance.
+        self.assertEqual(rows["ASIN-PARTIAL"][0], 3)   # 5 accepted - 2 received
+        self.assertEqual(rows["ASIN-DONE"][0], 0)
+        self.assertEqual(rows["ASIN-CANC"][0], 0)
+        # remaining_ltrs mirrors remaining_qty scaled by per_liter (0 here: test
+        # SKUs have no master_sheet per-litre), and is 0 for the non-partial rows.
+        self.assertEqual(rows["ASIN-DONE"][1], 0)
+        self.assertEqual(rows["ASIN-CANC"][1], 0)
+
     def test_validation_errors_and_warnings_are_stored(self):
         response = self.client.post(
             "/api/uploads",

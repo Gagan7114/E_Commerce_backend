@@ -1478,7 +1478,8 @@ def _transform_amazon_po(cur, upload_id: int) -> tuple[int, int]:
             sku_name, requested_qty, accepted_qty, received_qty, cancelled_qty,
             fulfillment_center, cost_price, total_requested_cost, total_accepted_cost,
             total_received_cost, total_cancelled_cost, vendor, days_to_expiry,
-            po_window, po_status, item_status, item, sap_sku_name,
+            po_window, po_status, item_status, remaining_qty, remaining_ltrs,
+            item, sap_sku_name,
             sap_sku_code, category, sub_category, case_pack, requested_boxes,
             accepted_boxes, per_ltr_unit, per_liter, total_order_liters,
             total_accepted_liters, total_delivered_liters,
@@ -1522,6 +1523,26 @@ def _transform_amazon_po(cur, upload_id: int) -> tuple[int, int]:
                     THEN 'FULL SUPPLIED'
                 ELSE 'SHORT SUPPLIED'
             END AS item_status,
+            -- Remaining QTY / Remaining LTR: the outstanding balance on a still-open
+            -- partially-received line, i.e. Item Status = SHORT SUPPLIED AND
+            -- PO Status = PENDING (equivalently PENDING + 0 < received < requested).
+            -- Blank (NULL) when PO Status is blank, else the shortfall, else 0.
+            CASE
+                WHEN COALESCE(po_status_calc, '') = '' THEN NULL
+                WHEN po_status_calc = 'PENDING'
+                     AND COALESCE(received_quantity, 0) > 0
+                     AND COALESCE(received_quantity, 0) < COALESCE(requested_quantity, 0)
+                    THEN accepted_quantity - received_quantity
+                ELSE 0
+            END AS remaining_qty,
+            CASE
+                WHEN COALESCE(po_status_calc, '') = '' THEN NULL
+                WHEN po_status_calc = 'PENDING'
+                     AND COALESCE(received_quantity, 0) > 0
+                     AND COALESCE(received_quantity, 0) < COALESCE(requested_quantity, 0)
+                    THEN (accepted_quantity - received_quantity) * COALESCE(per_liter_calc, 0)
+                ELSE 0
+            END AS remaining_ltrs,
             item,
             sap_sku_name,
             sap_sku_code,
@@ -1602,6 +1623,8 @@ def _transform_amazon_po(cur, upload_id: int) -> tuple[int, int]:
             po_window = EXCLUDED.po_window,
             po_status = EXCLUDED.po_status,
             item_status = EXCLUDED.item_status,
+            remaining_qty = EXCLUDED.remaining_qty,
+            remaining_ltrs = EXCLUDED.remaining_ltrs,
             item = EXCLUDED.item,
             sap_sku_name = EXCLUDED.sap_sku_name,
             sap_sku_code = EXCLUDED.sap_sku_code,
@@ -1778,6 +1801,14 @@ def refresh_amazon_po_from_master_sheet(cur, format_sku_codes=None, items=None) 
                    ELSE 0
                END,
                filled_ltrs = w.received_qty * COALESCE(w.per_liter_calc, 0),
+               remaining_ltrs = CASE
+                   WHEN COALESCE(NULLIF(TRIM(w.po_status), ''), '') = '' THEN NULL
+                   WHEN UPPER(TRIM(w.po_status)) = 'PENDING'
+                        AND COALESCE(w.received_qty, 0) > 0
+                        AND COALESCE(w.received_qty, 0) < COALESCE(w.requested_qty, 0)
+                       THEN (w.accepted_qty - w.received_qty) * COALESCE(w.per_liter_calc, 0)
+                   ELSE 0
+               END,
                updated_at = now()
           FROM winner w
          WHERE a.source_line_key = w.source_line_key
@@ -3287,6 +3318,8 @@ AMAZON_PO_REPORT_COLUMNS = (
     "po_window",
     "po_status",
     "item_status",
+    "remaining_qty",
+    "remaining_ltrs",
     "item",
     "sap_sku_name",
     "sap_sku_code",
