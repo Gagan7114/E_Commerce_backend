@@ -191,3 +191,19 @@ class ShipmentPoDocument(models.Model):
         db_table = 'sp_po_document'
         unique_together = ('shipment', 'po_number')
         ordering = ['po_number']
+
+
+class ShipmentInvoice(models.Model):
+    """The invoice PDF (2-4 pages) for a shipment — one per shipment, stored
+    inline in the DB as bytes (no external file storage). Replaceable: uploading
+    again overwrites the row (OneToOne on shipment)."""
+    shipment = models.OneToOneField(Shipment, on_delete=models.CASCADE, related_name='invoice')
+    file_name = models.CharField(max_length=255)
+    content_type = models.CharField(max_length=100, default='application/pdf')
+    size = models.IntegerField(default=0)
+    data = models.BinaryField()
+    uploaded_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True)
+    uploaded_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = 'sp_invoice'

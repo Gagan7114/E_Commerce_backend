@@ -21,7 +21,7 @@ from rest_framework.views import APIView
 from rest_framework.parsers import MultiPartParser, FormParser
 
 from accounts.permissions import has_permission_code
-from .models import Shipment, ShipmentAuditLog, ShipmentItem, ShipmentPoDocument
+from .models import Shipment, ShipmentAuditLog, ShipmentItem, ShipmentPoDocument, ShipmentInvoice
 from .serializers import (
     ShipmentAuditLogSerializer,
     ShipmentItemSerializer,
@@ -3069,6 +3069,76 @@ class ShipmentPoDocumentFileView(_SafeAPIView):
         return Response(status=204)
 
 
+class ShipmentInvoiceView(_SafeAPIView):
+    """The shipment invoice PDF — one per shipment, stored in the DB. GET returns
+    its metadata; POST uploads/replaces it; DELETE removes it. Uploading and
+    deleting are only allowed while the shipment is Approved."""
+    permission_classes = [IsAuthenticated]
+    parser_classes = [MultiPartParser, FormParser]
+
+    MAX_BYTES = 30 * 1024 * 1024  # 30 MB
+
+    def get(self, request, pk):
+        inv = (
+            ShipmentInvoice.objects
+            .filter(shipment_id=pk)
+            .values('file_name', 'size', 'content_type', 'uploaded_at')
+            .first()
+        )
+        return Response(inv or {})
+
+    def post(self, request, pk):
+        try:
+            shipment = Shipment.objects.get(pk=pk)
+        except Shipment.DoesNotExist:
+            return Response({'error': 'Not found'}, status=404)
+        if shipment.status != Shipment.Status.APPROVED:
+            return Response({'error': 'The invoice can only be uploaded while the shipment is Approved.'}, status=400)
+        f = request.FILES.get('file')
+        if f is None:
+            return Response({'error': 'file is required'}, status=400)
+        if f.size > self.MAX_BYTES:
+            return Response({'error': 'File exceeds the 30 MB limit'}, status=400)
+        ct = (f.content_type or '').lower()
+        if 'pdf' not in ct and not (f.name or '').lower().endswith('.pdf'):
+            return Response({'error': 'Only PDF files are allowed'}, status=400)
+        ShipmentInvoice.objects.update_or_create(
+            shipment=shipment,
+            defaults={
+                'file_name': (f.name or 'invoice.pdf')[:255],
+                'content_type': f.content_type or 'application/pdf',
+                'size': f.size,
+                'data': f.read(),
+                'uploaded_by': request.user if getattr(request.user, 'is_authenticated', False) else None,
+            },
+        )
+        return Response({'file_name': f.name, 'size': f.size}, status=201)
+
+    def delete(self, request, pk):
+        try:
+            shipment = Shipment.objects.get(pk=pk)
+        except Shipment.DoesNotExist:
+            return Response({'error': 'Not found'}, status=404)
+        if shipment.status != Shipment.Status.APPROVED:
+            return Response({'error': 'The invoice can only be changed while the shipment is Approved.'}, status=400)
+        ShipmentInvoice.objects.filter(shipment_id=pk).delete()
+        return Response(status=204)
+
+
+class ShipmentInvoiceFileView(_SafeAPIView):
+    """Download / view the shipment invoice PDF (works on any status)."""
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, pk):
+        try:
+            inv = ShipmentInvoice.objects.get(shipment_id=pk)
+        except ShipmentInvoice.DoesNotExist:
+            return Response({'error': 'Not found'}, status=404)
+        resp = HttpResponse(bytes(inv.data), content_type=inv.content_type or 'application/pdf')
+        resp['Content-Disposition'] = f'inline; filename="{inv.file_name}"'
+        return resp
+
+
 class ShipmentApproveView(_SafeAPIView):
     permission_classes = [IsAuthenticated, IsShipmentManager]
 
@@ -3121,6 +3191,9 @@ class ShipmentDispatchView(_SafeAPIView):
 
         if shipment.status != Shipment.Status.APPROVED:
             return Response({'error': 'Shipment must be approved before dispatch'}, status=400)
+
+        if not ShipmentInvoice.objects.filter(shipment_id=pk).exists():
+            return Response({'error': 'Upload the invoice PDF before marking this shipment dispatched.'}, status=400)
 
         shipment.status = Shipment.Status.DISPATCHED
         shipment.save(update_fields=['status'])
