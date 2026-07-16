@@ -81,11 +81,31 @@ def backfill(apps, schema_editor):
         cur.execute("SELECT to_regclass(%s)", ['reporting."Amazon PO"'])
         if cur.fetchone()[0] is None:
             return
-        cur.execute(FLIP_PARTIAL_TO_PENDING)
-        cur.execute(RECOMPUTE_ITEM_STATUS)
+        # This is a data-only backfill (Item Status changed for most rows, so the
+        # UPDATE can touch many rows). It must NEVER block the migration chain: if
+        # it did, the schema migration right after this one (0075, which ADDS the
+        # remaining_qty/remaining_ltrs columns the app now SELECTs) would stay
+        # unapplied and every read of the table would error. So we run it
+        # best-effort under a bounded timeout; new uploads already apply the new
+        # rules, and the full backfill can be completed with:
+        #     manage.py backfill_amazon_po_columns
+        try:
+            cur.execute("SET statement_timeout = '30s'")
+            cur.execute("SET lock_timeout = '10s'")
+        except Exception:
+            pass
+        for statement in (FLIP_PARTIAL_TO_PENDING, RECOMPUTE_ITEM_STATUS):
+            try:
+                cur.execute(statement)
+            except Exception:
+                pass
 
 
 class Migration(migrations.Migration):
+    # atomic=False: each backfill statement autocommits, so a slow/failed one
+    # rolls back on its own instead of poisoning the transaction or halting
+    # migrate (which would block the schema change in 0075).
+    atomic = False
 
     dependencies = [
         ("uploads", "0073_ads_daily_master_total_sale_basic_rate"),

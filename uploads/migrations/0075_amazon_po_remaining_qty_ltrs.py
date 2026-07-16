@@ -46,14 +46,25 @@ UPDATE {_AMAZON_PO}
 """
 
 
-def add_and_backfill(apps, schema_editor):
+def backfill_data(apps, schema_editor):
     conn = schema_editor.connection
     with conn.cursor() as cur:
         cur.execute("SELECT to_regclass(%s)", ['reporting."Amazon PO"'])
         if cur.fetchone()[0] is None:
             return
-        cur.execute(ADD_COLUMNS)
-        cur.execute(BACKFILL)
+        # Best-effort: the ADD COLUMN above is a separate RunSQL op that has
+        # already committed (atomic=False), so reads work even if this backfill
+        # can't finish under a prod timeout. Full backfill:
+        #     manage.py backfill_amazon_po_columns
+        try:
+            cur.execute("SET statement_timeout = '30s'")
+            cur.execute("SET lock_timeout = '10s'")
+        except Exception:
+            pass
+        try:
+            cur.execute(BACKFILL)
+        except Exception:
+            pass
 
 
 def drop_columns(apps, schema_editor):
@@ -70,11 +81,19 @@ def drop_columns(apps, schema_editor):
 
 
 class Migration(migrations.Migration):
+    # atomic=False so ADD COLUMN (RunSQL) commits independently of the
+    # best-effort data backfill — the columns MUST exist for reads to work even
+    # if the backfill can't finish under a prod statement_timeout.
+    atomic = False
 
     dependencies = [
         ("uploads", "0074_amazon_po_status_partial_pending"),
     ]
 
     operations = [
-        migrations.RunPython(add_and_backfill, drop_columns),
+        # 1) Schema first — fast, idempotent, cannot time out. This is what the
+        #    Amazon-Primary report and Shipment Planner SELECTs depend on.
+        migrations.RunSQL(ADD_COLUMNS, reverse_sql=migrations.RunSQL.noop),
+        # 2) Data backfill — best-effort (see backfill_data).
+        migrations.RunPython(backfill_data, drop_columns),
     ]
