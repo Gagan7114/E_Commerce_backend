@@ -1,4 +1,4 @@
-from django.db import migrations
+from django.db import migrations, transaction
 
 # One-time backfill so the revised PO Status / Item Status rules take effect on
 # EXISTING reporting."Amazon PO" rows immediately — in the Amazon-Primary views
@@ -75,36 +75,37 @@ UPDATE {_AMAZON_PO} a
 
 def backfill(apps, schema_editor):
     conn = schema_editor.connection
+    # reporting."Amazon PO" is a raw (non-ORM) table; skip cleanly on any DB
+    # where it does not exist yet (fresh installs / test DBs).
     with conn.cursor() as cur:
-        # reporting."Amazon PO" is a raw (non-ORM) table; skip cleanly on any DB
-        # where it does not exist yet (fresh installs / test DBs).
         cur.execute("SELECT to_regclass(%s)", ['reporting."Amazon PO"'])
         if cur.fetchone()[0] is None:
             return
-        # This is a data-only backfill (Item Status changed for most rows, so the
-        # UPDATE can touch many rows). It must NEVER block the migration chain: if
-        # it did, the schema migration right after this one (0075, which ADDS the
-        # remaining_qty/remaining_ltrs columns the app now SELECTs) would stay
-        # unapplied and every read of the table would error. So we run it
-        # best-effort under a bounded timeout; new uploads already apply the new
-        # rules, and the full backfill can be completed with:
-        #     manage.py backfill_amazon_po_columns
+    # This is a data-only backfill (Item Status changed for most rows, so the
+    # UPDATE can touch many rows). It must NEVER block the migration chain: if it
+    # did, the schema migration right after this one (0075, which ADDS the
+    # remaining_qty/remaining_ltrs columns the app now SELECTs) would stay
+    # unapplied and every read of the table would error. So each statement runs
+    # in its OWN transaction under a bounded timeout: a slow/failed one rolls
+    # back cleanly (no aborted-transaction state can reach Django's migration
+    # recorder) and is simply skipped. New uploads already apply the new rules,
+    # and the full backfill can be completed later with:
+    #     manage.py backfill_amazon_po_columns
+    for statement in (FLIP_PARTIAL_TO_PENDING, RECOMPUTE_ITEM_STATUS):
         try:
-            cur.execute("SET statement_timeout = '30s'")
-            cur.execute("SET lock_timeout = '10s'")
+            with transaction.atomic():
+                with conn.cursor() as cur:
+                    cur.execute("SET LOCAL statement_timeout = '30s'")
+                    cur.execute("SET LOCAL lock_timeout = '10s'")
+                    cur.execute(statement)
         except Exception:
             pass
-        for statement in (FLIP_PARTIAL_TO_PENDING, RECOMPUTE_ITEM_STATUS):
-            try:
-                cur.execute(statement)
-            except Exception:
-                pass
 
 
 class Migration(migrations.Migration):
-    # atomic=False: each backfill statement autocommits, so a slow/failed one
-    # rolls back on its own instead of poisoning the transaction or halting
-    # migrate (which would block the schema change in 0075).
+    # atomic=False so this data-only backfill is not wrapped in one big
+    # transaction; each statement above manages its own (see backfill), so a
+    # slow/failed one can never halt migrate and block the schema change in 0075.
     atomic = False
 
     dependencies = [

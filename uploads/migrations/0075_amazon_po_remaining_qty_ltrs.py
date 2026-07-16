@@ -1,4 +1,4 @@
-from django.db import migrations
+from django.db import migrations, transaction
 
 # Two brand-new Amazon-PO columns: Remaining QTY and Remaining LTR.
 # They carry the outstanding balance on a still-open, partially-received line,
@@ -46,25 +46,44 @@ UPDATE {_AMAZON_PO}
 """
 
 
+def add_columns(apps, schema_editor):
+    conn = schema_editor.connection
+    with conn.cursor() as cur:
+        cur.execute("SELECT to_regclass(%s)", ['reporting."Amazon PO"'])
+        if cur.fetchone()[0] is None:
+            return
+    # CRITICAL: the app SELECTs these columns, so they MUST be added. ADD COLUMN
+    # (nullable, no table rewrite) is instant once it holds the lock. Disable any
+    # global statement_timeout so a lock wait can't kill it, and cap the lock
+    # wait so a stuck transaction can't hang the deploy forever (migrate just
+    # retries next deploy). NOT wrapped in try/except: if it genuinely can't add
+    # the columns we want the migration to fail and retry, never to be recorded
+    # as applied without the columns actually existing.
+    with transaction.atomic():
+        with conn.cursor() as cur:
+            cur.execute("SET LOCAL statement_timeout = 0")
+            cur.execute("SET LOCAL lock_timeout = '30s'")
+            cur.execute(ADD_COLUMNS)
+
+
 def backfill_data(apps, schema_editor):
     conn = schema_editor.connection
     with conn.cursor() as cur:
         cur.execute("SELECT to_regclass(%s)", ['reporting."Amazon PO"'])
         if cur.fetchone()[0] is None:
             return
-        # Best-effort: the ADD COLUMN above is a separate RunSQL op that has
-        # already committed (atomic=False), so reads work even if this backfill
-        # can't finish under a prod timeout. Full backfill:
-        #     manage.py backfill_amazon_po_columns
-        try:
-            cur.execute("SET statement_timeout = '30s'")
-            cur.execute("SET lock_timeout = '10s'")
-        except Exception:
-            pass
-        try:
-            cur.execute(BACKFILL)
-        except Exception:
-            pass
+    # Best-effort: add_columns above already committed the schema, so reads work
+    # even if this backfill can't finish under a prod timeout. Runs in its own
+    # transaction so a slow/failed run rolls back cleanly and is simply skipped.
+    # Full backfill: manage.py backfill_amazon_po_columns
+    try:
+        with transaction.atomic():
+            with conn.cursor() as cur:
+                cur.execute("SET LOCAL statement_timeout = '30s'")
+                cur.execute("SET LOCAL lock_timeout = '10s'")
+                cur.execute(BACKFILL)
+    except Exception:
+        pass
 
 
 def drop_columns(apps, schema_editor):
@@ -81,7 +100,7 @@ def drop_columns(apps, schema_editor):
 
 
 class Migration(migrations.Migration):
-    # atomic=False so ADD COLUMN (RunSQL) commits independently of the
+    # atomic=False so ADD COLUMN (add_columns) commits independently of the
     # best-effort data backfill — the columns MUST exist for reads to work even
     # if the backfill can't finish under a prod statement_timeout.
     atomic = False
@@ -91,9 +110,9 @@ class Migration(migrations.Migration):
     ]
 
     operations = [
-        # 1) Schema first — fast, idempotent, cannot time out. This is what the
-        #    Amazon-Primary report and Shipment Planner SELECTs depend on.
-        migrations.RunSQL(ADD_COLUMNS, reverse_sql=migrations.RunSQL.noop),
+        # 1) Schema first — fast, idempotent, controlled timeouts. This is what
+        #    the Amazon-Primary report and Shipment Planner SELECTs depend on.
+        migrations.RunPython(add_columns, drop_columns),
         # 2) Data backfill — best-effort (see backfill_data).
-        migrations.RunPython(backfill_data, drop_columns),
+        migrations.RunPython(backfill_data, migrations.RunPython.noop),
     ]
