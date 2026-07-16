@@ -3381,7 +3381,26 @@ class POListView(_SafeAPIView):
                     pa.appt_fc            AS appt_fc,
                     ap.availability_status,
                     ap.status, ap.po_status, ap.item_status,
-                    ap.remaining_qty, ap.remaining_ltrs,
+                    -- Remaining QTY / LTR computed on read (no stored columns, no
+                    -- migration dependency): outstanding balance on a still-open
+                    -- partial line (Item Status = SHORT SUPPLIED AND PO Status =
+                    -- PENDING), else 0, blank when PO Status is blank.
+                    CASE
+                        WHEN COALESCE(NULLIF(TRIM(ap.po_status), ''), '') = '' THEN NULL
+                        WHEN UPPER(TRIM(ap.po_status)) = 'PENDING'
+                             AND COALESCE(ap.received_qty, 0) > 0
+                             AND COALESCE(ap.received_qty, 0) < COALESCE(ap.requested_qty, 0)
+                            THEN ap.accepted_qty - ap.received_qty
+                        ELSE 0
+                    END AS remaining_qty,
+                    CASE
+                        WHEN COALESCE(NULLIF(TRIM(ap.po_status), ''), '') = '' THEN NULL
+                        WHEN UPPER(TRIM(ap.po_status)) = 'PENDING'
+                             AND COALESCE(ap.received_qty, 0) > 0
+                             AND COALESCE(ap.received_qty, 0) < COALESCE(ap.requested_qty, 0)
+                            THEN COALESCE(ap.total_accepted_liters, 0) - COALESCE(ap.total_delivered_liters, 0)
+                        ELSE 0
+                    END AS remaining_ltrs,
                     ap.case_pack, ap.per_liter,
                     ap.total_accepted_liters, ap.total_order_liters, ap.days_to_expiry,
                     ap.expiry_date, ap.category, ap.sub_category, ap.brand,

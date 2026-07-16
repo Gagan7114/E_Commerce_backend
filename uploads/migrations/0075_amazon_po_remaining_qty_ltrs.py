@@ -52,18 +52,20 @@ def add_columns(apps, schema_editor):
         cur.execute("SELECT to_regclass(%s)", ['reporting."Amazon PO"'])
         if cur.fetchone()[0] is None:
             return
-    # CRITICAL: the app SELECTs these columns, so they MUST be added. ADD COLUMN
-    # (nullable, no table rewrite) is instant once it holds the lock. Disable any
-    # global statement_timeout so a lock wait can't kill it, and cap the lock
-    # wait so a stuck transaction can't hang the deploy forever (migrate just
-    # retries next deploy). NOT wrapped in try/except: if it genuinely can't add
-    # the columns we want the migration to fail and retry, never to be recorded
-    # as applied without the columns actually existing.
-    with transaction.atomic():
-        with conn.cursor() as cur:
-            cur.execute("SET LOCAL statement_timeout = 0")
-            cur.execute("SET LOCAL lock_timeout = '30s'")
-            cur.execute(ADD_COLUMNS)
+    # NOTE: the app now computes remaining_qty / remaining_ltrs ON READ (see
+    # amazon_uploads._REMAINING_QTY_EXPR and shipment.views.POListView), so it
+    # does NOT depend on these stored columns existing. We still add them
+    # (harmless — a future stored-column path could use them), but strictly
+    # best-effort: a failure must never halt the migration chain, since nothing
+    # requires the columns.
+    try:
+        with transaction.atomic():
+            with conn.cursor() as cur:
+                cur.execute("SET LOCAL statement_timeout = 0")
+                cur.execute("SET LOCAL lock_timeout = '30s'")
+                cur.execute(ADD_COLUMNS)
+    except Exception:
+        pass
 
 
 def backfill_data(apps, schema_editor):
