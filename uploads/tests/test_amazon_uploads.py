@@ -801,7 +801,8 @@ class AmazonUploadTests(TransactionTestCase):
             "PO-STATUS,2026-05-01,Confirmed,ASIN-EXPIRED,AC - Accepted: In stock,10,5,0,0,FC1,2000-01-01\n"
             "PO-STATUS,2026-05-01,Confirmed,ASIN-MOV,OS - Cancelled: Out of stock,10,0,0,0,FC1,2099-01-01\n"
             "PO-STATUS,2026-05-01,Closed,ASIN-CANCELLED,OS - Cancelled: Out of stock,10,0,0,0,FC1,2099-01-01\n"
-            "PO-STATUS,2026-05-01,Confirmed,ASIN-COMPLETED,AC - Accepted: In stock,10,5,2,0,FC1,2099-01-01\n"
+            "PO-STATUS,2026-05-01,Confirmed,ASIN-COMPLETED,AC - Accepted: In stock,10,5,5,0,FC1,2099-01-01\n"
+            "PO-STATUS,2026-05-01,Confirmed,ASIN-PARTIAL,AC - Accepted: In stock,10,5,2,0,FC1,2099-01-01\n"
             "PO-STATUS,2026-05-01,Unconfirmed,ASIN-PENDING,AC - Accepted: In stock,10,0,0,0,FC1,2099-01-01\n"
         )
         response = self.client.post(
@@ -810,7 +811,7 @@ class AmazonUploadTests(TransactionTestCase):
             format="multipart",
         )
         self.assertEqual(response.status_code, 200, response.data)
-        self.assertEqual(response.data["rows_inserted_final"], 5)
+        self.assertEqual(response.data["rows_inserted_final"], 6)
 
         with connection.cursor() as cur:
             cur.execute(
@@ -825,10 +826,56 @@ class AmazonUploadTests(TransactionTestCase):
             rows = dict(cur.fetchall())
 
         self.assertEqual(rows["ASIN-CANCELLED"], "CANCELLED")
+        # COMPLETED now requires Received QTY >= Accepted QTY (5 >= 5).
         self.assertEqual(rows["ASIN-COMPLETED"], "COMPLETED")
+        # Confirmed + In-stock partial receipt (0 < 2 < 5 accepted) stays PENDING.
+        self.assertEqual(rows["ASIN-PARTIAL"], "PENDING")
         self.assertEqual(rows["ASIN-EXPIRED"], "EXPIRED")
         self.assertEqual(rows["ASIN-MOV"], "MOV")
         self.assertEqual(rows["ASIN-PENDING"], "PENDING")
+
+    def test_amazon_item_status_reflects_supply_rules(self):
+        with connection.cursor() as cur:
+            cur.execute(
+                "INSERT INTO master.fc_master (fc_code, fc_name, city, state) VALUES (%s, %s, %s, %s)",
+                ["FC1", "FC One", "Delhi", "Delhi"],
+            )
+
+        content = (
+            "PO,Order date,Status,ASIN,Availability,Requested quantity,Accepted quantity,"
+            "Received quantity,Cancelled quantity,Ship-to location,Cancellation deadline\n"
+            # COMPLETED + received (5) < requested (10) -> SHORT SUPPLIED
+            "PO-ITEM,2026-05-01,Confirmed,ASIN-SHORT,AC - Accepted: In stock,10,5,5,0,FC1,2099-01-01\n"
+            # COMPLETED + received (10) >= requested (10) -> FULL SUPPLIED
+            "PO-ITEM,2026-05-01,Confirmed,ASIN-FULL,AC - Accepted: In stock,10,10,10,0,FC1,2099-01-01\n"
+            # PENDING (nothing received) -> NOT SUPPLIED
+            "PO-ITEM,2026-05-01,Unconfirmed,ASIN-NOTSUP,AC - Accepted: In stock,10,0,0,0,FC1,2099-01-01\n"
+            # CANCELLED -> NOT SUPPLIED
+            "PO-ITEM,2026-05-01,Closed,ASIN-CANC,OS - Cancelled: Out of stock,10,0,0,0,FC1,2099-01-01\n"
+        )
+        response = self.client.post(
+            "/api/uploads",
+            {"report_type": "AMAZON_PO", "file": csv_file("po-item.csv", content)},
+            format="multipart",
+        )
+        self.assertEqual(response.status_code, 200, response.data)
+
+        with connection.cursor() as cur:
+            cur.execute(
+                """
+                SELECT asin, item_status
+                  FROM reporting."Amazon PO"
+                 WHERE po_number = %s
+                 ORDER BY asin
+                """,
+                ["PO-ITEM"],
+            )
+            rows = dict(cur.fetchall())
+
+        self.assertEqual(rows["ASIN-SHORT"], "SHORT SUPPLIED")
+        self.assertEqual(rows["ASIN-FULL"], "FULL SUPPLIED")
+        self.assertEqual(rows["ASIN-NOTSUP"], "NOT SUPPLIED")
+        self.assertEqual(rows["ASIN-CANC"], "NOT SUPPLIED")
 
     def test_validation_errors_and_warnings_are_stored(self):
         response = self.client.post(

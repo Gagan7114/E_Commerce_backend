@@ -1396,11 +1396,17 @@ def _transform_amazon_po(cur, upload_id: int) -> tuple[int, int]:
                             AND COALESCE(c.accepted_quantity, 0) = 0
                             AND COALESCE(c.received_quantity, 0) = 0
                             AND COALESCE(c.cancelled_quantity, 0) = 0 THEN 'MOV'
-                       -- GS-5: Confirmed + AC + accepted>0 received>0
+                       -- GS-5: Confirmed + AC + accepted>0 + received>=accepted (fully received) → COMPLETED
                        WHEN TRIM(COALESCE(c.status, '')) = 'Confirmed'
                             AND TRIM(COALESCE(c.availability, '')) = 'AC - Accepted: In stock'
                             AND COALESCE(c.accepted_quantity, 0) > 0
-                            AND COALESCE(c.received_quantity, 0) > 0 THEN 'COMPLETED'
+                            AND COALESCE(c.received_quantity, 0) >= COALESCE(c.accepted_quantity, 0) THEN 'COMPLETED'
+                       -- GS-5b: Confirmed + AC + accepted>0 + 0<received<accepted (partial receipt) → still PENDING
+                       WHEN TRIM(COALESCE(c.status, '')) = 'Confirmed'
+                            AND TRIM(COALESCE(c.availability, '')) = 'AC - Accepted: In stock'
+                            AND COALESCE(c.accepted_quantity, 0) > 0
+                            AND COALESCE(c.received_quantity, 0) > 0
+                            AND COALESCE(c.received_quantity, 0) < COALESCE(c.accepted_quantity, 0) THEN 'PENDING'
                        -- GS-6: Closed + OS + accepted=0 received=0 cancelled=0
                        WHEN TRIM(COALESCE(c.status, '')) = 'Closed'
                             AND TRIM(COALESCE(c.availability, '')) = 'OS - Cancelled: Out of stock'
@@ -1509,11 +1515,12 @@ def _transform_amazon_po(cur, upload_id: int) -> tuple[int, int]:
             (expiry_calc - order_date)::int AS po_window,
             po_status_calc AS po_status,
             CASE
-                WHEN po_status_calc = 'COMPLETED' AND COALESCE(received_quantity, 0) < COALESCE(requested_quantity, 0)
-                    THEN 'SHORT SUPPLIED'
-                WHEN po_status_calc = 'COMPLETED'
+                WHEN COALESCE(po_status_calc, '') = '' THEN ''
+                WHEN po_status_calc IN ('CANCELLED', 'MOV') THEN 'NOT SUPPLIED'
+                WHEN COALESCE(received_quantity, 0) = 0 THEN 'NOT SUPPLIED'
+                WHEN COALESCE(received_quantity, 0) >= COALESCE(requested_quantity, 0)
                     THEN 'FULL SUPPLIED'
-                ELSE ''
+                ELSE 'SHORT SUPPLIED'
             END AS item_status,
             item,
             sap_sku_name,
