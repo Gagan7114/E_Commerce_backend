@@ -3410,6 +3410,10 @@ def amazon_po_report(request):
     if po_status_val:
         where.append("po_status = %s")
         params.append(po_status_val)
+    item_status_val = str(q.get("item_status") or "").strip().upper()
+    if item_status_val:
+        where.append("item_status = %s")
+        params.append(item_status_val)
     helper_val = str(q.get("helper") or "").strip().upper()
     if helper_val:
         where.append("helper = %s")
@@ -3527,6 +3531,22 @@ def amazon_po_filter_options(request):
 
         cur.execute(
             """
+            WITH options(value) AS (
+                SELECT item_status::text
+                  FROM reporting."Amazon PO"
+                 WHERE item_status IS NOT NULL AND TRIM(item_status::text) != ''
+            )
+            SELECT DISTINCT value
+              FROM options
+             WHERE value IS NOT NULL AND TRIM(value) != ''
+             ORDER BY value ASC
+             LIMIT 500
+            """
+        )
+        item_statuses = [row[0] for row in cur.fetchall()]
+
+        cur.execute(
+            """
             SELECT DISTINCT po_month
               FROM reporting."Amazon PO"
              WHERE po_month IS NOT NULL
@@ -3566,6 +3586,7 @@ def amazon_po_filter_options(request):
             "asins": asins,
             "fulfillment_centers": fulfillment_centers,
             "po_statuses": po_statuses,
+            "item_statuses": item_statuses,
             "months": months,
             "years": years,
             "channels": channels,
