@@ -4306,7 +4306,11 @@ def table_data(request, table_name: str):
     q = request.query_params
     try:
         page = max(0, int(q.get("page", 0)))
-        page_size = min(200, max(1, int(q.get("page_size", 50))))
+        # Normal browsing pages at <=100 rows, but the "Export Excel" action
+        # requests every filtered row in one shot (page=0, page_size=200000) so
+        # the .xlsx isn't truncated to the current page. Cap high enough to honor
+        # that full-table export instead of clamping it to 200.
+        page_size = min(200000, max(1, int(q.get("page_size", 50))))
     except ValueError:
         page, page_size = 0, 50
 
