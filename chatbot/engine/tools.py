@@ -750,24 +750,35 @@ def secondary_sales(q: ParsedQuery) -> DataResult:
     where_sql = (" WHERE " + " AND ".join(where)) if where else ""
     span = f" ({q.date_label})" if q.date_label else ""
 
-    # Ranking submode: "top 10 skus by ltr sold on blinkit"
-    if q.dimension in source.dim_cols and _rank_words(text):
+    # Ranking / breakdown submode: "top 10 skus by ltr sold on blinkit" OR a
+    # plain group-by like "big basket secondary sale city wise" (no "top" word).
+    if q.dimension in source.dim_cols and (_rank_words(text) or q.group_by_dim):
         dim_col = source.dim_cols[q.dimension]
         metric_col, metric_label = _sec_metric(source, text, q)
         w2 = list(where) + [f"{dim_col} IS NOT NULL", f"{dim_col}::text <> ''"]
         wsql2 = " WHERE " + " AND ".join(w2)
-        limit = q.top_n or 10
+        # A "top N" ask is a ranking; a plain "city wise" breakdown shows the full
+        # (bounded) list, not just 10.
+        is_breakdown = q.group_by_dim and not q.top_n and not _rank_words(text)
+        limit = q.top_n or (50 if is_breakdown else 10)
         sql = (f"SELECT {dim_col}, COALESCE(SUM({metric_col}),0) v FROM {source.table}{wsql2} "
                f"GROUP BY {dim_col} ORDER BY v DESC LIMIT {int(limit)}")
         try:
             _c, rows, _t = safe_sql.run_select(sql, params, max_rows=limit)
         except Exception as exc:
-            return DataResult(summary=f"I couldn't rank secondary {q.dimension}: {exc}", ok=False, source=source.table)
+            return DataResult(summary=f"I couldn't break down secondary {q.dimension}: {exc}", ok=False, source=source.table)
         lines = [f"{i+1}. {r[0]} — {_fmt(r[1])}" for i, r in enumerate(rows)]
+        total = sum(float(r[1] or 0) for r in rows)
+        head = (f"{scope} secondary {metric_label} by {q.dimension} for {scope}{span} "
+                f"({len(rows)} {q.dimension}(s), total {_fmt(total)}):"
+                if is_breakdown else
+                f"Top {len(rows)} {q.dimension}(s) by secondary {metric_label} for {scope}{span}:")
         return DataResult(
-            summary=f"Top {len(rows)} {q.dimension}(s) by secondary {metric_label} for {scope}{span}:\n" + "\n".join(lines),
+            summary=head + "\n" + "\n".join(lines),
             columns=[q.dimension.title(), f"secondary {metric_label}"], rows=[[r[0], r[1]] for r in rows],
-            source=source.table, excel_title=f"Top {q.dimension.title()} (Secondary)")
+            source=source.table,
+            excel_title=(f"{scope} Secondary by {q.dimension.title()}" if is_breakdown
+                         else f"Top {q.dimension.title()} (Secondary)"))
 
     # Returns view (Amazon only)
     if "return" in text and source.return_value:

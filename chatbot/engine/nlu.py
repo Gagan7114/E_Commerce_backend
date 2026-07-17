@@ -50,6 +50,7 @@ class ParsedQuery:
     top_n: int | None = None
     group_by_month: bool = False   # "month wise" / "monthly" / "all months" breakdown
     group_by_platform: bool = False  # "platform wise" breakdown
+    group_by_dim: bool = False       # "<dimension> wise" / "by <dimension>" breakdown
     wants_amount: bool = False     # "order amount" / "value" / "revenue" question
     item_head: str = ""            # PREMIUM / COMMODITY filter
     product: str = ""              # item-family filter, e.g. "extra light", "canola"
@@ -291,6 +292,17 @@ def parse(message: str, db_platforms: list[dict] | None = None) -> ParsedQuery:
             q.dimension = dim
             break
 
+    # Group-by / breakdown request on the detected dimension ("city wise",
+    # "state-wise", "break up by brand", "by city"). Unlike a ranking this needs
+    # no "top/best" word — "big basket secondary sale city wise" should still
+    # produce a per-city breakdown. Guarded by q.dimension so a stray "wise"
+    # never triggers it on its own.
+    q.group_by_dim = bool(q.dimension) and bool(
+        re.search(r"\bwise\b|break\s*up|break\s*down|breakup|breakdown", low)
+        or any(re.search(r"\bby\s+" + re.escape(w) + r"\b", low)
+               for ws in _DIMENSION_WORDS.values() for w in ws)
+    )
+
     # Item-head filter (premium / commodity). If BOTH appear it's a split, not a
     # filter — leave blank so the split tool handles it.
     if "premium" in low and "commodity" not in low:
@@ -317,8 +329,12 @@ def parse(message: str, db_platforms: list[dict] | None = None) -> ParsedQuery:
                            r"commodity\s*(vs|versus|and|&|/|\s)\s*premium|"
                            r"item\s*head\s+(split|wise|breakup|breakdown)", low))
     drr_flag = bool(re.search(r"\bdrr\b|run\s*rate|day\s*wise|daywise|per\s*day|\bdaily\b|\bops\b", low))
-    secondary_flag = bool(re.search(r"\bsecondary\b|sell\s*out|sellout|sell-out|"
-                                    r"\bsold\b|\bshipped\b|\bshpd\b|\bsec sales\b|\breturns?\b", low))
+    # Accept common misspellings of "secondary" (secoundry / secandary / …) so a
+    # typo doesn't silently reroute the query to the primary (master_po) tools.
+    _sec_word = (r"secondary|secoundary|secoundry|secondry|secndary|"
+                 r"secandary|secandry|seconday|secndry")
+    secondary_flag = bool(re.search(r"\b(" + _sec_word + r")\b|sell\s*out|sellout|sell-out|"
+                                    r"\bsold\b|\bshipped\b|\bshpd\b|\bsec sales?\b|\breturns?\b", low))
     targets_flag = bool("target" in low or "achieved %" in low or "achievement" in low
                         or "require drr" in low or "req drr" in low or "behind on" in low)
     landing_flag = bool(re.search(r"landing rate|basic rate|landing price", low))
@@ -352,7 +368,7 @@ def parse(message: str, db_platforms: list[dict] | None = None) -> ParsedQuery:
     explain_flag = bool(
         (re.search(r"\b(explain|define|definition|meaning of|what do you mean)\b", low)
          or re.search(r"^\s*(what is|what's|whats)\b", low))
-        and not q.platforms and not q.date_from
+        and not q.platforms and not q.date_from and not q.movement and not q.metric
         and re.search(r"secondary|secandary|secndary|primary|\bdrr\b|\bdoh\b|\bsoh\b|fill rate|"
                       r"miss rate|pendency|realise|realize|brand fund|item head|\broas\b|\bacos\b|"
                       r"\btacos\b|lead time|\bmov\b|master po", low))
@@ -414,7 +430,7 @@ def parse(message: str, db_platforms: list[dict] | None = None) -> ParsedQuery:
         q.intent = "amazon_po"
     elif pendency_flag:
         q.intent = "pendency"
-    elif q.dimension and _RANK_RE.search(low):
+    elif q.dimension and (_RANK_RE.search(low) or q.group_by_dim):
         q.intent = "ranking"
     elif q.metric == "liters" or q.movement in ("delivered", "sold") or q.group_by_month or q.group_by_platform or q.wants_amount:
         q.intent = "liters"

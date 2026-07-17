@@ -4725,7 +4725,17 @@ _REALISE_ADS_SOURCES = {
     "blinkit": ("blinkit_ads_master", "ad_spent", "BLINKIT"),
     "swiggy": ("swiggy_ads_master", "ad_spent", "SWIGGY"),
     "zepto": ("zepto_ads_master", "ad_spent", "ZEPTO"),
+    # Flipkart ads are campaign-level (no category/format/item_head columns), so
+    # they can't feed the category-wise rollup — but they DO belong in the KPI
+    # grand total (and get equal-spread across categories), matching the Ads
+    # Summary / Flipkart Ads dashboard. The per-category collector skips this
+    # source via _REALISE_ADS_NO_CATEGORY_DIM.
+    "flipkart": ("flipkart_ads_master", "ad_spend", None),
 }
+
+# Ad sources with no category dimension — counted only in the grand total (their
+# spend flows into the equal-spread residual, never into a category row).
+_REALISE_ADS_NO_CATEGORY_DIM = {"flipkart"}
 
 # Brand fund per platform. blinkit/swiggy/zepto have dedicated brand-fund
 # masters; Amazon has no brand-fund ledger, so its brand fund is read from the
@@ -4737,6 +4747,14 @@ _REALISE_BRANDFUND_SOURCES = {
     "zepto": ("zepto_brandfund_master", "brand_fund_spent", "ZEPTO"),
     "amazon": ("amazon_coupon_master", "budget_spent", None),
 }
+
+# Ads masters that store CUMULATIVE month-to-date snapshots — each date row is a
+# running month total, so SUMming across dates over-counts (by ~one× per
+# snapshot date). Their spend is read at the latest (max) date only, mirroring
+# `summary_use_max_date` on the per-platform Ads dashboards (platforms/views.py).
+# amazon/blinkit ad masters are per-day and stay summable; every brand-fund
+# master is per-day too.
+_REALISE_CUMULATIVE_ADS = {"swiggy", "zepto", "bigbasket", "flipkart"}
 
 
 def _realise_ads_brandfund(platform, month_num, year, group_by, cat_filter=None):
@@ -4761,9 +4779,17 @@ def _realise_ads_brandfund(platform, month_num, year, group_by, cat_filter=None)
     else:
         ads_srcs, fund_srcs = _REALISE_ADS_SOURCES, _REALISE_BRANDFUND_SOURCES
 
-    def collect(target, sources):
+    def collect(target, sources, cumulative_slugs):
         with connection.cursor() as cur:
-            for table, spend_col, fmt in sources.values():
+            for slug, (table, spend_col, _fmt) in sources.items():
+                if slug in _REALISE_ADS_NO_CATEGORY_DIM:
+                    continue  # no category column — counted only in the grand total
+                # No `format` filter: each master is single-platform and its
+                # `format` column comes from a master_sheet LEFT JOIN that is NULL
+                # for unmapped SKUs — filtering on it silently drops real spend.
+                # The `category IS NOT NULL` clause stays only because a per-CATEGORY
+                # row needs a name; the accurate grand total (which counts unmapped
+                # spend) is computed separately in _realise_ads_brandfund_totals.
                 sql = f"""
                     SELECT UPPER(TRIM({name_col}::text)) AS name,
                            COALESCE(SUM({spend_col}), 0) AS spend
@@ -4774,12 +4800,17 @@ def _realise_ads_brandfund(platform, month_num, year, group_by, cat_filter=None)
                       AND TRIM({name_col}::text) <> ''
                 """
                 params = [month_name, year]
-                if fmt is not None:
-                    sql += " AND UPPER(TRIM(format::text)) = %s"
-                    params.append(fmt)
                 if cat_filter:
                     sql += " AND UPPER(TRIM(category::text)) = %s"
                     params.append(cat_filter)
+                if slug in cumulative_slugs:
+                    # Cumulative snapshot source → keep only the latest date's
+                    # running total, else SUM across dates over-counts.
+                    sql += (
+                        f" AND date = (SELECT MAX(date) FROM {table}"
+                        " WHERE UPPER(TRIM(month::text)) = %s AND year = %s)"
+                    )
+                    params += [month_name, year]
                 sql += " GROUP BY 1"
                 try:
                     cur.execute(sql, params)
@@ -4788,8 +4819,8 @@ def _realise_ads_brandfund(platform, month_num, year, group_by, cat_filter=None)
                 except Exception as e:  # noqa: BLE001
                     errors.append({"source": table, "error": str(e)})
 
-    collect(ads, ads_srcs)
-    collect(fund, fund_srcs)
+    collect(ads, ads_srcs, _REALISE_CUMULATIVE_ADS)
+    collect(fund, fund_srcs, frozenset())
     return ads, fund, errors
 
 
@@ -5091,11 +5122,60 @@ def _realise_totals(data):
 
 def _realise_ads_brandfund_totals(platform, month_num, year, cat_filter=None):
     """Grand-total ads spend and brand fund for the month (scoped to a category
-    when given), used by the KPI cards. Returns (ads_total, fund_total)."""
-    ads_map, fund_map, _ = _realise_ads_brandfund(
-        platform, month_num, year, "category", cat_filter,
-    )
-    return round(sum(ads_map.values()), 2), round(sum(fund_map.values()), 2)
+    when given), used by the KPI cards and every net-realise number.
+
+    Computed independently of the category rollup so it matches each platform's
+    own Ads / Brand-Fund dashboard exactly:
+      * NO category filter — unmapped-SKU spend (NULL category) is counted, not
+        dropped (the platform dashboards bucket it as '(Unmapped)').
+      * NO format filter — the masters are single-platform; their unmapped rows
+        carry a NULL format that must still be counted.
+      * Cumulative ad snapshots (swiggy/zepto/bigbasket) are read at the latest
+        date only; per-day ad masters and every brand-fund master are summed.
+    Returns (ads_total, fund_total)."""
+    month_name = calendar.month_name[month_num].upper()
+    if platform:
+        ads_srcs = {k: v for k, v in _REALISE_ADS_SOURCES.items() if k == platform}
+        fund_srcs = {k: v for k, v in _REALISE_BRANDFUND_SOURCES.items() if k == platform}
+    else:
+        ads_srcs, fund_srcs = _REALISE_ADS_SOURCES, _REALISE_BRANDFUND_SOURCES
+
+    def source_total(cur, table, spend_col, cumulative):
+        sql = (
+            f"SELECT COALESCE(SUM({spend_col}), 0) FROM {table}"
+            " WHERE UPPER(TRIM(month::text)) = %s AND year = %s"
+        )
+        params = [month_name, year]
+        if cat_filter:
+            sql += " AND UPPER(TRIM(category::text)) = %s"
+            params.append(cat_filter)
+        if cumulative:
+            sql += (
+                f" AND date = (SELECT MAX(date) FROM {table}"
+                " WHERE UPPER(TRIM(month::text)) = %s AND year = %s)"
+            )
+            params += [month_name, year]
+        cur.execute(sql, params)
+        row = cur.fetchone()
+        return float(row[0] or 0) if row and row[0] is not None else 0.0
+
+    ads_total = fund_total = 0.0
+    with connection.cursor() as cur:
+        for slug, (table, spend_col, _fmt) in ads_srcs.items():
+            # Category-less sources (e.g. flipkart) can't be scoped to a specific
+            # category, so drop them from a category-filtered total.
+            if cat_filter and slug in _REALISE_ADS_NO_CATEGORY_DIM:
+                continue
+            try:
+                ads_total += source_total(cur, table, spend_col, slug in _REALISE_CUMULATIVE_ADS)
+            except Exception:  # noqa: BLE001
+                pass  # a missing/odd source contributes 0, never breaks the KPI
+        for _slug, (table, spend_col, _fmt) in fund_srcs.items():
+            try:
+                fund_total += source_total(cur, table, spend_col, False)
+            except Exception:  # noqa: BLE001
+                pass
+    return round(ads_total, 2), round(fund_total, 2)
 
 
 def _parallel_db(funcs):
@@ -5204,12 +5284,17 @@ def realise_breakdown(request):
     # The realise aggregate and the ads/brand-fund fetch hit different tables and
     # don't depend on each other — run them concurrently.
     ab_cat = (filters.get("category") or "").strip().upper() or None
-    (agg_res, ab_res) = _parallel_db([
+    (agg_res, ab_res, tot_res) = _parallel_db([
         lambda: _realise_aggregate(platform, month_num, year, group_by, filters),
         lambda: _realise_ads_brandfund(platform, month_num, year, group_by, ab_cat),
+        lambda: _realise_ads_brandfund_totals(platform, month_num, year, ab_cat),
     ])
     data, errors = agg_res
     ads_map, fund_map, ab_err = ab_res
+    # Accurate ads/brand-fund grand totals (count unmapped spend + de-snapshot
+    # cumulative ad sources) — the per-category rows can only attribute the
+    # MAPPED portion, so summing them would undercount the total.
+    accurate_ads_total, accurate_fund_total = tot_res
 
     rows = []
     for name, slot in data.items():
@@ -5230,12 +5315,35 @@ def realise_breakdown(request):
         r["ads_spent"] = round(ads_map.get(key, 0.0), 2)
         r["brand_fund"] = round(fund_map.get(key, 0.0), 2)
 
+    # Blank/unmapped spend — the ads/brand-fund that couldn't be pinned to a
+    # category (NULL/blank category, or an ad category with no delivered-value
+    # row) — is what makes the column total fall short of the KPI card. Spread it
+    # EQUALLY across every category row (flat add-on per row) so the columns
+    # reconcile with the card while every category shares the unmapped cost.
+    # Only the dimensions the ads/brand-fund masters actually carry
+    # (category / sub_category) get the spread; brand/sku/state have no ads
+    # attribution to reconcile against.
+    if group_by in ("category", "sub_category") and rows:
+        mapped_ads = sum(r["ads_spent"] for r in rows)
+        mapped_fund = sum(r["brand_fund"] for r in rows)
+        residual_ads = accurate_ads_total - mapped_ads
+        residual_fund = accurate_fund_total - mapped_fund
+        if abs(residual_ads) > 0.005 or abs(residual_fund) > 0.005:
+            add_ads = residual_ads / len(rows)
+            add_fund = residual_fund / len(rows)
+            for r in rows:
+                r["ads_spent"] = round(r["ads_spent"] + add_ads, 2)
+                r["brand_fund"] = round(r["brand_fund"] + add_fund, 2)
+
     rows.sort(key=lambda r: r["ltrs"], reverse=True)
     total_ltrs = round(sum(r["ltrs"] for r in rows), 2)
     total_value = round(sum(r["value"] for r in rows), 2)
     total_commission = round(sum(r["commission"] for r in rows), 2)
-    total_ads = round(sum(r["ads_spent"] for r in rows), 2)
-    total_fund = round(sum(r["brand_fund"] for r in rows), 2)
+    # Use the accurate grand totals (not the sum of per-category rows), so the
+    # Total row's Ads Spend / Brand Fund — and the net Realise ₹/L derived from
+    # them — match the KPI cards and each platform's own dashboard.
+    total_ads = accurate_ads_total
+    total_fund = accurate_fund_total
 
     return Response({
         "platform": platform,
