@@ -40,6 +40,16 @@ urlpatterns = [
         views.primary_overview_total,
         name="platform-primary-overview-total",
     ),
+    path(
+        "primary-summary",
+        views.primary_summary,
+        name="platform-primary-summary",
+    ),
+    path(
+        "primary-summary-version",
+        views.primary_summary_version,
+        name="platform-primary-summary-version",
+    ),
     # Call Center monthly target (isolated single-target store). Registered
     # before the <slug:slug> routes so it isn't matched as a platform slug.
     path(

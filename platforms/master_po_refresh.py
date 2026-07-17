@@ -110,9 +110,28 @@ def refresh_master_po_mv() -> bool:
                 # Migration not applied -> nothing to refresh. Cheap no-op.
                 return False
             cur.execute("REFRESH MATERIALIZED VIEW public.master_po_mv")
+        # primary_summary_mv is the derived layer built ON master_po_mv, so it
+        # must refresh right after (best-effort; never breaks this path).
+        refresh_primary_summary_mv()
         return True
     except Exception:  # noqa: BLE001 - a refresh failure must not break callers
         logger.exception("Failed to refresh master_po_mv")
+        return False
+
+
+def refresh_primary_summary_mv() -> bool:
+    """Refresh public.primary_summary_mv (the Primary Summary's derived matview,
+    built on master_po_mv). Best-effort; never raises. No-op if the matview is
+    absent (migration 0056 not applied yet)."""
+    try:
+        with connection.cursor() as cur:
+            cur.execute("SELECT to_regclass('public.primary_summary_mv')")
+            if cur.fetchone()[0] is None:
+                return False
+            cur.execute("REFRESH MATERIALIZED VIEW public.primary_summary_mv")
+        return True
+    except Exception:  # noqa: BLE001 - a refresh failure must not break callers
+        logger.exception("Failed to refresh primary_summary_mv")
         return False
 
 

@@ -2520,6 +2520,356 @@ def primary_overview_total(request):
     return Response(payload)
 
 
+# ───────────────────────────────────────────────────────────────────────────
+# Cross-platform PRIMARY SUMMARY — one materialization of master_po (all primary
+# formats at once) + a handful of grouped queries, plus one Amazon pass. This
+# replaces the frontend's 8 per-platform round-trips for the Primary Summary
+# dashboard: same numbers, one request, one heavy scan instead of eight.
+# ───────────────────────────────────────────────────────────────────────────
+
+_PRIMARY_SUMMARY_METRIC_FIELDS = (
+    "done_value", "done_ltrs", "done_qty",
+    "order_value", "order_ltrs", "order_qty",
+    "pending_value", "pending_ltrs", "pending_qty",
+)
+
+
+def _primary_summary_cte(format_keys) -> str:
+    keys = []
+    for k in format_keys:
+        fk = re.sub(r"[^a-z0-9]+", "", str(k or "").strip().lower()).replace("'", "''")
+        if fk and fk not in keys:
+            keys.append(fk)
+    if not keys:
+        keys = ["__none__"]
+    in_list = ", ".join(f"'{k}'" for k in keys)
+    return f"""
+WITH base AS (
+    SELECT
+        p.*,
+        {_PRIM_PO_DATE_EXPR} AS po_dt,
+        {_PRIM_PO_EXPIRY_DATE_EXPR} AS expiry_dt,
+        {_PRIM_DELIVERY_DATE_EXPR} AS delivery_dt,
+        REGEXP_REPLACE(LOWER(TRIM(p.format::text)), '[^a-z0-9]+', '', 'g') AS format_key
+    FROM public.master_po p
+    WHERE REGEXP_REPLACE(LOWER(TRIM(p.format::text)), '[^a-z0-9]+', '', 'g') IN ({in_list})
+),
+with_pack_text AS (
+    SELECT *, UPPER(CONCAT_WS(' ', item::text, sap_sku_name::text, sku_name::text, unit_of_measure::text)) AS pack_text
+    FROM base
+),
+with_pack_matches AS (
+    SELECT *,
+        regexp_match(pack_text, '([0-9]+(?:\\.[0-9]+)?)\\s*(?:LTR|LITRE|LITER|L)\\s*\\+\\s*([0-9]+(?:\\.[0-9]+)?)\\s*(?:LTR|LITRE|LITER|L)(?:[^A-Z0-9]|$)') AS combo_full_match,
+        regexp_match(pack_text, '([0-9]+(?:\\.[0-9]+)?)\\s*\\+\\s*([0-9]+(?:\\.[0-9]+)?)\\s*(?:LTR|LITRE|LITER|L)(?:[^A-Z0-9]|$)') AS combo_compact_match,
+        regexp_match(pack_text, '([0-9]+(?:\\.[0-9]+)?)\\s*(?:ML|MLS|M)(?:[^A-Z0-9]|$)') AS ml_match,
+        regexp_match(pack_text, '([0-9]+(?:\\.[0-9]+)?)\\s*(?:LTR|LITRE|LITER)(?:[^A-Z0-9]|$)') AS ltr_match,
+        regexp_match(pack_text, '([0-9]+(?:\\.[0-9]+)?)\\s*L(?:[^A-Z0-9]|$)') AS l_match
+    FROM with_pack_text
+),
+metric_base AS (
+    SELECT *, COALESCE(
+        CASE WHEN combo_full_match IS NOT NULL THEN combo_full_match[1]::numeric + combo_full_match[2]::numeric
+             WHEN combo_compact_match IS NOT NULL THEN combo_compact_match[1]::numeric + combo_compact_match[2]::numeric
+             WHEN ml_match IS NOT NULL THEN ml_match[1]::numeric/1000
+             WHEN ltr_match IS NOT NULL THEN ltr_match[1]::numeric
+             WHEN l_match IS NOT NULL THEN l_match[1]::numeric ELSE NULL END,
+        NULLIF(per_liter,0), 1) AS effective_per_liter
+    FROM with_pack_matches
+),
+normalized AS (
+    SELECT *,
+        COALESCE(NULLIF(UPPER(TRIM(po_status::text)),''),'OTHER') AS status_key,
+        CASE WHEN UPPER(TRIM(item_head::text))='PREMIUM' THEN 'PREMIUM' WHEN UPPER(TRIM(item_head::text))='COMMODITY' THEN 'COMMODITY' ELSE 'OTHER' END AS item_head_key,
+        COALESCE(NULLIF(UPPER(TRIM(item::text)),''),NULLIF(UPPER(TRIM(sku_name::text)),''),'OTHER') AS item_key,
+        COALESCE(NULLIF(UPPER(TRIM(category::text)),''),'OTHER') AS category_key,
+        COALESCE(NULLIF(UPPER(TRIM(sub_category::text)),''),'OTHER') AS sub_category_key,
+        COALESCE(NULLIF(UPPER(TRIM(open_close::text)),''),'CLOSED') AS open_close_key,
+        COALESCE(NULLIF(UPPER(TRIM(po_month::text)),''),UPPER(TRIM(TO_CHAR(po_dt,'FMMONTH')))) AS po_month_key,
+        COALESCE(NULLIF(UPPER(TRIM(delivery_month::text)),''),UPPER(TRIM(TO_CHAR(delivery_dt,'FMMONTH')))) AS delivery_month_key,
+        EXTRACT(YEAR FROM delivery_dt)::integer AS delivery_year,
+        CASE WHEN effective_per_liter IS NULL THEN UPPER(TRIM(unit_of_measure::text))
+             WHEN effective_per_liter<1 THEN UPPER(TRIM(TO_CHAR(effective_per_liter*1000,'FM999999990.###')))||' MLS'
+             ELSE UPPER(TRIM(TO_CHAR(effective_per_liter,'FM999999990.###')))||' LTR' END AS per_ltr_key,
+        COALESCE(total_order_liters,0) AS metric_order_liters,
+        COALESCE(total_delivered_liters,0) AS metric_delivered_liters,
+        COALESCE(total_order_amt_inclusive,0) AS metric_order_value,
+        COALESCE(total_deliver_amt_inclusive,0) AS metric_delivered_value,
+        COALESCE(order_qty,0) AS metric_order_qty,
+        COALESCE(delivered_qty,0) AS metric_delivered_qty,
+        0 AS metric_projection_value, 0 AS metric_projection_ltrs, 0 AS metric_projection_qty,
+        COALESCE(missed_ltrs,0) AS metric_pending_liters,
+        COALESCE(missed_qty,0) AS metric_pending_qty,
+        COALESCE(COALESCE(missed_qty,0)*CASE WHEN NULLIF(TRIM(basic_rate::text),'') ~ '^-?[0-9]+(\\.[0-9]+)?$' THEN NULLIF(TRIM(basic_rate::text),'')::numeric ELSE 0 END,0) AS metric_pending_value
+    FROM metric_base
+)
+"""
+
+
+@api_view(["GET"])
+@permission_classes([require("platform.po.view")])
+@cached_get(timeout=60, prefix="plat.primary_summary")
+def primary_summary(request):
+    """One-shot cross-platform aggregate for the Primary Summary dashboard."""
+    params = request.query_params
+    mode, month, year, defaulted_to_latest = _parse_primary_dashboard_params(params)
+    month_name = _month_name(month)
+    period_end_cap = min(date(year, month, monthrange(year, month)[1]), timezone.localdate())
+
+    requested = [s.strip().lower() for s in str(params.get("slugs") or "").split(",") if s.strip()]
+    if not requested:
+        requested = ["amazon", *_PRIMARY_DASHBOARD_FORMATS.keys()]
+    allowed = [s for s in requested if can_access_platform(request.user, s)]
+    include_amazon = "amazon" in allowed
+
+    # slug -> format_key, deduped so a shared key (flipkart/flipkart_grocery) is
+    # never double-counted; prefer a dedicated *_grocery slug for the label.
+    fk_to_slug = {}
+    for slug in allowed:
+        if slug == "amazon":
+            continue
+        platform_format = _PRIMARY_DASHBOARD_FORMATS.get(slug)
+        if not platform_format:
+            continue
+        fk = re.sub(r"[^a-z0-9]+", "", str(platform_format).strip().lower())
+        if fk not in fk_to_slug or slug.endswith("_grocery"):
+            fk_to_slug[fk] = slug
+    format_keys = list(fk_to_slug.keys())
+
+    cache_key = (
+        f"prim_summary:v{_PRIMARY_DASHBOARD_CACHE_VERSION}:{mode}:{month}:{year}:"
+        f"{period_end_cap.isoformat()}:{','.join(sorted(allowed))}"
+    )
+    cached = cache.get(cache_key)
+    if cached is not None:
+        return Response(cached)
+
+    date_col = "po_dt" if mode == "PO MONTH" else "delivery_dt"
+    period_filter = f"{_primary_period_filter(mode)} AND {date_col} <= %s"
+    period_params = [month_name, year, period_end_cap]
+
+    def _zero():
+        return {f: 0.0 for f in _PRIMARY_SUMMARY_METRIC_FIELDS}
+
+    def _add(dst, row):
+        for f in _PRIMARY_SUMMARY_METRIC_FIELDS:
+            dst[f] += _num(row.get(f))
+
+    def _head_of(value):
+        head = str(value or "OTHER").strip().upper()
+        return head if head in ("PREMIUM", "COMMODITY", "OTHER") else "OTHER"
+
+    summary_heads = {h: _zero() for h in ("PREMIUM", "COMMODITY", "OTHER")}
+    by_platform = {}
+    details = []
+    top_items = []
+    vendors = []
+    max_dates = []
+
+    if format_keys:
+        # Fast path: query the precomputed matview (derivation already done, so
+        # this is just cheap GROUP BYs). Fallback: materialize the derived CTE
+        # per request — used until migration 0056 is applied.
+        mv_ready = (
+            _scalar("SELECT to_regclass('public.primary_summary_mv')", []) is not None
+        )
+        materialized = False
+        if mv_ready:
+            src = "public.primary_summary_mv"
+            fmt_in = ", ".join("'%s'" % k for k in format_keys) or "'__none__'"
+            fmtw = f"format_key IN ({fmt_in}) AND "
+            plain = ""
+            withkw = "WITH "
+            vendor_where = f"WHERE format_key IN ({fmt_in})"
+        else:
+            _materialize_primary_normalized(_primary_summary_cte(format_keys))
+            materialized = True
+            src = "normalized"
+            fmtw = ""
+            plain = _PRIMARY_CTE_STUB + " "
+            withkw = _PRIMARY_CTE_STUB + ", "
+            vendor_where = ""
+        try:
+            for r in _dict_rows(
+                f"{plain}SELECT format_key, item_head_key AS item_head, {_PRIMARY_METRIC_SQL} "
+                f"FROM {src} WHERE {fmtw}{period_filter} GROUP BY format_key, item_head_key",
+                period_params,
+            ):
+                head = _head_of(r.get("item_head"))
+                slug = fk_to_slug.get(r.get("format_key"))
+                _add(summary_heads[head], r)
+                if slug:
+                    bp = by_platform.setdefault(
+                        slug,
+                        {"total": _zero(), "item_heads": {h: _zero() for h in ("PREMIUM", "COMMODITY", "OTHER")}},
+                    )
+                    _add(bp["total"], r)
+                    _add(bp["item_heads"][head], r)
+
+            for r in _dict_rows(
+                f"{plain}SELECT item_head_key AS item_head, category_key AS category, "
+                f"sub_category_key AS sub_category, per_ltr_key AS per_ltr, {_PRIMARY_METRIC_SQL} "
+                f"FROM {src} WHERE {fmtw}{period_filter} "
+                f"GROUP BY item_head_key, category_key, sub_category_key, per_ltr_key",
+                period_params,
+            ):
+                r["item_head"] = _head_of(r.get("item_head"))
+                details.append(r)
+
+            for r in _dict_rows(
+                f"{withkw}item_agg AS (SELECT item_key AS item, item_head_key AS item_head, {_PRIMARY_METRIC_SQL} "
+                f"FROM {src} WHERE {fmtw}{period_filter} GROUP BY item_key, item_head_key) "
+                f"SELECT * FROM item_agg WHERE done_value<>0 OR done_ltrs<>0 OR done_qty<>0 "
+                f"OR order_value<>0 OR order_ltrs<>0 OR order_qty<>0 "
+                f"ORDER BY done_value DESC, done_ltrs DESC LIMIT 200",
+                period_params,
+            ):
+                r["item_head"] = _head_of(r.get("item_head"))
+                top_items.append(r)
+
+            vmf = f"{_primary_vendor_metric_filter(mode)} AND {date_col} <= %s"
+            vpf = f"{_primary_vendor_pending_filter(mode)} AND {date_col} <= %s"
+            vendors = _dict_rows(
+                f"""{withkw}vendor_rows AS (
+                    SELECT COALESCE(NULLIF(UPPER(TRIM(vendor_new::text)),''),NULLIF(UPPER(TRIM(vendor_name::text)),''),'UNMAPPED') AS vendor,
+                        ({vmf}) AS in_metric_period, ({vpf}) AS in_pending_period,
+                        COALESCE(metric_order_value,0) AS ov, COALESCE(metric_delivered_value,0) AS dv,
+                        COALESCE(metric_order_liters,0) AS ol, COALESCE(metric_delivered_liters,0) AS dl,
+                        COALESCE(metric_order_qty,0) AS oq, COALESCE(metric_delivered_qty,0) AS dq,
+                        lead_time AS lt, open_close_key AS oc
+                    FROM {src} {vendor_where}
+                ), vendor_agg AS (
+                    SELECT vendor,
+                        COALESCE(SUM(CASE WHEN in_metric_period THEN ov ELSE 0 END),0) AS order_value,
+                        COALESCE(SUM(CASE WHEN in_metric_period THEN dv ELSE 0 END),0) AS delivered_value,
+                        COALESCE(SUM(CASE WHEN oc='OPEN' AND in_pending_period THEN ov ELSE 0 END),0) AS pending_value,
+                        COALESCE(SUM(CASE WHEN in_metric_period THEN ol ELSE 0 END),0) AS order_ltrs,
+                        COALESCE(SUM(CASE WHEN in_metric_period THEN dl ELSE 0 END),0) AS delivered_ltrs,
+                        COALESCE(SUM(CASE WHEN oc='OPEN' AND in_pending_period THEN ol ELSE 0 END),0) AS pending_ltrs,
+                        COALESCE(SUM(CASE WHEN in_metric_period THEN oq ELSE 0 END),0) AS order_qty,
+                        COALESCE(SUM(CASE WHEN in_metric_period THEN dq ELSE 0 END),0) AS delivered_qty,
+                        COALESCE(SUM(CASE WHEN oc='OPEN' AND in_pending_period THEN oq ELSE 0 END),0) AS pending_qty,
+                        AVG(lt) FILTER (WHERE in_metric_period AND lt IS NOT NULL) AS lead_time_avg
+                    FROM vendor_rows GROUP BY vendor
+                ) SELECT * FROM vendor_agg
+                WHERE order_value<>0 OR delivered_value<>0 OR pending_value<>0
+                   OR order_ltrs<>0 OR delivered_ltrs<>0 OR pending_ltrs<>0
+                   OR order_qty<>0 OR delivered_qty<>0 OR pending_qty<>0
+                ORDER BY pending_value DESC, order_value DESC, vendor""",
+                [month_name, year, period_end_cap, month_name, year, period_end_cap],
+            )
+
+            md = _scalar(
+                f"{plain}SELECT MAX({date_col}) FROM {src} WHERE {fmtw}{period_filter}",
+                period_params,
+            )
+            if hasattr(md, "isoformat"):
+                max_dates.append(md)
+        finally:
+            if materialized:
+                _drop_primary_normalized()
+
+    if include_amazon:
+        acte = _amazon_primary_po_cte()
+        aparams = [month_name, year]
+        amazon_total = _zero()
+        amazon_heads = {h: _zero() for h in ("PREMIUM", "COMMODITY", "OTHER")}
+        for r in _dict_rows(
+            f"{acte} SELECT item_head_key AS item_head, {_AMAZON_PRIMARY_METRIC_SQL} "
+            f"FROM normalized WHERE po_month_key=%s AND po_year=%s GROUP BY item_head_key",
+            aparams,
+        ):
+            head = _head_of(r.get("item_head"))
+            _add(summary_heads[head], r)
+            _add(amazon_total, r)
+            _add(amazon_heads[head], r)
+        if any(amazon_total[f] for f in _PRIMARY_SUMMARY_METRIC_FIELDS):
+            by_platform["amazon"] = {"total": amazon_total, "item_heads": amazon_heads}
+
+        for r in _dict_rows(
+            f"{acte} SELECT item_head_key AS item_head, category_key AS category, "
+            f"sub_category_key AS sub_category, per_ltr_key AS per_ltr, {_AMAZON_PRIMARY_METRIC_SQL} "
+            f"FROM normalized WHERE po_month_key=%s AND po_year=%s "
+            f"GROUP BY item_head_key, category_key, sub_category_key, per_ltr_key",
+            aparams,
+        ):
+            r["item_head"] = _head_of(r.get("item_head"))
+            details.append(r)
+
+        for r in _dict_rows(
+            f"{acte}, item_agg AS (SELECT item_key AS item, item_head_key AS item_head, {_AMAZON_PRIMARY_METRIC_SQL} "
+            f"FROM normalized WHERE po_month_key=%s AND po_year=%s GROUP BY item_key, item_head_key) "
+            f"SELECT * FROM item_agg WHERE done_value<>0 OR done_ltrs<>0 OR done_qty<>0 "
+            f"OR order_value<>0 OR order_ltrs<>0 OR order_qty<>0 "
+            f"ORDER BY done_value DESC, done_ltrs DESC LIMIT 200",
+            aparams,
+        ):
+            r["item_head"] = _head_of(r.get("item_head"))
+            top_items.append(r)
+
+        amd = _scalar(
+            f"{acte} SELECT MAX(period_dt) FROM normalized WHERE po_month_key=%s AND po_year=%s",
+            aparams,
+        )
+        if hasattr(amd, "isoformat"):
+            max_dates.append(amd)
+
+    summary = [{"item_head": h, **summary_heads[h]} for h in ("PREMIUM", "COMMODITY", "OTHER")]
+    summary_total = _zero()
+    for h in summary_heads.values():
+        for f in _PRIMARY_SUMMARY_METRIC_FIELDS:
+            summary_total[f] += h[f]
+    by_platform_out = {
+        slug: {**v["total"], "item_heads": v["item_heads"]}
+        for slug, v in by_platform.items()
+    }
+
+    payload = {
+        "source": "primary_summary",
+        "mode": mode,
+        "month": month,
+        "month_name": month_name,
+        "year": year,
+        "defaulted_to_latest": defaulted_to_latest,
+        "max_date": max(max_dates).isoformat() if max_dates else None,
+        "lead_time_days": None,
+        "summary": summary,
+        "summary_total": summary_total,
+        "details": details,
+        "top_items": top_items,
+        "open_vendor_pending": vendors,
+        "by_platform": by_platform_out,
+        "platforms": allowed,
+    }
+    cache.set(cache_key, payload, _PRIMARY_DASHBOARD_CACHE_TTL)
+    return Response(payload)
+
+
+@api_view(["GET"])
+@permission_classes([require("platform.po.view")])
+def primary_summary_version(request):
+    """Cheap change-beacon for the Primary Summary. Returns a tiny token that
+    changes whenever the underlying PO data changes (rows added/removed or the
+    key numeric columns edited). The frontend polls this and only refetches the
+    heavy summary when the token moves — so an upload shows up within seconds
+    without re-running the big aggregate on a timer."""
+    row = _dict_rows(
+        """
+        SELECT
+            (SELECT COUNT(*) FROM public.master_po) AS m_cnt,
+            (SELECT COALESCE(SUM(COALESCE(total_delivered_liters,0)
+                             + COALESCE(total_order_liters,0)
+                             + COALESCE(missed_ltrs,0)),0)::text FROM public.master_po) AS m_sum,
+            (SELECT COUNT(*) FROM reporting."Amazon PO") AS a_cnt,
+            (SELECT COALESCE(SUM(COALESCE(total_received_cost,0)),0)::text FROM reporting."Amazon PO") AS a_sum
+        """,
+        [],
+    )
+    r = row[0] if row else {}
+    version = f"{r.get('m_cnt', 0)}:{r.get('m_sum', 0)}:{r.get('a_cnt', 0)}:{r.get('a_sum', 0)}"
+    return Response({"version": version})
+
+
 def _parse_price_upload_date(value: str) -> date | None:
     value = str(value or "").strip()
     if not value:
@@ -7112,6 +7462,8 @@ _SEC_DASHBOARD_YEAR_SOURCES = {
     "swiggy": (("swiggySec", 'EXTRACT(YEAR FROM "ORDERED_DATE")::int', None),),
     "flipkart": (("flipkart_secondary_all", '"year"', None),),
     "flipkart_grocery": (("flipkart_grocery_master", '"year"', None),),
+    # Amazon MP: shipment_year is a plain int column on amazon_mp_master.
+    "amazon_mp": (("amazon_mp_master", "shipment_year", None),),
 }
 
 
@@ -7122,7 +7474,8 @@ def sec_dashboard_years(request, slug: str):
     """Distinct years that actually have secondary data for the platform, so the
     Sec Dashboard year filter only lists years present in the database."""
     slug = (slug or "").strip().lower()
-    _ensure_scope(request.user, slug)
+    # Amazon MP has no scope of its own — authorize it against Amazon access.
+    _ensure_scope(request.user, "amazon" if slug == "amazon_mp" else slug)
     sources = _SEC_DASHBOARD_YEAR_SOURCES.get(slug)
     years: set[int] = set()
     errors = []
@@ -7152,10 +7505,175 @@ def sec_dashboard_years(request, slug: str):
     return Response({"years": sorted(years, reverse=True), "errors": errors})
 
 
+def _amazon_mp_sec_dashboard_response(request):
+    """Secondary-summary-shaped view of Amazon MP (amazon_mp_master).
+
+    Lets Amazon MP join the combined Secondary Summary alongside the sec-dashboard
+    platforms. The payload mirrors the other sec builders (summary / details /
+    top_items / *_total / max_date) so the frontend normaliser needs no changes.
+
+    Conventions match the standalone MP dashboard so the numbers reconcile:
+    litres & quantity are summed GROSS (ABS) — refunded/returned units count as
+    positive volume — while value is NET exclusive (tax_exclusive_gross), the
+    exclusive sale figure the other secondary platforms report.
+    """
+    today = timezone.localdate()
+    month_raw = request.query_params.get("month")
+    year_raw = request.query_params.get("year")
+    defaulted_to_latest = False
+    if month_raw and year_raw:
+        try:
+            month = int(month_raw)
+            year = int(year_raw)
+        except (TypeError, ValueError):
+            raise ValidationError("`month` and `year` must be integers.")
+        if not 1 <= month <= 12:
+            raise ValidationError("`month` must be between 1 and 12.")
+        if not 2000 <= year <= 2100:
+            raise ValidationError("`year` must be between 2000 and 2100.")
+    else:
+        month, year = _amazon_mp_dashboard_latest(today.month, today.year)
+        defaulted_to_latest = True
+
+    month_name = _month_name(month)
+    where = "WHERE shipment_year = %s AND UPPER(TRIM(shipment_month)) = %s"
+    params = [year, month_name]
+
+    max_date = _scalar(
+        f"""
+        SELECT MAX(CASE WHEN TRIM(shipment_date) ~ '^[0-9]{{2}}/[0-9]{{2}}/[0-9]{{2}}'
+                        THEN TO_DATE(LEFT(TRIM(shipment_date), 8), 'DD/MM/YY') END)
+        FROM amazon_mp_master
+        {where}
+        """,
+        params,
+    )
+
+    # Item Head split — fold any head that isn't PREMIUM/COMMODITY into OTHER so
+    # no volume is dropped (mirrors the frontend headKey() bucketing).
+    head_raw = _dict_rows(
+        f"""
+        SELECT
+            COALESCE(NULLIF(UPPER(TRIM(item_head)), ''), 'OTHER') AS item_head,
+            COALESCE(SUM(ABS(quantity)), 0) AS shipped_units,
+            COALESCE(SUM(ABS(delivered_ltr)), 0) AS shipped_ltr,
+            COALESCE(SUM(tax_exclusive_gross), 0) AS shipped_value
+        FROM amazon_mp_master
+        {where}
+        GROUP BY COALESCE(NULLIF(UPPER(TRIM(item_head)), ''), 'OTHER')
+        """,
+        params,
+    )
+    head_buckets = {
+        head: {"shipped_units": 0.0, "shipped_ltr": 0.0, "shipped_value": 0.0}
+        for head in ("PREMIUM", "COMMODITY", "OTHER")
+    }
+    for row in head_raw:
+        key = _norm_sec_key(row.get("item_head"))
+        bucket = head_buckets[key] if key in ("PREMIUM", "COMMODITY") else head_buckets["OTHER"]
+        bucket["shipped_units"] += _num(row.get("shipped_units"))
+        bucket["shipped_ltr"] += _num(row.get("shipped_ltr"))
+        bucket["shipped_value"] += _num(row.get("shipped_value"))
+    summary = []
+    for item_head in ("PREMIUM", "COMMODITY", "OTHER"):
+        bucket = head_buckets[item_head]
+        summary.append({
+            "item_head": item_head,
+            "shipped_units": bucket["shipped_units"],
+            "shipped_ltr": bucket["shipped_ltr"],
+            "shipped_value": bucket["shipped_value"],
+            "per_liter_shpd": _per_liter_shpd(bucket["shipped_units"], bucket["shipped_ltr"]),
+        })
+
+    # Detail rows — one per item_head × category × sub_category (drives the
+    # Sub Category Mix once merged with the other platforms).
+    detail_raw = _dict_rows(
+        f"""
+        SELECT
+            COALESCE(NULLIF(UPPER(TRIM(item_head)), ''), 'OTHER') AS item_head,
+            COALESCE(NULLIF(UPPER(TRIM(category)), ''), '-') AS category,
+            COALESCE(NULLIF(UPPER(TRIM(sub_category)), ''), '-') AS sub_category,
+            COALESCE(SUM(ABS(quantity)), 0) AS shipped_units,
+            COALESCE(SUM(ABS(delivered_ltr)), 0) AS shipped_ltr,
+            COALESCE(SUM(tax_exclusive_gross), 0) AS shipped_value
+        FROM amazon_mp_master
+        {where}
+        GROUP BY 1, 2, 3
+        ORDER BY shipped_ltr DESC
+        """,
+        params,
+    )
+    details = []
+    for row in detail_raw:
+        shipped_units = _num(row.get("shipped_units"))
+        shipped_ltr = _num(row.get("shipped_ltr"))
+        details.append({
+            "item_head": row.get("item_head"),
+            "category": row.get("category"),
+            "sub_category": row.get("sub_category"),
+            "shipped_units": shipped_units,
+            "shipped_ltr": shipped_ltr,
+            "shipped_value": _num(row.get("shipped_value")),
+            "per_liter_shpd": _per_liter_shpd(shipped_units, shipped_ltr),
+        })
+
+    # Top items by litres (product title, falling back to SKU / ASIN).
+    top_raw = _dict_rows(
+        f"""
+        SELECT
+            COALESCE(
+                NULLIF(TRIM(item_description), ''),
+                NULLIF(TRIM(sku), ''),
+                NULLIF(TRIM(asin), ''),
+                'OTHER'
+            ) AS item,
+            COALESCE(SUM(ABS(quantity)), 0) AS shipped_units,
+            COALESCE(SUM(ABS(delivered_ltr)), 0) AS shipped_ltr,
+            COALESCE(SUM(tax_exclusive_gross), 0) AS shipped_value
+        FROM amazon_mp_master
+        {where}
+        GROUP BY 1
+        ORDER BY shipped_ltr DESC
+        LIMIT 20
+        """,
+        params,
+    )
+    top_items = []
+    for row in top_raw:
+        shipped_units = _num(row.get("shipped_units"))
+        shipped_ltr = _num(row.get("shipped_ltr"))
+        top_items.append({
+            "item": row.get("item") or "OTHER",
+            "shipped_units": shipped_units,
+            "shipped_ltr": shipped_ltr,
+            "shipped_value": _num(row.get("shipped_value")),
+            "per_liter_shpd": _per_liter_shpd(shipped_units, shipped_ltr),
+        })
+
+    return Response({
+        "source": "amazon_mp_master",
+        "defaulted_to_latest": defaulted_to_latest,
+        "month": month,
+        "year": year,
+        "max_date": max_date.isoformat() if hasattr(max_date, "isoformat") and max_date else None,
+        "summary": summary,
+        "summary_total": _sec_total(summary),
+        "details": details,
+        "detail_total": _sec_total(details),
+        "top_items": top_items,
+    })
+
+
 @api_view(["GET"])
 @permission_classes([require("platform.secondary.view")])
 @cached_get(timeout=60, prefix="plat.fk_sec")
 def flipkart_grocery_sec_dashboard(request, slug: str):
+    if slug == "amazon_mp":
+        # Amazon MP has no scope of its own — it rides on Amazon access (like the
+        # MP dashboard's ?source=mp). Authorize against 'amazon' and serve the
+        # secondary-shaped MP view so Amazon MP joins the Secondary Summary.
+        _ensure_scope(request.user, "amazon")
+        return _amazon_mp_sec_dashboard_response(request)
     _ensure_scope(request.user, slug)
     if slug == "blinkit":
         return _blinkit_sec_dashboard_response(request)
@@ -10668,6 +11186,7 @@ def flipkart_grocery_drr_dashboard(request, slug: str):
         SELECT
             "real_date",
             COALESCE(SUM("sale_amt_exclusive"), 0) AS ops,
+            COALESCE(SUM("qty"), 0) AS qty,
             COALESCE(SUM("ltr_sold"), 0) AS ltr
         FROM "flipkart_grocery_master"
         WHERE "month" = %s
@@ -10685,6 +11204,7 @@ def flipkart_grocery_drr_dashboard(request, slug: str):
             "date": current_date.isoformat(),
             "display_date": current_date.strftime("%d-%m-%Y"),
             "ops": _num(row.get("ops")),
+            "qty": _num(row.get("qty")),
             "ltr": _num(row.get("ltr")),
         })
 
