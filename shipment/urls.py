@@ -16,6 +16,7 @@ urlpatterns = [
     path('shipments/', views.ShipmentListCreateView.as_view(), name='shipment-list-create'),
     path('shipments/stats/', views.ShipmentStatsView.as_view(), name='shipment-stats'),
     path('shipments/pending-approvals/', views.ShipmentPendingApprovalsView.as_view(), name='shipment-pending-approvals'),
+    path('shipments/deletion-log/', views.ShipmentDeletionLogView.as_view(), name='shipment-deletion-log'),
     path('shipments/manual-plan/', views.ManualPlanView.as_view(), name='shipment-manual-plan'),
     path('shipments/doh-auto-fill/', views.DOHAutoFillView.as_view(), name='shipment-doh-auto-fill'),
     path('po-shipment-lookup/', views.PoShipmentLookupView.as_view(), name='po-shipment-lookup'),

@@ -207,3 +207,26 @@ class ShipmentInvoice(models.Model):
 
     class Meta:
         db_table = 'sp_invoice'
+
+
+class ShipmentDeletionLog(models.Model):
+    """Append-only record of a deleted shipment. The shipment (and its cascade
+    of items + audit logs) is gone after a delete, so this is the only durable,
+    in-app trace of who deleted what, when, and the shipment's state at the time.
+    shipment_id is a plain int (not a FK) because the row it referenced no longer
+    exists; emails are snapshotted so they survive later user deletions."""
+    shipment_id = models.IntegerField()
+    status = models.CharField(max_length=32, blank=True)
+    planning_mode = models.CharField(max_length=16, blank=True)
+    appointment_id = models.TextField(blank=True)
+    destination_fc = models.TextField(blank=True)
+    loaded_item_count = models.IntegerField(default=0)
+    planned_liters = models.DecimalField(max_digits=14, decimal_places=4, null=True)
+    created_by_email = models.TextField(blank=True)
+    deleted_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True)
+    deleted_by_email = models.TextField(blank=True)
+    deleted_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = 'sp_deletion_log'
+        ordering = ['-deleted_at']

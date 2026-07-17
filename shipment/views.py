@@ -22,7 +22,7 @@ from rest_framework.views import APIView
 from rest_framework.parsers import MultiPartParser, FormParser
 
 from accounts.permissions import has_permission_code
-from .models import Shipment, ShipmentAuditLog, ShipmentItem, ShipmentPoDocument, ShipmentInvoice
+from .models import Shipment, ShipmentAuditLog, ShipmentItem, ShipmentPoDocument, ShipmentInvoice, ShipmentDeletionLog
 from .serializers import (
     ShipmentAuditLogSerializer,
     ShipmentItemSerializer,
@@ -2953,10 +2953,26 @@ class ShipmentDetailView(_SafeAPIView):
                 and not request.user.is_staff):
             return Response({'error': 'Only the creator or staff can delete this shipment.'}, status=403)
         sid = shipment.id
-        # Durable audit trail: the ShipmentAuditLog FK cascades on delete, so a
-        # DB row would vanish with the shipment — log to the server instead.
-        # Approved deletions are logged loudly (who + override flag) since they
-        # unwind a committed shipment.
+        # Durable, in-app audit trail: the ShipmentAuditLog rows cascade away with
+        # the shipment, so snapshot who/when/what into sp_deletion_log first. Best
+        # effort — if the table isn't there yet (migration not applied) the delete
+        # must still go through, so a missing-table error is swallowed, not raised.
+        try:
+            ShipmentDeletionLog.objects.create(
+                shipment_id=sid,
+                status=shipment.status,
+                planning_mode=shipment.planning_mode or '',
+                appointment_id=shipment.appointment_id or '',
+                destination_fc=shipment.destination_fc or '',
+                loaded_item_count=shipment.items.filter(not_loaded=False).count(),
+                planned_liters=shipment.planned_liters,
+                created_by_email=(shipment.created_by.email if shipment.created_by_id else ''),
+                deleted_by=request.user if getattr(request.user, 'is_authenticated', False) else None,
+                deleted_by_email=getattr(request.user, 'email', '') or '',
+            )
+        except Exception:
+            logger.exception('shipment: could not write deletion log for id=%s', sid)
+        # Also log to the server (approved deletions loudly — they unwind a commit).
         logger.info(
             'shipment delete: id=%s status=%s approved_override=%s appointment=%s fc=%s by user_id=%s (%s)',
             sid, shipment.status, approved_override, shipment.appointment_id, shipment.destination_fc,
@@ -2964,6 +2980,34 @@ class ShipmentDetailView(_SafeAPIView):
         )
         shipment.delete()  # cascades to items + audit_logs via FK
         return Response({'deleted': True, 'shipment_id': sid}, status=200)
+
+
+class ShipmentDeletionLogView(_SafeAPIView):
+    """Append-only log of deleted shipments — who deleted what, when, and the
+    shipment's state at the time. Resilient: returns an empty list if the table
+    isn't there yet (migration pending) rather than erroring."""
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        limit = _safe_int(request.query_params.get('limit'), 300, lo=1, hi=2000)
+        try:
+            rows = list(ShipmentDeletionLog.objects.all()[:limit])
+        except Exception:
+            return Response({'results': [], 'count': 0})
+        out = [{
+            'id': r.id,
+            'shipment_id': r.shipment_id,
+            'status': r.status,
+            'planning_mode': r.planning_mode,
+            'appointment_id': r.appointment_id,
+            'destination_fc': r.destination_fc,
+            'loaded_item_count': r.loaded_item_count,
+            'planned_liters': float(r.planned_liters) if r.planned_liters is not None else None,
+            'created_by_email': r.created_by_email,
+            'deleted_by_email': r.deleted_by_email,
+            'deleted_at': r.deleted_at.isoformat() if r.deleted_at else None,
+        } for r in rows]
+        return Response({'results': out, 'count': len(out)})
 
 
 class ShipmentItemUpdateView(_SafeAPIView):
