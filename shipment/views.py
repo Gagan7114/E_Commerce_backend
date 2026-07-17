@@ -1221,6 +1221,39 @@ def _reserved_stock_by_asin():
     return reserved
 
 
+def _reserved_detail_by_asin():
+    """ASIN (upper) → [{shipment_id, status, qty, destination_fc, appointment_id}]:
+    the per-shipment breakdown BEHIND ``planned_reserved`` (same active-shipment
+    scope: draft / pending_approval / approved, loaded lines only). Lets the
+    inventory page show which shipments a SKU's 'In Loads' units belong to."""
+    detail = {}
+    with connection.cursor() as cur:
+        cur.execute("""
+            SELECT UPPER(TRIM(si.asin)) AS asin, s.id, s.status,
+                   COALESCE(s.destination_fc, '') AS fc,
+                   COALESCE(s.appointment_id, '') AS appointment_id,
+                   SUM(COALESCE(si.planned_qty, 0)) AS qty
+            FROM sp_items si
+            JOIN sp_shipments s ON s.id = si.shipment_id
+            WHERE si.not_loaded = FALSE
+              AND si.asin IS NOT NULL
+              AND s.status IN ('draft', 'pending_approval', 'approved')
+            GROUP BY UPPER(TRIM(si.asin)), s.id, s.status,
+                     COALESCE(s.destination_fc, ''), COALESCE(s.appointment_id, '')
+            HAVING SUM(COALESCE(si.planned_qty, 0)) > 0
+            ORDER BY qty DESC, s.id DESC
+        """)
+        for asin, sid, status, fc, appt, qty in cur.fetchall():
+            detail.setdefault(asin, []).append({
+                'shipment_id': sid,
+                'status': status,
+                'destination_fc': fc or '',
+                'appointment_id': appt or '',
+                'qty': float(qty or 0),
+            })
+    return detail
+
+
 def _apply_stock_caps(items, avail_total, avail_remaining, respect, detail, reserved):
     """Tag each item with live stock figures (on-hand, reserved-elsewhere,
     available, incoming on-order). When ``respect``, set ``stock_cap`` = units
@@ -5100,8 +5133,11 @@ class SapInventoryView(_SafeAPIView):
         it's planned. SAP's own OnHand / Committed / Available are left untouched.
         Keyed by the row's ASIN (format_sku_code); non-Amazon rows reserve nothing."""
         reserved = _reserved_stock_by_asin()
+        detail = _reserved_detail_by_asin()
         for r in rows:
             asin = str(r.get('format_sku_code') or '').strip().upper()
             res = reserved.get(asin, 0.0) if asin else 0.0
             r['planned_reserved'] = res
             r['free_to_plan'] = float(r.get('OnHand') or 0) - res
+            # Per-shipment breakdown of the 'In Loads' figure (for the click-through).
+            r['reservations'] = detail.get(asin, []) if asin else []
