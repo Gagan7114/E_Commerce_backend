@@ -4,6 +4,7 @@ import hmac
 import json
 import math
 import time
+import uuid
 from datetime import date as _date, timedelta
 from decimal import Decimal
 
@@ -89,15 +90,31 @@ class _SafeAPIView(_BaseAPIView):
     def handle_exception(self, exc):
         if isinstance(exc, (APIException, Http404, PermissionDenied)):
             return super().handle_exception(exc)
+        # Diagnosable failures: every unexpected error gets a short reference id
+        # that is ALSO written to the server log next to the full traceback, so
+        # a screenshot of the UI message ("ref 3F9A21BC") pinpoints the exact
+        # stack trace. The exception class + view name go to the client too —
+        # this is an internal tool, and "NameError in DOHAutoFillView" tells the
+        # team what broke instead of a blind "something went wrong".
+        ref = uuid.uuid4().hex[:8].upper()
+        where = self.__class__.__name__
         if isinstance(exc, DatabaseError):
-            logger.exception('shipment: database error in %s', self.__class__.__name__)
+            logger.exception('shipment: database error in %s [ref %s]', where, ref)
             return Response(
-                {'error': 'A database error occurred. Please try again in a moment.'},
+                {
+                    'error': 'A database error occurred. Please try again in a moment.',
+                    'error_id': ref,
+                    'where': where,
+                },
                 status=status.HTTP_503_SERVICE_UNAVAILABLE,
             )
-        logger.exception('shipment: unhandled error in %s', self.__class__.__name__)
+        logger.exception('shipment: unhandled error in %s [ref %s]', where, ref)
         return Response(
-            {'error': 'Something went wrong while processing your request.'},
+            {
+                'error': f'Something went wrong while processing your request ({type(exc).__name__}).',
+                'error_id': ref,
+                'where': where,
+            },
             status=status.HTTP_500_INTERNAL_SERVER_ERROR,
         )
 
