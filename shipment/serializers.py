@@ -124,6 +124,7 @@ class ShipmentListSerializer(serializers.ModelSerializer):
     is_stale_draft = serializers.SerializerMethodField()
     channel = serializers.SerializerMethodField()
     summary = serializers.SerializerMethodField()
+    approved_by_email = serializers.SerializerMethodField()
 
     class Meta:
         model = Shipment
@@ -134,10 +135,16 @@ class ShipmentListSerializer(serializers.ModelSerializer):
             'created_by_email', 'item_count', 'created_at', 'updated_at',
             'vehicle_type', 'vehicle_number', 'driver_name', 'driver_phone',
             'dispatch_date_planned', 'notes', 'is_stale_draft', 'summary',
+            'approved_by_email',
         ]
 
     def get_created_by_email(self, obj):
         return obj.created_by.email if obj.created_by else None
+
+    def get_approved_by_email(self, obj):
+        # `approved_by` is set at approval and never cleared, so it survives into
+        # dispatched/delivered too. The list view already select_relates it.
+        return obj.approved_by.email if obj.approved_by_id else None
 
     def get_item_count(self, obj):
         # Prefer the `loaded_item_count` annotation set by the list view (one
