@@ -4725,17 +4725,12 @@ _REALISE_ADS_SOURCES = {
     "blinkit": ("blinkit_ads_master", "ad_spent", "BLINKIT"),
     "swiggy": ("swiggy_ads_master", "ad_spent", "SWIGGY"),
     "zepto": ("zepto_ads_master", "ad_spent", "ZEPTO"),
-    # Flipkart ads are campaign-level (no category/format/item_head columns), so
-    # they can't feed the category-wise rollup — but they DO belong in the KPI
-    # grand total (and get equal-spread across categories), matching the Ads
-    # Summary / Flipkart Ads dashboard. The per-category collector skips this
-    # source via _REALISE_ADS_NO_CATEGORY_DIM.
-    "flipkart": ("flipkart_ads_master", "ad_spend", None),
+    # NOTE: Flipkart ads are NOT in this dict. Flipkart's SKU-level ad spend lives
+    # in `consolidated_fsn_report` (no period column, campaign-level
+    # flipkart_ads_master reports a very different, far larger figure), so it needs
+    # bespoke handling — see _realise_flipkart_fsn_ads. This matches the Ads
+    # Summary dashboard's item-head/category source for Flipkart.
 }
-
-# Ad sources with no category dimension — counted only in the grand total (their
-# spend flows into the equal-spread residual, never into a category row).
-_REALISE_ADS_NO_CATEGORY_DIM = {"flipkart"}
 
 # Brand fund per platform. blinkit/swiggy/zepto have dedicated brand-fund
 # masters; Amazon has no brand-fund ledger, so its brand fund is read from the
@@ -4754,7 +4749,7 @@ _REALISE_BRANDFUND_SOURCES = {
 # `summary_use_max_date` on the per-platform Ads dashboards (platforms/views.py).
 # amazon/blinkit ad masters are per-day and stay summable; every brand-fund
 # master is per-day too.
-_REALISE_CUMULATIVE_ADS = {"swiggy", "zepto", "bigbasket", "flipkart"}
+_REALISE_CUMULATIVE_ADS = {"swiggy", "zepto", "bigbasket"}
 
 
 def _realise_ads_brandfund(platform, month_num, year, group_by, cat_filter=None):
@@ -4782,8 +4777,6 @@ def _realise_ads_brandfund(platform, month_num, year, group_by, cat_filter=None)
     def collect(target, sources, cumulative_slugs):
         with connection.cursor() as cur:
             for slug, (table, spend_col, _fmt) in sources.items():
-                if slug in _REALISE_ADS_NO_CATEGORY_DIM:
-                    continue  # no category column — counted only in the grand total
                 # No `format` filter: each master is single-platform and its
                 # `format` column comes from a master_sheet LEFT JOIN that is NULL
                 # for unmapped SKUs — filtering on it silently drops real spend.
@@ -5162,10 +5155,6 @@ def _realise_ads_brandfund_totals(platform, month_num, year, cat_filter=None):
     ads_total = fund_total = 0.0
     with connection.cursor() as cur:
         for slug, (table, spend_col, _fmt) in ads_srcs.items():
-            # Category-less sources (e.g. flipkart) can't be scoped to a specific
-            # category, so drop them from a category-filtered total.
-            if cat_filter and slug in _REALISE_ADS_NO_CATEGORY_DIM:
-                continue
             try:
                 ads_total += source_total(cur, table, spend_col, slug in _REALISE_CUMULATIVE_ADS)
             except Exception:  # noqa: BLE001
@@ -5175,7 +5164,39 @@ def _realise_ads_brandfund_totals(platform, month_num, year, cat_filter=None):
                 fund_total += source_total(cur, table, spend_col, False)
             except Exception:  # noqa: BLE001
                 pass
+        # Flipkart ads — from the FSN SKU report, matching the Ads Summary. Added
+        # for all-platforms and the flipkart view only.
+        if platform is None or platform == "flipkart":
+            ads_total += _realise_flipkart_fsn_ads(cur, month_name, year, cat_filter)
     return round(ads_total, 2), round(fund_total, 2)
+
+
+def _realise_flipkart_fsn_ads(cur, month_name, year, cat_filter=None):
+    """Flipkart ad spend for the Realise KPIs, read from `consolidated_fsn_report`
+    (SKU-level) — the SAME source the Ads Summary dashboard uses for Flipkart's
+    item-head / category breakdown. The FSN report has NO period column, so (like
+    Ads Summary) its whole spend is attributed to the LATEST flipkart_ads_master
+    period; it therefore counts only when the requested month/year IS that latest
+    period. Deliberately NOT the campaign-level flipkart_ads_master figure, which
+    is ~12× larger and disagrees with the FSN report."""
+    try:
+        cur.execute(
+            "SELECT year, UPPER(TRIM(month::text)) FROM flipkart_ads_master "
+            "GROUP BY year, month ORDER BY MAX(date) DESC LIMIT 1"
+        )
+        latest = cur.fetchone()
+        if not latest or int(latest[0]) != int(year) or latest[1] != month_name:
+            return 0.0
+        sql = "SELECT COALESCE(SUM(ad_spend), 0) FROM consolidated_fsn_report"
+        params = []
+        if cat_filter:
+            sql += " WHERE UPPER(TRIM(category::text)) = %s"
+            params.append(cat_filter)
+        cur.execute(sql, params)
+        row = cur.fetchone()
+        return float(row[0] or 0) if row and row[0] is not None else 0.0
+    except Exception:  # noqa: BLE001
+        return 0.0
 
 
 def _parallel_db(funcs):
