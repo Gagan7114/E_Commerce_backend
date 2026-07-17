@@ -4,6 +4,7 @@ import hmac
 import json
 import math
 import time
+import uuid
 from datetime import date as _date, timedelta
 from decimal import Decimal
 
@@ -89,15 +90,31 @@ class _SafeAPIView(_BaseAPIView):
     def handle_exception(self, exc):
         if isinstance(exc, (APIException, Http404, PermissionDenied)):
             return super().handle_exception(exc)
+        # Diagnosable failures: every unexpected error gets a short reference id
+        # that is ALSO written to the server log next to the full traceback, so
+        # a screenshot of the UI message ("ref 3F9A21BC") pinpoints the exact
+        # stack trace. The exception class + view name go to the client too —
+        # this is an internal tool, and "NameError in DOHAutoFillView" tells the
+        # team what broke instead of a blind "something went wrong".
+        ref = uuid.uuid4().hex[:8].upper()
+        where = self.__class__.__name__
         if isinstance(exc, DatabaseError):
-            logger.exception('shipment: database error in %s', self.__class__.__name__)
+            logger.exception('shipment: database error in %s [ref %s]', where, ref)
             return Response(
-                {'error': 'A database error occurred. Please try again in a moment.'},
+                {
+                    'error': 'A database error occurred. Please try again in a moment.',
+                    'error_id': ref,
+                    'where': where,
+                },
                 status=status.HTTP_503_SERVICE_UNAVAILABLE,
             )
-        logger.exception('shipment: unhandled error in %s', self.__class__.__name__)
+        logger.exception('shipment: unhandled error in %s [ref %s]', where, ref)
         return Response(
-            {'error': 'Something went wrong while processing your request.'},
+            {
+                'error': f'Something went wrong while processing your request ({type(exc).__name__}).',
+                'error_id': ref,
+                'where': where,
+            },
             status=status.HTTP_500_INTERNAL_SERVER_ERROR,
         )
 
@@ -3029,6 +3046,11 @@ class ShipmentPoDocumentsView(_SafeAPIView):
             shipment = Shipment.objects.get(pk=pk)
         except Shipment.DoesNotExist:
             return Response({'error': 'Not found'}, status=404)
+        # Docs are attach-while-planning artifacts: upload/replace stays open up
+        # to approval, but a locked (approved/dispatched/…) shipment's record
+        # must not change under it.
+        if shipment.status in LOCKED_STATUSES:
+            return Response({'error': 'PO documents can no longer be changed once the shipment is approved.'}, status=400)
         po_number = str(request.data.get('po_number') or '').strip()
         f = request.FILES.get('file')
         if not po_number or f is None:
@@ -3065,6 +3087,15 @@ class ShipmentPoDocumentFileView(_SafeAPIView):
         return resp
 
     def delete(self, request, pk, po_number):
+        try:
+            shipment = Shipment.objects.get(pk=pk)
+        except Shipment.DoesNotExist:
+            return Response({'error': 'Not found'}, status=404)
+        # Deleting is a wizard-stage action. Once submitted, the "every loaded
+        # PO has a document" invariant (enforced at submit) must keep holding,
+        # so pending/approved/dispatched shipments keep their documents.
+        if shipment.status not in (Shipment.Status.DRAFT, Shipment.Status.REJECTED):
+            return Response({'error': 'PO documents can only be deleted while the shipment is a draft or rejected.'}, status=400)
         ShipmentPoDocument.objects.filter(shipment_id=pk, po_number=str(po_number).strip()).delete()
         return Response(status=204)
 
@@ -3613,12 +3644,17 @@ class AllAppointmentsView(_SafeAPIView):
                        -- items: sum of (accepted_qty / case_pack) per SKU. Used
                        -- only when Amazon VC has no carton count for the appt.
                        (
+                           -- pos is a comma/semicolon CSV — split it, or a
+                           -- multi-PO appointment matches nothing and its
+                           -- carton estimate silently undercounts.
                            SELECT ROUND(SUM(p.accepted_qty::numeric / GREATEST(p.case_pack, 1)))
                            FROM reporting."Amazon PO" p
                            WHERE UPPER(TRIM(p.po_number)) IN (
-                               SELECT UPPER(TRIM(NULLIF(a2.pos, '')))
-                               FROM reporting."appointment" a2
+                               SELECT UPPER(TRIM(pv))
+                               FROM reporting."appointment" a2,
+                                    LATERAL unnest(regexp_split_to_array(COALESCE(a2.pos, ''), '\s*[,;]\s*')) AS pv
                                WHERE a2.appointment_id = a.appointment_id
+                                 AND NULLIF(TRIM(pv), '') IS NOT NULL
                            )
                        ) AS calc_carton_count
                 FROM reporting."appointment" a
@@ -4159,6 +4195,12 @@ class DOHAutoFillView(_SafeAPIView):
                 'source': {'sales': 'amazon_sec_range_master_view', 'inventory': 'amazon_master_inventory'},
                 'message': 'No inventory snapshots found in amazon_master_inventory.',
             })
+
+        # Snapshot month/year echoed in the response (and used to be read by the
+        # cache helper before it was extracted — keep them defined here or the
+        # response build below raises NameError and the whole endpoint 500s).
+        month_name = effective_date.strftime('%B').upper()
+        year = effective_date.year
 
         # Heavy rolling-window DOH aggregate (WITH inventory attributes) — TTL-cached
         # by snapshot date so repeated Auto-Fill runs reuse it (DOH changes daily).
