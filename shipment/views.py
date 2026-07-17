@@ -33,6 +33,23 @@ from .serializers import (
 TRUCK_CAPACITIES = {'10_ton': 10000.0, '15_ton': 15000.0}
 LOCKED_STATUSES = ('approved', 'dispatched', 'in_transit', 'delivered')
 
+# Accounts allowed to delete an APPROVED shipment — a destructive admin action
+# that permanently removes the shipment and frees its committed PO rows + stock.
+# Scoped to a single account by explicit request; every other user can only
+# delete draft / pending-approval / rejected shipments. Enforced server-side in
+# ShipmentDetailView.delete (the UI button is gated on the same email).
+APPROVED_DELETE_EMAILS = {'ecom@jivo.in'}
+
+
+def _can_delete_approved(user):
+    """True only for the allow-listed account(s) above. request.user.email comes
+    from the authenticated session, so this can't be spoofed by the client."""
+    return bool(
+        user
+        and getattr(user, 'is_authenticated', False)
+        and (getattr(user, 'email', '') or '').strip().lower() in APPROVED_DELETE_EMAILS
+    )
+
 # Fixed key for the Postgres transaction-scoped advisory lock that serializes the
 # shipment claim+create critical section. Without it, two planners can both pass
 # the "is this PO line still free?" check and then both insert the same rows
@@ -2875,27 +2892,42 @@ class ShipmentDetailView(_SafeAPIView):
         if not shipment:
             return Response({'error': 'Not found'}, status=404)
         # DRAFT, PENDING_APPROVAL and REJECTED shipments can be deleted;
-        # approved/dispatched/delivered are protected.
+        # approved/dispatched/delivered are protected — EXCEPT an approved
+        # shipment may be deleted by the single allow-listed account (see
+        # APPROVED_DELETE_EMAILS), which frees its committed PO rows + stock.
         deletable_statuses = {
             Shipment.Status.DRAFT,
             Shipment.Status.PENDING_APPROVAL,
             Shipment.Status.REJECTED,
         }
-        if shipment.status not in deletable_statuses:
+        approved_override = (
+            shipment.status == Shipment.Status.APPROVED and _can_delete_approved(request.user)
+        )
+        if shipment.status not in deletable_statuses and not approved_override:
+            extra = ('' if shipment.status != Shipment.Status.APPROVED
+                     else ' Deleting an approved shipment is restricted to an authorised account.')
             return Response(
-                {'error': f'Only draft, pending-approval or rejected shipments can be deleted. This shipment is "{shipment.get_status_display()}".'},
+                {'error': f'Only draft, pending-approval or rejected shipments can be deleted. '
+                          f'This shipment is "{shipment.get_status_display()}".{extra}'},
                 status=400,
             )
-        # Only the creator (or staff) can delete.
-        if shipment.created_by_id and shipment.created_by_id != request.user.id and not request.user.is_staff:
+        # Creator-or-staff gate for the normal statuses. The approved override is
+        # itself already limited to the allow-listed account, which is the
+        # authority here, so it skips the creator check.
+        if (not approved_override
+                and shipment.created_by_id
+                and shipment.created_by_id != request.user.id
+                and not request.user.is_staff):
             return Response({'error': 'Only the creator or staff can delete this shipment.'}, status=403)
         sid = shipment.id
         # Durable audit trail: the ShipmentAuditLog FK cascades on delete, so a
         # DB row would vanish with the shipment — log to the server instead.
+        # Approved deletions are logged loudly (who + override flag) since they
+        # unwind a committed shipment.
         logger.info(
-            'shipment delete: id=%s status=%s appointment=%s fc=%s by user_id=%s (%s)',
-            sid, shipment.status, shipment.appointment_id, shipment.destination_fc,
-            getattr(request.user, 'id', None), getattr(request.user, 'username', ''),
+            'shipment delete: id=%s status=%s approved_override=%s appointment=%s fc=%s by user_id=%s (%s)',
+            sid, shipment.status, approved_override, shipment.appointment_id, shipment.destination_fc,
+            getattr(request.user, 'id', None), getattr(request.user, 'email', ''),
         )
         shipment.delete()  # cascades to items + audit_logs via FK
         return Response({'deleted': True, 'shipment_id': sid}, status=200)
