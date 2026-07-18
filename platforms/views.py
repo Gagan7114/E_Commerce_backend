@@ -87,7 +87,7 @@ def _drop_primary_normalized() -> None:
 _PRIMARY_CTE_STUB = "WITH _stub AS (SELECT 1)"
 
 _PRIMARY_DASHBOARD_CACHE_TTL = 60  # seconds
-_PRIMARY_DASHBOARD_CACHE_VERSION = 22
+_PRIMARY_DASHBOARD_CACHE_VERSION = 23  # +open_po_total (all-months open-PO backlog)
 
 
 # Platforms hidden from the whole app. Kept in code/DB (not deleted), but the
@@ -543,6 +543,75 @@ def _primary_master_po_order_minus_deliver_kpi_total(
     metrics["projection_ltrs"] = _safe_div(metrics["done_ltrs"], elapsed_day) * days_in_month
     metrics["projection_qty"] = _safe_div(metrics["done_qty"], elapsed_day) * days_in_month
     return metrics
+
+
+def _primary_open_po_totals(format_keys) -> dict:
+    """All-months OPEN-PO pendency totals, grouped per format key.
+
+    The Primary Dashboard's "Pending" card is month-scoped (short-delivered
+    balance for the selected DEL/PO month). This returns the *full open backlog*
+    instead: every PO still OPEN, across all months, using the same semantics as
+    the Pendency Dashboard — open_close='OPEN', cancelled excluded, pending =
+    max(order - delivered, 0). Returns {"by_format": {fk: {...}}, "total": {...}}
+    so both the single-platform dashboard and the multi-platform home overview
+    can reuse one query.
+    """
+    keys: list[str] = []
+    for raw in format_keys or []:
+        fk = re.sub(r"[^a-z0-9]+", "", str(raw or "").strip().lower())
+        if fk and fk not in keys:
+            keys.append(fk)
+
+    def _empty() -> dict:
+        return {"pending_value": 0.0, "pending_ltrs": 0.0, "pending_qty": 0.0, "open_pos": 0}
+
+    if not keys:
+        return {"by_format": {}, "total": _empty()}
+
+    values_sql = ", ".join(["(%s)"] * len(keys))
+    rows = _dict_rows(
+        f"""
+        WITH requested(format_key) AS (
+            VALUES {values_sql}
+        )
+        SELECT
+            r.format_key AS format_key,
+            COALESCE(SUM(GREATEST(
+                COALESCE(p.total_order_liters, 0) - COALESCE(p.total_delivered_liters, 0), 0
+            )), 0) AS pending_ltrs,
+            COALESCE(SUM(GREATEST(
+                COALESCE(p.order_qty, 0) - COALESCE(p.delivered_qty, 0), 0
+            )), 0) AS pending_qty,
+            COALESCE(SUM(GREATEST(
+                COALESCE(p.total_order_amt_inclusive, 0) - COALESCE(p.total_deliver_amt_inclusive, 0), 0
+            )), 0) AS pending_value,
+            COUNT(DISTINCT p.po_number) AS open_pos
+        FROM public.master_po p
+        JOIN requested r
+          ON REGEXP_REPLACE(LOWER(TRIM(p.format::text)), '[^a-z0-9]+', '', 'g') = r.format_key
+        WHERE UPPER(TRIM(p.open_close::text)) = 'OPEN'
+          AND UPPER(TRIM(COALESCE(p.po_status, p.status, '')::text))
+              NOT IN ('CANCELLED', 'CANCELED', 'CANCEL')
+        GROUP BY r.format_key
+        """,
+        keys,
+    )
+
+    by_format: dict[str, dict] = {}
+    total = _empty()
+    for row in rows:
+        entry = {
+            "pending_value": _num(row.get("pending_value")),
+            "pending_ltrs": _num(row.get("pending_ltrs")),
+            "pending_qty": _num(row.get("pending_qty")),
+            "open_pos": int(row.get("open_pos") or 0),
+        }
+        by_format[row.get("format_key")] = entry
+        total["pending_value"] += entry["pending_value"]
+        total["pending_ltrs"] += entry["pending_ltrs"]
+        total["pending_qty"] += entry["pending_qty"]
+        total["open_pos"] += entry["open_pos"]
+    return {"by_format": by_format, "total": total}
 
 
 def _bigbasket_primary_period_bounds(month_name: str, year: int) -> tuple[date, date]:
@@ -2294,10 +2363,15 @@ def _primary_dashboard_payload(
     )
     card_total = kpi_total or summary_total
 
+    # All-months open-PO backlog for the Pending card (month-independent). See
+    # `_primary_open_po_totals` — mirrors the Pendency Dashboard's open-PO math.
+    open_po_total = _primary_open_po_totals([platform_format])["total"]
+
     payload = {
         "source": "master_po",
         "format": platform_format,
         "dashboard_title": f"{platform_format} Primary Dashboard",
+        "open_po_total": open_po_total,
         "mode": mode,
         "month": month,
         "month_name": month_name,
@@ -2500,6 +2574,17 @@ def primary_overview_total(request):
             amazon_heads[head]["done_value"] += Decimal(str(row.get("done_value") or 0))
         by_platform["amazon"] = _heads_payload(amazon_heads)
 
+    # All-months open-PO backlog per platform (month-independent), so the home
+    # Primary hero can surface the full open-PO pendency alongside delivered.
+    # Amazon has no open_close data, so it contributes nothing here.
+    open_po = _primary_open_po_totals(master_format_keys)
+    for slug, fk in slug_format_keys:
+        if slug in by_platform:
+            by_platform[slug]["open_po_total"] = open_po["by_format"].get(
+                fk,
+                {"pending_value": 0.0, "pending_ltrs": 0.0, "pending_qty": 0.0, "open_pos": 0},
+            )
+
     payload = {
         "done_ltrs": float(total_ltrs),
         "done_value": float(total_value),
@@ -2510,6 +2595,7 @@ def primary_overview_total(request):
             }
             for key, value in item_heads.items()
         },
+        "open_po_total": open_po["total"],
         "by_platform": by_platform,
         "month": month,
         "month_name": month_name,
