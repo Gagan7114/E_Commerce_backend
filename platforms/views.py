@@ -6448,49 +6448,6 @@ _FK_GROCERY_DRR_ITEM_ORDER = (
     "WG MOJITO 200ML",
 )
 
-_FK_GROCERY_MOM_TARGETS = {
-    "PREMIUM": 2000,
-    "COMMODITY": 52000,
-}
-
-_FK_GROCERY_MOM_TEMPLATE = (
-    ("CANOLA", "CANOLA 1L", "PREMIUM", 1000),
-    ("EXTRA LIGHT", "EXTRA LIGHT 2L", "PREMIUM", 200),
-    ("GOLD", "GOLD 5L", "COMMODITY", 0),
-    ("JIVO POMACE", "JIVO POMACE 1L", "PREMIUM", 400),
-    ("JIVO POMACE", "JIVO POMACE 5L", "PREMIUM", 400),
-    ("MUSTARD KACHI GHANI", "MUSTARD 1L", "COMMODITY", 45000),
-    ("MUSTARD KACHI GHANI", "MUSTARD 4L", "COMMODITY", 4500),
-    ("MUSTARD KACHI GHANI", "MUSTARD 5L", "COMMODITY", 1000),
-    ("SOYABEAN", "SOYABEAN 1L POUCH", "COMMODITY", 1000),
-    ("SUNFLOWER", "SUNFLOWER 4L", "COMMODITY", 500),
-)
-
-_BIGBASKET_MOM_TARGETS = {
-    "PREMIUM": 5000,
-    "COMMODITY": 12000,
-}
-
-_BIGBASKET_MOM_TEMPLATE = (
-    ("CANOLA", "CANOLA 1L", "PREMIUM", 1000),
-    ("CANOLA", "CANOLA 1L POUCH", "PREMIUM", 500),
-    ("CANOLA", "CANOLA 5L", "PREMIUM", 1000),
-    ("EXTRA LIGHT", "EXTRA LIGHT 1L", "PREMIUM", 800),
-    ("EXTRA LIGHT", "EXTRA LIGHT 2L", "PREMIUM", 500),
-    ("EXTRA LIGHT", "EXTRA LIGHT 5L", "PREMIUM", 100),
-    ("EXTRA VIRGIN", "EXTRA VIRGIN 1L", "PREMIUM", 100),
-    ("EXTRA VIRGIN", "EXTRA VIRGIN 5L", "PREMIUM", 0),
-    ("JIVO POMACE", "JIVO POMACE 1L", "PREMIUM", 800),
-    ("JIVO POMACE", "JIVO POMACE 2L", "PREMIUM", 100),
-    ("JIVO POMACE", "JIVO POMACE 5L", "PREMIUM", 100),
-    ("MUSTARD KACCHI GHANI", "MUSTARD 1L", "COMMODITY", 1000),
-    ("MUSTARD KACCHI GHANI", "MUSTARD 5L", "COMMODITY", 1500),
-    ("SOYABEAN", "SOYABEAN 1L", "COMMODITY", 0),
-    ("SOYABEAN", "SOYABEAN 5L", "COMMODITY", 0),
-    ("SUNFLOWER", "SUNFLOWER 1L", "COMMODITY", 6500),
-    ("SUNFLOWER", "SUNFLOWER 5L", "COMMODITY", 3000),
-)
-
 
 def _parse_sec_month_year(params, *, latest_source: str = "flipkart_grocery") -> tuple[int, int, bool]:
     raw_date = str(params.get("date") or "").strip()
@@ -6552,6 +6509,17 @@ def _parse_sec_month_year(params, *, latest_source: str = "flipkart_grocery") ->
             """
             SELECT "month", "year"
             FROM "amazon_sec_daily_master_view"
+            WHERE "to_date" IS NOT NULL
+            ORDER BY "to_date" DESC
+            LIMIT 1
+            """,
+            [],
+        )
+    elif latest_source == "bigbasket_sec_range_master":
+        latest = _dict_rows(
+            """
+            SELECT "month", "year"
+            FROM bigbasket_sec_range_master
             WHERE "to_date" IS NOT NULL
             ORDER BY "to_date" DESC
             LIMIT 1
@@ -7267,19 +7235,6 @@ _AMAZON_COMPARISON_ROWS = (
 )
 
 
-def _sum_mom_rows(rows: list[dict]) -> dict:
-    keys = (
-        "target",
-        "current_done_ltr",
-        "estimated_ltr",
-        "previous_1_ltr",
-        "previous_2_ltr",
-        "previous_3_ltr",
-        "previous_4_ltr",
-    )
-    return {key: sum(_num(row.get(key)) for row in rows) for key in keys}
-
-
 def _top_ltr_items_from_secmaster(
     format_key: str,
     month_name: str,
@@ -7544,7 +7499,8 @@ _SEC_DASHBOARD_YEAR_SOURCES = {
     ),
     "blinkit": (("secmaster_mv", '"year"', "blinkit"),),
     "zepto": (("secmaster_mv", '"year"', "zepto"),),
-    "bigbasket": (("secmaster_mv", '"year"', "bigbasket"),),
+    # BigBasket's SEC dashboard reads the RANGE upload table (not secmaster_mv).
+    "bigbasket": (("bigbasket_sec_range_master", '"year"', None),),
     "swiggy": (("swiggySec", 'EXTRACT(YEAR FROM "ORDERED_DATE")::int', None),),
     "flipkart": (("flipkart_secondary_all", '"year"', None),),
     "flipkart_grocery": (("flipkart_grocery_master", '"year"', None),),
@@ -9355,6 +9311,253 @@ def amazon_mp_dashboard_version(request, slug: str):
     return Response({"version": ts.isoformat() if ts is not None else None})
 
 
+# ── BigBasket Range Dashboard ────────────────────────────────────────────────
+# Aggregates bigbasket_sec_range — the range-report variant of the BigBasket
+# Secondary upload (manufacturer sales report downloaded for a date range,
+# date_range like '20260701 - 20260717'). Ranges are cumulative month-to-date
+# snapshots, so summing every stored row would double-count re-uploads of the
+# same month; every query below keeps only the FRESHEST snapshot per month
+# (max to_date among rows whose from_date falls in that month).
+
+# Parses the 'DD-MM-YYYY - DD-MM-YYYY' text (the format the Range uploader
+# stores, e.g. '01-07-2026 - 17-07-2026') into real dates; rows with a
+# malformed date_range are excluded rather than erroring the whole query.
+_BB_RANGE_PARSED_SQL = """
+    SELECT
+        TO_DATE(SPLIT_PART(TRIM(date_range), ' - ', 1), 'DD-MM-YYYY') AS from_date,
+        TO_DATE(SPLIT_PART(TRIM(date_range), ' - ', 2), 'DD-MM-YYYY') AS to_date,
+        source_city_name, business_type, brand_name,
+        top_slug, mid_slug, leaf_slug,
+        source_sku_id, sku_description, sku_weight,
+        COALESCE(total_quantity, 0) AS total_quantity,
+        COALESCE(total_mrp, 0) AS total_mrp,
+        COALESCE(total_sales, 0) AS total_sales
+    FROM public.bigbasket_sec_range
+    WHERE TRIM(COALESCE(date_range, '')) ~ '^[0-9]{2}-[0-9]{2}-[0-9]{4} - [0-9]{2}-[0-9]{2}-[0-9]{4}$'
+"""
+
+# The export writes category slugs in two spellings for the same category
+# (title-case 'Cold Pressed Oil' vs kebab 'cold-pressed-oil'); normalize both
+# to one label so the split doesn't show the same category twice.
+def _bb_range_slug_label(col: str) -> str:
+    return (
+        "COALESCE(NULLIF(INITCAP(TRIM(REGEXP_REPLACE(LOWER(COALESCE("
+        + col
+        + ", '')), '[^a-z0-9&]+', ' ', 'g'))), ''), '-')"
+    )
+
+
+def _bigbasket_range_dashboard_latest(default_month: int, default_year: int):
+    rows = _dict_rows(
+        f"""
+        WITH parsed AS ({_BB_RANGE_PARSED_SQL})
+        SELECT EXTRACT(MONTH FROM MAX(from_date))::int AS month,
+               EXTRACT(YEAR FROM MAX(from_date))::int AS year
+        FROM parsed
+        """,
+        [],
+    )
+    row = rows[0] if rows else {}
+    month = row.get("month")
+    year = row.get("year")
+    if month and year:
+        return int(month), int(year)
+    return default_month, default_year
+
+
+def _bigbasket_range_dashboard_response(request):
+    today = timezone.localdate()
+    month_raw = request.query_params.get("month")
+    year_raw = request.query_params.get("year")
+    defaulted_to_latest = False
+    if month_raw and year_raw:
+        try:
+            month = int(month_raw)
+            year = int(year_raw)
+        except (TypeError, ValueError):
+            raise ValidationError("`month` and `year` must be integers.")
+        if not 1 <= month <= 12:
+            raise ValidationError("`month` must be between 1 and 12.")
+        if not 2000 <= year <= 2100:
+            raise ValidationError("`year` must be between 2000 and 2100.")
+    else:
+        month, year = _bigbasket_range_dashboard_latest(today.month, today.year)
+        defaulted_to_latest = True
+
+    month_name = _month_name(month)
+
+    # `snap` = the freshest range snapshot for the selected month.
+    snap_cte = f"""
+        WITH parsed AS ({_BB_RANGE_PARSED_SQL}),
+        month_rows AS (
+            SELECT * FROM parsed
+            WHERE EXTRACT(MONTH FROM from_date) = %s
+              AND EXTRACT(YEAR FROM from_date) = %s
+        ),
+        snap AS (
+            SELECT * FROM month_rows
+            WHERE to_date = (SELECT MAX(to_date) FROM month_rows)
+        )
+    """
+    params = [month, year]
+
+    kpi_rows = _dict_rows(
+        snap_cte
+        + """
+        SELECT
+            COALESCE(SUM(total_sales), 0) AS sales,
+            COALESCE(SUM(total_mrp), 0) AS mrp,
+            COALESCE(SUM(total_quantity), 0) AS quantity,
+            COUNT(DISTINCT source_sku_id) AS sku_count,
+            COUNT(DISTINCT UPPER(TRIM(source_city_name))) AS city_count,
+            COUNT(*) AS row_count,
+            MIN(from_date) AS from_date,
+            MAX(to_date) AS to_date
+        FROM snap
+        """,
+        params,
+    )
+    kpi_row = kpi_rows[0] if kpi_rows else {}
+
+    def _iso(value):
+        return value.isoformat() if hasattr(value, "isoformat") else (str(value) if value else None)
+
+    def _group(col_expr: str, *, limit: int | None = None) -> list[dict]:
+        sql = (
+            snap_cte
+            + f"""
+            SELECT
+                {col_expr} AS label,
+                COALESCE(SUM(total_sales), 0) AS value,
+                COALESCE(SUM(total_mrp), 0) AS mrp,
+                COALESCE(SUM(total_quantity), 0) AS quantity
+            FROM snap
+            GROUP BY {col_expr}
+            ORDER BY value DESC
+            """
+        )
+        if limit:
+            sql += f"\nLIMIT {int(limit)}"
+        return [
+            {
+                "label": row.get("label") or "-",
+                "value": _num(row.get("value")),
+                "mrp": _num(row.get("mrp")),
+                "quantity": _num(row.get("quantity")),
+            }
+            for row in _dict_rows(sql, params)
+        ]
+
+    business = _group("COALESCE(NULLIF(UPPER(TRIM(business_type)), ''), '-')")
+    city = _group("COALESCE(NULLIF(UPPER(TRIM(source_city_name)), ''), '-')", limit=12)
+    category = _group(_bb_range_slug_label("leaf_slug"), limit=10)
+    brand = _group("COALESCE(NULLIF(UPPER(TRIM(brand_name)), ''), '-')", limit=10)
+
+    sku_rows = _dict_rows(
+        snap_cte
+        + """
+        SELECT
+            source_sku_id AS sku_id,
+            MAX(NULLIF(TRIM(sku_description), '')) AS description,
+            MAX(NULLIF(TRIM(sku_weight), '')) AS weight,
+            COALESCE(SUM(total_sales), 0) AS value,
+            COALESCE(SUM(total_mrp), 0) AS mrp,
+            COALESCE(SUM(total_quantity), 0) AS quantity,
+            COUNT(DISTINCT UPPER(TRIM(source_city_name))) AS city_count
+        FROM snap
+        GROUP BY source_sku_id
+        ORDER BY value DESC
+        LIMIT 25
+        """,
+        params,
+    )
+    top_skus = [
+        {
+            "sku_id": row.get("sku_id"),
+            "description": row.get("description") or "-",
+            "weight": row.get("weight") or "-",
+            "value": _num(row.get("value")),
+            "mrp": _num(row.get("mrp")),
+            "quantity": _num(row.get("quantity")),
+            "city_count": int(_num(row.get("city_count"))),
+        }
+        for row in sku_rows
+    ]
+
+    # Trend: freshest snapshot of every month in the selected year.
+    trend_raw = _dict_rows(
+        f"""
+        WITH parsed AS ({_BB_RANGE_PARSED_SQL}),
+        year_rows AS (
+            SELECT * FROM parsed WHERE EXTRACT(YEAR FROM from_date) = %s
+        ),
+        latest AS (
+            SELECT DATE_TRUNC('month', from_date) AS month_start, MAX(to_date) AS max_to
+            FROM year_rows
+            GROUP BY DATE_TRUNC('month', from_date)
+        )
+        SELECT
+            EXTRACT(MONTH FROM y.from_date)::int AS month,
+            COALESCE(SUM(y.total_sales), 0) AS value,
+            COALESCE(SUM(y.total_mrp), 0) AS mrp,
+            COALESCE(SUM(y.total_quantity), 0) AS quantity
+        FROM year_rows y
+        JOIN latest l
+          ON DATE_TRUNC('month', y.from_date) = l.month_start
+         AND y.to_date = l.max_to
+        GROUP BY EXTRACT(MONTH FROM y.from_date)
+        ORDER BY month
+        """,
+        [year],
+    )
+    trend = [
+        {
+            "month": int(row["month"]),
+            "label": date(2000, int(row["month"]), 1).strftime("%b").upper(),
+            "value": _num(row.get("value")),
+            "mrp": _num(row.get("mrp")),
+            "quantity": _num(row.get("quantity")),
+        }
+        for row in trend_raw
+        if row.get("month")
+    ]
+
+    return Response(
+        {
+            "dashboard_title": "BigBasket Range Dashboard",
+            "available": True,
+            "defaulted_to_latest": defaulted_to_latest,
+            "month": month,
+            "month_name": month_name,
+            "year": year,
+            "from_date": _iso(kpi_row.get("from_date")),
+            "to_date": _iso(kpi_row.get("to_date")),
+            "row_count": int(_num(kpi_row.get("row_count"))),
+            "kpi": {
+                "sales": _num(kpi_row.get("sales")),
+                "mrp": _num(kpi_row.get("mrp")),
+                "quantity": _num(kpi_row.get("quantity")),
+                "sku_count": int(_num(kpi_row.get("sku_count"))),
+                "city_count": int(_num(kpi_row.get("city_count"))),
+            },
+            "business": business,
+            "city": city,
+            "category": category,
+            "brand": brand,
+            "top_skus": top_skus,
+            "trend": trend,
+        }
+    )
+
+
+@api_view(["GET"])
+@permission_classes([require("platform.secondary.view")])
+@cached_get(timeout=60, prefix="plat.bb_range")
+def bigbasket_range_dashboard(request, slug: str = "bigbasket"):
+    _ensure_scope(request.user, "bigbasket")
+    return _bigbasket_range_dashboard_response(request)
+
+
 # ── Amazon Coupon Dashboard ──────────────────────────────────────────────────
 # Sourced from amazon_coupon_master. KPIs are grand-total columns; the table is
 # coupon-name-wise; the item_head split powers a Premium/Commodity donut.
@@ -9530,27 +9733,48 @@ def _amazon_coupon_dashboard_response(request):
 
 
 def _bigbasket_sec_dashboard_response(request):
+    # Sourced from bigbasket_sec_range via bigbasket_sec_range_master (the
+    # RANGE option of the BigBasket Secondary uploader) — NOT the daily
+    # bigbasketSec/secmaster_mv data. Each upload is a cumulative
+    # month-to-date snapshot; every figure below reads only the FRESHEST
+    # snapshot of the selected month (to_date = MAX), so re-uploads of a later
+    # MTD file replace rather than double-count.
     month, year, defaulted_to_latest = _parse_sec_month_year(
         request.query_params,
-        latest_source="secmaster_bigbasket",
+        latest_source="bigbasket_sec_range_master",
     )
     selected_date = _parse_sec_selected_date(request.query_params)
-    date_filter, date_params = _sec_date_filter(selected_date)
     month_name = _month_name(month)
     days_in_month = monthrange(year, month)[1]
 
+    # A selected date acts as "as of": the freshest snapshot ending on/before it.
+    snap_extra = ""
+    snap_params = [month, year]
+    if selected_date:
+        snap_extra = " AND to_date <= %s"
+        snap_params.append(selected_date)
     max_date = _scalar(
         f"""
-        SELECT MAX("date")
-        FROM secmaster_mv
-        WHERE REGEXP_REPLACE(LOWER(TRIM("format"::text)), '[^a-z0-9]+', '', 'g') = 'bigbasket'
-          AND UPPER(TRIM("month"::text)) = %s
-          AND "year"::numeric = %s
-          {date_filter}
+        SELECT MAX(to_date)
+        FROM bigbasket_sec_range_master
+        WHERE EXTRACT(MONTH FROM from_date) = %s
+          AND EXTRACT(YEAR FROM from_date) = %s
+          {snap_extra}
         """,
-        [month_name, year, *date_params],
+        snap_params,
     )
     elapsed_day = _sec_elapsed_day(max_date)
+
+    if max_date is None:
+        snap_where = " WHERE FALSE "
+        snap_where_params = []
+    else:
+        snap_where = """
+        WHERE EXTRACT(MONTH FROM from_date) = %s
+          AND EXTRACT(YEAR FROM from_date) = %s
+          AND to_date = %s
+        """
+        snap_where_params = [month, year, max_date]
 
     summary_raw = _dict_rows(
         f"""
@@ -9559,15 +9783,12 @@ def _bigbasket_sec_dashboard_response(request):
             COALESCE(SUM("quantity"), 0) AS shipped_units,
             COALESCE(SUM("ltr_sold"), 0) AS shipped_ltr,
             COALESCE(SUM("sales_amt_exc"), 0) AS shipped_value
-        FROM secmaster_mv
-        WHERE REGEXP_REPLACE(LOWER(TRIM("format"::text)), '[^a-z0-9]+', '', 'g') = 'bigbasket'
-          AND UPPER(TRIM("month"::text)) = %s
-          AND "year"::numeric = %s
-          {date_filter}
+        FROM bigbasket_sec_range_master
+        {snap_where}
           AND UPPER(TRIM("item_head"::text)) IN ('PREMIUM', 'COMMODITY', 'OTHER')
         GROUP BY UPPER(TRIM("item_head"::text))
         """,
-        [month_name, year, *date_params],
+        snap_where_params,
     )
     summary_by_head = {_norm_sec_key(r.get("item_head")): r for r in summary_raw}
     summary = []
@@ -9600,16 +9821,13 @@ def _bigbasket_sec_dashboard_response(request):
             COALESCE(SUM("sales_amt_exc"), 0) AS shipped_value,
             COALESCE(SUM("quantity"), 0) AS shipped_units,
             COALESCE(SUM("ltr_sold"), 0) AS shipped_ltr
-        FROM secmaster_mv
-        WHERE REGEXP_REPLACE(LOWER(TRIM("format"::text)), '[^a-z0-9]+', '', 'g') = 'bigbasket'
-          AND UPPER(TRIM("month"::text)) = %s
-          AND "year"::numeric = %s
-          {date_filter}
+        FROM bigbasket_sec_range_master
+        {snap_where}
         GROUP BY
             UPPER(TRIM("sub_category"::text)),
             UPPER(TRIM("per_ltr_unit"::text))
         """,
-        [month_name, year, *date_params],
+        snap_where_params,
     )
     detail_by_key = {
         (_norm_sec_key(r.get("sub_category_key")), _norm_sec_key(r.get("per_ltr_key"))): r
@@ -9650,20 +9868,45 @@ def _bigbasket_sec_dashboard_response(request):
         detail_total["shipped_value"],
         detail_total["shipped_ltr"],
     )
-    top_items = _top_ltr_items_from_secmaster(
-        "bigbasket",
-        month_name,
-        year,
-        date_filter,
-        date_params,
+    top_items = _dict_rows(
+        f"""
+        SELECT
+            COALESCE(NULLIF(TRIM("item"::text), ''), '-') AS item,
+            COALESCE(NULLIF(UPPER(TRIM("item_head"::text)), ''), 'OTHER') AS item_head,
+            COALESCE(SUM("quantity"), 0) AS shipped_units,
+            COALESCE(SUM("ltr_sold"), 0) AS shipped_ltr,
+            COALESCE(SUM("sales_amt_exc"), 0) AS shipped_value
+        FROM bigbasket_sec_range_master
+        {snap_where}
+          AND NULLIF(TRIM("item"::text), '') IS NOT NULL
+        GROUP BY 1, 2
+        ORDER BY COALESCE(SUM("ltr_sold"), 0) DESC
+        LIMIT 8
+        """,
+        snap_where_params,
     )
 
+    # Trend stays DAILY-sourced (secmaster_mv ← bigbasketSec) so the Day line
+    # shows real per-day movement — range snapshots have no daily breakdown.
+    # Everything else (KPIs, summary, details, top items) is range-sourced.
+    # The trend gets its own max-date bound from the daily data, so daily days
+    # beyond the range snapshot's to_date aren't zeroed out.
+    trend_max_date = _scalar(
+        """
+        SELECT MAX("date")
+        FROM secmaster_mv
+        WHERE REGEXP_REPLACE(LOWER(TRIM("format"::text)), '[^a-z0-9]+', '', 'g') = 'bigbasket'
+          AND UPPER(TRIM("month"::text)) = %s
+          AND "year"::numeric = %s
+        """,
+        [month_name, year],
+    )
     sec_trend = _build_sec_keyed_trend(
         table="secmaster_mv",
         date_col='"date"',
         month=month,
         year=year,
-        max_date=max_date,
+        max_date=trend_max_date,
         days_in_month=days_in_month,
         value_expr='"sales_amt_exc"',
         ltr_expr='"ltr_sold"',
@@ -9673,7 +9916,7 @@ def _bigbasket_sec_dashboard_response(request):
     )
 
     return Response({
-        "source": "SecMaster",
+        "source": "BigBasket Range",
         "format": "BIG BASKET",
         "sec_trend": sec_trend,
         "detail_rows_fixed": True,
@@ -11254,9 +11497,13 @@ def flipkart_grocery_drr_dashboard(request, slug: str):
 
     month, year, defaulted_to_latest = _parse_sec_month_year(request.query_params)
     sales_of = str(request.query_params.get("sales_of") or "ALL").strip().upper() or "ALL"
-    if sales_of != "ALL":
-        raise ValidationError("DRR Dashboard currently supports SALES OF = ALL only.")
+    if sales_of not in _FLIPKART_MP_DRR_SALES_OF:
+        raise ValidationError(
+            "`sales_of` must be one of ALL, PREMIUM, COMMODITY or OTHER."
+        )
 
+    # Max date (and so elapsed days / DRR divisor) always follows the WHOLE
+    # month's sales, not the picked item head — mirrors the Flipkart MP DRR.
     max_date = _scalar(
         """
         SELECT MAX("real_date")
@@ -11267,8 +11514,17 @@ def flipkart_grocery_drr_dashboard(request, slug: str):
         [month, year],
     )
 
+    daily_sales_of_filter = ""
+    daily_params = [month, year]
+    if sales_of != "ALL":
+        # Blank item_head buckets as OTHER — same convention as the item rows.
+        daily_sales_of_filter = (
+            "AND COALESCE(NULLIF(UPPER(TRIM(\"item_head\"::text)), ''), 'OTHER') = %s"
+        )
+        daily_params.append(sales_of)
+
     daily_raw = _dict_rows(
-        """
+        f"""
         SELECT
             "real_date",
             COALESCE(SUM("sale_amt_exclusive"), 0) AS ops,
@@ -11277,10 +11533,11 @@ def flipkart_grocery_drr_dashboard(request, slug: str):
         FROM "flipkart_grocery_master"
         WHERE "month" = %s
           AND "year" = %s
+          {daily_sales_of_filter}
         GROUP BY "real_date"
         ORDER BY "real_date"
         """,
-        [month, year],
+        daily_params,
     )
     daily_by_date = {r["real_date"]: r for r in daily_raw}
     daily = []
@@ -11320,6 +11577,10 @@ def flipkart_grocery_drr_dashboard(request, slug: str):
         item_raw,
         key=lambda r: (order.get(str(r.get("item") or "").upper(), 999), str(r.get("item") or "")),
     ):
+        # Mirror the daily filter so KPI totals + the item table reflect only
+        # the selected item-head bucket (item_head is already OTHER-coalesced).
+        if sales_of != "ALL" and str(row.get("item_head") or "").upper() != sales_of:
+            continue
         qty = _num(row.get("qty"))
         liters = _num(row.get("liters"))
         landing_amt = _num(row.get("landing_amt"))
@@ -11358,6 +11619,7 @@ def flipkart_grocery_drr_dashboard(request, slug: str):
         "source": "flipkart_grocery_master",
         "defaulted_to_latest": defaulted_to_latest,
         "sales_of": sales_of,
+        "sales_of_options": list(_FLIPKART_MP_DRR_SALES_OF),
         "month": month,
         "year": year,
         "max_date": max_date.isoformat() if max_date else None,
@@ -12693,7 +12955,8 @@ def _flipkart_mp_drr_dashboard_response(request):
         SELECT
             "Order Date"::date AS sale_date,
             COALESCE(SUM("Final Sale Amount"), 0) AS ops,
-            COALESCE(SUM("ltr_sold"), 0) AS ltr
+            COALESCE(SUM("ltr_sold"), 0) AS ltr,
+            COALESCE(SUM("Final Sale Units"), 0) AS qty
         FROM "flipkart_secondary_all"
         WHERE UPPER(TRIM("month"::text)) = %s
           AND "year" = %s
@@ -12713,6 +12976,7 @@ def _flipkart_mp_drr_dashboard_response(request):
             "display_date": current_date.strftime("%d-%m-%Y"),
             "ops": _num(row.get("ops")),
             "ltr": _num(row.get("ltr")),
+            "qty": _num(row.get("qty")),
         })
 
     item_raw = _dict_rows(
@@ -12801,276 +13065,7 @@ def _flipkart_mp_drr_dashboard_response(request):
     })
 
 
-@api_view(["GET"])
-@permission_classes([require("platform.secondary.view")])
-@cached_get(timeout=60, prefix="plat.fk_mom")
-def flipkart_grocery_month_on_month_sale(request, slug: str):
-    _ensure_scope(request.user, slug)
-    if slug == "bigbasket":
-        return _bigbasket_month_on_month_analysis_response(request)
-    if slug != "flipkart_grocery":
-        raise ValidationError(
-            "Month On Month Sale is available only for Big Basket and Flipkart Grocery."
-        )
-
-    month, year, defaulted_to_latest = _parse_sec_month_year(request.query_params)
-    max_date = _scalar(
-        """
-        SELECT MAX("real_date")
-        FROM "flipkart_grocery_master"
-        WHERE "month" = %s
-          AND "year" = %s
-        """,
-        [month, year],
-    )
-
-    comparison_months = []
-    for index, offset in enumerate([0, -1, -2, -3, -4]):
-        compare_month, compare_year = _shift_month(month, year, offset)
-        comparison_months.append({
-            "key": "current" if index == 0 else f"previous_{index}",
-            "month": compare_month,
-            "year": compare_year,
-            "label": _month_name(compare_month),
-        })
-
-    params: list = []
-    clauses = []
-    for item in comparison_months:
-        clauses.append('("month" = %s AND "year" = %s)')
-        params.extend([item["month"], item["year"]])
-
-    item_month_rows = _dict_rows(
-        f"""
-        SELECT
-            COALESCE(NULLIF(TRIM("item"::text), ''), 'UNMAPPED') AS item,
-            "month",
-            "year",
-            COALESCE(SUM("ltr_sold"), 0) AS ltr
-        FROM "flipkart_grocery_master"
-        WHERE {" OR ".join(clauses)}
-        GROUP BY
-            COALESCE(NULLIF(TRIM("item"::text), ''), 'UNMAPPED'),
-            "month",
-            "year"
-        """,
-        params,
-    )
-    ltr_by_key = {
-        (_norm_sec_key(row.get("item")), int(row.get("month")), int(row.get("year"))): _num(row.get("ltr"))
-        for row in item_month_rows
-    }
-
-    elapsed_days = max_date.day if max_date else 0
-    days_in_month = monthrange(year, month)[1]
-    group_map: dict[str, list[dict]] = {}
-    for sub_category, item, item_head, target in _FK_GROCERY_MOM_TEMPLATE:
-        current_ltr = ltr_by_key.get((_norm_sec_key(item), month, year), 0.0)
-        row = {
-            "sub_category": sub_category,
-            "item": item,
-            "item_head": item_head,
-            "target": float(target),
-            "current_done_ltr": current_ltr,
-            "estimated_ltr": _safe_div(current_ltr, elapsed_days) * days_in_month,
-            "previous_1_ltr": ltr_by_key.get(
-                (_norm_sec_key(item), comparison_months[1]["month"], comparison_months[1]["year"]),
-                0.0,
-            ),
-            "previous_2_ltr": ltr_by_key.get(
-                (_norm_sec_key(item), comparison_months[2]["month"], comparison_months[2]["year"]),
-                0.0,
-            ),
-            "previous_3_ltr": ltr_by_key.get(
-                (_norm_sec_key(item), comparison_months[3]["month"], comparison_months[3]["year"]),
-                0.0,
-            ),
-            "previous_4_ltr": ltr_by_key.get(
-                (_norm_sec_key(item), comparison_months[4]["month"], comparison_months[4]["year"]),
-                0.0,
-            ),
-        }
-        group_map.setdefault(sub_category, []).append(row)
-
-    groups = []
-    for sub_category, rows in group_map.items():
-        groups.append({
-            "sub_category": sub_category,
-            "rows": rows,
-            "total": _sum_mom_rows(rows),
-        })
-
-    group_totals = [group["total"] for group in groups]
-    target_summary = [
-        {"item_head": item_head, "target": float(target)}
-        for item_head, target in _FK_GROCERY_MOM_TARGETS.items()
-    ]
-    target_summary.append({
-        "item_head": "TOTAL",
-        "target": float(sum(_FK_GROCERY_MOM_TARGETS.values())),
-    })
-
-    return Response({
-        "source": "flipkart_grocery_master",
-        "defaulted_to_latest": defaulted_to_latest,
-        "month": month,
-        "year": year,
-        "max_date": max_date.isoformat() if max_date else None,
-        "elapsed_days": elapsed_days,
-        "days_in_month": days_in_month,
-        "target_summary": target_summary,
-        "comparison_months": comparison_months,
-        "groups": groups,
-        "grand_total": _sum_mom_rows(group_totals),
-    })
-
-
 # ─── /{slug}/landing-rate  (GET) ───
-def _bigbasket_month_on_month_analysis_response(request):
-    month, year, defaulted_to_latest = _parse_sec_month_year(
-        request.query_params,
-        latest_source="secmaster_bigbasket",
-    )
-    month_name = _month_name(month)
-
-    max_date = _scalar(
-        """
-        SELECT MAX("date")
-        FROM secmaster_mv
-        WHERE REGEXP_REPLACE(LOWER(TRIM("format"::text)), '[^a-z0-9]+', '', 'g') = 'bigbasket'
-          AND UPPER(TRIM("month"::text)) = %s
-          AND "year"::numeric = %s
-        """,
-        [month_name, year],
-    )
-
-    comparison_months = []
-    for index, offset in enumerate([0, -1, -2, -3, -4]):
-        compare_month, compare_year = _shift_month(month, year, offset)
-        comparison_months.append({
-            "key": "current" if index == 0 else f"previous_{index}",
-            "month": compare_month,
-            "year": compare_year,
-            "label": _month_name(compare_month),
-        })
-
-    params: list = []
-    clauses = []
-    for item in comparison_months:
-        clauses.append('(UPPER(TRIM("month"::text)) = %s AND "year"::numeric = %s)')
-        params.extend([item["label"], item["year"]])
-
-    item_month_rows = _dict_rows(
-        f"""
-        SELECT
-            COALESCE(NULLIF(TRIM("item"::text), ''), 'UNMAPPED') AS item,
-            UPPER(TRIM("month"::text)) AS month_name,
-            "year"::numeric AS year,
-            COALESCE(SUM("ltr_sold"), 0) AS ltr
-        FROM secmaster_mv
-        WHERE REGEXP_REPLACE(LOWER(TRIM("format"::text)), '[^a-z0-9]+', '', 'g') = 'bigbasket'
-          AND ({" OR ".join(clauses)})
-        GROUP BY
-            COALESCE(NULLIF(TRIM("item"::text), ''), 'UNMAPPED'),
-            UPPER(TRIM("month"::text)),
-            "year"::numeric
-        """,
-        params,
-    )
-    ltr_by_key = {
-        (
-            _norm_sec_key(row.get("item")),
-            _norm_sec_key(row.get("month_name")),
-            int(row.get("year")),
-        ): _num(row.get("ltr"))
-        for row in item_month_rows
-    }
-
-    elapsed_days = _sec_elapsed_day(max_date)
-    projection_days = 30
-    group_map: dict[str, list[dict]] = {}
-    for sub_category, item, item_head, target in _BIGBASKET_MOM_TEMPLATE:
-        current_ltr = ltr_by_key.get(
-            (_norm_sec_key(item), month_name, year),
-            0.0,
-        )
-        row = {
-            "sub_category": sub_category,
-            "item": item,
-            "item_head": item_head,
-            "target": float(target),
-            "current_done_ltr": current_ltr,
-            "estimated_ltr": _safe_div(current_ltr, elapsed_days) * projection_days,
-            "previous_1_ltr": ltr_by_key.get(
-                (
-                    _norm_sec_key(item),
-                    comparison_months[1]["label"],
-                    comparison_months[1]["year"],
-                ),
-                0.0,
-            ),
-            "previous_2_ltr": ltr_by_key.get(
-                (
-                    _norm_sec_key(item),
-                    comparison_months[2]["label"],
-                    comparison_months[2]["year"],
-                ),
-                0.0,
-            ),
-            "previous_3_ltr": ltr_by_key.get(
-                (
-                    _norm_sec_key(item),
-                    comparison_months[3]["label"],
-                    comparison_months[3]["year"],
-                ),
-                0.0,
-            ),
-            "previous_4_ltr": ltr_by_key.get(
-                (
-                    _norm_sec_key(item),
-                    comparison_months[4]["label"],
-                    comparison_months[4]["year"],
-                ),
-                0.0,
-            ),
-        }
-        group_map.setdefault(sub_category, []).append(row)
-
-    groups = []
-    for sub_category, rows in group_map.items():
-        groups.append({
-            "sub_category": sub_category,
-            "rows": rows,
-            "total": _sum_mom_rows(rows),
-        })
-
-    group_totals = [group["total"] for group in groups]
-    target_summary = [
-        {"item_head": item_head, "target": float(target)}
-        for item_head, target in _BIGBASKET_MOM_TARGETS.items()
-    ]
-    target_summary.append({
-        "item_head": "TOTAL",
-        "target": float(sum(_BIGBASKET_MOM_TARGETS.values())),
-    })
-
-    return Response({
-        "source": "SecMaster",
-        "format": "BIG BASKET",
-        "dashboard_title": "Big Basket Month On Month Analysis",
-        "defaulted_to_latest": defaulted_to_latest,
-        "month": month,
-        "year": year,
-        "max_date": max_date.isoformat() if hasattr(max_date, "isoformat") else max_date,
-        "elapsed_days": elapsed_days,
-        "days_in_month": monthrange(year, month)[1],
-        "projection_days": projection_days,
-        "target_summary": target_summary,
-        "comparison_months": comparison_months,
-        "groups": groups,
-        "grand_total": _sum_mom_rows(group_totals),
-        "estimation_note": "Estimated LTR uses Excel formula: Done LTR / day(max date) * 30.",
-    })
 
 
 @api_view(["GET"])

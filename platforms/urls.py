@@ -70,6 +70,12 @@ urlpatterns = [
     path("swiggy/drr-dashboard", views.swiggy_drr_dashboard, name="platform-swiggy-drr-dashboard"),
     path("bigbasket/drr-dashboard", views.bigbasket_drr_dashboard, name="platform-bigbasket-drr-dashboard"),
     path(
+        "bigbasket/range-dashboard",
+        views.bigbasket_range_dashboard,
+        {"slug": "bigbasket"},
+        name="platform-bigbasket-range-dashboard",
+    ),
+    path(
         "zepto/primary-dashboard",
         views.primary_dashboard,
         {"slug": "zepto"},
@@ -106,7 +112,6 @@ urlpatterns = [
     path("<slug:slug>/sec-monthly-dashboard", views.flipkart_secondary_monthly_dashboard, name="platform-sec-monthly-dashboard"),
     path("<slug:slug>/sku-analysis-dashboard", views.sku_analysis_dashboard, name="platform-sku-analysis-dashboard"),
     path("<slug:slug>/drr-dashboard", views.flipkart_grocery_drr_dashboard, name="platform-drr-dashboard"),
-    path("<slug:slug>/month-on-month-sale", views.flipkart_grocery_month_on_month_sale, name="platform-month-on-month-sale"),
     path("<slug:slug>/landing-rate", views.landing_rate_list, name="platform-landing-rate-list"),
     path("<slug:slug>/landing-rate/skus", views.landing_rate_skus, name="platform-landing-rate-skus"),
     path("<slug:slug>/landing-rate/skus/add", views.landing_rate_sku_add, name="platform-landing-rate-sku-add"),
