@@ -2669,6 +2669,40 @@ _PINCODE_SYNC_JUNK = {
 }
 
 
+# Excel renders long numeric ids in scientific notation (569872352551 →
+# "5.69872E+11"), which destroys the low digits. shipment_item_id is part of
+# amazon_mp's dedupe key (order_id, shipment_item_id, transaction_type), so a
+# mangled id never collides with the correctly-formatted row from the raw file
+# and the same transaction is stored twice (found 2026-07-18: 141 duplicate
+# rows inflating the July dashboard by 30 qty and May by 82 vs the MTR sheet).
+_SCI_NOTATION = re.compile(r"^\s*\d+(?:\.\d+)?[eE][+-]?\d+\s*$")
+
+
+def _amazon_mp_reject_sci_notation(data):
+    """Reject an amazon_mp upload if any shipment_item_id arrived in Excel
+    scientific notation. The true id is unrecoverable (precision is already
+    lost), so ingesting the batch would silently create duplicates; the whole
+    upload is refused with instructions rather than partially applied."""
+    bad = sum(
+        1 for row in data
+        if _SCI_NOTATION.match(str(row.get("shipment_item_id") or ""))
+    )
+    if not bad:
+        return None
+    return Response(
+        {
+            "detail": (
+                f"{bad} row(s) have Shipment Item Id in Excel scientific "
+                "notation (e.g. 5.69872E+11). The original id digits are lost, "
+                "which breaks duplicate detection and double-counts sales. "
+                "Upload the raw MTR report file instead, or format the column "
+                "as Number/Text with all digits before copying."
+            )
+        },
+        status=400,
+    )
+
+
 def _amazon_city_prune_stale_ranges(rows):
     """Amazon city-wise Secondary files are cumulative month-to-date exports
     (1-28, then 1-29, then 1-30 ...), so each newer file fully contains the
@@ -2915,6 +2949,11 @@ def _batch_upload(body, *, forced_table: str | None = None):
         unique_key = ""
 
     missing_rates = _collect_zepto_missing_rates(data) if table == "zeptoSec" else []
+
+    if table == "amazon_mp":
+        sci_error = _amazon_mp_reject_sci_notation(data)
+        if sci_error is not None:
+            return sci_error
 
     # City-wise Amazon Secondary: cumulative ranges — clear this month's older
     # ranges and drop incoming rows staler than what's stored (see helper).
