@@ -194,10 +194,12 @@ class ShipmentPoDocument(models.Model):
 
 
 class ShipmentInvoice(models.Model):
-    """The invoice PDF (2-4 pages) for a shipment — one per shipment, stored
-    inline in the DB as bytes (no external file storage). Replaceable: uploading
-    again overwrites the row (OneToOne on shipment)."""
-    shipment = models.OneToOneField(Shipment, on_delete=models.CASCADE, related_name='invoice')
+    """Invoice PDF(s) for a shipment — one OR MORE per shipment, each tagged with
+    the PO it belongs to, stored inline in the DB as bytes (no external file
+    storage). A shipment can carry several invoices (e.g. one per PO); each is an
+    independent row (ForeignKey, not OneToOne)."""
+    shipment = models.ForeignKey(Shipment, on_delete=models.CASCADE, related_name='invoices')
+    po_number = models.CharField(max_length=255, blank=True, default='')
     file_name = models.CharField(max_length=255)
     content_type = models.CharField(max_length=100, default='application/pdf')
     size = models.IntegerField(default=0)
@@ -207,6 +209,7 @@ class ShipmentInvoice(models.Model):
 
     class Meta:
         db_table = 'sp_invoice'
+        ordering = ['id']
 
 
 class ShipmentDeletionLog(models.Model):

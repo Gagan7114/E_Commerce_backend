@@ -3209,23 +3209,23 @@ class ShipmentPoDocumentFileView(_SafeAPIView):
         return Response(status=204)
 
 
-class ShipmentInvoiceView(_SafeAPIView):
-    """The shipment invoice PDF — one per shipment, stored in the DB. GET returns
-    its metadata; POST uploads/replaces it; DELETE removes it. Uploading and
-    deleting are only allowed while the shipment is Approved."""
+class ShipmentInvoiceListView(_SafeAPIView):
+    """Invoices for a shipment — one OR MORE, each tagged with a PO, stored in the
+    DB. GET lists them; POST adds one (does not replace). Adding is only allowed
+    while the shipment is Approved."""
     permission_classes = [IsAuthenticated]
     parser_classes = [MultiPartParser, FormParser]
 
     MAX_BYTES = 30 * 1024 * 1024  # 30 MB
 
     def get(self, request, pk):
-        inv = (
+        rows = list(
             ShipmentInvoice.objects
             .filter(shipment_id=pk)
-            .values('file_name', 'size', 'content_type', 'uploaded_at')
-            .first()
+            .order_by('id')
+            .values('id', 'po_number', 'file_name', 'size', 'content_type', 'uploaded_at')
         )
-        return Response(inv or {})
+        return Response(rows)
 
     def post(self, request, pk):
         try:
@@ -3233,7 +3233,7 @@ class ShipmentInvoiceView(_SafeAPIView):
         except Shipment.DoesNotExist:
             return Response({'error': 'Not found'}, status=404)
         if shipment.status != Shipment.Status.APPROVED:
-            return Response({'error': 'The invoice can only be uploaded while the shipment is Approved.'}, status=400)
+            return Response({'error': 'Invoices can only be added while the shipment is Approved.'}, status=400)
         f = request.FILES.get('file')
         if f is None:
             return Response({'error': 'file is required'}, status=400)
@@ -3242,36 +3242,41 @@ class ShipmentInvoiceView(_SafeAPIView):
         ct = (f.content_type or '').lower()
         if 'pdf' not in ct and not (f.name or '').lower().endswith('.pdf'):
             return Response({'error': 'Only PDF files are allowed'}, status=400)
-        ShipmentInvoice.objects.update_or_create(
+        po_number = (request.data.get('po_number') or '').strip()[:255]
+        inv = ShipmentInvoice.objects.create(
             shipment=shipment,
-            defaults={
-                'file_name': (f.name or 'invoice.pdf')[:255],
-                'content_type': f.content_type or 'application/pdf',
-                'size': f.size,
-                'data': f.read(),
-                'uploaded_by': request.user if getattr(request.user, 'is_authenticated', False) else None,
-            },
+            po_number=po_number,
+            file_name=(f.name or 'invoice.pdf')[:255],
+            content_type=f.content_type or 'application/pdf',
+            size=f.size,
+            data=f.read(),
+            uploaded_by=request.user if getattr(request.user, 'is_authenticated', False) else None,
         )
-        return Response({'file_name': f.name, 'size': f.size}, status=201)
+        return Response({'id': inv.id, 'po_number': inv.po_number, 'file_name': inv.file_name, 'size': inv.size}, status=201)
 
-    def delete(self, request, pk):
+
+class ShipmentInvoiceDetailView(_SafeAPIView):
+    """Delete a single invoice. Only allowed while the shipment is Approved."""
+    permission_classes = [IsAuthenticated]
+
+    def delete(self, request, pk, invoice_id):
         try:
             shipment = Shipment.objects.get(pk=pk)
         except Shipment.DoesNotExist:
             return Response({'error': 'Not found'}, status=404)
         if shipment.status != Shipment.Status.APPROVED:
-            return Response({'error': 'The invoice can only be changed while the shipment is Approved.'}, status=400)
-        ShipmentInvoice.objects.filter(shipment_id=pk).delete()
+            return Response({'error': 'Invoices can only be changed while the shipment is Approved.'}, status=400)
+        ShipmentInvoice.objects.filter(shipment_id=pk, id=invoice_id).delete()
         return Response(status=204)
 
 
 class ShipmentInvoiceFileView(_SafeAPIView):
-    """Download / view the shipment invoice PDF (works on any status)."""
+    """Download / view a single invoice PDF (works on any status)."""
     permission_classes = [IsAuthenticated]
 
-    def get(self, request, pk):
+    def get(self, request, pk, invoice_id):
         try:
-            inv = ShipmentInvoice.objects.get(shipment_id=pk)
+            inv = ShipmentInvoice.objects.get(shipment_id=pk, id=invoice_id)
         except ShipmentInvoice.DoesNotExist:
             return Response({'error': 'Not found'}, status=404)
         resp = HttpResponse(bytes(inv.data), content_type=inv.content_type or 'application/pdf')
