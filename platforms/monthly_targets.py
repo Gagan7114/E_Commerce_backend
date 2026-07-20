@@ -230,7 +230,19 @@ def _read_secmaster(fmt: str, item_head: str, month: int, year: int) -> dict:
     `sales_amt` (tax-inclusive sales) and finally to `amount` (GMV) so
     the dashboard still reflects the business reality. The fallback is
     computed inside a single scalar subquery so it's evaluated once.
+
+    BigBasket exception: its Secondary "done" is read from the RANGE upload
+    (bigbasket_sec_range_master, freshest month-to-date snapshot) instead of the
+    daily secmaster_mv — see `_read_bigbasket_range_done`. This keeps the
+    persisted month_targets figures aligned with the live dashboard and the
+    BigBasket SEC Dashboard, all of which are range-sourced.
     """
+    if _format_key(fmt) == "BIG BASKET":
+        got = _read_bigbasket_range_done((item_head,), month, year)
+        return got.get(
+            _format_key(item_head),
+            {"done_ltrs": Decimal(0), "done_value": Decimal(0), "latest_date": None},
+        )
     month_name = _MONTH_NAMES[month]
     sql = """
         SELECT
@@ -255,6 +267,65 @@ def _read_secmaster(fmt: str, item_head: str, month: int, year: int) -> dict:
         "done_ltrs": Decimal(row[0] or 0),
         "done_value": Decimal(row[1] or 0),
         "latest_date": row[2],
+    }
+
+
+def _read_bigbasket_range_done(
+    item_heads: tuple[str, ...],
+    month: int,
+    year: int,
+) -> dict[str, dict]:
+    """BigBasket Secondary "done" litres/value from the RANGE upload.
+
+    Sourced from `bigbasket_sec_range_master` (the Range option of the BigBasket
+    Secondary uploader), NOT the daily `bigbasketSec`/`secmaster_mv`. Each range
+    upload is a cumulative month-to-date snapshot, so — exactly like the BigBasket
+    SEC Dashboard — this reads ONLY the freshest snapshot of the month
+    (to_date = MAX). A later MTD re-upload therefore replaces rather than
+    double-counts. Month/year are matched on the snapshot's `from_date`.
+
+    Returns { item_head_key: {done_ltrs, done_value, latest_date} }. Item heads
+    with no rows in the freshest snapshot are simply absent (caller treats as 0).
+    """
+    if not item_heads:
+        return {}
+    placeholder = ",".join(["UPPER(TRIM(%s))"] * len(item_heads))
+    sql = f"""
+        WITH snap AS (
+            SELECT MAX(to_date) AS max_to
+              FROM bigbasket_sec_range_master
+             WHERE EXTRACT(MONTH FROM from_date) = %s
+               AND EXTRACT(YEAR  FROM from_date) = %s
+        )
+        SELECT
+            UPPER(TRIM(v.item_head::text))                 AS item_head,
+            COALESCE(SUM(COALESCE(v.ltr_sold, 0)), 0)      AS done_ltrs,
+            COALESCE(
+                NULLIF(SUM(v.sales_amt_exc), 0),
+                NULLIF(SUM(v.sales_amt), 0),
+                SUM(v.amount),
+                0
+            )                                              AS done_value,
+            MAX(v.to_date)                                 AS latest_date
+          FROM bigbasket_sec_range_master v
+          CROSS JOIN snap
+         WHERE EXTRACT(MONTH FROM v.from_date) = %s
+           AND EXTRACT(YEAR  FROM v.from_date) = %s
+           AND v.to_date = snap.max_to
+           AND UPPER(TRIM(v.item_head::text)) IN ({placeholder})
+         GROUP BY UPPER(TRIM(v.item_head::text))
+    """
+    params = [month, year, month, year, *item_heads]
+    with connection.cursor() as cur:
+        cur.execute(sql, params)
+        rows = cur.fetchall()
+    return {
+        _format_key(item_head): {
+            "done_ltrs": Decimal(done_ltrs or 0),
+            "done_value": Decimal(done_value or 0),
+            "latest_date": latest_date,
+        }
+        for item_head, done_ltrs, done_value, latest_date in rows
     }
 
 
@@ -552,32 +623,9 @@ def _read_secmaster_dashboard_many(
         """,
         [start, end],
     )
-    add_part(
-        "BIG BASKET",
-        f"""
-        SELECT 'BIG BASKET' AS fmt,
-               UPPER(TRIM(m.item_head::text)) AS item_head,
-               COALESCE(SUM(
-                   CASE WHEN m.is_litre = 'Y'
-                        THEN COALESCE(bb.total_quantity, 0)::numeric * COALESCE(m.per_unit_value, 0)::numeric
-                        ELSE 0 END
-               ), 0) AS done_ltrs,
-               MAX(bb.date_range) AS latest_date
-          FROM "bigbasketSec" bb
-          LEFT JOIN LATERAL (
-                SELECT ms.item_head, ms.per_unit_value, ms.is_litre
-                  FROM master_sheet ms
-                 WHERE UPPER(TRIM(ms.format_sku_code::text)) = UPPER(TRIM(bb.source_sku_id::text))
-                   AND regexp_replace(lower(TRIM(ms.format::text)), '[^a-z0-9]+', '', 'g') = 'bigbasket'
-                 ORDER BY ms.product_name, ms.item, ms.per_unit
-                 LIMIT 1
-          ) m ON true
-         WHERE bb.date_range >= %s AND bb.date_range < %s
-           AND UPPER(TRIM(m.item_head::text)) IN ({item_placeholder})
-         GROUP BY UPPER(TRIM(m.item_head::text))
-        """,
-        [start, end],
-    )
+    # BIG BASKET is intentionally NOT part of this daily UNION. Its Secondary
+    # "done" is range-sourced (bigbasket_sec_range_master, freshest MTD snapshot)
+    # and merged in after the UNION via _read_bigbasket_range_done — see below.
     add_part(
         "FLIPKART",
         f"""
@@ -605,21 +653,34 @@ def _read_secmaster_dashboard_many(
         [start, end],
     )
 
-    if not parts:
-        return {}
-
-    sql = " UNION ALL ".join(parts)
-    with connection.cursor() as cur:
-        cur.execute(sql, params)
-        rows = cur.fetchall()
-    return {
-        (_format_key(fmt), _format_key(item_head)): {
-            "done_ltrs": Decimal(done_ltrs or 0),
-            "done_value": None,
-            "latest_date": latest_date,
+    result: dict[tuple[str, str], dict] = {}
+    if parts:
+        sql = " UNION ALL ".join(parts)
+        with connection.cursor() as cur:
+            cur.execute(sql, params)
+            rows = cur.fetchall()
+        result = {
+            (_format_key(fmt), _format_key(item_head)): {
+                "done_ltrs": Decimal(done_ltrs or 0),
+                "done_value": None,
+                "latest_date": latest_date,
+            }
+            for fmt, item_head, done_ltrs, latest_date in rows
         }
-        for fmt, item_head, done_ltrs, latest_date in rows
-    }
+
+    # BigBasket Secondary is range-sourced (bigbasket_sec_range_master, freshest
+    # month-to-date snapshot) — merged in here rather than in the daily UNION
+    # above, so cumulative MTD re-uploads replace instead of double-count.
+    # done_value stays None to match the other platforms on this hot path (the
+    # home/target dashboard only needs litres here).
+    if "BIG BASKET" in requested:
+        for ih_key, vals in _read_bigbasket_range_done(item_heads, month, year).items():
+            result[("BIG BASKET", ih_key)] = {
+                "done_ltrs": vals["done_ltrs"],
+                "done_value": None,
+                "latest_date": vals["latest_date"],
+            }
+    return result
 
 
 def _read_master_po_dashboard_many(
