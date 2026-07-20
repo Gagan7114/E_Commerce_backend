@@ -5548,6 +5548,9 @@ def lead_time_report(request):
     platforms = _multi("platform")
     months = _multi("month")
     year = (request.GET.get("year") or "").strip()
+    # Item-head filter (All / Premium / Commodity). Same CSV-list contract as
+    # platform/month: an empty list or "ALL" means no filter.
+    heads = _multi("item_head")
 
     where = ["lead_time IS NOT NULL", "delivery_date IS NOT NULL"]
     params = []
@@ -5559,6 +5562,9 @@ def lead_time_report(request):
     if months:
         where.append("UPPER(TRIM(delivery_month::text)) = ANY(%s)")
         params.append([m.upper() for m in months])
+    if heads:
+        where.append("UPPER(TRIM(item_head::text)) = ANY(%s)")
+        params.append([h.upper() for h in heads])
     if year and year.lower() != "all":
         try:
             where.append("delivered_year::numeric = %s")
@@ -5604,6 +5610,36 @@ def lead_time_report(request):
         for k in grand:
             grand[k] += row[k]
 
+    # Same lead-time slab buckets, but grouped by PLATFORM (format) instead of
+    # vendor — powers the "By Platform" table under the vendor table. Uses the
+    # identical where_sql/params so it honours every active filter.
+    platform_raw = _rows(
+        f"""
+        SELECT COALESCE(NULLIF(TRIM(format::text), ''), '(Unknown)') AS platform,
+          COALESCE(SUM(CASE WHEN lead_time <= 7  THEN total_delivered_liters ELSE 0 END), 0) AS d7,
+          COALESCE(SUM(CASE WHEN lead_time BETWEEN 8 AND 15 THEN total_delivered_liters ELSE 0 END), 0) AS d8_15,
+          COALESCE(SUM(CASE WHEN lead_time > 15 THEN total_delivered_liters ELSE 0 END), 0) AS d15p,
+          COALESCE(SUM(total_delivered_liters), 0) AS total
+        FROM public.master_po
+        {where_sql}
+        GROUP BY platform
+        ORDER BY total DESC
+        """,
+        params,
+    )
+    platform_rows = []
+    for r in platform_raw:
+        row = {
+            "platform": r["platform"],
+            "d7": float(r["d7"] or 0),
+            "d8_15": float(r["d8_15"] or 0),
+            "d15p": float(r["d15p"] or 0),
+            "total": float(r["total"] or 0),
+        }
+        if row["total"] <= 0:
+            continue
+        platform_rows.append(row)
+
     # Filter options — always global so the dropdowns show every choice. (Named
     # *_opts so they don't shadow the selected `platforms` / `months` filters.)
     format_opts = [
@@ -5633,6 +5669,7 @@ def lead_time_report(request):
 
     return Response({
         "rows": rows,
+        "platform_rows": platform_rows,
         "grand_total": grand,
         "slabs": _LEAD_TIME_SLABS,
         "filter_options": {
@@ -5643,6 +5680,7 @@ def lead_time_report(request):
         "filters": {
             "platform": platforms,
             "month": months,
+            "item_head": heads,
             "year": year or "ALL",
         },
     })
