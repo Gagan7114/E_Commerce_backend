@@ -125,7 +125,15 @@ MASTER_SHEET_SEARCH_COLUMNS = [
     "sub_category",
 ]
 
-UPLOAD_FORCED_UNIQUE_KEYS = {}
+# Force the upsert conflict key server-side, regardless of what the client sends.
+# blinkit_ads: a campaign-day is uniquely (date, campaign_id). Keying on
+# campaign_name too meant a Blinkit *rename* (same id, new name) inserted a
+# duplicate row and double-counted spend. Forcing (date, campaign_id) here makes
+# a rename UPDATE the existing campaign-day even for the current deployed
+# uploader, and matches the (date, campaign_id) unique index (migration 0081).
+UPLOAD_FORCED_UNIQUE_KEYS = {
+    "blinkit_ads": "date,campaign_id",
+}
 
 PRIMARY_UPLOAD_REPLACE_KEYS = {
     # Primary PO rows are identified by platform PO + platform SKU. Status,
