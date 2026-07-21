@@ -108,6 +108,47 @@ HANA_SCHEMAS: dict[str, str] = {
 }
 DEFAULT_SOURCE = "mart"
 
+# Finished-goods warehouse codes shown as the columns of the JM Inventory
+# dashboard's FG pivot. Single source of truth: the dashboard view
+# (sap.views.inventory_finished_goods) and the chatbot's jm_inventory tool +
+# NLU both import these so they never drift apart.
+FG_WAREHOUSE_CODES: tuple[str, ...] = (
+    "BH-FGM", "DL-MP", "DL-EC", "DL-GR", "DL-FG", "BH-JM",
+    "FBF-HR", "KT-FG", "DL-INT", "KT-FBF", "PB-FG", "BH-GR", "BH-FG",
+)
+# OITB item-group name that marks a finished good (matched case-insensitively).
+FG_GROUP_NAME = "FINISHED"
+
+# Match an FG warehouse code named in free text: 'dl fg' / 'dl-fg' / 'DLFG' ->
+# 'DL-FG'. Longest codes first (in the alternation) so 'BH-FGM' wins over
+# 'BH-FG', and the word-boundary lookarounds stop a shorter code from matching
+# inside a longer word. Used by the chatbot's NLU (intent detection) and its
+# jm_inventory tool (which code to filter), so both agree on the code list.
+_FG_WHS_RE = re.compile(
+    r"(?<![a-z0-9])(?:"
+    + "|".join(
+        code.lower().replace("-", r"[\s\-]?")
+        for code in sorted(FG_WAREHOUSE_CODES, key=len, reverse=True)
+    )
+    + r")(?![a-z0-9])",
+    re.IGNORECASE,
+)
+
+
+def match_fg_warehouse(text: str) -> str | None:
+    """Return the canonical FG warehouse code named in ``text`` (e.g. 'dl fg' ->
+    'DL-FG'), or None when no code is present."""
+    if not text:
+        return None
+    m = _FG_WHS_RE.search(text)
+    if not m:
+        return None
+    norm = re.sub(r"[\s\-]", "", m.group(0)).upper()
+    for code in FG_WAREHOUSE_CODES:
+        if code.replace("-", "") == norm:
+            return code
+    return None
+
 
 def resolve_schema(source: str | None) -> tuple[str, str]:
     """Map a `source` key to (source_key, schema_name). Unknown/blank sources

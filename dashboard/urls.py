@@ -1,8 +1,10 @@
 from django.urls import path
 
-from . import views
+from . import penetration, views
 
 urlpatterns = [
+    path("penetration-report", penetration.penetration_report, name="dashboard-penetration-report"),
+    path("penetration-report/options", penetration.penetration_report_options, name="dashboard-penetration-report-options"),
     path("table-counts", views.table_counts, name="dashboard-table-counts"),
     path("latest-month", views.latest_month, name="dashboard-latest-month"),
     path("feed-health", views.feed_health_view, name="dashboard-feed-health"),

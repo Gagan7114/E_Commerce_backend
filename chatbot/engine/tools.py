@@ -1090,6 +1090,28 @@ _BRANDFUND = {
     "zepto": "zepto_brandfund_master",
 }
 
+# Ads masters that store CUMULATIVE month-to-date snapshots — each date row is a
+# running MTD total, so SUM() across dates over-counts every metric (spend, sales,
+# impressions, ...) ~20-30×. For these the summary/KPI totals must read the latest
+# (MAX date) snapshot within the window, mirroring the per-platform Ads dashboards
+# (platforms/views.py `_ads_dashboard_payload(summary_use_max_date=True)`) and the
+# Realise dashboard (`_REALISE_CUMULATIVE_ADS`). amazon/blinkit/flipkart ads
+# masters are per-day and stay summable.
+_ADS_CUMULATIVE = {"swiggy", "zepto", "bigbasket"}
+
+
+def _ads_effective_where(slug: str, table: str, wsql: str, params: list) -> tuple[str, list]:
+    """WHERE clause for an ads-summary aggregate that is correct for cumulative
+    snapshot tables. For a cumulative platform it pins the query to the latest
+    snapshot date within the window (so SUM() reflects the MTD total once, not once
+    per day); per-day platforms are returned unchanged."""
+    if slug not in _ADS_CUMULATIVE:
+        return wsql, list(params)
+    md_sub = f"(SELECT MAX(date) FROM {table}{wsql})"
+    if wsql:
+        return f"{wsql} AND date = {md_sub}", list(params) + list(params)
+    return f" WHERE date = {md_sub}", list(params)
+
 
 def _ads_cols(cols: list[dict]) -> dict:
     names = [c["name"] for c in cols]
@@ -1122,6 +1144,15 @@ def ads(q: ParsedQuery) -> DataResult:
     (Amazon adds clicks/CTR/CPC/NTB/DPV). Cross-platform 'which platform spent
     most' and item/campaign/portfolio rankings supported."""
     text = q.text.lower()
+    # No period given → default to the current month (month-to-date). The ads
+    # masters mix cumulative-MTD sources (swiggy/zepto/bigbasket) with per-day ones
+    # (amazon/blinkit/flipkart); without a common window they aren't comparable —
+    # an open-ended SUM over a per-day table returns lifetime spend next to a single
+    # MTD snapshot. Mirrors the drr tool's current-month default.
+    if not (q.date_from and q.date_to):
+        _t = timezone.localdate()
+        q.date_from, q.date_to = _t.replace(day=1), _t
+        q.date_label = q.date_label or _t.strftime("%B")
     slugs = [p["slug"] for p in q.platforms if p["slug"] in _ADS_SPEND]
     cross = (len(slugs) >= 2) or (not slugs and any(
         w in text for w in ("which platform", "highest ad", "by platform", "each platform", "compare")))
@@ -1129,11 +1160,13 @@ def ads(q: ParsedQuery) -> DataResult:
     if cross:
         targets_ = slugs or list(_ADS_SPEND)
         out = []
+        base_w, base_p = ("", [])
+        if q.date_from and q.date_to:
+            base_w, base_p = " WHERE date BETWEEN %s AND %s", [q.date_from, q.date_to]
         for slug in targets_:
             tbl, spend = _ADS_SPEND[slug]
-            w, p = "", []
-            if q.date_from and q.date_to:
-                w, p = " WHERE date BETWEEN %s AND %s", [q.date_from, q.date_to]
+            # Cumulative-snapshot platforms use the latest MTD snapshot; per-day sum.
+            w, p = _ads_effective_where(slug, tbl, base_w, base_p)
             try:
                 _c, r, _t = safe_sql.run_select(f"SELECT COALESCE(SUM({spend}),0) FROM {tbl}{w}", p, max_rows=1)
                 out.append((slug.title(), float(r[0][0]) if r else 0.0))
@@ -1204,8 +1237,12 @@ def ads(q: ParsedQuery) -> DataResult:
             extra_sel.append(f"COALESCE(SUM({C[keyname]}),0)")
             extra_labels.append((keyname, lbl))
     sel = [spend_e, sales_e] + extra_sel
-    sql = f"SELECT {', '.join(sel)} FROM {table}{wsql}"
-    _c, rows, _t = safe_sql.run_select(sql, params, max_rows=1)
+    # Cumulative-snapshot platforms (swiggy/zepto/bigbasket) store running MTD
+    # totals per date; pin the aggregate to the latest snapshot so we don't
+    # over-count. Ratios (ROAS/ACOS) recompute from the corrected spend/sales.
+    sum_wsql, sum_params = _ads_effective_where(slug, table, wsql, params)
+    sql = f"SELECT {', '.join(sel)} FROM {table}{sum_wsql}"
+    _c, rows, _t = safe_sql.run_select(sql, sum_params, max_rows=1)
     vals = list(rows[0])
     spend, sales = float(vals[0] or 0), float(vals[1] or 0)
     roas = sales / spend if spend else 0.0
@@ -1215,7 +1252,8 @@ def ads(q: ParsedQuery) -> DataResult:
     for (keyname, lbl), v in zip(extra_labels, vals[2:]):
         parts.append(f"{_fmt(v)} {lbl}")
         data_rows.append([lbl, v])
-    summary = f"{scope} ads{span}: " + ", ".join(parts) + f". Source: {table}."
+    basis = " (latest MTD snapshot)" if slug in _ADS_CUMULATIVE else ""
+    summary = f"{scope} ads{span}{basis}: " + ", ".join(parts) + f". Source: {table}."
     return DataResult(summary=summary, columns=["metric", "value"], rows=data_rows,
                       source=table, excel_title=f"{scope} Ads")
 
@@ -1696,17 +1734,142 @@ def realise(q: ParsedQuery) -> DataResult:
                       source=table, meta=[("scope", scope)], excel_title=f"{scope} Realise")
 
 
-def sap_info(q: ParsedQuery) -> DataResult:
-    """SAP/HANA data (JM primary sales, SAP warehouse inventory, distributor
-    balances, FIFO distributor inventory) is not wired into the chatbot yet."""
+def jm_inventory(q: ParsedQuery) -> DataResult:
+    """JM Inventory finished-goods on-hand, read live from SAP HANA (OITM ⨝ OITW
+    ⨝ OWHS ⨝ OITB), the same source the JM Inventory dashboard shows.
+
+    * A named warehouse ('DL-FG', 'dl fg', 'BH-JM', ...) → that warehouse's total
+      OnHand, stock value and in-stock SKU count.
+    * Otherwise → OnHand per FG warehouse (the dashboard's column list) + a total.
+    * ``source`` selects the company DB: mart (default) or oil.
+
+    OnHand is a stock-unit count (the item's stock UOM, e.g. PCS) — JM Inventory
+    has no litre metric, so a 'liters' ask is answered in units with a note."""
+    try:
+        from sap.service import (
+            FG_GROUP_NAME,
+            FG_WAREHOUSE_CODES,
+            match_fg_warehouse,
+            resolve_schema,
+            select as hana_select,
+        )
+    except Exception as exc:  # pragma: no cover - SAP app/driver missing
+        return DataResult(
+            summary=f"SAP HANA integration isn't available in this build ({exc}).",
+            ok=False, source="SAP HANA")
+
+    source_key, schema = resolve_schema(getattr(q, "sap_source", "") or None)
+    src_label = f"JM Inventory ({source_key})"
+    text = q.text.lower()
+    whs = match_fg_warehouse(q.text)
+    wants_value = bool(re.search(r"\bvalue\b|\bworth\b|\bstock value\b|₹|amount", text))
+    unit_note = (
+        " (Note: JM Inventory is tracked in stock units — the item's stock UOM, "
+        "e.g. PCS — not litres; there's no litre figure in JM Inventory.)"
+        if q.metric == "liters" else "")
+
+    # ── Single named warehouse ──────────────────────────────────────────────
+    if whs:
+        sql = f"""
+            SELECT COALESCE(SUM(T1."OnHand"), 0)                         AS on_hand,
+                   COALESCE(SUM(T1."OnHand" - T1."IsCommited"), 0)       AS available,
+                   COALESCE(SUM(T1."OnHand" * T0."LastPurPrc"), 0)       AS stock_value,
+                   COUNT(DISTINCT CASE WHEN T1."OnHand" <> 0
+                                       THEN T0."ItemCode" END)           AS skus_in_stock
+            FROM OITM T0
+            INNER JOIN OITW T1 ON T1."ItemCode" = T0."ItemCode"
+            LEFT  JOIN OITB T3 ON T3."ItmsGrpCod" = T0."ItmsGrpCod"
+            WHERE UPPER(T3."ItmsGrpNam") = ? AND T1."WhsCode" = ?
+        """
+        try:
+            rows = hana_select(sql, [FG_GROUP_NAME, whs], schema=schema)
+        except Exception as exc:
+            logger.warning("jm_inventory (warehouse=%s) HANA read failed: %s", whs, exc)
+            return DataResult(
+                summary=(f"I couldn't reach SAP HANA to read {whs} in {src_label}: {exc}. "
+                         "The ERP/VPN may be down — try again shortly or use the JM Inventory dashboard."),
+                ok=False, source=src_label)
+        r = rows[0] if rows else {}
+        on_hand = float(r.get("ON_HAND") or 0)
+        available = float(r.get("AVAILABLE") or 0)
+        value = float(r.get("STOCK_VALUE") or 0)
+        skus = int(r.get("SKUS_IN_STOCK") or 0)
+        headline = (f"{whs}: ₹{_fmt(value)} finished-goods stock value"
+                    if wants_value else
+                    f"{whs}: {_fmt(on_hand)} units of finished goods on hand")
+        summary = (
+            f"{headline} ({src_label}). On hand {_fmt(on_hand)} units across {_fmt(skus)} "
+            f"in-stock SKU(s), available {_fmt(available)}, stock value ₹{_fmt(value)} "
+            f"(at last purchase price). Source: SAP HANA {schema}, FINISHED group.{unit_note}")
+        return DataResult(
+            summary=summary, columns=["metric", "value"],
+            rows=[["Warehouse", whs], ["On hand (units)", on_hand],
+                  ["Available (units)", available], ["In-stock SKUs", skus],
+                  ["Stock value (₹)", round(value, 2)]],
+            source=src_label, meta=[("warehouse", whs), ("source", source_key)],
+            excel_title=f"JM Inventory {whs}")
+
+    # ── All FG warehouses (breakdown, matches the dashboard columns) ─────────
+    placeholders = ", ".join(["?"] * len(FG_WAREHOUSE_CODES))
+    sql = f"""
+        SELECT T1."WhsCode"                                    AS whs_code,
+               MAX(T2."WhsName")                               AS whs_name,
+               COALESCE(SUM(T1."OnHand"), 0)                   AS on_hand,
+               COALESCE(SUM(T1."OnHand" * T0."LastPurPrc"), 0) AS stock_value
+        FROM OITM T0
+        INNER JOIN OITW T1 ON T1."ItemCode" = T0."ItemCode"
+        LEFT  JOIN OWHS T2 ON T2."WhsCode"  = T1."WhsCode"
+        LEFT  JOIN OITB T3 ON T3."ItmsGrpCod" = T0."ItmsGrpCod"
+        WHERE UPPER(T3."ItmsGrpNam") = ? AND T1."WhsCode" IN ({placeholders})
+        GROUP BY T1."WhsCode"
+        ORDER BY on_hand DESC
+    """
+    try:
+        rows = hana_select(sql, [FG_GROUP_NAME, *FG_WAREHOUSE_CODES], schema=schema)
+    except Exception as exc:
+        logger.warning("jm_inventory (all warehouses) HANA read failed: %s", exc)
+        return DataResult(
+            summary=(f"I couldn't reach SAP HANA to read {src_label}: {exc}. "
+                     "The ERP/VPN may be down — try again shortly or use the JM Inventory dashboard."),
+            ok=False, source=src_label)
+    if not rows:
+        return DataResult(summary=f"No finished-goods stock found in {src_label}.",
+                          ok=False, source=src_label)
+
+    data_rows, tot_units, tot_value = [], 0.0, 0.0
+    for r in rows:
+        code = r.get("WHS_CODE")
+        name = r.get("WHS_NAME") or ""
+        units = float(r.get("ON_HAND") or 0)
+        val = float(r.get("STOCK_VALUE") or 0)
+        data_rows.append([code, name, units, round(val, 2)])
+        tot_units += units
+        tot_value += val
+    data_rows.append(["TOTAL", "", tot_units, round(tot_value, 2)])
+    top = "; ".join(f"{r[0]} {_fmt(r[2])}u" for r in data_rows[:5] if r[0] != "TOTAL")
+    summary = (
+        f"{src_label} finished goods on hand: {_fmt(tot_units)} units "
+        f"(stock value ₹{_fmt(tot_value)}) across {len(rows)} warehouse(s). "
+        f"Top: {top}. Source: SAP HANA {schema}, FINISHED group.{unit_note}")
     return DataResult(
-        summary=("That data lives in the SAP HANA system (JM primary sales analysis, SAP warehouse stock "
-                 "value / below-min / zero-stock, distributor balances & invoices, distributor FIFO inventory). "
-                 "The chatbot reads the operational Postgres database, which doesn't include SAP HANA yet — "
-                 "please use the JM Primary / SAP Inventory / Distributors dashboards for those. "
-                 "I can still answer platform PO, secondary, inventory, ads, targets, pendency and state-sales questions."),
-        ok=False, source="SAP HANA (not connected)",
-        suggestions=["state wise sales for june", "total distributor commission for june", "blinkit inventory"],
+        summary=summary, columns=["Warehouse", "Name", "On hand (units)", "Stock value (₹)"],
+        rows=data_rows, source=src_label, meta=[("source", source_key)],
+        excel_title=f"JM Inventory ({source_key})")
+
+
+def sap_info(q: ParsedQuery) -> DataResult:
+    """SAP/HANA topics not yet wired into the chatbot (JM primary sales,
+    distributor balances/invoices, FIFO distributor inventory, below-min /
+    zero-stock). JM Inventory warehouse on-hand IS wired — see jm_inventory."""
+    return DataResult(
+        summary=("That part still lives only in the SAP HANA dashboards (JM primary sales analysis, "
+                 "distributor balances & invoices, distributor FIFO inventory, below-min / zero-stock) — "
+                 "please use the JM Primary / Distributors / SAP Inventory dashboards for those. "
+                 "I CAN now read JM Inventory warehouse on-hand — try 'jm inventory dl-fg' or "
+                 "'jm inventory warehouse wise'. I also answer platform PO, secondary, inventory, ads, "
+                 "targets, pendency and state-sales questions."),
+        ok=False, source="SAP HANA (partly connected)",
+        suggestions=["jm inventory dl-fg", "jm inventory warehouse wise", "total distributor commission for june"],
     )
 
 

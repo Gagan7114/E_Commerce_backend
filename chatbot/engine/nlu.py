@@ -14,6 +14,16 @@ from datetime import date, timedelta
 
 from django.utils import timezone
 
+# JM Inventory lives in SAP HANA; the matcher + warehouse-code list are owned by
+# the SAP service layer so NLU and the jm_inventory tool agree on the codes.
+try:
+    from sap.service import FG_WAREHOUSE_CODES, match_fg_warehouse
+except Exception:  # pragma: no cover - SAP app optional in some builds
+    FG_WAREHOUSE_CODES = ()
+
+    def match_fg_warehouse(_text):
+        return None
+
 # --- Platform aliases --------------------------------------------------------
 # Base aliases; merged at runtime with PlatformConfig (slug, name) so any
 # admin-configured platform also resolves. Keyed by canonical slug.
@@ -54,6 +64,7 @@ class ParsedQuery:
     wants_amount: bool = False     # "order amount" / "value" / "revenue" question
     item_head: str = ""            # PREMIUM / COMMODITY filter
     product: str = ""              # item-family filter, e.g. "extra light", "canola"
+    sap_source: str = ""           # SAP HANA company DB: "mart" | "oil" | ""
 
     @property
     def platform_slugs(self) -> list[str]:
@@ -354,6 +365,26 @@ def parse(message: str, db_platforms: list[dict] | None = None) -> ParsedQuery:
     amazon_po_flag = bool("mov" in low or "fulfillment center" in low or "fulfilment center" in low
                           or ("requested" in low and "received" in low)
                           or (is_amazon and re.search(r"\bpos?\b|pending|new po|\bfc\b|status|fill rate", low)))
+    # SAP HANA company DB selector (mart is the default when unstated).
+    if re.search(r"\boil\s*(source|company|hana|schema|db)\b|\bjivo\s*oil\b", low):
+        q.sap_source = "oil"
+    elif re.search(r"\bmart\s*(source|company|hana|schema|db)\b|\bjivo\s*mart\b", low):
+        q.sap_source = "mart"
+
+    # JM Inventory (SAP HANA warehouse on-hand). Fires on an explicit FG
+    # warehouse code (DL-FG, BH-JM, ...), the phrase "jm/sap inventory", or a
+    # warehouse + stock/on-hand ask with no platform named (a platform means the
+    # question is about that platform's Postgres inventory, not SAP). Checked
+    # before the generic inventory + sap intents so it wins the route.
+    warehouse_code_hit = match_fg_warehouse(text) is not None
+    jm_inv_flag = bool(
+        warehouse_code_hit
+        or re.search(r"\bjm\s*inventory\b|\bsap\s*inventory\b|\bsap\s*warehouse\b", low)
+        or (not q.platforms and re.search(r"\bwarehouse\b", low)
+            and re.search(r"\bstock\b|\binventory\b|on[\s\-]?hand|\bsoh\b", low))
+        or (not q.platforms and "finished goods" in low)
+    )
+
     sap_flag = bool("jm primary" in low or "hana" in low or "wellness billing" in low
                     or "mart source" in low or "oil source" in low or "below min" in low
                     or "zero stock" in low or "finished goods" in low or "fifo" in low
@@ -365,10 +396,16 @@ def parse(message: str, db_platforms: list[dict] | None = None) -> ParsedQuery:
                       or ("jivo" in low and "sano" in low) or bool(_STATE_RE.search(low)))
     q.group_by_platform = bool(re.search(r"platform\s*wise|platformwise|platform-wise|by\s+platform|"
                                          r"platform\s+break", low))
+    # A bare definitional question ("what is fill rate", "explain miss rate"). Note
+    # we deliberately do NOT require `not q.metric` here: "fill rate" / "miss rate"
+    # set q.metric="liters" via the metric parser, so guarding on it would send the
+    # bot's own "What is fill rate" glossary chip to the liters data tool instead.
+    # The no-platform / no-date / no-movement guards already exclude real data asks
+    # ("blinkit fill rate this month" has a platform + date, so it stays a query).
     explain_flag = bool(
         (re.search(r"\b(explain|define|definition|meaning of|what do you mean)\b", low)
          or re.search(r"^\s*(what is|what's|whats)\b", low))
-        and not q.platforms and not q.date_from and not q.movement and not q.metric
+        and not q.platforms and not q.date_from and not q.movement
         and re.search(r"secondary|secandary|secndary|primary|\bdrr\b|\bdoh\b|\bsoh\b|fill rate|"
                       r"miss rate|pendency|realise|realize|brand fund|item head|\broas\b|\bacos\b|"
                       r"\btacos\b|lead time|\bmov\b|master po", low))
@@ -386,19 +423,28 @@ def parse(message: str, db_platforms: list[dict] | None = None) -> ParsedQuery:
                                     r"\bsup\b|what'?s up|\bnice\b|\bgood (job|bot|work)\b|\bcool\b|"
                                     r"this is (incorrect|wrong)|not correct|that'?s wrong", low))
     ack_flag = bool(re.fullmatch(r"\s*(ok|okay|k|kk|yes|yep|no|nope|hmm+|great|fine|got it|thx|ty)\s*[.! ]*", low))
+    # A message that is ONLY a greeting, incl. "hi there" / "hello team" — a bare
+    # "hi" is caught by _GREETING_WORDS, but the trailing word made it fall through.
+    greet_only = bool(re.fullmatch(
+        r"(hi+|hey+|hello+|hii+|namaste|yo+|hola)(\s+(there|all|team|bot|everyone|guys|folks))?[.!\s]*",
+        text.lower().strip()))
     if _has(low, _PLATFORM_LIST_WORDS) and not data_signal:
         q.intent = "list_platforms"
     elif explain_flag:
         q.intent = "explain"
     elif _has(low, _ALERT_WORDS):
         q.intent = "alerts"
+    elif jm_inv_flag:
+        q.intent = "jm_inventory"
     elif sap_flag:
         q.intent = "sap"
     elif movers:
         q.intent = "movers"
     elif split and not (coupon_flag or brandfund_flag):
         q.intent = "split"
-    elif _has(low, _INVENTORY_WORDS):
+    elif _has(low, _INVENTORY_WORDS) and not expiry_flag:
+        # "expiring stock" / "expiring inventory" mentions a stock word but is an
+        # expiry question — let it fall through to the expiry intent below.
         q.intent = "inventory"
     elif targets_flag:
         q.intent = "targets"
@@ -450,7 +496,7 @@ def parse(message: str, db_platforms: list[dict] | None = None) -> ParsedQuery:
         q.intent = "datetime"
     elif _has(low, _HELP_WORDS):
         q.intent = "help"
-    elif smalltalk_flag or ack_flag or (text and text.lower().strip(" !.?") in _GREETING_WORDS):
+    elif smalltalk_flag or ack_flag or greet_only or (text and text.lower().strip(" !.?") in _GREETING_WORDS):
         q.intent = "greeting"
     else:
         q.intent = "unknown"

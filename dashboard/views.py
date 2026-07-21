@@ -841,6 +841,55 @@ def _city_canon_sql(col):
     return f"(CASE {cases} ELSE {base} END)"
 
 
+def _blinkit_city_sql(col):
+    """Fold a raw Blinkit warehouse `location` to its city.
+
+    Blinkit inventory ships the warehouse code, not a city
+    ('CPC-GGN4', 'Bengaluru B3 - Feeder Warehouse', 'CPC - Delhi Mundka (HP)'),
+    so the raw column would never match the secondary feed's real city names.
+    We strip the warehouse boilerplate (CPC-/Super Store/SS/CC-DTS- prefixes;
+    Feeder Warehouse/Warehouse suffixes; (HP)/FRZ/Ecom/ZHPL/PCn tags), take the
+    leading token (the city — the rest is the locality), drop its trailing unit
+    number (AGRA2 -> AGRA), then expand Blinkit's short codes and fix spellings.
+
+    Decisions (2026-07-21, user): the NCR satellite towns Dasna / Kundli /
+    Farrukhnagar stay as their own cities; Gurgaon/GGN -> Gurugram (app
+    standard); 'DHD' is left flagged as unmapped rather than guessed.
+
+    Caveat: assumes the city is a single leading token — true for every current
+    Blinkit warehouse. A genuine two-word city (e.g. 'Navi Mumbai') would need a
+    WHEN branch added below.
+    """
+    s = f"TRIM({col}::text)"
+    s = f"regexp_replace({s}, '\\s*-\\s*(SR\\s+)?Feeder\\s+Warehouse.*$', '', 'i')"
+    s = f"regexp_replace({s}, '\\s*-\\s*Warehouse.*$', '', 'i')"
+    s = f"regexp_replace({s}, '^\\s*Super\\s+Store\\s+', '', 'i')"
+    s = f"regexp_replace({s}, '^\\s*SS\\s+', '', 'i')"
+    s = f"regexp_replace({s}, '^\\s*CPC\\s*-\\s*', '', 'i')"
+    s = f"regexp_replace({s}, '^\\s*CPC-', '', 'i')"
+    s = f"regexp_replace({s}, '^\\s*CC-DTS-', '', 'i')"
+    s = f"regexp_replace({s}, '\\(HP\\)', '', 'gi')"
+    s = f"regexp_replace({s}, '-?\\s*FRZ', '', 'gi')"
+    s = f"regexp_replace({s}, '\\y(Ecom|ZHPL)\\y', '', 'gi')"
+    s = f"regexp_replace({s}, '\\yPC[0-9]+\\y', '', 'gi')"
+    token = f"regexp_replace(split_part(TRIM({s}), ' ', 1), '[0-9]+$', '')"
+    return (
+        f"(CASE UPPER({token}) "
+        f"WHEN 'GGN' THEN 'Gurugram' WHEN 'GURGAON' THEN 'Gurugram' "
+        f"WHEN 'DEL' THEN 'Delhi' "
+        f"WHEN 'DDN' THEN 'Dehradun' "
+        f"WHEN 'AGRA' THEN 'Agra' "
+        f"WHEN 'GOA' THEN 'Goa' "
+        f"WHEN 'NOIDA' THEN 'Noida' "
+        f"WHEN 'DHD' THEN 'DHD (unmapped)' "
+        f"WHEN 'FARUKHNAGAR' THEN 'Farrukhnagar' "
+        f"WHEN 'MANGALORE' THEN 'Mangaluru' "
+        f"WHEN 'BANGALORE' THEN 'Bengaluru' WHEN 'BENGALOORU' THEN 'Bengaluru' "
+        f"WHEN 'BOMBAY' THEN 'Mumbai' "
+        f"ELSE INITCAP({token}) END)"
+    )
+
+
 # Frontend platform slug → "SecMaster".format value (secondary source). BigBasket
 # and Jio Mart carry a space in the view's format string. Flipkart is intentionally
 # absent — it has no usable state in the secondary feed and is excluded from the map.

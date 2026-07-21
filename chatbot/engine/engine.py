@@ -152,6 +152,7 @@ _ROUTES = {
     "amazon_po": tools.amazon_po,
     "state_sales": tools.state_sales,
     "realise": tools.realise,
+    "jm_inventory": tools.jm_inventory,
     "sap": tools.sap_info,
     "datetime": tools.datetime_now,
     "appcontrol": tools.app_control,

@@ -13,7 +13,10 @@ from rest_framework.response import Response
 from accounts.permissions import require
 from config.perf_cache import cached_get
 
+from .litres import is_litre_flag, per_unit_litre_map, row_litres
 from .service import (
+    FG_GROUP_NAME,
+    FG_WAREHOUSE_CODES,
     HANA_SCHEMAS,
     SALES_ANALYSIS_DEFAULT_SOURCE,
     SALES_ANALYSIS_PROCEDURES,
@@ -698,6 +701,9 @@ def inventory_overview(request):
     if group_codes:
         ph = ", ".join(["?"] * len(group_codes))
         frag["group"] = (f'T0."ItmsGrpCod" IN ({ph})', list(group_codes))
+    is_litre = (request.query_params.get("is_litre") or "").strip().upper()
+    if is_litre in ("Y", "N"):
+        frag["is_litre"] = ('T0."U_IsLitre" = ?', [is_litre])
     if stock_state == "in":
         frag["stock_state"] = ('T1."OnHand" > 0', [])
     elif stock_state == "out":
@@ -742,7 +748,8 @@ def inventory_overview(request):
             T1."OnOrder",
             T1."MinStock",
             T1."MaxStock",
-            T1."OnHand" * T0."LastPurPrc" AS "StockValue"
+            T1."OnHand" * T0."LastPurPrc" AS "StockValue",
+            T0."U_IsLitre" AS "IsLitre"
         FROM OITM T0
         INNER JOIN OITW T1 ON T1."ItemCode" = T0."ItemCode"
         LEFT  JOIN OWHS T2 ON T2."WhsCode"  = T1."WhsCode"
@@ -752,6 +759,14 @@ def inventory_overview(request):
         LIMIT {page_size} OFFSET {offset}
     """
     data = _run(rows_sql, params or None, schema=schema)
+
+    # Litres on hand per row. SAP stores OnHand as pieces and has no populated
+    # litres column, so we derive it: OnHand × litres-per-piece (SAP's own JM
+    # Primary Liter÷Qty, with a master_sheet fallback), gated on U_IsLitre.
+    litre_map = per_unit_litre_map(source)
+    for row in data:
+        row["Litres"] = row_litres(
+            row.get("ItemCode"), row.get("OnHand"), row.get("IsLitre"), litre_map)
 
     # 2) Total row count for pagination footer
     count_sql = f"""
@@ -778,6 +793,40 @@ def inventory_overview(request):
     summary = dict(summary_rows[0]) if summary_rows else {
         "total_skus": 0, "total_units_on_hand": 0, "total_stock_value": 0,
     }
+
+    # Total litres on hand over the FULL filtered set. OnHand is grouped per item
+    # (a bounded set) so we can multiply by the Python litres-per-piece map and
+    # sum. Coverage = share of litre-SKU units that have a factor, so the UI can
+    # flag the figure as an estimate when some litre SKUs are unmapped.
+    litre_units_sql = f"""
+        SELECT T0."ItemCode" AS "code",
+               MAX(T0."U_IsLitre") AS "isl",
+               COALESCE(SUM(T1."OnHand"), 0) AS "oh"
+        FROM OITM T0
+        INNER JOIN OITW T1 ON T1."ItemCode" = T0."ItemCode"
+        LEFT  JOIN OWHS T2 ON T2."WhsCode"  = T1."WhsCode"
+        {where_sql}
+        GROUP BY T0."ItemCode"
+    """
+    total_litres = 0.0
+    litre_units_total = 0.0
+    litre_units_covered = 0.0
+    for lr in _run(litre_units_sql, params or None, schema=schema):
+        if not is_litre_flag(lr.get("isl")):
+            continue
+        oh = _num(lr.get("oh"))
+        litre_units_total += oh
+        factor = litre_map.get(str(lr.get("code") or "").strip().upper())
+        if factor is not None:
+            litre_units_covered += oh
+            total_litres += oh * factor
+    summary["total_litres_on_hand"] = round(total_litres, 2)
+    summary["litre_units_total"] = round(litre_units_total, 2)
+    summary["litre_units_covered"] = round(litre_units_covered, 2)
+    summary["litre_coverage_pct"] = (
+        round(litre_units_covered / litre_units_total * 100, 1)
+        if litre_units_total else None
+    )
 
     # Items where the total OnHand across all (filtered) warehouses is 0.
     items_zero_sql = f"""
@@ -927,15 +976,9 @@ def inventory_warehouse_comparison(request):
 # ─── /inventory-finished-goods ───
 # Pivot view for the JM Inventory Dashboard: rows are FINISHED-group items
 # (sub_group / variety / item code / name) and columns are the fixed warehouse
-# code list below. Cell = OnHand for that item × warehouse. Includes a per-row
-# Grand Total. Reads mart or oil schema via ?source=.
-FG_WAREHOUSE_CODES: tuple[str, ...] = (
-    "BH-FGM", "DL-MP", "DL-EC", "DL-GR", "DL-FG", "BH-JM",
-    "FBF-HR", "KT-FG", "DL-INT", "KT-FBF", "PB-FG", "BH-GR", "BH-FG",
-)
-FG_GROUP_NAME = "FINISHED"
-
-
+# code list (FG_WAREHOUSE_CODES, from sap.service). Cell = OnHand for that
+# item × warehouse. Includes a per-row Grand Total. Reads mart or oil schema
+# via ?source=.
 @api_view(["GET"])
 @permission_classes([require("sap.view")])
 @cached_get(timeout=120, prefix="sap.inventory_finished_goods")

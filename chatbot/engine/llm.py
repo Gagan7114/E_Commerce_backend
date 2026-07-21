@@ -60,6 +60,14 @@ _TOOL_DEFS = [
          "top_n": {"type": "integer"}}}},
     {"name": "query_inventory", "description": "Current inventory / stock on hand for a platform.",
      "input_schema": {"type": "object", "properties": {"platform": {"type": "string"}}, "required": ["platform"]}},
+    {"name": "query_jm_inventory",
+     "description": ("JM Inventory finished-goods stock ON HAND from SAP HANA (the JM Inventory dashboard "
+                     "source). Give a warehouse code (e.g. 'DL-FG', 'BH-JM', 'KT-FG') for one warehouse, or "
+                     "omit it for a per-warehouse breakdown. OnHand is a stock-unit count (the item's stock "
+                     "UOM, e.g. PCS) — NOT litres. source selects the company DB: mart (default) or oil."),
+     "input_schema": {"type": "object", "properties": {
+         "warehouse": {"type": "string", "description": "FG warehouse code, e.g. DL-FG"},
+         "source": {"type": "string", "enum": ["mart", "oil"]}}}},
     {"name": "query_secondary_sales", "description": "Secondary (sell-out) sales for a platform.",
      "input_schema": {"type": "object", "properties": {"platform": {"type": "string"}}, "required": ["platform"]}},
     {"name": "read_master_po_sheet", "description": "Read the Master PO Google Sheet.",
@@ -101,6 +109,9 @@ def _mk_query(text: str, args: dict) -> ParsedQuery:
     if args.get("movement") == "sold":
         q.metric = "liters"
     q.top_n = args.get("top_n")
+    src = (args.get("source") or "").strip().lower()
+    if src in ("mart", "oil"):
+        q.sap_source = src
     return q
 
 
@@ -120,6 +131,11 @@ def _run_tool(name: str, args: dict, question: str):
         return tools.purchase_orders(q)
     if name == "query_inventory":
         return tools.inventory(q)
+    if name == "query_jm_inventory":
+        whs = (args.get("warehouse") or "").strip()
+        if whs:
+            q.text = f"{q.text} {whs}".strip()
+        return tools.jm_inventory(q)
     if name == "query_secondary_sales":
         return tools.secondary_sales(q)
     if name == "read_master_po_sheet":

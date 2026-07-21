@@ -2931,29 +2931,68 @@ def primary_summary(request):
     return Response(payload)
 
 
+# Change-beacon relation lists. A "version" is derived from PostgreSQL's own
+# per-table write counters (pg_stat_user_tables: n_tup_ins/upd/del), so the
+# token moves whenever ANY row is inserted, updated or deleted in these tables —
+# regardless of who wrote it (in-app upload, Google Sheets sync, or the
+# ecomautocli pipeline). It is O(number-of-tables), reading in-memory stats, so
+# it stays cheap even when polled every few seconds. Listing a name that isn't a
+# real base table (e.g. a plain view) is harmless — pg_stat simply has no row for
+# it and it contributes nothing, so we list generously to guarantee coverage.
+_PRIMARY_BEACON_RELATIONS = ["master_po", "Amazon PO"]
+_SECONDARY_BEACON_RELATIONS = [
+    # QC platforms (Blinkit/Zepto/…) read secmaster_mv (a materialized view over
+    # "SecMaster"); track both the matview (REFRESH churn) and its base table.
+    "SecMaster",
+    "secmaster_mv",
+    "swiggySec",               # Swiggy secondary (base table)
+    "flipkartSec",             # Flipkart secondary (base behind flipkart_secondary_all)
+    "flipkart_grocery_master",  # Flipkart Grocery secondary (base table)
+    "amazon_sec_daily",         # Amazon secondary — daily
+    "amazon_sec_range",         # Amazon secondary — range (defensive alias)
+    "amazon_sec_range_margins",  # Amazon secondary — range (base table)
+    "amazon_mp_master",         # Amazon MP secondary (base table)
+    "bigbasket_sec_range",      # BigBasket secondary — range (base behind master view)
+    "bigbasketSec",             # BigBasket secondary — legacy/daily (defensive)
+]
+
+
+def _change_beacon(relnames: list[str]) -> str:
+    """Return a tiny token summarising cumulative write activity across the given
+    tables. Sourced from pg_stat_user_tables, so it moves on any insert/update/
+    delete from any source and is O(tables) — not a row scan. Matched on relname
+    only (schema-agnostic) because these names are distinctive; a stats reset just
+    causes one harmless extra refetch."""
+    row = _dict_rows(
+        """
+        SELECT COALESCE(SUM(n_tup_ins + n_tup_upd + n_tup_del), 0)::text AS churn
+        FROM pg_stat_user_tables
+        WHERE relname = ANY(%s)
+        """,
+        [relnames],
+    )
+    return (row[0].get("churn") if row else None) or "0"
+
+
 @api_view(["GET"])
 @permission_classes([require("platform.po.view")])
 def primary_summary_version(request):
     """Cheap change-beacon for the Primary Summary. Returns a tiny token that
-    changes whenever the underlying PO data changes (rows added/removed or the
-    key numeric columns edited). The frontend polls this and only refetches the
-    heavy summary when the token moves — so an upload shows up within seconds
-    without re-running the big aggregate on a timer."""
-    row = _dict_rows(
-        """
-        SELECT
-            (SELECT COUNT(*) FROM public.master_po) AS m_cnt,
-            (SELECT COALESCE(SUM(COALESCE(total_delivered_liters,0)
-                             + COALESCE(total_order_liters,0)
-                             + COALESCE(missed_ltrs,0)),0)::text FROM public.master_po) AS m_sum,
-            (SELECT COUNT(*) FROM reporting."Amazon PO") AS a_cnt,
-            (SELECT COALESCE(SUM(COALESCE(total_received_cost,0)),0)::text FROM reporting."Amazon PO") AS a_sum
-        """,
-        [],
-    )
-    r = row[0] if row else {}
-    version = f"{r.get('m_cnt', 0)}:{r.get('m_sum', 0)}:{r.get('a_cnt', 0)}:{r.get('a_sum', 0)}"
-    return Response({"version": version})
+    changes whenever the underlying PO data changes (rows added/removed/edited).
+    The frontend polls this and only refetches the heavy summary when the token
+    moves — so an upload shows up within seconds without re-running the big
+    aggregate on a timer."""
+    return Response({"version": _change_beacon(_PRIMARY_BEACON_RELATIONS)})
+
+
+@api_view(["GET"])
+@permission_classes([require("platform.secondary.view")])
+def secondary_summary_version(request):
+    """Cheap change-beacon for the Secondary Summary — the mirror of
+    primary_summary_version for the secondary platform tables. Lets the Secondary
+    dashboard auto-refresh within seconds of an upload/sync landing, without
+    fanning out the per-platform sec-dashboard queries on a timer."""
+    return Response({"version": _change_beacon(_SECONDARY_BEACON_RELATIONS)})
 
 
 def _parse_price_upload_date(value: str) -> date | None:
@@ -5301,10 +5340,13 @@ def blinkit_ads_dashboard(request, slug: str):
 # filter applies uniformly to the union.
 _ADS_SUMMARY_UNION = """
     -- Ads sale = DIRECT ads qty × the SKU's basic_rate from monthly_landing_rate
-    -- (matched on platform format + sku_code + the row's month). Indirect/halo
-    -- qty is deliberately excluded from ads_sale for the QC platforms (it still
-    -- counts in the qty column). The landing table has at most one rate per
-    -- (format, sku, month) so the LEFT JOIN can't fan out; a missing rate →
+    -- (matched on platform format + sku_code). Indirect/halo qty is deliberately
+    -- excluded from ads_sale for the QC platforms (it still counts in the qty
+    -- column). The rate is looked up CARRY-FORWARD — the latest rate whose month
+    -- is <= the row's month (LATERAL … LIMIT 1), mirroring the SecMaster rate
+    -- join (platforms migration 0049). So a month whose rate sheet hasn't been
+    -- uploaded yet shows the previous month's rate instead of 0, and the LIMIT 1
+    -- lateral can never fan out the ads rows. A SKU never priced in ANY month →
     -- ads_sale 0.
     -- `use_max_date` mirrors each platform ads dashboard's summary method:
     -- TRUE  → cumulative month-to-date snapshot (Swiggy/Zepto/BigBasket/Flipkart)
@@ -5320,10 +5362,15 @@ _ADS_SUMMARY_UNION = """
              * COALESCE(lr.basic_rate, 0))::numeric AS ads_sale,
            b.year, b.month, b.date, FALSE AS use_max_date, 'other'::text AS src
       FROM blinkit_ads_master b
-      LEFT JOIN monthly_landing_rate lr
-        ON REGEXP_REPLACE(LOWER(lr.format), '[^a-z0-9]+', '', 'g') = 'blinkit'
-       AND UPPER(TRIM(lr.sku_code)) = UPPER(TRIM(b.format_sku_code))
-       AND lr.month = to_char(date_trunc('month', b.date::date), 'YYYY-MM-DD')
+      LEFT JOIN LATERAL (
+        SELECT rate.basic_rate
+          FROM monthly_landing_rate rate
+         WHERE REGEXP_REPLACE(LOWER(rate.format), '[^a-z0-9]+', '', 'g') = 'blinkit'
+           AND UPPER(TRIM(rate.sku_code)) = UPPER(TRIM(b.format_sku_code))
+           AND rate.month::date <= date_trunc('month', b.date::date)::date
+         ORDER BY rate.month::date DESC, rate.created_at DESC
+         LIMIT 1
+      ) lr ON TRUE
     UNION ALL
     SELECT 'Zepto', z.item_head, z.category, z.sub_category, z.item,
            (COALESCE(z.direct_qty_sold, 0) + COALESCE(z.indirect_qty_sold, 0))::numeric,
@@ -5333,10 +5380,15 @@ _ADS_SUMMARY_UNION = """
              * COALESCE(lr.basic_rate, 0))::numeric,
            z.year, z.month, z.date, TRUE, 'other'::text
       FROM zepto_ads_master z
-      LEFT JOIN monthly_landing_rate lr
-        ON REGEXP_REPLACE(LOWER(lr.format), '[^a-z0-9]+', '', 'g') = 'zepto'
-       AND UPPER(TRIM(lr.sku_code)) = UPPER(TRIM(z.sku_id))
-       AND lr.month = to_char(date_trunc('month', z.date::date), 'YYYY-MM-DD')
+      LEFT JOIN LATERAL (
+        SELECT rate.basic_rate
+          FROM monthly_landing_rate rate
+         WHERE REGEXP_REPLACE(LOWER(rate.format), '[^a-z0-9]+', '', 'g') = 'zepto'
+           AND UPPER(TRIM(rate.sku_code)) = UPPER(TRIM(z.sku_id))
+           AND rate.month::date <= date_trunc('month', z.date::date)::date
+         ORDER BY rate.month::date DESC, rate.created_at DESC
+         LIMIT 1
+      ) lr ON TRUE
     UNION ALL
     SELECT 'BigBasket', bb.item_head, bb.category, bb.sub_category, bb.item,
            (COALESCE(bb.direct_qty_sold, 0) + COALESCE(bb.indirect_qty_sold, 0))::numeric,
@@ -5346,10 +5398,15 @@ _ADS_SUMMARY_UNION = """
              * COALESCE(lr.basic_rate, 0))::numeric,
            bb.year, bb.month, bb.date, TRUE, 'other'::text
       FROM bigbasket_ads_master bb
-      LEFT JOIN monthly_landing_rate lr
-        ON REGEXP_REPLACE(LOWER(lr.format), '[^a-z0-9]+', '', 'g') = 'bigbasket'
-       AND UPPER(TRIM(lr.sku_code)) = UPPER(TRIM(bb.sku_id))
-       AND lr.month = to_char(date_trunc('month', bb.date::date), 'YYYY-MM-DD')
+      LEFT JOIN LATERAL (
+        SELECT rate.basic_rate
+          FROM monthly_landing_rate rate
+         WHERE REGEXP_REPLACE(LOWER(rate.format), '[^a-z0-9]+', '', 'g') = 'bigbasket'
+           AND UPPER(TRIM(rate.sku_code)) = UPPER(TRIM(bb.sku_id))
+           AND rate.month::date <= date_trunc('month', bb.date::date)::date
+         ORDER BY rate.month::date DESC, rate.created_at DESC
+         LIMIT 1
+      ) lr ON TRUE
     UNION ALL
     SELECT 'Swiggy', s.item_head, s.category, s.sub_category, s.item,
            COALESCE(s.direct_qty_sold, 0)::numeric,
@@ -5358,10 +5415,15 @@ _ADS_SUMMARY_UNION = """
            (COALESCE(s.direct_qty_sold, 0) * COALESCE(lr.basic_rate, 0))::numeric,
            s.year, s.month, s.date, TRUE, 'other'::text
       FROM swiggy_ads_master s
-      LEFT JOIN monthly_landing_rate lr
-        ON REGEXP_REPLACE(LOWER(lr.format), '[^a-z0-9]+', '', 'g') = 'swiggy'
-       AND UPPER(TRIM(lr.sku_code)) = UPPER(TRIM(s.format_sku_code))
-       AND lr.month = to_char(date_trunc('month', s.date::date), 'YYYY-MM-DD')
+      LEFT JOIN LATERAL (
+        SELECT rate.basic_rate
+          FROM monthly_landing_rate rate
+         WHERE REGEXP_REPLACE(LOWER(rate.format), '[^a-z0-9]+', '', 'g') = 'swiggy'
+           AND UPPER(TRIM(rate.sku_code)) = UPPER(TRIM(s.format_sku_code))
+           AND rate.month::date <= date_trunc('month', s.date::date)::date
+         ORDER BY rate.month::date DESC, rate.created_at DESC
+         LIMIT 1
+      ) lr ON TRUE
     UNION ALL
     SELECT 'Amazon', item_head, category, sub_category, NULL::text,
            COALESCE(units_sold, 0)::numeric,
