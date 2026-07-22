@@ -7,12 +7,13 @@ SELECT <cols> FROM <view> WHERE <filters> LIMIT N.
 
 import io
 import re
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal
 
 from django.db import connection
 from django.http import HttpResponse
 from openpyxl import Workbook
+from openpyxl.cell import WriteOnlyCell
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.exceptions import ValidationError
 from rest_framework.permissions import IsAuthenticated
@@ -143,12 +144,27 @@ def _format_filter(col: str, formats: list[str]) -> tuple[str, list]:
 EXPORT_MAX_ROWS = 1_000_000
 
 
-def _coerce(v):
-    """Make a DB value safe for an openpyxl write-only cell."""
+def _coerce_cell(ws, v):
+    """Make a DB value safe for an openpyxl write-only cell.
+
+    Pure DATE columns (po_date, po_expiry_date, delivery_date, appointment_date,
+    ...) are written as genuine Excel dates but displayed in dd-mm-yyyy (Indian
+    format) via an explicit number format, so the downloaded file reads
+    14-07-2026 instead of openpyxl's default 2026-07-14. They stay real dates,
+    so Excel can still sort/filter them as dates. `ws` is the write-only sheet
+    the cell will be appended to (WriteOnlyCell needs it).
+    """
     if isinstance(v, Decimal):
         return float(v)
-    if isinstance(v, datetime) and v.tzinfo is not None:
-        return v.replace(tzinfo=None)  # openpyxl can't store tz-aware datetimes
+    # datetime is a subclass of date, so it must be checked first. Timestamps
+    # keep their existing behaviour (openpyxl's default format); only tz-aware
+    # ones need stripping because openpyxl can't store a timezone.
+    if isinstance(v, datetime):
+        return v.replace(tzinfo=None) if v.tzinfo is not None else v
+    if isinstance(v, date):
+        cell = WriteOnlyCell(ws, value=v)
+        cell.number_format = "DD-MM-YYYY"
+        return cell
     if isinstance(v, (bytes, bytearray, memoryview)):
         return bytes(v).decode("utf-8", "replace")
     return v
@@ -399,7 +415,7 @@ def report_export(request):
         keys = columns or (list(sap_rows[0].keys()) if sap_rows else [])
         ws.append(labels if labels and len(labels) == len(keys) else keys)
         for r in sap_rows[:EXPORT_MAX_ROWS]:
-            ws.append([_coerce(r.get(k)) for k in keys])
+            ws.append([_coerce_cell(ws, r.get(k)) for k in keys])
             total += 1
     else:
         view = _safe_view(view_raw)
@@ -423,7 +439,7 @@ def report_export(request):
                 if not chunk:
                     break
                 for row in chunk:
-                    ws.append([_coerce(v) for v in row])
+                    ws.append([_coerce_cell(ws, v) for v in row])
                     total += 1
 
     # Filters sheet — mirror the on-screen filters, then the real exported count.

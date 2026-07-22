@@ -238,6 +238,7 @@ def platform_stats(request, slug: str):
 # ─── /{slug}/pos ───
 @api_view(["GET"])
 @permission_classes([require("platform.po.view")])
+@cached_get(timeout=60, prefix="plat.po_list")
 def platform_pos(request, slug: str):
     _ensure_scope(request.user, slug)
     p = _get_platform(slug)
@@ -1704,153 +1705,171 @@ def pendency_dashboard(request, slug: str):
         ')), 0)'
     )
 
-    totals_row = _dict_rows(
-        f'''
-        SELECT
+    # master_po is a VIEW over a multi-table join, so each aggregate below used
+    # to re-execute that join — six times per request, always with the identical
+    # WHERE. Instead materialize the filtered scope ONCE into a session-temp
+    # table; every aggregation is then a fast scan of the small local copy.
+    # Dropped defensively before create AND in the finally block, because with
+    # CONN_MAX_AGE pooling the session (and any leftover temp table) outlives
+    # the request.
+    scope_cols = (
+        '"order_qty", "delivered_qty", "total_order_liters", '
+        '"total_delivered_liters", "total_order_amt_exclusive", "po_number", '
+        '"po_date", "po_expiry_date", "city", "sku_code", "sku_name", '
+        '"item", "location", "vendor_new"'
+    )
+    with connection.cursor() as cur:
+        cur.execute("DROP TABLE IF EXISTS pend_scope")
+        cur.execute(
+            f'CREATE TEMP TABLE pend_scope AS '
+            f'SELECT {scope_cols} FROM "master_po" {full_where}',
+            params,
+        )
+    try:
+        totals_row = _dict_rows(
+            f'''
+            SELECT
+                {pending_units_expr} AS pending_units,
+                {pending_ltrs_expr} AS pending_ltrs,
+                COALESCE(SUM("order_qty"), 0) AS open_units,
+                COALESCE(SUM("total_order_liters"), 0) AS open_ltrs,
+                COUNT(DISTINCT "po_number") AS open_pos,
+                COUNT(*) AS rows,
+                TO_CHAR(
+                    MAX(
+                        CASE
+                            WHEN TRIM("po_date"::text) ~ '^[0-9]{{2}}-[0-9]{{2}}-[0-9]{{4}}$'
+                                THEN TO_DATE(TRIM("po_date"::text), 'DD-MM-YYYY')
+                            WHEN TRIM("po_date"::text) ~ '^[0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}$'
+                                THEN TRIM("po_date"::text)::date
+                        END
+                    ),
+                    'DD-MM-YYYY'
+                ) AS max_po_date,
+                TO_CHAR(
+                    MIN(
+                        CASE
+                            WHEN TRIM("po_date"::text) ~ '^[0-9]{{2}}-[0-9]{{2}}-[0-9]{{4}}$'
+                                THEN TO_DATE(TRIM("po_date"::text), 'DD-MM-YYYY')
+                            WHEN TRIM("po_date"::text) ~ '^[0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}$'
+                                THEN TRIM("po_date"::text)::date
+                        END
+                    ),
+                    'DD-MM-YYYY'
+                ) AS min_po_date
+            FROM pend_scope
+            ''',
+            [],
+        )
+        totals = totals_row[0] if totals_row else {
+            "pending_units": 0,
+            "pending_ltrs": 0,
+            "open_units": 0,
+            "open_ltrs": 0,
+            "open_pos": 0,
+            "rows": 0,
+            "max_po_date": None,
+            "min_po_date": None,
+        }
+
+        metric_cols = f'''
             {pending_units_expr} AS pending_units,
             {pending_ltrs_expr} AS pending_ltrs,
             COALESCE(SUM("order_qty"), 0) AS open_units,
             COALESCE(SUM("total_order_liters"), 0) AS open_ltrs,
-            COUNT(DISTINCT "po_number") AS open_pos,
-            COUNT(*) AS rows,
-            TO_CHAR(
-                MAX(
-                    CASE
-                        WHEN TRIM("po_date"::text) ~ '^[0-9]{{2}}-[0-9]{{2}}-[0-9]{{4}}$'
-                            THEN TO_DATE(TRIM("po_date"::text), 'DD-MM-YYYY')
-                        WHEN TRIM("po_date"::text) ~ '^[0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}$'
-                            THEN TRIM("po_date"::text)::date
-                    END
-                ),
-                'DD-MM-YYYY'
-            ) AS max_po_date,
-            TO_CHAR(
-                MIN(
-                    CASE
-                        WHEN TRIM("po_date"::text) ~ '^[0-9]{{2}}-[0-9]{{2}}-[0-9]{{4}}$'
-                            THEN TO_DATE(TRIM("po_date"::text), 'DD-MM-YYYY')
-                        WHEN TRIM("po_date"::text) ~ '^[0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}$'
-                            THEN TRIM("po_date"::text)::date
-                    END
-                ),
-                'DD-MM-YYYY'
-            ) AS min_po_date
-        FROM "master_po"
-        {full_where}
-        ''',
-        params,
-    )
-    totals = totals_row[0] if totals_row else {
-        "pending_units": 0,
-        "pending_ltrs": 0,
-        "open_units": 0,
-        "open_ltrs": 0,
-        "open_pos": 0,
-        "rows": 0,
-        "max_po_date": None,
-        "min_po_date": None,
-    }
+            COALESCE(SUM("total_order_amt_exclusive"), 0) AS order_value,
+            COUNT(DISTINCT "po_number") AS open_pos
+        '''
+        order_clause = "ORDER BY pending_ltrs DESC, pending_units DESC"
 
-    metric_cols = f'''
-        {pending_units_expr} AS pending_units,
-        {pending_ltrs_expr} AS pending_ltrs,
-        COALESCE(SUM("order_qty"), 0) AS open_units,
-        COALESCE(SUM("total_order_liters"), 0) AS open_ltrs,
-        COALESCE(SUM("total_order_amt_exclusive"), 0) AS order_value,
-        COUNT(DISTINCT "po_number") AS open_pos
-    '''
-    order_clause = "ORDER BY pending_ltrs DESC, pending_units DESC"
+        by_city = _dict_rows(
+            f'''
+            SELECT
+                COALESCE(NULLIF(TRIM("city"::text), ''), 'UNMAPPED') AS city,
+                {metric_cols}
+            FROM pend_scope
+            GROUP BY 1
+            {order_clause}
+            ''',
+            [],
+        )
 
-    by_city = _dict_rows(
-        f'''
-        SELECT
-            COALESCE(NULLIF(TRIM("city"::text), ''), 'UNMAPPED') AS city,
-            {metric_cols}
-        FROM "master_po"
-        {full_where}
-        GROUP BY 1
-        {order_clause}
-        ''',
-        params,
-    )
+        by_sku = _dict_rows(
+            f'''
+            SELECT
+                COALESCE(NULLIF(TRIM("sku_code"::text), ''), 'UNMAPPED') AS sku_code,
+                COALESCE(NULLIF(TRIM("sku_name"::text), ''), '-') AS sku_name,
+                COALESCE(NULLIF(TRIM("item"::text), ''), '-') AS item,
+                {metric_cols}
+            FROM pend_scope
+            GROUP BY 1, 2, 3
+            {order_clause}
+            ''',
+            [],
+        )
 
-    by_sku = _dict_rows(
-        f'''
-        SELECT
-            COALESCE(NULLIF(TRIM("sku_code"::text), ''), 'UNMAPPED') AS sku_code,
-            COALESCE(NULLIF(TRIM("sku_name"::text), ''), '-') AS sku_name,
-            COALESCE(NULLIF(TRIM("item"::text), ''), '-') AS item,
-            {metric_cols}
-        FROM "master_po"
-        {full_where}
-        GROUP BY 1, 2, 3
-        {order_clause}
-        ''',
-        params,
-    )
+        by_warehouse = _dict_rows(
+            f'''
+            SELECT
+                COALESCE(NULLIF(TRIM("location"::text), ''), 'UNMAPPED') AS warehouse,
+                {metric_cols}
+            FROM pend_scope
+            GROUP BY 1
+            {order_clause}
+            ''',
+            [],
+        )
 
-    by_warehouse = _dict_rows(
-        f'''
-        SELECT
-            COALESCE(NULLIF(TRIM("location"::text), ''), 'UNMAPPED') AS warehouse,
-            {metric_cols}
-        FROM "master_po"
-        {full_where}
-        GROUP BY 1
-        {order_clause}
-        ''',
-        params,
-    )
+        by_distributor = _dict_rows(
+            f'''
+            SELECT
+                COALESCE(NULLIF(TRIM("vendor_new"::text), ''), 'UNMAPPED') AS distributor,
+                {metric_cols}
+            FROM pend_scope
+            GROUP BY 1
+            {order_clause}
+            ''',
+            [],
+        )
 
-    by_distributor = _dict_rows(
-        f'''
-        SELECT
-            COALESCE(NULLIF(TRIM("vendor_new"::text), ''), 'UNMAPPED') AS distributor,
-            {metric_cols}
-        FROM "master_po"
-        {full_where}
-        GROUP BY 1
-        {order_clause}
-        ''',
-        params,
-    )
-
-    by_po = _dict_rows(
-        f'''
-        SELECT
-            COALESCE(NULLIF(TRIM("po_number"::text), ''), 'UNMAPPED') AS po_number,
-            MAX(NULLIF(TRIM("vendor_new"::text), '')) AS distributor,
-            MAX(NULLIF(TRIM("location"::text), '')) AS location,
-            TO_CHAR(
-                MAX(
-                    CASE
-                        WHEN TRIM("po_date"::text) ~ '^[0-9]{{2}}-[0-9]{{2}}-[0-9]{{4}}$'
-                            THEN TO_DATE(TRIM("po_date"::text), 'DD-MM-YYYY')
-                        WHEN TRIM("po_date"::text) ~ '^[0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}$'
-                            THEN TRIM("po_date"::text)::date
-                    END
-                ),
-                'DD-MM-YYYY'
-            ) AS po_date,
-            TO_CHAR(
-                MAX(
-                    CASE
-                        WHEN TRIM("po_expiry_date"::text) ~ '^[0-9]{{2}}-[0-9]{{2}}-[0-9]{{4}}$'
-                            THEN TO_DATE(TRIM("po_expiry_date"::text), 'DD-MM-YYYY')
-                        WHEN TRIM("po_expiry_date"::text) ~ '^[0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}$'
-                            THEN TRIM("po_expiry_date"::text)::date
-                    END
-                ),
-                'DD-MM-YYYY'
-            ) AS po_expiry_date,
-            {metric_cols}
-        FROM "master_po"
-        {full_where}
-        GROUP BY 1
-        {order_clause}
-        ''',
-        params,
-    )
+        by_po = _dict_rows(
+            f'''
+            SELECT
+                COALESCE(NULLIF(TRIM("po_number"::text), ''), 'UNMAPPED') AS po_number,
+                MAX(NULLIF(TRIM("vendor_new"::text), '')) AS distributor,
+                MAX(NULLIF(TRIM("location"::text), '')) AS location,
+                TO_CHAR(
+                    MAX(
+                        CASE
+                            WHEN TRIM("po_date"::text) ~ '^[0-9]{{2}}-[0-9]{{2}}-[0-9]{{4}}$'
+                                THEN TO_DATE(TRIM("po_date"::text), 'DD-MM-YYYY')
+                            WHEN TRIM("po_date"::text) ~ '^[0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}$'
+                                THEN TRIM("po_date"::text)::date
+                        END
+                    ),
+                    'DD-MM-YYYY'
+                ) AS po_date,
+                TO_CHAR(
+                    MAX(
+                        CASE
+                            WHEN TRIM("po_expiry_date"::text) ~ '^[0-9]{{2}}-[0-9]{{2}}-[0-9]{{4}}$'
+                                THEN TO_DATE(TRIM("po_expiry_date"::text), 'DD-MM-YYYY')
+                            WHEN TRIM("po_expiry_date"::text) ~ '^[0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}$'
+                                THEN TRIM("po_expiry_date"::text)::date
+                        END
+                    ),
+                    'DD-MM-YYYY'
+                ) AS po_expiry_date,
+                {metric_cols}
+            FROM pend_scope
+            GROUP BY 1
+            {order_clause}
+            ''',
+            [],
+        )
+    finally:
+        with connection.cursor() as cur:
+            cur.execute("DROP TABLE IF EXISTS pend_scope")
 
     _payload = {
         "platform": slug,
@@ -5512,15 +5531,15 @@ _ADS_SUMMARY_UNION = """
            END,
            item_head, category, sub_category, item,
            0::numeric, 0::numeric, 0::numeric, 0::numeric,
-           -- Total Qty Delivered = quantity. Total Sale = sales_amt_exc
-           -- (tax-exclusive) for every QC platform EXCEPT Flipkart, which uses
-           -- `amount` (its sales_amt_exc is 0 in SecMaster).
-           COALESCE(quantity, 0)::numeric,
-           CASE WHEN UPPER(TRIM(format::text)) = 'FLIPKART'
-                THEN COALESCE(amount, 0)
-                ELSE COALESCE(sales_amt_exc, 0) END::numeric,
+           -- Total Qty Delivered (sec_qty) and Total Sale (sec_value) are
+           -- pre-summed per (date, format, dims) in secmaster_ads_summary_mv
+           -- (migration 0065) with the SAME per-row casts the raw branch used, so
+           -- this scans ~1k rows instead of the ~853k-row secmaster_mv and the
+           -- outer per-dimension SUM is bit-identical to summing secmaster_mv.
+           sec_qty,
+           sec_value,
            0::numeric, year, month, date, FALSE, 'other'::text
-      FROM secmaster_mv
+      FROM secmaster_ads_summary_mv
 """
 
 # group_by key -> (column expression, display label). 'platform' groups by the
@@ -5537,7 +5556,7 @@ _ADS_SUMMARY_DIMENSION_KEYS = {key for key, _ in _ADS_SUMMARY_DIMENSIONS}
 
 @api_view(["GET"])
 @permission_classes([require("platform.stats.view")])
-@cached_get(timeout=600, prefix="plat.ads_summary")
+@cached_get(timeout=600, prefix="plat.ads_summary", shared=True)
 def marketing_ads_summary(request):
     """Cross-platform ads summary over the range ads views.
 
@@ -13215,6 +13234,7 @@ def landing_rate_list(request, slug: str):
 # platform, for autocomplete. Frontend lets the user add new SKUs too.
 @api_view(["GET"])
 @permission_classes([require("platform.landing_rate.view")])
+@cached_get(timeout=300, prefix="plat.landing_rate_skus")
 def landing_rate_skus(request, slug: str):
     _ensure_scope(request.user, slug)
     if slug not in _LANDING_PLATFORMS:

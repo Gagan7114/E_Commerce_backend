@@ -212,6 +212,19 @@ def refresh_secmaster_mv(min_interval_s: int = _SECMASTER_MIN_INTERVAL_S) -> boo
 
                 cur.execute("REFRESH MATERIALIZED VIEW public.secmaster_mv")
 
+                # Chained: the Ads-Summary pre-aggregate is derived from
+                # secmaster_mv (migration 0065), so rebuild it right after — under
+                # the same advisory lock — to keep the Ads Summary secondary
+                # numbers in step with the freshly-rebuilt secmaster_mv.
+                try:
+                    cur.execute("SELECT to_regclass('public.secmaster_ads_summary_mv')")
+                    if cur.fetchone()[0] is not None:
+                        cur.execute(
+                            "REFRESH MATERIALIZED VIEW public.secmaster_ads_summary_mv"
+                        )
+                except Exception:  # noqa: BLE001 - dependent refresh is best-effort
+                    logger.exception("Failed to refresh secmaster_ads_summary_mv")
+
                 try:
                     cur.execute(
                         "INSERT INTO matview_refresh_state (name, last_refreshed) "
@@ -266,6 +279,10 @@ def refresh_ads_master_mvs() -> bool:
     for mv in (
         "public.blinkit_ads_master_mv",
         "public.swiggy_ads_master_mv",
+        # Range ads masters for Zepto / BigBasket (Ads dashboards + Ads Summary) —
+        # migration 0063. Materialized for the same reason as blinkit/swiggy.
+        "public.zepto_ads_master_mv",
+        "public.bigbasket_ads_master_mv",
         # Per-day ads masters (Daily Ads dashboards) — migration 0055.
         "public.swiggyads_daily_master_mv",
         "public.zeptoads_daily_master_mv",
@@ -276,6 +293,36 @@ def refresh_ads_master_mvs() -> bool:
                 cur.execute("SELECT to_regclass(%s)", [mv])
                 if cur.fetchone()[0] is None:
                     # Migration 0060 not applied yet -> nothing to refresh.
+                    continue
+                cur.execute(f"REFRESH MATERIALIZED VIEW {mv}")
+            refreshed = True
+        except Exception:  # noqa: BLE001 - a refresh failure must not break callers
+            logger.exception("Failed to refresh %s", mv)
+    return refreshed
+
+
+def refresh_amazon_view_mvs() -> bool:
+    """Refresh the Amazon SOH/Secondary view matviews (migration 0063).
+
+    amazon_master_inventory_mv / amazon_sec_range_master_view_mv /
+    amazon_sec_daily_master_view_mv are materialized copies of views whose
+    per-read DISTINCT ON master_sheet + per-row math is too expensive to recompute
+    on every dashboard hit. Their sources (amazon_inventory / amazon_sec_range /
+    amazon_sec_daily / amazon_sec_range_margins / master_sheet) only change on
+    upload, so refreshing after uploads keeps the SOH/DOH + Ads Summary dashboards
+    current while making every read a cheap table scan. Best-effort; never raises.
+    Skips any matview that isn't present yet (migration not applied). Returns True
+    if at least one matview was refreshed."""
+    refreshed = False
+    for mv in (
+        "public.amazon_master_inventory_mv",
+        "public.amazon_sec_range_master_view_mv",
+        "public.amazon_sec_daily_master_view_mv",
+    ):
+        try:
+            with connection.cursor() as cur:
+                cur.execute("SELECT to_regclass(%s)", [mv])
+                if cur.fetchone()[0] is None:
                     continue
                 cur.execute(f"REFRESH MATERIALIZED VIEW {mv}")
             refreshed = True

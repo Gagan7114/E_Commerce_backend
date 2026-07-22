@@ -244,8 +244,18 @@ _SECMASTER_SOURCE_TABLES = frozenset({
 # category / per-litre enrichment).
 _ADS_MASTER_SOURCE_TABLES = frozenset({
     "blinkit_ads", "swiggy_ads", "ads_master_bs", "master_sheet",
+    # Range ads raw tables feeding the Zepto/BigBasket range ads matviews
+    # (migration 0063); monthly_landing_rate feeds their carry-forward rate.
+    "zepto_ads", "bigbasket_ads", "monthly_landing_rate",
     # Per-day ads raw tables feeding the Daily Ads matviews (migration 0055).
     "swiggyads_daily", "zeptoads_daily", "bigbasketads_daily",
+})
+# Tables feeding the Amazon SOH/DOH + Ads-Summary view matviews (migration 0063):
+# amazon_master_inventory_mv / amazon_sec_range_master_view_mv /
+# amazon_sec_daily_master_view_mv.
+_AMAZON_VIEWS_SOURCE_TABLES = frozenset({
+    "amazon_inventory", "amazon_sec_range", "amazon_sec_daily",
+    "amazon_sec_range_margins", "master_sheet",
 })
 
 # Serializes background refreshes so two near-simultaneous uploads don't run
@@ -256,13 +266,14 @@ _MATVIEW_REFRESH_LOCK = threading.Lock()
 
 def _refresh_matviews_async(
     do_master_po: bool, do_amazon_mp: bool, do_secmaster: bool = False,
-    do_ads_master: bool = False,
+    do_ads_master: bool = False, do_amazon_views: bool = False,
 ) -> None:
     """Refresh the dashboard matviews OFF the request thread so the upload
     responds immediately. The matviews still refresh (REFRESH recomputes the
     same rows — no data is changed or dropped); only the wait moves off the
     upload's response. The dashboard reflects the upload a few seconds later."""
-    if not (do_master_po or do_amazon_mp or do_secmaster or do_ads_master):
+    if not (do_master_po or do_amazon_mp or do_secmaster or do_ads_master
+            or do_amazon_views):
         return
 
     def _worker():
@@ -270,6 +281,7 @@ def _refresh_matviews_async(
         from platforms.master_po_refresh import (
             refresh_ads_master_mvs,
             refresh_amazon_mp_master,
+            refresh_amazon_view_mvs,
             refresh_master_po_mv,
             refresh_secmaster_mv,
         )
@@ -289,8 +301,12 @@ def _refresh_matviews_async(
                     refresh_master_po_mv()
                     cache.clear()
                 if do_ads_master:
-                    # Blinkit / Swiggy ADS dashboards.
+                    # Blinkit / Swiggy / Zepto / BigBasket ADS dashboards.
                     refresh_ads_master_mvs()
+                    cache.clear()
+                if do_amazon_views:
+                    # Amazon SOH/DOH + Ads Summary view matviews (migration 0063).
+                    refresh_amazon_view_mvs()
                     cache.clear()
                 if do_secmaster:
                     # ~10s rebuild for DRR / Secondary / Summary dashboards — run
@@ -324,8 +340,12 @@ def _clear_upload_dependent_cache(table: str | None = None) -> None:
     do_amazon_mp = table is None or table in _AMAZON_MP_SOURCE_TABLES
     do_secmaster = table is None or table in _SECMASTER_SOURCE_TABLES
     do_ads_master = table is None or table in _ADS_MASTER_SOURCE_TABLES
+    do_amazon_views = table is None or table in _AMAZON_VIEWS_SOURCE_TABLES
     try:
-        _refresh_matviews_async(do_master_po, do_amazon_mp, do_secmaster, do_ads_master)
+        _refresh_matviews_async(
+            do_master_po, do_amazon_mp, do_secmaster, do_ads_master,
+            do_amazon_views,
+        )
     except Exception:  # noqa: BLE001 - scheduling must never break an upload
         logger.exception("Failed to schedule dashboard matview refresh")
 
@@ -2485,12 +2505,68 @@ def _update_total_po_grn_dates(data: list[dict], target_table: str = "total_po")
     updated = 0
     created = 0
     failed = 0
+    blocked = 0
     last_error: str | None = None
+
+    # Blinkit-only hard block. A Blinkit GRN file carries only a date (no qty).
+    # If the PO has no delivered qty in the DB yet (Primary PO not loaded), the
+    # PO-completion rule (platforms.master_po_refresh.apply_po_completion_
+    # delivery_dates) NULLs the grn_date on the next matview refresh, so the
+    # upload would silently vanish. Reject those rows up front (block) — and warn
+    # — so the user uploads the Primary PO first. Scoped to Blinkit; every other
+    # platform's GRN carries its own qty and is never blocked.
+    is_blinkit = any(
+        str(row.get("format") or "").strip().upper() == "BLINKIT" for row in data
+    )
+    blinkit_blocked_pos: set[str] = set()
+    if is_blinkit:
+        uploaded_pos = sorted(
+            {str(row.get("po_number") or "").strip() for row in data if str(row.get("po_number") or "").strip()}
+        )
+        if uploaded_pos:
+            try:
+                with connection.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT po_number
+                        FROM total_po_zbs
+                        WHERE UPPER(TRIM(format::text)) = 'BLINKIT'
+                          AND po_number = ANY(%s)
+                        GROUP BY po_number
+                        HAVING COALESCE(SUM(delivered_qty), 0) = 0
+                        """,
+                        [uploaded_pos],
+                    )
+                    blinkit_blocked_pos = {str(r[0]).strip().lower() for r in cur.fetchall()}
+            except Exception:  # noqa: BLE001 - the block guard must never break the upload
+                blinkit_blocked_pos = set()
+        # A GRN row that itself supplies a positive delivered qty MAKES the PO
+        # delivered, so the vanishing-date problem doesn't apply — never block it.
+        # Only genuinely date-only rows (no qty) on a still-undelivered PO are the
+        # case we guard against. Drop any PO this upload delivers qty for. (This is
+        # why a sheet-sync GRN, which carries qty, correctly bypasses the block.)
+        if blinkit_blocked_pos:
+            qty_pos = {
+                str(row.get("po_number") or "").strip().lower()
+                for row in data
+                if _grn_qty(row.get("delivered_qty")) > 0
+            }
+            blinkit_blocked_pos -= qty_pos
+    blocked_hit: set[str] = set()
 
     if prepared:
         try:
             with transaction.atomic(), connection.cursor() as cur:
                 for row in prepared.values():
+                    # Blinkit hard block: a date-only GRN for a PO with no
+                    # delivered qty would be NULLed on refresh, so reject it here
+                    # rather than commit a doomed row. Primary-PO-first enforced.
+                    if is_blinkit:
+                        _blk_po = str(row.get("po_number") or "").strip()
+                        if _blk_po.lower() in blinkit_blocked_pos:
+                            blocked += 1
+                            blocked_hit.add(_blk_po)
+                            continue
                     # Zepto multi-receipt rows take the dedicated keyed upsert
                     # (update existing grn_code / claim base row / clone-insert).
                     if _is_zepto_grn_code_row(target_table, row, table_columns):
@@ -2602,9 +2678,23 @@ def _update_total_po_grn_dates(data: list[dict], target_table: str = "total_po")
             failed = len(prepared)
             last_error = str(exc)
 
-    skipped += max(0, len(prepared) - success)
+    skipped += max(0, len(prepared) - success - blocked)
     if updated or created:
         _clear_upload_dependent_cache(target_table)
+
+    # Report the Blinkit rows that were blocked above (rejected — not saved —
+    # because their PO has no delivered qty yet). Warn-level: the good rows still
+    # committed; only the doomed date-only rows were held back.
+    warnings: list[str] = []
+    if blocked_hit:
+        pos = sorted(blocked_hit)
+        shown = ", ".join(pos[:20])
+        more = f" …and {len(pos) - 20} more" if len(pos) > 20 else ""
+        warnings.append(
+            f"BLOCKED {len(pos)} Blinkit PO(s): no delivered qty yet, so the GRN date "
+            f"would not register. These rows were NOT saved — upload the Primary PO "
+            f"first, then re-upload this GRN. POs: {shown}{more}"
+        )
 
     return Response(
         {
@@ -2613,7 +2703,9 @@ def _update_total_po_grn_dates(data: list[dict], target_table: str = "total_po")
             "updated": updated,
             "skipped": skipped,
             "failed": failed,
+            "blocked": blocked,
             "error": last_error,
+            "warnings": warnings,
         }
     )
 
