@@ -36,7 +36,7 @@ UPLOAD_ALLOWED_TABLES = {
     # Inventory
     "blinkit_inventory", "zepto_inventory", "swiggy_inventory",
     "bigbasket_inventory", "jiomart_inventory", "amazon_inventory",
-    "zomato_inventory", "citymall_inventory",
+    "zomato_inventory", "citymall_inventory", "flipkart_grocery_inventory",
     # Secondary sells
     "blinkitSec", "zeptoSec", "swiggySec", "flipkartSec",
     "jiomartSec", "bigbasketSec", "amazon_sec_daily", "amazon_sec_range",
