@@ -1486,7 +1486,7 @@ def _transform_amazon_po(cur, upload_id: int) -> tuple[int, int]:
             year, item_head, city, state, distributor_margin,
             tax, brand, category_head, core_fresh_now, order_ltrs_cl,
             missed_ltrs, filled_ltrs, order_unit_cl, missed_unit, filled_units,
-            fill_rate, miss_rate, helper, upload_id, updated_at
+            fill_rate, miss_rate, remaining_qty, remaining_ltrs, helper, upload_id, updated_at
         )
         SELECT
             source_line_key,
@@ -1567,6 +1567,9 @@ def _transform_amazon_po(cur, upload_id: int) -> tuple[int, int]:
                 WHEN po_status_calc IN ('PENDING', 'MOV') THEN 0
                 ELSE 1 - (received_quantity / NULLIF(requested_quantity, 0))
             END AS miss_rate,
+            remaining_quantity AS remaining_qty,
+            CASE WHEN remaining_quantity IS NULL THEN NULL
+                 ELSE remaining_quantity * COALESCE(per_liter_calc, 0) END AS remaining_ltrs,
             CASE
                 WHEN LOWER(COALESCE(status, '')) = 'confirmed'
                      AND po_status_calc IN ('PENDING', 'MOV')
@@ -1635,6 +1638,8 @@ def _transform_amazon_po(cur, upload_id: int) -> tuple[int, int]:
             filled_units = EXCLUDED.filled_units,
             fill_rate = EXCLUDED.fill_rate,
             miss_rate = EXCLUDED.miss_rate,
+            remaining_qty = EXCLUDED.remaining_qty,
+            remaining_ltrs = EXCLUDED.remaining_ltrs,
             helper = EXCLUDED.helper,
             upload_id = EXCLUDED.upload_id,
             updated_at = now()
@@ -1778,6 +1783,8 @@ def refresh_amazon_po_from_master_sheet(cur, format_sku_codes=None, items=None) 
                    ELSE 0
                END,
                filled_ltrs = w.received_qty * COALESCE(w.per_liter_calc, 0),
+               remaining_ltrs = CASE WHEN a.remaining_qty IS NULL THEN NULL
+                                     ELSE a.remaining_qty * COALESCE(w.per_liter_calc, 0) END,
                updated_at = now()
           FROM winner w
          WHERE a.source_line_key = w.source_line_key
@@ -3344,29 +3351,11 @@ APPOINTMENT_REPORT_COLUMNS = (
     "year",
 )
 
-# Remaining QTY / Remaining LTR are computed on read from existing columns, so the
-# report never depends on stored columns (nor a migration to add them). Value =
-# the outstanding balance on a still-open partially-received line: Item Status =
-# SHORT SUPPLIED AND PO Status = PENDING (equivalently PENDING with
-# 0 < received < requested) -> shortfall, else 0, blank when PO Status is blank.
-_REMAINING_QTY_EXPR = """
-    CASE
-        WHEN COALESCE(NULLIF(TRIM(po_status), ''), '') = '' THEN NULL
-        WHEN UPPER(TRIM(po_status)) = 'PENDING'
-             AND COALESCE(received_qty, 0) > 0
-             AND COALESCE(received_qty, 0) < COALESCE(requested_qty, 0)
-            THEN accepted_qty - received_qty
-        ELSE 0
-    END"""
-_REMAINING_LTRS_EXPR = """
-    CASE
-        WHEN COALESCE(NULLIF(TRIM(po_status), ''), '') = '' THEN NULL
-        WHEN UPPER(TRIM(po_status)) = 'PENDING'
-             AND COALESCE(received_qty, 0) > 0
-             AND COALESCE(received_qty, 0) < COALESCE(requested_qty, 0)
-            THEN COALESCE(total_accepted_liters, 0) - COALESCE(total_delivered_liters, 0)
-        ELSE 0
-    END"""
+# Remaining QTY / Remaining LTR come straight from Amazon's uploaded
+# "Remaining quantity" (remaining_ltrs = remaining_qty * per_liter), populated on
+# the row by the Amazon-PO upload transform — read the stored columns directly.
+_REMAINING_QTY_EXPR = "remaining_qty"
+_REMAINING_LTRS_EXPR = "remaining_ltrs"
 
 
 @api_view(["GET"])

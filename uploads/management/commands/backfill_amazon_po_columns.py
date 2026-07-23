@@ -79,7 +79,10 @@ UPDATE {_AMAZON_PO}
                 AND COALESCE(received_qty, 0) < COALESCE(requested_qty, 0)
                THEN COALESCE(total_accepted_liters, 0) - COALESCE(total_delivered_liters, 0)
            ELSE 0
-       END;
+       END
+ -- Only fill historical rows that have no uploaded value; never clobber the
+ -- Amazon-sourced remaining_qty the upload transform now writes.
+ WHERE remaining_qty IS NULL;
 """
 
 
