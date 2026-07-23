@@ -58,7 +58,19 @@ _PAGE_SIZE_MAX = 100000  # export asks for everything in one go
 # Deliberately NOT the city_state_mapping table — that is a 127k locality list
 # (villages included) and would make any coverage % read as ~0. Echoed to the
 # frontend so the number lives in exactly one place.
+#
+# This all-India figure is only a sensible denominator for parcel-delivery
+# formats (Amazon / Amazon MP can ship to any town) and for the mixed
+# "All formats" view. Dark-store platforms only OPERATE in a limited city set
+# (Blinkit ~200, Zepto ~70, Big Basket ~46 clusters), so dividing their
+# covered cities by 7,935 read as "2.3% covered" and looked broken. When the
+# format filter selects only QC platforms the denominator switches to those
+# platforms' own city universe — see `_universe_denominator`.
 INDIA_TOTAL_CITIES = 7935
+
+# Formats whose reach is parcel shipping (any Indian town), not dark stores.
+# They keep the all-India denominator and never use the platform universe.
+_PARCEL_FORMATS = ("AMAZON", "AMAZON MP")
 
 _STATUSES = ("live", "selling", "stocked", "inactive")
 
@@ -305,6 +317,134 @@ def _base_sql(month, year, month_start, month_end, fmts, heads):
     return sql, params
 
 
+def _universe_cte_sql(fmts, has_upload_tbl):
+    """(sql, params) for a `uni(format, city)` CTE — the selected QC platforms'
+    serviceable-city universe.
+
+    Two sources, uploaded winning per platform:
+
+    * `up` — rows uploaded into platform_city_universe (the official operating
+      city list from each platform's seller portal). Authoritative when present.
+    * `der` — derived fallback: every city that platform has EVER shown in
+      secondary sales or an inventory snapshot (all months, not just the
+      selected one). Zero-maintenance, but it can only see our own footprint —
+      cities the platform serves where we never sold are invisible to it.
+
+    A platform with uploaded rows uses ONLY those; platforms without any use
+    the derived set. Cities go through the same canonicalisation as the main
+    report so covered-vs-universe subtraction lines up spelling-for-spelling.
+    Blinkit inventory locations get the warehouse→city cleanup for the same
+    reason."""
+    uni_city = _city_canon_sql("u.city")
+    sec_city = _city_canon_sql("s.city")
+    inv_city = (
+        "(CASE WHEN UPPER(TRIM(i.format::text)) = 'BLINKIT' "
+        f"THEN {_blinkit_city_sql('i.location')} "
+        f"ELSE {_city_canon_sql('i.location')} END)"
+    )
+    params = []
+    if has_upload_tbl:
+        up_sql = f"""
+        SELECT UPPER(TRIM(u.platform::text)) AS format, {uni_city} AS city
+        FROM public.platform_city_universe u
+        WHERE u.active
+          AND NULLIF(TRIM(u.city::text), '') IS NOT NULL
+          AND UPPER(TRIM(u.platform::text)) = ANY(%s)
+        GROUP BY 1, 2
+        """
+        params.append(fmts)
+    else:  # migration not applied yet — derived fallback only
+        up_sql = "SELECT NULL::text AS format, NULL::text AS city WHERE FALSE"
+    sql = f"""
+    WITH up AS ({up_sql}),
+    der AS (
+        SELECT UPPER(TRIM(s.format::text)) AS format, {sec_city} AS city
+        FROM secmaster_mv s
+        WHERE NULLIF(TRIM(s.city::text), '') IS NOT NULL
+          AND UPPER(TRIM(s.format::text)) = ANY(%s)
+        GROUP BY 1, 2
+        UNION
+        SELECT UPPER(TRIM(i.format::text)) AS format, {inv_city} AS city
+        FROM all_platform_inventory i
+        WHERE NULLIF(TRIM(i.location::text), '') IS NOT NULL
+          AND UPPER(TRIM(i.format::text)) = ANY(%s)
+        GROUP BY 1, 2
+    ),
+    uni AS (
+        SELECT format, city FROM up
+        UNION
+        SELECT format, city FROM der
+        WHERE der.format NOT IN (SELECT up2.format FROM up up2)
+    )
+    """
+    params += [fmts, fmts]
+    return sql, params
+
+
+def _universe_denominator(cur, fmts):
+    """(universe_total, universe_source) for the coverage cards.
+
+    Only kicks in when the format filter selects dark-store platforms
+    exclusively; "All formats", no filter, or any parcel format keeps the
+    all-India census denominator. `universe_source` tells the frontend what
+    the number is: 'india' | 'uploaded' | 'derived' | 'mixed' (some selected
+    platforms uploaded, the rest derived)."""
+    if not fmts or any(f in _PARCEL_FORMATS for f in fmts):
+        return INDIA_TOTAL_CITIES, "india"
+    cur.execute("SELECT to_regclass('public.platform_city_universe') IS NOT NULL")
+    has_upload_tbl = bool(cur.fetchone()[0])
+    cte, params = _universe_cte_sql(fmts, has_upload_tbl)
+    cur.execute(
+        cte + " SELECT COUNT(DISTINCT city),"
+        "        (SELECT COUNT(DISTINCT up3.format) FROM up up3)"
+        " FROM uni",
+        params,
+    )
+    total, uploaded_formats = cur.fetchone()
+    total = int(total or 0)
+    if total <= 0:  # nothing known about these platforms — census fallback
+        return INDIA_TOTAL_CITIES, "india"
+    if uploaded_formats >= len(fmts):
+        source = "uploaded"
+    elif uploaded_formats == 0:
+        source = "derived"
+    else:
+        source = "mixed"
+    return total, source
+
+
+_PENDING_CITIES_CAP = 300
+
+
+def _pending_cities(cur, fmts, has_upload_tbl, summary_where, summary_params):
+    """(cities, truncated, total) — universe cities with NO penetration row
+    this month, the actionable "pending" list behind the coverage card.
+    Uploaded universe ⇒ expansion whitespace; derived universe ⇒ cities we
+    sold in before but not now. Reads the pen_joined temp table, so the
+    covered side honours the same search/category filters as the summary
+    cards. `total` is the full set-difference count (the list is capped) —
+    used for the card instead of `universe - covered` arithmetic, which
+    undercounts when covered cities are missing from an uploaded universe."""
+    cte, params = _universe_cte_sql(fmts, has_upload_tbl)
+    pending_sql = (
+        " SELECT city FROM uni"
+        " EXCEPT"
+        " SELECT DISTINCT city FROM pen_joined"
+        " WHERE city IS NOT NULL" + summary_where
+    )
+    cur.execute(
+        cte + " SELECT COUNT(*) FROM (" + pending_sql + ") x",
+        params + summary_params,
+    )
+    total = int(cur.fetchone()[0] or 0)
+    cur.execute(
+        cte + pending_sql + " ORDER BY 1 LIMIT %s",
+        params + summary_params + [_PENDING_CITIES_CAP],
+    )
+    cities = [r[0] for r in cur.fetchall()]
+    return cities, total > len(cities), total
+
+
 @api_view(["GET"])
 @permission_classes([require("dashboard.view")])
 @cached_get(timeout=300, prefix="dash.penetration", shared=True)
@@ -399,16 +539,30 @@ def penetration_report(request):
             )
             (total, live, selling, stocked, inactive,
              cities, items, formats_n) = cur.fetchone()
-            covered_pct = min(round(cities / INDIA_TOTAL_CITIES * 100, 1), 100.0)
+            # Denominator: the selected platforms' own city universe when the
+            # filter is QC-only, the all-India census figure otherwise. An
+            # uploaded universe can be smaller than reality, so clamp at 100%.
+            universe_total, universe_source = _universe_denominator(cur, fmts)
+            covered_pct = min(round(cities / universe_total * 100, 1), 100.0)
             summary = {
                 "total": total, "live": live, "selling": selling,
                 "stocked": stocked, "inactive": inactive,
                 "cities": cities, "items": items, "formats": formats_n,
                 "india_cities_total": INDIA_TOTAL_CITIES,
-                "cities_pending": max(INDIA_TOTAL_CITIES - cities, 0),
+                "universe_total": universe_total,
+                "universe_source": universe_source,
+                "cities_pending": max(universe_total - cities, 0),
                 "covered_pct": covered_pct,
                 "pending_pct": round(100 - covered_pct, 1),
             }
+            if universe_source in ("uploaded", "derived", "mixed"):
+                pending, truncated, pending_total = _pending_cities(
+                    cur, fmts, universe_source != "derived",
+                    summary_where, summary_params,
+                )
+                summary["pending_cities"] = pending
+                summary["pending_cities_truncated"] = truncated
+                summary["cities_pending"] = pending_total
 
             if group_by:
                 # Roll up to one row per city (dim=city, count items per status)

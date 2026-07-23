@@ -81,6 +81,9 @@ UPLOAD_ALLOWED_TABLES = {
     # Vendor Central per-appointment commit (Carton/Unit count scraped from
     # Amazon appointment detail pages; upsert keyed on appointment_id).
     "appointment_commit",
+    # Platform city universe — official operating-city list per QC platform
+    # (Penetration Report coverage denominator; uploads migration 0084).
+    "platform_city_universe",
 }
 
 BATCH_SIZE = 1000
@@ -141,6 +144,9 @@ UPLOAD_FORCED_UNIQUE_KEYS = {
     "amazon_sec_daily": "business,asin,report_date",
     "amazon_inventory": "inventory_date,asin,business",
     "amazon_sec_city": "business,city,asin,from_date,to_date",
+    # City universe: one row per platform+city, matching the unique index
+    # from uploads migration 0084 — a re-upload updates state/active in place.
+    "platform_city_universe": "platform,city",
 }
 
 # Amazon upload tables whose unique key includes the `business` entity name.
@@ -2222,9 +2228,26 @@ def _update_existing_primary_upload_row(
     if not key_parts or not key_specs:
         return 0
 
+    # BIG BASKET never-overwrite guard: the BB primary PO file carries only
+    # order data — its delivery columns arrive blank. Re-uploading a PO after
+    # its GRN landed used to replace the whole row, so those blanks silently
+    # ERASED the delivered qty / GRN date the GRN upload had filled in
+    # (2026-07-23: a BB PO re-upload wiped 9 delivered POs, -9,638 qty, which
+    # then read as "never delivered" on the dashboards). A blank must never
+    # overwrite a filled value: drop blank delivery-fill columns from the
+    # UPDATE so the stored values survive; a real (non-blank) incoming value
+    # still overwrites normally. Scoped to BIG BASKET — Flipkart's flow already
+    # omits these columns client-side, and Blinkit's PO file legitimately
+    # carries its delivered qty (non-blank), which this guard never touches.
+    update_columns = list(columns)
+    if str(row.get("format") or "").strip().upper() == "BIG BASKET":
+        for column in ("delivered_qty", "grn_date", "status"):
+            if column in update_columns and not str(row.get(column) or "").strip():
+                update_columns.remove(column)
+
     assignments = ", ".join(
         f"{_quote_ident(column)} = %s"
-        for column in columns
+        for column in update_columns
     )
     where = " AND ".join(
         f"{_primary_upload_key_sql(spec)} = %s"
@@ -2233,7 +2256,7 @@ def _update_existing_primary_upload_row(
     cur.execute(
         f"UPDATE {_quote_ident(table)} AS t SET {assignments} WHERE {where}",
         [
-            *_upload_row_values(row, columns, column_types),
+            *_upload_row_values(row, update_columns, column_types),
             *key_parts,
         ],
     )

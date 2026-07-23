@@ -1605,6 +1605,27 @@ def pendency_dashboard(request, slug: str):
     raw_po_month = (request.query_params.get("po_month") or "").strip()
     raw_from = (request.query_params.get("from_date") or "").strip()
     raw_to = (request.query_params.get("to_date") or "").strip()
+    # `status=expired` flips the dashboard from open-PO pendency to the EXPIRED
+    # bucket: POs whose expiry date passed with nothing delivered (auto-expired
+    # by master_po_raw's fact-aware cascade). Same layout and metric shapes —
+    # an expired PO has delivered = 0 by definition, so the "pending" figures
+    # equal the full undelivered order qty. If a GRN lands later the cascade
+    # flips the PO to COMPLETED and it leaves this bucket automatically.
+    expired_mode = (request.query_params.get("status") or "").strip().lower() == "expired"
+
+    if expired_mode:
+        status_filter = (
+            " AND UPPER(TRIM(COALESCE(\"po_status\", \"status\", '')::text)) = 'EXPIRED'"
+        )
+    else:
+        # Match Primary Dashboard semantics: only OPEN POs; cancelled POs are
+        # never pending/open (even with no GRN yet). po_status is the
+        # normalized status; fall back to the raw status column.
+        status_filter = (
+            " AND UPPER(TRIM(\"open_close\"::text)) = 'OPEN'"
+            " AND UPPER(TRIM(COALESCE(\"po_status\", \"status\", '')::text))"
+            " NOT IN ('CANCELLED', 'CANCELED', 'CANCEL')"
+        )
 
     # No response cache here: the pendency dashboard must reflect uploads
     # immediately. It reads the master_po_mv materialized view (refreshed on
@@ -1639,10 +1660,9 @@ def pendency_dashboard(request, slug: str):
                     END
                 ) AS max_date
             FROM "master_po"
-            WHERE UPPER(TRIM("format"::text)) = %s
-              AND UPPER(TRIM("open_close"::text)) = 'OPEN'
-              AND UPPER(TRIM(COALESCE("po_status", "status", '')::text))
-                  NOT IN ('CANCELLED', 'CANCELED', 'CANCEL')
+            WHERE UPPER(TRIM("format"::text)) = %s'''
+            + status_filter
+            + '''
               AND "po_month" IS NOT NULL
               AND "po_year" IS NOT NULL
             GROUP BY 1, 2
@@ -1672,14 +1692,8 @@ def pendency_dashboard(request, slug: str):
             params.append(resolved_year)
 
     base_where = "WHERE " + " AND ".join(where_parts)
-    # Match Primary Dashboard semantics: only OPEN POs, pending = max(order - delivered, 0).
-    # Cancelled POs are never pending/open (even with no GRN yet), so drop them —
-    # po_status is the normalized status; fall back to the raw status column.
-    pending_filter = (
-        " AND UPPER(TRIM(\"open_close\"::text)) = 'OPEN'"
-        " AND UPPER(TRIM(COALESCE(\"po_status\", \"status\", '')::text))"
-        " NOT IN ('CANCELLED', 'CANCELED', 'CANCEL')"
-    )
+    # pending = max(order - delivered, 0); scope (OPEN vs EXPIRED) comes from
+    # the mode-dependent status_filter built above.
     # User-selected PO-date range (both YYYY-MM-DD) filters POs whose po_date
     # falls between the two dates.
     date_range_filter = ""
@@ -1692,7 +1706,7 @@ def pendency_dashboard(request, slug: str):
             "THEN TRIM(\"po_date\"::text)::date END) BETWEEN %s AND %s"
         )
         params.extend([raw_from, raw_to])
-    full_where = base_where + pending_filter + date_range_filter
+    full_where = base_where + status_filter + date_range_filter
 
     pending_units_expr = (
         'COALESCE(SUM(GREATEST('
@@ -1874,6 +1888,7 @@ def pendency_dashboard(request, slug: str):
     _payload = {
         "platform": slug,
         "format": fmt,
+        "status_mode": "expired" if expired_mode else "pending",
         "po_month": resolved_month,
         "year": resolved_year,
         "defaulted_to_latest": defaulted_to_latest,

@@ -7,7 +7,12 @@ PRIMARY_MASTER_PO_COLUMNS = (
     "delivery_date",
     "appointment_date",
     "vendor_name",
+    # Raw platform-reported status, immediately followed by the system-computed
+    # statuses (auto-expiry / any-delivery cascade) so a stale platform label
+    # like "Pending" on an expired PO is never read in isolation.
     "status",
+    "po_status",
+    "item_status",
     "remarks",
     "sku_code",
     "sku_name",
@@ -20,8 +25,6 @@ PRIMARY_MASTER_PO_COLUMNS = (
     "lead_time",
     "days_to_expiry",
     "po_window",
-    "po_status",
-    "item_status",
     "vendor_new",
     "item",
     "sap_sku_name",
