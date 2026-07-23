@@ -133,7 +133,66 @@ MASTER_SHEET_SEARCH_COLUMNS = [
 # uploader, and matches the (date, campaign_id) unique index (migration 0081).
 UPLOAD_FORCED_UNIQUE_KEYS = {
     "blinkit_ads": "date,campaign_id",
+    # Amazon tables: force the exact DB unique-index key so EVERY upload lane
+    # (Upload Hub UI and the automation CLI) upserts onto the same rows instead
+    # of relying on the client to send the right unique_key. Keys mirror the
+    # tables' unique indexes verbatim.
+    "amazon_sec_range": "business,asin,from_date,to_date",
+    "amazon_sec_daily": "business,asin,report_date",
+    "amazon_inventory": "inventory_date,asin,business",
+    "amazon_sec_city": "business,city,asin,from_date,to_date",
 }
+
+# Amazon upload tables whose unique key includes the `business` entity name.
+# Amazon renders legal entities with a trailing period ("Jivo Mart Private
+# Limited.") — the Upload Hub UI strips it while the automation CLI uploads it
+# verbatim, so the same entity landed under two spellings, splitting the upsert
+# key and double-counting every dashboard that reads these tables (seen
+# 2026-07-22, when the 01→20 July range snapshot was stored twice and the home
+# Secondary KPI doubled its Amazon litres). `_normalize_amazon_business_rows`
+# canonicalises the name at the single choke point every lane goes through.
+AMAZON_BUSINESS_KEY_TABLES = frozenset({
+    "amazon_sec_range",
+    "amazon_sec_daily",
+    "amazon_inventory",
+    "amazon_sec_city",
+})
+
+
+def _normalize_amazon_business_rows(table: str, data: list[dict]) -> int:
+    """Canonicalise key fields on Amazon upload rows in place.
+
+    - `business`: trim whitespace and strip any trailing period(s) — the Hub
+      convention ("Jivo Mart Private Limited." → "Jivo Mart Private Limited",
+      "JIVO WELLNESS PVT. LTD." → "JIVO WELLNESS PVT. LTD"). Interior periods
+      are preserved.
+    - `asin`: trim surrounding whitespace (never re-cased).
+
+    Returns the number of rows whose value(s) changed. No-op for tables whose
+    unique key doesn't include `business`.
+    """
+    if table not in AMAZON_BUSINESS_KEY_TABLES:
+        return 0
+    changed = 0
+    for row in data:
+        row_changed = False
+        raw = row.get("business")
+        if raw is not None:
+            cleaned = str(raw).strip()
+            while cleaned.endswith("."):
+                cleaned = cleaned[:-1].rstrip()
+            if cleaned != raw:
+                row["business"] = cleaned
+                row_changed = True
+        raw_asin = row.get("asin")
+        if raw_asin is not None:
+            cleaned_asin = str(raw_asin).strip()
+            if cleaned_asin != raw_asin:
+                row["asin"] = cleaned_asin
+                row_changed = True
+        if row_changed:
+            changed += 1
+    return changed
 
 PRIMARY_UPLOAD_REPLACE_KEYS = {
     # Primary PO rows are identified by platform PO + platform SKU. Status,
@@ -2998,6 +3057,15 @@ def _batch_upload(body, *, forced_table: str | None = None):
     format_error = _validate_primary_upload_format(table, data, expected_platform_format)
     if format_error is not None:
         return format_error
+
+    # Canonicalise Amazon business-entity names (and trim ASINs) before any
+    # dedupe/prune logic runs, so both upload lanes share one upsert key.
+    normalized_business = _normalize_amazon_business_rows(table, data)
+    if normalized_business:
+        logger.info(
+            "Normalized business/asin on %s row(s) for %s upload",
+            normalized_business, table,
+        )
 
     if table == "total_po_grn_update":
         return _update_total_po_grn_dates(data)
