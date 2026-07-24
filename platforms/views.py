@@ -10907,9 +10907,42 @@ def _swiggy_sec_dashboard_response(request):
         [current_rate_month, current_start, current_end],
     )
 
+    # Per-item-head trend (day / month / year) keyed by {all, premium,
+    # commodity} so the dashboard's Item Head dropdown filters the Trend chart —
+    # the same shape the other secondary platforms emit. Sourced from
+    # secmaster_mv (the same data that already backs Swiggy's DRR-derived trend),
+    # so the chart values are unchanged when "All" is selected and now respond to
+    # the Premium / Commodity selection.
+    days_in_month = monthrange(year, month)[1]
+    trend_max_date = _scalar(
+        """
+        SELECT MAX("date"::date)
+        FROM secmaster_mv
+        WHERE REGEXP_REPLACE(LOWER(TRIM("format"::text)), '[^a-z0-9]+', '', 'g') = 'swiggy'
+          AND EXTRACT(MONTH FROM "date"::date)::int = %s
+          AND EXTRACT(YEAR FROM "date"::date)::int = %s
+        """,
+        [month, year],
+    )
+    sec_trend = _build_sec_keyed_trend(
+        table="secmaster_mv",
+        date_col='"date"',
+        month=month,
+        year=year,
+        max_date=trend_max_date,
+        days_in_month=days_in_month,
+        value_expr='"sales_amt_exc"',
+        ltr_expr='"ltr_sold"',
+        qty_expr='"quantity"',
+        where_sql=_SECMASTER_FORMAT_WHERE,
+        where_params=["swiggy"],
+    )
+
     return Response({
         "source": "SecMaster",
         "format": "SWIGGY",
+        "sec_trend": sec_trend,
+        "days_in_month": days_in_month,
         "detail_rows_fixed": True,
         "defaulted_to_latest": defaulted_to_latest,
         "month": month,
