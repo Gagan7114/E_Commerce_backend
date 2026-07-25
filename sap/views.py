@@ -13,7 +13,7 @@ from rest_framework.response import Response
 from accounts.permissions import require
 from config.perf_cache import cached_get
 
-from .litres import is_litre_flag, per_unit_litre_map, row_litres
+from .litres import is_litre_flag, row_litres
 from .service import (
     FG_GROUP_NAME,
     FG_WAREHOUSE_CODES,
@@ -749,7 +749,8 @@ def inventory_overview(request):
             T1."MinStock",
             T1."MaxStock",
             T1."OnHand" * T0."LastPurPrc" AS "StockValue",
-            T0."U_IsLitre" AS "IsLitre"
+            T0."U_IsLitre" AS "IsLitre",
+            T0."SalPackUn"
         FROM OITM T0
         INNER JOIN OITW T1 ON T1."ItemCode" = T0."ItemCode"
         LEFT  JOIN OWHS T2 ON T2."WhsCode"  = T1."WhsCode"
@@ -761,12 +762,12 @@ def inventory_overview(request):
     data = _run(rows_sql, params or None, schema=schema)
 
     # Litres on hand per row. SAP stores OnHand as pieces and has no populated
-    # litres column, so we derive it: OnHand × litres-per-piece (SAP's own JM
-    # Primary Liter÷Qty, with a master_sheet fallback), gated on U_IsLitre.
-    litre_map = per_unit_litre_map(source)
+    # litres column, so we derive it: OnHand × OITM.SalPackUn — the same
+    # litres-per-unit factor the JM Primary procedure multiplies by — gated on
+    # U_IsLitre.
     for row in data:
         row["Litres"] = row_litres(
-            row.get("ItemCode"), row.get("OnHand"), row.get("IsLitre"), litre_map)
+            row.get("OnHand"), row.get("IsLitre"), row.get("SalPackUn"))
 
     # 2) Total row count for pagination footer
     count_sql = f"""
@@ -795,12 +796,13 @@ def inventory_overview(request):
     }
 
     # Total litres on hand over the FULL filtered set. OnHand is grouped per item
-    # (a bounded set) so we can multiply by the Python litres-per-piece map and
-    # sum. Coverage = share of litre-SKU units that have a factor, so the UI can
-    # flag the figure as an estimate when some litre SKUs are unmapped.
+    # so each item's units multiply by its own SalPackUn. Coverage = share of
+    # litre-SKU units that carry a SalPackUn; it is 100% today, so the UI only
+    # surfaces it if SAP master data loses a factor.
     litre_units_sql = f"""
         SELECT T0."ItemCode" AS "code",
                MAX(T0."U_IsLitre") AS "isl",
+               MAX(T0."SalPackUn") AS "spu",
                COALESCE(SUM(T1."OnHand"), 0) AS "oh"
         FROM OITM T0
         INNER JOIN OITW T1 ON T1."ItemCode" = T0."ItemCode"
@@ -816,8 +818,8 @@ def inventory_overview(request):
             continue
         oh = _num(lr.get("oh"))
         litre_units_total += oh
-        factor = litre_map.get(str(lr.get("code") or "").strip().upper())
-        if factor is not None:
+        factor = _num(lr.get("spu"))
+        if factor > 0:
             litre_units_covered += oh
             total_litres += oh * factor
     summary["total_litres_on_hand"] = round(total_litres, 2)
