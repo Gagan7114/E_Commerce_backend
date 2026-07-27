@@ -4265,15 +4265,27 @@ def _ads_build_where(request, *, allow_date: bool = True):
         # The `month` column stores uppercase names ('JUNE'). Also accept a
         # numeric month (1-12) — the sales/secondary endpoints take numbers, so
         # a client following that convention would otherwise get silent zeros.
-        if month_param.isdigit():
-            m = int(month_param)
-            if not 1 <= m <= 12:
-                raise ValidationError(
-                    f"Invalid month value: {month_param!r} (expected 1-12 or a month name)"
-                )
-            month_param = _month_name(m)
-        base_clauses.append("month = %s")
-        base_params.append(month_param)
+        # A comma-separated list ('MAY,JUNE') matches any of the given months —
+        # the Brand Fund dashboards expose a multi-month picker.
+        month_names: list[str] = []
+        for token in month_param.split(","):
+            token = token.strip()
+            if not token:
+                continue
+            if token.isdigit():
+                m = int(token)
+                if not 1 <= m <= 12:
+                    raise ValidationError(
+                        f"Invalid month value: {token!r} (expected 1-12 or a month name)"
+                    )
+                token = _month_name(m)
+            month_names.append(token)
+        if month_names:
+            base_clauses.append(
+                "month IN (" + ", ".join(["%s"] * len(month_names)) + ")"
+            )
+            base_params.extend(month_names)
+        month_param = ",".join(month_names)
 
     # Trend version starts from the base (year/month) clauses; a date filter is
     # added below.
@@ -5114,7 +5126,8 @@ def amazon_ads_total_sales(request, slug: str):
 # and indirect GMV separate. All share ad_spent, direct_qty_sold, ads_ltr_sold,
 # impressions.
 
-def _quick_commerce_metrics(*, gmv_field: str, include_indirect_qty: bool, include_indirect_gmv: bool):
+def _quick_commerce_metrics(*, gmv_field: str, include_indirect_qty: bool, include_indirect_gmv: bool,
+                            include_ads_sale: bool = False):
     """Build metric_specs for Swiggy/Zepto/BigBasket/Blinkit. Single source of
     truth so the schema stays in lockstep across the four platforms."""
     # The Direct/Indirect GMV columns are no longer surfaced in the ads
@@ -5123,6 +5136,8 @@ def _quick_commerce_metrics(*, gmv_field: str, include_indirect_qty: bool, inclu
     # ACOS still derive from the underlying GMV columns (kept in the views): when
     # indirect GMV is tracked separately (Blinkit only), the ROAS numerator sums
     # direct + indirect; ACOS uses `gmv_field` (direct) alone.
+    # `include_ads_sale` (Blinkit only) surfaces the ROAS numerator itself as an
+    # "Ads sale" column, placed right after Ad spent.
     roas_numerator = (
         f"(COALESCE(SUM({gmv_field}), 0) + COALESCE(SUM(indirect_gmv), 0))"
         if include_indirect_gmv
@@ -5146,6 +5161,10 @@ def _quick_commerce_metrics(*, gmv_field: str, include_indirect_qty: bool, inclu
         {"key": "direct_qty_sold", "label": "Direct qty sold", "format": "count",   "agg": "sum",
          "expr": "COALESCE(SUM(direct_qty_sold), 0)"},
     ]
+    if include_ads_sale:
+        # Right after Ad spent (index 0) so the table reads Ad spent → Ads sale.
+        specs.insert(1, {"key": "ads_sale", "label": "Ads sale", "format": "inr", "agg": "sum",
+                         "expr": roas_numerator})
     if include_indirect_qty:
         specs.append({"key": "indirect_qty_sold", "label": "Indirect qty sold", "format": "count", "agg": "sum",
                       "expr": "COALESCE(SUM(indirect_qty_sold), 0)"})
@@ -5363,9 +5382,10 @@ def blinkit_ads_dashboard(request, slug: str):
         dimension_label="Items",
         dimension_unmapped="(Unmapped)",
         # blinkit_ads_master has both `direct_gmv` and `indirect_gmv` — keep them separate.
-        metric_specs=_quick_commerce_metrics(gmv_field="direct_gmv", include_indirect_qty=True, include_indirect_gmv=True),
+        metric_specs=_quick_commerce_metrics(gmv_field="direct_gmv", include_indirect_qty=True, include_indirect_gmv=True,
+                                             include_ads_sale=True),
         default_metric_keys=_QC_DEFAULT_METRIC_KEYS,
-        default_visible_columns=[*_QC_DEFAULT_VISIBLE_COLUMNS, "indirect_qty_sold"],
+        default_visible_columns=[*_QC_DEFAULT_VISIBLE_COLUMNS, "ads_sale", "indirect_qty_sold"],
         spend_metric="ad_spent",
         revenue_metric="total_sale_basic_rate",
         where_sql=where_sql,
@@ -5374,6 +5394,218 @@ def blinkit_ads_dashboard(request, slug: str):
         trend_params=trend_params,
         filters=filters,
     ))
+
+
+def _report_ordinal_day(day: int) -> str:
+    if 11 <= day % 100 <= 13:
+        return f"{day}th"
+    return f"{day}{ {1: 'st', 2: 'nd', 3: 'rd'}.get(day % 10, 'th') }"
+
+
+def _report_month_label(year: int, month_num: int, through) -> str:
+    """"Jan-26" for complete months; "23rd July" (sheet style) when `through`
+    (the source's max data date) falls inside this month before month-end."""
+    if (
+        through is not None
+        and getattr(through, "year", None) == year
+        and getattr(through, "month", None) == month_num
+        and through.day < monthrange(year, month_num)[1]
+    ):
+        return f"{_report_ordinal_day(through.day)} {through.strftime('%B')}"
+    return f"{date(year, month_num, 1).strftime('%b')}-{str(year)[-2:]}"
+
+
+@api_view(["GET"])
+@permission_classes([require("platform.stats.view")])
+@cached_get(timeout=60, prefix="plat.blinkit_summary_report")
+def blinkit_summary_report(request, slug: str):
+    """Month-by-month Primary / Secondary report for the Blinkit Summary page.
+
+    Mirrors the offline tracking sheet: one row per month of the selected year.
+    Secondary rows combine SecMaster (sold litres / qty / MRP & basic sale) with
+    blinkit_ads_master (spend, GMV, ads qty, impressions, basic-rate ads sale)
+    and blinkit_brandfund_master. Primary rows aggregate master_po by delivery
+    month using the same normalized CTE as the Primary Dashboard.
+    """
+    _ensure_scope(request.user, slug)
+    if slug != "blinkit":
+        raise ValidationError("Summary monthly report is available only for Blinkit.")
+
+    today = timezone.localdate()
+    try:
+        year = int(request.query_params.get("year") or today.year)
+    except (TypeError, ValueError):
+        raise ValidationError("`year` must be an integer.")
+    if not 2000 <= year <= 2100:
+        raise ValidationError("`year` is out of range.")
+
+    sec_rows = _dict_rows(
+        """
+        SELECT
+            EXTRACT(MONTH FROM "date")::int AS month_num,
+            COALESCE(SUM("ltr_sold") FILTER (
+                WHERE UPPER(TRIM("item_head"::text)) = 'PREMIUM'), 0) AS premium_ltr,
+            COALESCE(SUM("ltr_sold") FILTER (
+                WHERE UPPER(TRIM("item_head"::text)) = 'COMMODITY'), 0) AS commodity_ltr,
+            COALESCE(SUM("ltr_sold"), 0) AS total_ltr,
+            COALESCE(SUM("quantity"), 0) AS total_qty,
+            -- `amount` carries blinkitSec.mrp, which is already the row's MRP
+            -- sale VALUE (not a unit price) — summing it reproduces the sheet's
+            -- "MRP Sale" column. `gmv` (= mrp × qty) over-multiplies; don't use.
+            COALESCE(SUM("amount"), 0) AS mrp_sale,
+            COALESCE(SUM("sales_amt_exc"), 0) AS basic_sale,
+            -- Landing-rate sale (= basic × 1.05) — the sheet's Paid / TCOS
+            -- ratio denominator; kept out of the table columns.
+            COALESCE(SUM("sales_amt"), 0) AS landing_sale,
+            MAX("date") AS max_date
+        FROM secmaster_mv
+        WHERE REGEXP_REPLACE(LOWER(TRIM("format"::text)), '[^a-z0-9]+', '', 'g') = 'blinkit'
+          AND "year"::numeric = %s
+        GROUP BY 1
+        """,
+        [year],
+    )
+    ads_rows = _dict_rows(
+        """
+        SELECT
+            EXTRACT(MONTH FROM "date")::int AS month_num,
+            COALESCE(SUM("ad_spent"), 0) AS ads_spend,
+            -- "Ads Sales SP" = GMV at selling price, direct + indirect (halo).
+            COALESCE(SUM(COALESCE("direct_gmv", 0) + COALESCE("indirect_gmv", 0)), 0) AS ads_sales_sp,
+            COALESCE(SUM(COALESCE("direct_qty_sold", 0) + COALESCE("indirect_qty_sold", 0)), 0) AS ads_qty,
+            COALESCE(SUM("impressions"), 0) AS impressions,
+            -- Direct ads qty × basic rate — the paid share of Basic Sale.
+            COALESCE(SUM("total_sale_basic_rate"), 0) AS ads_sale_basic
+        FROM blinkit_ads_master
+        WHERE "year" = %s
+        GROUP BY 1
+        """,
+        [year],
+    )
+    bf_rows = _dict_rows(
+        """
+        SELECT
+            EXTRACT(MONTH FROM "date")::int AS month_num,
+            COALESCE(SUM("brand_fund_spent"), 0) AS brand_fund
+        FROM blinkit_brandfund_master
+        WHERE "year" = %s
+        GROUP BY 1
+        """,
+        [year],
+    )
+    primary_rows = _dict_rows(
+        f"""
+        {_primary_master_po_cte("BLINKIT")}
+        SELECT
+            EXTRACT(MONTH FROM delivery_dt)::int AS month_num,
+            COALESCE(SUM(COALESCE(metric_delivered_liters, 0)) FILTER (
+                WHERE item_head_key = 'PREMIUM'), 0) AS premium_ltr,
+            COALESCE(SUM(COALESCE(metric_delivered_liters, 0)) FILTER (
+                WHERE item_head_key = 'COMMODITY'), 0) AS commodity_ltr,
+            COALESCE(SUM(COALESCE(metric_delivered_liters, 0)), 0) AS done_ltr,
+            COALESCE(SUM(COALESCE(metric_delivered_qty, 0)), 0) AS done_qty,
+            COALESCE(SUM(COALESCE(metric_delivered_value, 0)), 0) AS done_value,
+            COALESCE(SUM(COALESCE(metric_order_liters, 0)), 0) AS order_ltr,
+            COALESCE(SUM(COALESCE(metric_order_qty, 0)), 0) AS order_qty,
+            COALESCE(SUM(COALESCE(metric_order_value, 0)), 0) AS order_value,
+            MAX(delivery_dt) AS max_date
+        FROM normalized
+        WHERE delivery_year = %s
+          AND delivery_dt IS NOT NULL
+          AND delivery_dt <= %s
+        GROUP BY 1
+        """,
+        [year, today],
+    )
+
+    sec_by_m = {int(r["month_num"]): r for r in sec_rows if r.get("month_num")}
+    ads_by_m = {int(r["month_num"]): r for r in ads_rows if r.get("month_num")}
+    bf_by_m = {int(r["month_num"]): r for r in bf_rows if r.get("month_num")}
+    prim_by_m = {int(r["month_num"]): r for r in primary_rows if r.get("month_num")}
+
+    sec_through = max(
+        (r["max_date"] for r in sec_rows if r.get("max_date")), default=None
+    )
+    prim_through = max(
+        (r["max_date"] for r in primary_rows if r.get("max_date")), default=None
+    )
+
+    secondary = []
+    for m in range(1, 13):
+        s = sec_by_m.get(m, {})
+        a = ads_by_m.get(m, {})
+        b = bf_by_m.get(m, {})
+        total_ltr = _num(s.get("total_ltr"))
+        total_qty = _num(s.get("total_qty"))
+        mrp_sale = _num(s.get("mrp_sale"))
+        basic_sale = _num(s.get("basic_sale"))
+        landing_sale = _num(s.get("landing_sale"))
+        brand_fund = _num(b.get("brand_fund"))
+        ads_spend = _num(a.get("ads_spend"))
+        ads_sales_sp = _num(a.get("ads_sales_sp"))
+        ads_qty = _num(a.get("ads_qty"))
+        impressions = _num(a.get("impressions"))
+        if not any([total_ltr, total_qty, mrp_sale, basic_sale,
+                    brand_fund, ads_spend, impressions]):
+            continue
+        # Sheet formulas: Paid% = Ads Sales SP / landing-rate sale; TCOS =
+        # Ads Spend / landing-rate sale; ROAS = Ads Sales SP / Ads Spend.
+        paid_pct = (ads_sales_sp / landing_sale * 100) if landing_sale else None
+        secondary.append({
+            "month_num": m,
+            "label": _report_month_label(year, m, sec_through),
+            "premium_ltr": _num(s.get("premium_ltr")),
+            "commodity_ltr": _num(s.get("commodity_ltr")),
+            "total_ltr": total_ltr,
+            "total_qty": total_qty,
+            "brand_fund": brand_fund,
+            "ads_spend": ads_spend,
+            "ads_sales_sp": ads_sales_sp,
+            "ads_qty": ads_qty,
+            "impressions": impressions,
+            "mrp_sale": mrp_sale,
+            "basic_sale": basic_sale,
+            "paid_pct": paid_pct,
+            "organic_pct": (100 - paid_pct) if paid_pct is not None else None,
+            "roas": (ads_sales_sp / ads_spend) if ads_spend else None,
+            "tcos_pct": (ads_spend / landing_sale * 100) if landing_sale else None,
+        })
+
+    primary = []
+    for m in range(1, 13):
+        p = prim_by_m.get(m)
+        if not p:
+            continue
+        done_ltr = _num(p.get("done_ltr"))
+        order_ltr = _num(p.get("order_ltr"))
+        if not any([done_ltr, order_ltr, _num(p.get("done_qty")),
+                    _num(p.get("order_value"))]):
+            continue
+        primary.append({
+            "month_num": m,
+            "label": _report_month_label(year, m, prim_through),
+            "premium_ltr": _num(p.get("premium_ltr")),
+            "commodity_ltr": _num(p.get("commodity_ltr")),
+            "done_ltr": done_ltr,
+            "done_qty": _num(p.get("done_qty")),
+            "done_value": _num(p.get("done_value")),
+            "order_ltr": order_ltr,
+            "order_qty": _num(p.get("order_qty")),
+            "order_value": _num(p.get("order_value")),
+            "fill_pct": (done_ltr / order_ltr * 100) if order_ltr else None,
+        })
+
+    return Response({
+        "year": year,
+        "secondary": {
+            "rows": secondary,
+            "through": sec_through.isoformat() if sec_through else None,
+        },
+        "primary": {
+            "rows": primary,
+            "through": prim_through.isoformat() if prim_through else None,
+        },
+    })
 
 
 # ─── Marketing Ads Summary (cross-platform) ──────────────────────────────────
