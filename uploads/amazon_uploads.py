@@ -3518,12 +3518,20 @@ def amazon_po_sku_pendency(request):
     where: list[str] = [_SKU_PENDENCY_PENDING]
     params: list[Any] = []
 
-    # "Search ASIN" box — match across the columns that can hold the ASIN/SKU, so a
-    # search works whether the value lives in sku_code, asin, or merchant_sku.
+    # Global search box — one query matches any meaningful field, including every
+    # column that also has a dropdown (category / sub-category / channel / FC), so
+    # typing "canola", "DED5", "premium" or an ASIN all just work.
     search = str(q.get("search") or q.get("asin") or "").strip()
     if search:
-        where.append("(sku_code ILIKE %s OR asin ILIKE %s OR merchant_sku ILIKE %s)")
-        params.extend([f"%{search[:200]}%"] * 3)
+        where.append(
+            "("
+            "po_number ILIKE %s OR sku_code ILIKE %s OR asin ILIKE %s "
+            "OR merchant_sku ILIKE %s OR item ILIKE %s OR category ILIKE %s "
+            "OR sub_category ILIKE %s OR fulfillment_center ILIKE %s "
+            "OR core_fresh_now ILIKE %s OR item_head ILIKE %s"
+            ")"
+        )
+        params.extend([f"%{search[:200]}%"] * 10)
 
     _add_pendency_eq(where, params, "category", q.get("category"))
     _add_pendency_eq(where, params, "sub_category", q.get("sub_category"))
