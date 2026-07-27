@@ -81,9 +81,6 @@ UPLOAD_ALLOWED_TABLES = {
     # Vendor Central per-appointment commit (Carton/Unit count scraped from
     # Amazon appointment detail pages; upsert keyed on appointment_id).
     "appointment_commit",
-    # Platform city universe — official operating-city list per QC platform
-    # (Penetration Report coverage denominator; uploads migration 0084).
-    "platform_city_universe",
 }
 
 BATCH_SIZE = 1000
@@ -144,9 +141,6 @@ UPLOAD_FORCED_UNIQUE_KEYS = {
     "amazon_sec_daily": "business,asin,report_date",
     "amazon_inventory": "inventory_date,asin,business",
     "amazon_sec_city": "business,city,asin,from_date,to_date",
-    # City universe: one row per platform+city, matching the unique index
-    # from uploads migration 0084 — a re-upload updates state/active in place.
-    "platform_city_universe": "platform,city",
 }
 
 # Amazon upload tables whose unique key includes the `business` entity name.
