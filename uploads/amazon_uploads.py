@@ -3551,6 +3551,19 @@ def amazon_po_sku_pendency(request):
             page=page,
             page_size=page_size,
             offset=offset,
+            # Column totals across the WHOLE filtered pending set (not just the
+            # page) — shown as a totals row above the table, like Sheet Preview.
+            total_columns=(
+                "requested_qty",
+                "accepted_qty",
+                "received_qty",
+                "cancelled_qty",
+                "remaining_qty",
+                "total_order_liters",
+                "total_accepted_liters",
+                "total_delivered_liters",
+                "remaining_ltrs",
+            ),
         )
     )
 
