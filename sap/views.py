@@ -981,6 +981,11 @@ def inventory_warehouse_comparison(request):
 # code list (FG_WAREHOUSE_CODES, from sap.service). Cell = OnHand for that
 # item × warehouse. Includes a per-row Grand Total. Reads mart or oil schema
 # via ?source=.
+#
+# Cells stay in UNITS. The per-item conversion factors travel alongside instead
+# (`IsLitre` + `SalPackUn` for litres, `Price` for value), so the dashboard's
+# Units / Litres / Value toggle is pure client-side arithmetic — no refetch, and
+# the payload grows by three scalars per item rather than tripling.
 @api_view(["GET"])
 @permission_classes([require("sap.view")])
 @cached_get(timeout=120, prefix="sap.inventory_finished_goods")
@@ -996,6 +1001,9 @@ def inventory_finished_goods(request):
             T0."ItemName",
             T0."U_Sub_Group" AS "SubGroup",
             T0."U_Variety"   AS "Variety",
+            T0."U_IsLitre"   AS "IsLitre",
+            T0."SalPackUn"   AS "SalPackUn",
+            T0."LastPurPrc"  AS "Price",
             T1."WhsCode",
             COALESCE(SUM(T1."OnHand"), 0) AS "OnHand"
         FROM OITM T0
@@ -1004,7 +1012,8 @@ def inventory_finished_goods(request):
         WHERE UPPER(T3."ItmsGrpNam") = ?
           AND T1."WhsCode" IN ({placeholders})
         GROUP BY T0."ItemCode", T0."ItemName", T0."U_Sub_Group",
-                 T0."U_Variety", T1."WhsCode"
+                 T0."U_Variety", T0."U_IsLitre", T0."SalPackUn",
+                 T0."LastPurPrc", T1."WhsCode"
         """,
         params,
         schema=schema,
@@ -1021,6 +1030,12 @@ def inventory_finished_goods(request):
                 "ItemName": r.get("ItemName") or "",
                 "SubGroup": r.get("SubGroup") or "",
                 "Variety": r.get("Variety") or "",
+                # Conversion factors for the Units / Litres / Value toggle.
+                # SalPackUn is litres per unit but only means litres when
+                # U_IsLitre is 'Y' — packaging and seeds carry a SalPackUn too.
+                "IsLitre": is_litre_flag(r.get("IsLitre")),
+                "SalPackUn": _num(r.get("SalPackUn")),
+                "Price": _num(r.get("Price")),
                 "warehouses": {w: 0 for w in FG_WAREHOUSE_CODES},
                 "grand_total": 0,
             }
