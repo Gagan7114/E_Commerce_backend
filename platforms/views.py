@@ -87,7 +87,7 @@ def _drop_primary_normalized() -> None:
 _PRIMARY_CTE_STUB = "WITH _stub AS (SELECT 1)"
 
 _PRIMARY_DASHBOARD_CACHE_TTL = 60  # seconds
-_PRIMARY_DASHBOARD_CACHE_VERSION = 23  # +open_po_total (all-months open-PO backlog)
+_PRIMARY_DASHBOARD_CACHE_VERSION = 24  # Amazon Pending LTRS -> true remaining_ltrs (was full order of open POs)
 
 
 # Platforms hidden from the whole app. Kept in code/DB (not deleted), but the
@@ -1056,6 +1056,10 @@ _AMAZON_PRIMARY_METRIC_SQL = """
         THEN COALESCE(total_requested_cost, 0) ELSE 0 END), 0) AS pending_value,
     COALESCE(SUM(CASE WHEN status_key = 'PENDING' AND item_head_key <> 'OTHER'
         THEN COALESCE(order_ltrs_cl, total_order_liters, 0) ELSE 0 END), 0) AS pending_ltrs,
+    -- Remaining LTRS card: the TRUE remaining balance (remaining_qty x per_liter,
+    -- from the Amazon upload) of still-PENDING POs — reconciles with SKU PO Pendency.
+    COALESCE(SUM(CASE WHEN status_key = 'PENDING' AND item_head_key <> 'OTHER'
+        THEN COALESCE(remaining_ltrs, 0) ELSE 0 END), 0) AS remaining_ltrs,
     COALESCE(SUM(CASE WHEN status_key = 'PENDING'
         THEN COALESCE(order_unit_cl, requested_qty, 0) ELSE 0 END), 0) AS pending_qty,
     COALESCE(SUM(CASE WHEN status_key = 'EXPIRED'
@@ -7170,6 +7174,7 @@ def _primary_zero_metrics() -> dict:
         "projection_value": 0.0,
         "projection_ltrs": 0.0,
         "projection_qty": 0.0,
+        "remaining_ltrs": 0.0,
     }
 
 
@@ -7194,6 +7199,7 @@ def _primary_metrics(row: dict | None) -> dict:
             "projection_value",
             "projection_ltrs",
             "projection_qty",
+            "remaining_ltrs",
         ):
             metrics[key] = _num(row.get(key))
     metrics["dp_value"] = metrics["done_value"] + metrics["pending_value"]
