@@ -29,9 +29,10 @@ from django.utils import timezone
 from rest_framework import status
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.exceptions import PermissionDenied
+from rest_framework.permissions import BasePermission
 from rest_framework.response import Response
 
-from accounts.permissions import can_access_platform, require
+from accounts.permissions import can_access_platform, has_permission_code, require
 from config.perf_cache import cached_get
 
 try:
@@ -3443,6 +3444,138 @@ def amazon_po_report(request):
                 "total_received_cost",
             ),
         )
+    )
+
+
+# ── SKU PO Pendency ─────────────────────────────────────────────────────────
+# One shared "pending PO" view surfaced in TWO places: the Amazon PO area
+# (Primary → Amazon → under New PO) and the Shipment Planner (after Appointment).
+# Same endpoint, same data — mirrors the source sheet formula:
+#   FILTER(Amazon_PO, SKU Code = search, channel ∈ {ALL, x}, FC ∈ {ALL, x},
+#          PO Status = "Pending")
+# picking sheet columns 1,2,3,7,26,14,51,43,9,10,11,12,13,36,37,38,25.
+
+
+class _CanViewSkuPendency(BasePermission):
+    """SKU PO Pendency lives in both the Amazon PO area and the Shipment Planner,
+    so allow either audience: whoever can view PO data (`platform.po.view`) OR the
+    Shipment Planner (`amazon.shipment_planning.view`). Superusers pass through
+    has_permission_code."""
+
+    message = "You do not have access to SKU PO Pendency."
+
+    def has_permission(self, request, view) -> bool:
+        user = getattr(request, "user", None)
+        return has_permission_code(user, "platform.po.view") or has_permission_code(
+            user, "amazon.shipment_planning.view"
+        )
+
+
+# The exact 17 columns the pendency sheet shows, in order (header → db column):
+#   PO Number, Po Date, Expiry Date, SKU Code, ITEM, FC, TYPE, ITEM HEAD,
+#   Ordered/Accepted/Received/Cancelled/Remaining QTY,
+#   Ordered/Accepted/Delivered/Remaining LTR.
+SKU_PENDENCY_COLUMNS = (
+    "po_number",
+    "order_date",
+    "expiry_date",
+    "sku_code",
+    "item",
+    "fulfillment_center",
+    "core_fresh_now",
+    "item_head",
+    "requested_qty",
+    "accepted_qty",
+    "received_qty",
+    "cancelled_qty",
+    "remaining_qty",
+    "total_order_liters",
+    "total_accepted_liters",
+    "total_delivered_liters",
+    "remaining_ltrs",
+)
+
+# PENDING is the whole point of a "pendency" list (mirrors TRIM(PO Status)="Pending").
+_SKU_PENDENCY_PENDING = "UPPER(TRIM(COALESCE(po_status, ''))) = 'PENDING'"
+
+
+def _add_pendency_eq(
+    where: list[str], params: list[Any], column_sql: str, value: str | None
+) -> None:
+    """Exact, case/space-insensitive dropdown filter. Blank or 'ALL' = no filter."""
+    text = str(value or "").strip()
+    if text and text.upper() != "ALL":
+        where.append(f"UPPER(TRIM(COALESCE({column_sql}::text, ''))) = %s")
+        params.append(text.upper())
+
+
+@api_view(["GET"])
+@permission_classes([_CanViewSkuPendency])
+@cached_get(timeout=60, prefix="amzpo.sku_pendency")
+def amazon_po_sku_pendency(request):
+    page, page_size, offset = _page_params(request)
+    q = request.query_params
+    where: list[str] = [_SKU_PENDENCY_PENDING]
+    params: list[Any] = []
+
+    # "Search ASIN" box — match across the columns that can hold the ASIN/SKU, so a
+    # search works whether the value lives in sku_code, asin, or merchant_sku.
+    search = str(q.get("search") or q.get("asin") or "").strip()
+    if search:
+        where.append("(sku_code ILIKE %s OR asin ILIKE %s OR merchant_sku ILIKE %s)")
+        params.extend([f"%{search[:200]}%"] * 3)
+
+    _add_pendency_eq(where, params, "category", q.get("category"))
+    _add_pendency_eq(where, params, "sub_category", q.get("sub_category"))
+    _add_pendency_eq(where, params, "core_fresh_now", q.get("channel") or q.get("core_fresh_now"))
+    _add_pendency_eq(
+        where, params, "fulfillment_center", q.get("fulfillment_center") or q.get("fc")
+    )
+
+    return Response(
+        _paginated_select(
+            table_sql='reporting."Amazon PO"',
+            columns=SKU_PENDENCY_COLUMNS,
+            where=where,
+            params=params,
+            # Soonest-to-expire first — the rows that matter most in a pendency view.
+            order_sql="ORDER BY expiry_date ASC NULLS LAST, po_number ASC",
+            page=page,
+            page_size=page_size,
+            offset=offset,
+        )
+    )
+
+
+@api_view(["GET"])
+@permission_classes([_CanViewSkuPendency])
+@cached_get(timeout=300, prefix="amzpo.sku_pendency_options")
+def amazon_po_sku_pendency_options(request):
+    # Dropdown values, sourced only from PENDING rows so the filters never offer a
+    # value that would return nothing.
+    def _distinct(column_sql: str, upper: bool = False) -> list[str]:
+        expr = f"UPPER(TRIM({column_sql}::text))" if upper else f"TRIM({column_sql}::text)"
+        with connection.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT DISTINCT {expr} AS value
+                  FROM reporting."Amazon PO"
+                 WHERE {_SKU_PENDENCY_PENDING}
+                   AND {column_sql} IS NOT NULL
+                   AND TRIM({column_sql}::text) != ''
+                 ORDER BY value ASC
+                 LIMIT 5000
+                """
+            )
+            return [row[0] for row in cur.fetchall() if row[0]]
+
+    return Response(
+        {
+            "categories": _distinct("category"),
+            "sub_categories": _distinct("sub_category"),
+            "channels": _distinct("core_fresh_now", upper=True),
+            "fulfillment_centers": _distinct("fulfillment_center"),
+        }
     )
 
 

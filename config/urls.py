@@ -26,6 +26,16 @@ urlpatterns = [
     path("api/reports/columns", platform_reports.report_columns, name="reports-columns"),
     path("api/reports/amazon-po/matrix", amazon_uploads.amazon_po_matrix, name="amazon-po-matrix"),
     path("api/reports/amazon-po/new-po", amazon_uploads.amazon_po_new_po_dashboard, name="amazon-po-new-po"),
+    path(
+        "api/reports/amazon-po/sku-pendency/filter-options",
+        amazon_uploads.amazon_po_sku_pendency_options,
+        name="amazon-po-sku-pendency-options",
+    ),
+    path(
+        "api/reports/amazon-po/sku-pendency",
+        amazon_uploads.amazon_po_sku_pendency,
+        name="amazon-po-sku-pendency",
+    ),
     path("api/reports/amazon-po", amazon_uploads.amazon_po_report, name="amazon-po-report"),
     path(
         "api/reports/amazon-po/filter-options",
