@@ -22,6 +22,42 @@ class User(AbstractUser):
         return self.email
 
 
+class FeatureFlag(models.Model):
+    """A global on/off switch owned by holders of `profile_controls.manage`.
+
+    These are server-side, not a per-browser preference, because the owner's
+    choice has to apply to EVERY user: turning Game Play off must stop everyone
+    else playing, and turning Uploader off must stop everyone else uploading.
+
+    A MISSING row means enabled. That is the app's behaviour from before the
+    switches existed, so a fresh database — or a read that fails — leaves both
+    features working rather than silently locking them.
+    """
+
+    UPLOADER = "uploader"
+    GAME_PLAY = "game_play"
+    KEYS = (UPLOADER, GAME_PLAY)
+
+    key = models.CharField(max_length=64, unique=True)
+    is_enabled = models.BooleanField(default=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    # Who flipped it last — kept for the audit trail, cleared if that account is
+    # ever deleted (the flag itself must survive).
+    updated_by = models.ForeignKey(
+        "accounts.User",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="feature_flag_updates",
+    )
+
+    class Meta:
+        ordering = ["key"]
+
+    def __str__(self) -> str:
+        return f"{self.key}={'on' if self.is_enabled else 'off'}"
+
+
 class InventoryDohNotification(models.Model):
     ALERT_TYPE = "INVENTORY_DOH_LOW"
 
