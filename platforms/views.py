@@ -4374,9 +4374,22 @@ def _ads_dashboard_payload(
     # (max) date only — for EVERY metric, including the ratios: recomputing
     # e.g. SUM(gmv)/SUM(spend) at `date = max_date` yields the ratio of the
     # max-date totals, so ROAS/ACOS stay consistent with the spend/GMV shown.
-    # Breakdown + trend are intentionally left as range data.
+    # The plain BREAKDOWN is pinned to the same latest snapshot (see step 2) so
+    # its rows add up to the Total row; only the trend stays range data (each
+    # date is one cumulative point on the line).
     if summary_use_max_date:
         summary_max_date_keys = [spec["key"] for spec in metric_specs]
+        # Month-wise on a cumulative source: a month's true total is its LATEST
+        # snapshot, not the sum of its snapshots — keep only each month's
+        # max-date rows for the month-wise summary, breakdown and trend.
+        if month_wise:
+            mw_where = (mw_where + " AND " if mw_where else "WHERE ") + (
+                f"(month, date) IN (SELECT month, MAX(date) FROM {source} "
+                + ("WHERE year = %s " if mw_year else "")
+                + "GROUP BY month)"
+            )
+            if mw_year:
+                mw_params = mw_params + [int(mw_year)]
 
     # Inline the unmapped-placeholder literal so we don't have to manage
     # param ordering with the GROUP BY.
@@ -4451,15 +4464,25 @@ def _ads_dashboard_payload(
             if hasattr(r.get("row_date"), "isoformat"):
                 r["row_date"] = r["row_date"].isoformat()
     else:
+        # Cumulative range-snapshot sources: summing a dimension across snapshot
+        # dates counts the same rupees once per upload (~one× per snapshot), so
+        # a single item could read bigger than the max-date Total row. Pin the
+        # breakdown to the SAME latest snapshot the summary/KPIs use — the rows
+        # then add up to the Total. max_date already respects the caller's
+        # month/year/date filters (it comes from the filtered summary above).
+        bd_where, bd_params = where_sql, params
+        if summary_use_max_date and max_date:
+            bd_where = (where_sql + " AND " if where_sql else "WHERE ") + "date = %s::date"
+            bd_params = list(params) + [max_date]
         breakdown_rows = _dict_rows(
             f"""
             SELECT {dim_expr} AS dimension, {metric_select_sql}
             FROM {source}
-            {where_sql}
+            {bd_where}
             GROUP BY {dim_expr}
             ORDER BY {spend_alias} DESC NULLS LAST
             """,
-            params,
+            bd_params,
         )
 
     # 3) Trend by date. Includes a value-per-metric column so the frontend can
