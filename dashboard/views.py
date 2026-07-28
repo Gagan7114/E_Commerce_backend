@@ -928,9 +928,11 @@ def _state_periods(request, today):
 
     Single mode (back-compat): one period from ?month/?year. Range mode: every
     month from from_month/from_year to to_month/to_year inclusive — triggered when
-    both from_month and to_month are supplied — capped at 36 months. Returns
-    (mode, periods, echo) where `echo` is the month fields to mirror back to the
-    client (month/year for single; from_*/to_* for range)."""
+    both from_month and to_month are supplied — capped at 36 months. Multi mode:
+    an explicit set of months within ?year (?months=2&months=4&months=7 — the
+    map's month checkbox picker). Returns (mode, periods, echo) where `echo` is
+    the month fields to mirror back to the client (month/year for single;
+    from_*/to_* for range; months/year for multi)."""
     def _int(name, default):
         try:
             return int(request.GET.get(name) or default)
@@ -962,6 +964,20 @@ def _state_periods(request, today):
             "to_month": (end % 12) + 1, "to_year": end // 12,
         }
         return "range", periods, echo
+
+    raw_months = []
+    for v in request.GET.getlist("months"):
+        try:
+            raw_months.append(int(v))
+        except (TypeError, ValueError):
+            continue
+    months = sorted({m for m in raw_months if 1 <= m <= 12})
+    if months:
+        return (
+            "multi",
+            [(year, mn) for mn in months],
+            {"months": months, "year": year},
+        )
     return "single", [(year, month_num)], {"month": month_num, "year": year}
 
 
