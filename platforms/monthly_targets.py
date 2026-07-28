@@ -1728,6 +1728,23 @@ def secondary_dashboard_result(user, month, year, only_slugs=None):
         year,
     )
 
+    # The DATE column is compared by users against the platform dashboard's
+    # Max Date, so it must be identical on the PREMIUM and COMMODITY tabs. The
+    # refresh write path already overrides the per-item-head source date with
+    # the platform-wide max (_read_platform_latest_date); apply the same
+    # override here so the display path can't show e.g. Flipkart PREMIUM
+    # 25-07 / COMMODITY 24-07 just because one item head had no sales on the
+    # latest day. Only flipkart / flipkart_grocery resolve a platform date;
+    # every other slug returns None and keeps its per-item-head date.
+    platform_dates: dict[str, date] = {}
+    for slug in ordered:
+        p = platforms.get(slug)
+        if not p:
+            continue
+        d = _read_platform_latest_date(slug, _format_for(p), month, year)
+        if d:
+            platform_dates[slug] = d
+
     result = {}
     for item_head in DASHBOARD_ITEM_HEADS:
         params = [month, year, item_head] + formats
@@ -1756,6 +1773,16 @@ def secondary_dashboard_result(user, month, year, only_slugs=None):
             fmt_key = _format_key(fmt)
             row = by_format.get(fmt.lower())
             source = source_map.get((fmt_key, _format_key(item_head)))
+            platform_date = platform_dates.get(slug)
+            if platform_date:
+                if source:
+                    source = dict(source, latest_date=platform_date)
+                else:
+                    source = {
+                        "done_ltrs": Decimal(0),
+                        "done_value": None,
+                        "latest_date": platform_date,
+                    }
             # Amazon MP shares one target across the Primary and Secondary
             # sheets, stored only in primary_month_targets. If there is no
             # Secondary row, fall back to that shared Primary target so the MP
