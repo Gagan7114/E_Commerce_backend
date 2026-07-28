@@ -3378,10 +3378,7 @@ def _batch_upload(body, *, forced_table: str | None = None):
         "warnings": [
             f"Landing rate missing for {r['item']}, {r['month_label']} ({r['rows']} rows)"
             for r in missing_rates
-        ] + ([
-            "New cities without a known state (add them in Pincode Mapping to "
-            "show on the map): " + ", ".join(pincode_sync["unmapped"])
-        ] if pincode_sync and pincode_sync.get("unmapped") else []),
+        ],
         "missing_rates": missing_rates,
         "pincode_sync": pincode_sync,
         "pruned_ranges": pruned_ranges,
