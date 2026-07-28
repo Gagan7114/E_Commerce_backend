@@ -87,7 +87,7 @@ def _drop_primary_normalized() -> None:
 _PRIMARY_CTE_STUB = "WITH _stub AS (SELECT 1)"
 
 _PRIMARY_DASHBOARD_CACHE_TTL = 60  # seconds
-_PRIMARY_DASHBOARD_CACHE_VERSION = 25  # Amazon Pending LTRS -> net (Order − Deliver) so cards reconcile; + Remaining LTRS field
+_PRIMARY_DASHBOARD_CACHE_VERSION = 26  # Amazon Pending LTRS -> gross (SUM Total Order Liters WHERE PENDING), matching the source sheet
 
 
 # Platforms hidden from the whole app. Kept in code/DB (not deleted), but the
@@ -1052,28 +1052,18 @@ _AMAZON_PRIMARY_METRIC_SQL = """
     COALESCE(SUM(CASE WHEN item_head_key = 'OTHER'
         THEN 0 ELSE COALESCE(total_delivered_liters, 0) END), 0) AS done_ltrs,
     COALESCE(SUM(COALESCE(received_qty, 0)), 0) AS done_qty,
-    -- Pending = NET undelivered (Order − Deliver) so the KPI cards reconcile
-    -- exactly: Order = Deliver + Pending. (Not the gross open-PO order backlog;
-    -- the true "still to deliver" on open POs is the separate remaining_ltrs.)
-    COALESCE(SUM(
-        (CASE WHEN status_key NOT IN ('CANCELLED', 'CANCELED', 'CANCEL', 'MOV')
-              THEN COALESCE(total_requested_cost, 0) ELSE 0 END)
-        - COALESCE(total_received_cost, 0)
-    ), 0) AS pending_value,
-    COALESCE(SUM(
-        (CASE WHEN status_key NOT IN ('CANCELLED', 'CANCELED', 'CANCEL', 'MOV') AND item_head_key <> 'OTHER'
-              THEN COALESCE(order_ltrs_cl, total_order_liters, 0) ELSE 0 END)
-        - (CASE WHEN item_head_key = 'OTHER' THEN 0 ELSE COALESCE(total_delivered_liters, 0) END)
-    ), 0) AS pending_ltrs,
+    -- Pending = GROSS order of PENDING POs, matching the source sheet's
+    -- SUMIFS("Total Order Liters" AJ, ..., PO Status = "PENDING") per head/month/year.
+    COALESCE(SUM(CASE WHEN status_key = 'PENDING'
+        THEN COALESCE(total_requested_cost, 0) ELSE 0 END), 0) AS pending_value,
+    COALESCE(SUM(CASE WHEN status_key = 'PENDING' AND item_head_key <> 'OTHER'
+        THEN COALESCE(total_order_liters, order_ltrs_cl, 0) ELSE 0 END), 0) AS pending_ltrs,
     -- Remaining LTRS card: the TRUE remaining balance (remaining_qty x per_liter,
     -- from the Amazon upload) of still-PENDING POs — reconciles with SKU PO Pendency.
     COALESCE(SUM(CASE WHEN status_key = 'PENDING' AND item_head_key <> 'OTHER'
         THEN COALESCE(remaining_ltrs, 0) ELSE 0 END), 0) AS remaining_ltrs,
-    COALESCE(SUM(
-        (CASE WHEN status_key NOT IN ('CANCELLED', 'CANCELED', 'CANCEL', 'MOV')
-              THEN COALESCE(order_unit_cl, requested_qty, 0) ELSE 0 END)
-        - COALESCE(received_qty, 0)
-    ), 0) AS pending_qty,
+    COALESCE(SUM(CASE WHEN status_key = 'PENDING'
+        THEN COALESCE(order_unit_cl, requested_qty, 0) ELSE 0 END), 0) AS pending_qty,
     COALESCE(SUM(CASE WHEN status_key = 'EXPIRED'
         THEN COALESCE(total_requested_cost, 0) ELSE 0 END), 0) AS expired_value,
     COALESCE(SUM(CASE WHEN status_key IN ('CANCELLED', 'MOV')
