@@ -4180,8 +4180,144 @@ def platform_expiry_alerts(request):
                 })
         except Exception as e:
             errors.append({"source": "amazon_po", "error": str(e)})
+
+    # ── Pendency block ────────────────────────────────────────────────────
+    # Powers the "Pendency" card under the expiry alerts on Home. This is the
+    # ALL-MONTHS open-PO backlog (every PO still open, cancelled excluded,
+    # pending = max(order - delivered, 0)) — the same math the per-platform
+    # Pendency Dashboard uses, NOT the current month's short-delivered balance.
+    # Each platform also carries a PREMIUM / COMMODITY litres split from
+    # `item_head`, which both PO tables have.
+    _PEND_EMPTY = {
+        "pending_ltrs": 0.0, "pending_qty": 0.0, "pending_value": 0.0,
+        "pending_ltrs_premium": 0.0, "pending_ltrs_commodity": 0.0,
+        "open_pos": 0,
+    }
+    pendency = {"total": dict(_PEND_EMPTY), "platforms": []}
+    try:
+        # Local import: platforms.views is a heavy module and importing it at
+        # module scope risks an app-loading cycle.
+        from platforms.views import _primary_open_po_totals
+
+        # (format key as normalised by _primary_open_po_totals, slug, label)
+        PENDENCY_PLATFORMS = [
+            ("blinkit", "blinkit", "Blinkit"),
+            ("swiggy", "swiggy", "Swiggy"),
+            ("zepto", "zepto", "Zepto"),
+            ("bigbasket", "bigbasket", "BigBasket"),
+            ("flipkartgrocery", "flipkart_grocery", "Flipkart Grocery"),
+            ("citymall", "citymall", "City Mall"),
+            ("zomato", "zomato", "Zomato"),
+        ]
+        # Headline figures stay with the shared helper, so this card, the
+        # Primary "Pending (All Open)" card and each Pendency Dashboard can
+        # never drift apart.
+        totals = _primary_open_po_totals([k for k, _s, _n in PENDENCY_PLATFORMS])
+        by_format = totals.get("by_format") or {}
+
+        # Premium / Commodity litres over that same OPEN scope. Kept as a
+        # separate additive query rather than widening the shared helper, so the
+        # Primary dashboard's payload shape is untouched. Rows whose item_head
+        # is neither (i.e. 'OTHER') are counted in pending_ltrs but in neither
+        # split column — the row's total litres is what reconciles.
+        head_by_format: dict[str, dict] = {}
+        with connection.cursor() as cur:
+            cur.execute("""
+                SELECT REGEXP_REPLACE(LOWER(TRIM(format::text)), '[^a-z0-9]+', '', 'g') AS fk,
+                       UPPER(TRIM(COALESCE(item_head, ''))) AS head,
+                       COALESCE(SUM(GREATEST(
+                           COALESCE(total_order_liters, 0)
+                           - COALESCE(total_delivered_liters, 0), 0)), 0) AS ltrs
+                FROM public.master_po
+                WHERE UPPER(TRIM(open_close::text)) = 'OPEN'
+                  AND UPPER(TRIM(COALESCE(po_status, status, '')::text))
+                      NOT IN ('CANCELLED', 'CANCELED', 'CANCEL')
+                GROUP BY 1, 2
+            """, [])
+            for fk, head, ltrs in cur.fetchall():
+                head_by_format.setdefault(fk, {})[head] = float(ltrs or 0)
+
+        rows = []
+        for key, slug, label in PENDENCY_PLATFORMS:
+            entry = by_format.get(key)
+            if not entry or entry.get("open_pos", 0) <= 0:
+                continue  # nothing open for this platform — leave it off the card
+            heads = head_by_format.get(key) or {}
+            rows.append({
+                "slug": slug,
+                "name": label,
+                "pending_ltrs": float(entry.get("pending_ltrs") or 0),
+                "pending_qty": float(entry.get("pending_qty") or 0),
+                "pending_value": float(entry.get("pending_value") or 0),
+                "pending_ltrs_premium": heads.get("PREMIUM", 0.0),
+                "pending_ltrs_commodity": heads.get("COMMODITY", 0.0),
+                "open_pos": int(entry.get("open_pos") or 0),
+            })
+
+        # Amazon lives in its own table with no open_close flag. Its equivalent
+        # "still open" state is po_status = 'PENDING' — the normalised status
+        # that excludes CANCELLED / COMPLETED / EXPIRED / MOV, and which maps to
+        # the raw vendor statuses CONFIRMED and UNCONFIRMED. Value uses the
+        # EXCLUSIVE amounts (this table has no inclusive columns, unlike
+        # master_po), so Amazon's pending value is tax-exclusive.
+        try:
+            with connection.cursor() as cur:
+                cur.execute("""
+                    SELECT COUNT(DISTINCT po_number) AS open_pos,
+                           COALESCE(SUM(GREATEST(
+                               COALESCE(total_order_liters, 0)
+                               - COALESCE(total_delivered_liters, 0), 0)), 0) AS pending_ltrs,
+                           COALESCE(SUM(GREATEST(
+                               COALESCE(requested_qty, 0)
+                               - COALESCE(received_qty, 0), 0)), 0) AS pending_qty,
+                           COALESCE(SUM(GREATEST(
+                               COALESCE(total_order_amt_exclusive, 0)
+                               - COALESCE(total_deliver_amt_exclusive, 0), 0)), 0) AS pending_value,
+                           COALESCE(SUM(CASE
+                               WHEN UPPER(TRIM(COALESCE(item_head, ''))) = 'PREMIUM'
+                               THEN GREATEST(COALESCE(total_order_liters, 0)
+                                    - COALESCE(total_delivered_liters, 0), 0)
+                               ELSE 0 END), 0) AS premium_ltrs,
+                           COALESCE(SUM(CASE
+                               WHEN UPPER(TRIM(COALESCE(item_head, ''))) = 'COMMODITY'
+                               THEN GREATEST(COALESCE(total_order_liters, 0)
+                                    - COALESCE(total_delivered_liters, 0), 0)
+                               ELSE 0 END), 0) AS commodity_ltrs
+                    FROM reporting."Amazon PO"
+                    WHERE UPPER(TRIM(COALESCE(po_status, '')::text)) = 'PENDING'
+                """, [])
+                az = cur.fetchone()
+            if az and int(az[0] or 0) > 0:
+                rows.append({
+                    "slug": "amazon",
+                    "name": "Amazon",
+                    "pending_ltrs": float(az[1] or 0),
+                    "pending_qty": float(az[2] or 0),
+                    "pending_value": float(az[3] or 0),
+                    "pending_ltrs_premium": float(az[4] or 0),
+                    "pending_ltrs_commodity": float(az[5] or 0),
+                    "open_pos": int(az[0] or 0),
+                })
+        except Exception as e:
+            errors.append({"source": "pendency_amazon", "error": str(e)})
+
+        rows.sort(key=lambda r: r["pending_ltrs"], reverse=True)
+        # Grand total is summed from the rows (not taken from the helper) so it
+        # includes Amazon, which the helper knows nothing about.
+        grand = dict(_PEND_EMPTY)
+        for r in rows:
+            for k in ("pending_ltrs", "pending_qty", "pending_value",
+                      "pending_ltrs_premium", "pending_ltrs_commodity"):
+                grand[k] += r[k]
+            grand["open_pos"] += r["open_pos"]
+        pendency["platforms"] = rows
+        pendency["total"] = grand
+    except Exception as e:
+        errors.append({"source": "pendency", "error": str(e)})
+
     return Response({
         "platforms": results,
+        "pendency": pendency,
         "errors": errors,
         "month": month_name,
         "year": year,
