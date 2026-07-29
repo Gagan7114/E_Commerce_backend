@@ -6236,7 +6236,52 @@ def _brandfund_dashboard_payload(*, source: str, title: str, request) -> dict:
     item_rows = _grouped("item")
     subcategory_rows = _grouped("sub_category")
 
-    # 2b) Day-by-day trend — total brand fund spent per date (single line).
+    # 2a) Month roll-up — the same filtered rows summed per calendar month, so
+    #     an "ALL MONTHS" selection can be read month by month instead of only
+    #     as one grand total. Grouped on (year, month) so two years never merge
+    #     into one "JANUARY"; ordered by the month's first date (calendar order,
+    #     not by spend) to read like a timeline. Months with no rows simply don't
+    #     appear. Sums to the same figure as item_rows / summary — one WHERE.
+    month_rows = _dict_rows(
+        f"""
+        SELECT COALESCE(NULLIF(TRIM(month::text), ''), '(Unknown)') AS dimension,
+               year AS year,
+               COALESCE(SUM(brand_fund_spent), 0) AS total,
+               MIN(date) AS sort_date
+        FROM {source}
+        {where_sql}
+        GROUP BY 1, 2
+        ORDER BY MIN(date)
+        """,
+        params,
+    )
+    for r in month_rows:
+        r.pop("sort_date", None)
+        if r.get("year") is not None:
+            r["year"] = int(r["year"])
+
+    # 2b) Item × month facts — the cells of the month-wise pivot table (items
+    #     down the left, months across the top). Returned FLAT (one row per
+    #     item/month/year) and pivoted client-side, so the column set stays
+    #     whatever `month_rows` reports. Summing all items of one month gives
+    #     that month's `month_rows` total; summing everything gives `summary`.
+    month_item_rows = _dict_rows(
+        f"""
+        SELECT COALESCE(NULLIF(TRIM(item::text), ''), '(Unmapped)') AS dimension,
+               COALESCE(NULLIF(TRIM(month::text), ''), '(Unknown)') AS month,
+               year AS year,
+               COALESCE(SUM(brand_fund_spent), 0) AS total
+        FROM {source}
+        {where_sql}
+        GROUP BY 1, 2, 3
+        """,
+        params,
+    )
+    for r in month_item_rows:
+        if r.get("year") is not None:
+            r["year"] = int(r["year"])
+
+    # 2c) Day-by-day trend — total brand fund spent per date (single line).
     #     Mirrors the ADS dashboards: the date filter acts as an inclusive UPPER
     #     BOUND (up-to-that-date) via `trend_where_sql`, so picking a date shows
     #     the series up to that day instead of collapsing it to a single point.
@@ -6292,6 +6337,8 @@ def _brandfund_dashboard_payload(*, source: str, title: str, request) -> dict:
         "summary": summary,
         "item_rows": item_rows,
         "subcategory_rows": subcategory_rows,
+        "month_rows": month_rows,
+        "month_item_rows": month_item_rows,
         "trend_axes": {"spend": {"label": "Brand Fund Spent", "format": "inr"}},
         "trend_rows": trend_rows,
         "max_date": max_date,
