@@ -64,6 +64,7 @@ class ParsedQuery:
     wants_amount: bool = False     # "order amount" / "value" / "revenue" question
     item_head: str = ""            # PREMIUM / COMMODITY filter
     product: str = ""              # item-family filter, e.g. "extra light", "canola"
+    pack_size: str = ""            # pack-size filter, e.g. "5L", "200ML" (needs a product)
     sap_source: str = ""           # SAP HANA company DB: "mart" | "oil" | ""
 
     @property
@@ -326,6 +327,18 @@ def parse(message: str, db_platforms: list[dict] | None = None) -> ParsedQuery:
         if any(a in low for a in aliases):
             q.product = canon
             break
+
+    # Pack size ("canola 5l", "groundnut 200 ml"). Only read when a product family
+    # was found, so a bare number+L elsewhere in the sentence ("which sku sold
+    # 815l") is never mistaken for a pack size.
+    if q.product:
+        ms = re.search(r"\b(\d{1,4}(?:\.\d+)?)\s*(ml|l|ltr|litre|liter)\b", low)
+        if ms:
+            num = ms.group(1)
+            if "." in num:                      # 5.0 -> 5, but 100 stays 100
+                num = num.rstrip("0").rstrip(".")
+            unit = "ML" if ms.group(2) == "ml" else "L"
+            q.pack_size = f"{num}{unit}"
 
     # --- Intent (order matters: most specific first) ---
     # "all platforms" only means "list the platforms" when the question isn't

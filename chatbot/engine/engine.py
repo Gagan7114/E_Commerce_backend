@@ -322,9 +322,40 @@ def _previous_user_question(conversation, current_text: str) -> str | None:
     return None
 
 
+# A follow-up only makes sense as a modifier of the previous question when it
+# actually names something that can modify it — a period, a platform, a product,
+# an item head, a dimension or a breakdown/export word. Without this test ANY
+# unrecognised message inherited the previous question, so "ceo of openai" after
+# "Blinkit drr this month" was answered with Blinkit's DRR.
+_FOLLOWUP_RE = re.compile(
+    r"\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|january|february|march|april|june|"
+    r"july|august|september|october|november|december|month|week|year|today|yesterday|ytd|mtd|"
+    r"q[1-4]|20\d\d|"
+    r"blinkit|zepto|swiggy|instamart|bigbasket|big basket|amazon|flipkart|jiomart|zomato|citymall|"
+    r"city mall|deal ?share|"
+    r"premium|commodity|item head|"
+    r"states?|cities|city|skus?|brands?|categor(?:y|ies)|items?|vendors?|platforms?|regions?|"
+    r"warehouses?|locations?|"
+    r"wise|breakup|break ?down|excel|download|export|table|chart|"
+    r"litres?|liters?|ltrs?|units?|qty|quantity|value|amount|delivered|ordered|pending|sold)\b",
+    re.I,
+)
+_MAX_FOLLOWUP_WORDS = 8
+
+
+def _looks_like_followup(message: str) -> bool:
+    """True when a short message reads as a refinement of the previous question."""
+    words = (message or "").split()
+    if not words or len(words) > _MAX_FOLLOWUP_WORDS:
+        return False
+    return bool(_FOLLOWUP_RE.search(message))
+
+
 def _try_continuation(user, conversation, message, db_platforms) -> EngineResult | None:
     """Combine a bare follow-up with the previous question and answer that, e.g.
     prev 'total order ltrs in blinkit' + 'in june' -> answered for June."""
+    if not _looks_like_followup(message):
+        return None
     prev = _previous_user_question(conversation, message)
     if not prev:
         return None
@@ -379,8 +410,13 @@ def _run_builtin(user, conversation: ChatConversation, message: str) -> EngineRe
         cont = _try_continuation(user, conversation, message, db_platforms)
         if cont is not None:
             return cont
+        # Say plainly that the question wasn't understood. Replying with the
+        # cheerful intro alone reads like an answer, which is how a wrong-looking
+        # reply used to reach the user.
         return EngineResult(
-            text=HELP_TEXT, intent="unknown", engine="builtin", suggestions=SUGGESTIONS,
+            text="I didn't understand that one — I only answer questions about your "
+                 "Jivo operations data.\n\n" + HELP_TEXT.removeprefix("Hi! "),
+            intent="unknown", engine="builtin", suggestions=SUGGESTIONS,
             data={"columns": [], "rows": [], "suggestions": SUGGESTIONS},
         )
 

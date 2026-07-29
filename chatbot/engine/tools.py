@@ -81,16 +81,23 @@ def _item_filters(q: ParsedQuery) -> tuple[list, list]:
     if q.product:
         clauses.append("item ILIKE %s")
         params.append(f"%{q.product}%")
+    if q.pack_size:
+        # Anchor the size so "5L" matches 'CANOLA 5L' but not 'CANOLA 15L' or
+        # 'CANOLA 100ML' — a plain LIKE '%5l%' would wrongly match both.
+        num, unit = re.match(r"([\d.]+)(ML|L)", q.pack_size).groups()
+        clauses.append("item ~* %s")
+        params.append(rf"(^|[^0-9.]){re.escape(num)}[[:space:]]*{unit}([^A-Za-z0-9]|$)")
     return clauses, params
 
 
 def _scope_suffix(q: ParsedQuery) -> str:
-    """Human label for active item-head / product filters, e.g. ' (premium, extra light)'."""
+    """Human label for active item-head / product / size filters, e.g.
+    ' (premium, extra light)' or ' (canola 5L)'."""
     bits = []
     if q.item_head:
         bits.append(q.item_head.lower())
     if q.product:
-        bits.append(q.product)
+        bits.append(f"{q.product} {q.pack_size}".strip() if q.pack_size else q.product)
     return f" ({', '.join(bits)})" if bits else ""
 
 
@@ -592,6 +599,12 @@ def inventory(q: ParsedQuery) -> DataResult:
     if fmt_val:
         base_where.append("format ILIKE %s")
         base_params.append(f"%{fmt_val}%")
+    # Item-head / product / pack-size filters, so "SOH canola 5L in blinkit"
+    # answers about CANOLA 5L only instead of the whole platform's stock.
+    ic, ip = _item_filters(q)
+    base_where.extend(ic)
+    base_params.extend(ip)
+    scope += _scope_suffix(q)
     base_wsql = (" WHERE " + " AND ".join(base_where)) if base_where else ""
 
     try:
@@ -640,9 +653,13 @@ def inventory(q: ParsedQuery) -> DataResult:
         f"SELECT item, format, COALESCE(SUM(soh_ltr),0), COALESCE(SUM(soh_unit),0) FROM {table}{wsql} "
         f"AND item IS NOT NULL GROUP BY item, format ORDER BY 3 DESC LIMIT {int(q.top_n or 10)}",
         params, max_rows=q.top_n or 10)
-    top = "; ".join(f"{r[0]} ({_fmt(r[2])} L)" for r in prows[:5])
     summary = (f"{scope} inventory (as of {latest}): {_fmt(tot_u)} SOH units, {_fmt(tot_l)} SOH liters "
-               f"across {_fmt(skus)} SKU(s). Top products: {top}.")
+               f"across {_fmt(skus)} SKU(s).")
+    # Only list "top products" when there are several — with a product filter the
+    # answer is usually one SKU, and repeating it reads like padding.
+    if len(prows) > 1:
+        top = "; ".join(f"{r[0]} ({_fmt(r[2])} L)" for r in prows[:5])
+        summary += f" Top products: {top}."
     return DataResult(summary=summary, columns=["item", "format", "soh_ltr", "soh_unit"],
                       rows=[list(r) for r in prows], source=table,
                       meta=[("as_of", str(latest)), ("soh_units", tot_u), ("soh_ltr", tot_l)],
