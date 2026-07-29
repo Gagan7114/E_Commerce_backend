@@ -36,6 +36,11 @@ urlpatterns = [
         name="primary-month-targets-refresh-all",
     ),
     path(
+        "primary-month-targets/set-target",
+        primary_monthly_targets.primary_month_targets_set_target,
+        name="primary-month-targets-set-target",
+    ),
+    path(
         "primary-overview-total",
         views.primary_overview_total,
         name="platform-primary-overview-total",

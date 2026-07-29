@@ -40,6 +40,11 @@ IN_SCOPE_SLUGS = {
 }
 SKIPPED_SLUGS = {"jiomart"}
 
+# How far back the Prim Targets sheet may look for a target to carry into a
+# month nobody has entered yet. 12 = one year; older targets are treated as too
+# stale to show. See `_select_carry_forward_targets`.
+TARGET_CARRY_FORWARD_MAX_MONTHS = 12
+
 DEFAULT_ITEM_HEADS = ("PREMIUM", "COMMODITY")
 FLIPKART_GROCERY_ITEM_HEADS = ("PREMIUM", "COMMODITY", "OTHER")
 DASHBOARD_ITEM_HEADS = ("PREMIUM", "COMMODITY")
@@ -1037,6 +1042,70 @@ def _select_dashboard_rows(
     return {_format_key(r.get("format")): r for r in rows}
 
 
+def _month_ordinal(month: int, year: int) -> int:
+    """(year, month) collapsed to one absolute, strictly increasing number.
+
+    Used so month comparisons are exact across year boundaries: JULY 2026 is
+    24319 and JULY 2027 is 24331 — they can never compare equal, so a target can
+    never be picked up by "the same month next year".
+    """
+    return int(year) * 12 + int(month)
+
+
+def _select_carry_forward_targets(
+    formats: list[str],
+    item_head: str,
+    month: int,
+    year: int,
+) -> dict[str, dict]:
+    """The most recent target saved in an EARLIER month, per format.
+
+    Targets rarely change month to month, so a month nobody has entered yet
+    shows the previous month's number instead of a blank. This is DISPLAY ONLY —
+    this function never writes, and the row it feeds is flagged
+    `targets_carried: true` so the frontend shows it as inherited and does not
+    save it. A carried number only becomes a real row when a person types a
+    target for that month.
+
+    Safety, in the SQL itself:
+      * `< current ordinal`  — strictly earlier, so a value can never leak into
+        its own month or forward into a future month.
+      * `>= current - 12`    — never resurrects a target older than a year.
+      * ordinal ordering     — July 2026 can only reach July 2027 if it is
+        genuinely the latest target in between, never by month-number match.
+    """
+    if not formats:
+        return {}
+    current_ordinal = _month_ordinal(month, year)
+    oldest_ordinal = current_ordinal - TARGET_CARRY_FORWARD_MAX_MONTHS
+    placeholder = ",".join(["LOWER(TRIM(%s))"] * len(formats))
+    sql = f"""
+        SELECT DISTINCT ON (LOWER(TRIM("format")))
+               LOWER(TRIM("format")) AS format_key,
+               targets,
+               month,
+               year
+          FROM primary_month_targets
+         WHERE UPPER(TRIM(item_head)) = UPPER(TRIM(%s))
+           AND LOWER(TRIM("format")) IN ({placeholder})
+           AND targets IS NOT NULL
+           AND targets > 0
+           AND (year * 12 + month) < %s
+           AND (year * 12 + month) >= %s
+         ORDER BY LOWER(TRIM("format")), (year * 12 + month) DESC
+    """
+    with connection.cursor() as cur:
+        cur.execute(
+            sql,
+            [item_head] + list(formats) + [current_ordinal, oldest_ordinal],
+        )
+        rows = cur.fetchall()
+    return {
+        r[0]: {"targets": r[1], "month": int(r[2]), "year": int(r[3])}
+        for r in rows
+    }
+
+
 def _select_secondary_target_dashboard_rows(
     formats: list[str],
     item_head: str,
@@ -1133,9 +1202,19 @@ def _dashboard_row_from_source(
     month: int,
     year: int,
     source: dict | None = None,
+    carried: dict | None = None,
 ) -> dict:
     source = source or _read_primary_target_source(defn["source_format"], item_head, month, year)
-    targets = Decimal(str(stored["targets"])) if stored and stored.get("targets") is not None else Decimal(0)
+    # The target for this month, if somebody actually saved one.
+    saved_target = stored.get("targets") if stored else None
+    # Nothing saved for this month → fall back to the latest earlier month's
+    # target (display only; see `_select_carry_forward_targets`). `carried_from`
+    # stays None whenever the number on screen is this month's own saved value.
+    carried_from = None
+    if saved_target is None and carried and carried.get("targets") is not None:
+        saved_target = carried["targets"]
+        carried_from = f"{int(carried['year']):04d}-{int(carried['month']):02d}"
+    targets = Decimal(str(saved_target)) if saved_target is not None else Decimal(0)
     derived = _compute_derived(
         targets=targets,
         done_ltrs=source["done_ltrs"],
@@ -1176,7 +1255,18 @@ def _dashboard_row_from_source(
         "format": defn["format"],
         "type": defn["type"],
         "source": defn["source"],
+        # True → the number in TARGETS belongs to an earlier month and has NOT
+        # been saved for this one. The sheet greys it and the editor treats it as
+        # a starting value, not a stored figure.
+        "targets_carried": carried_from is not None,
+        "targets_carried_from": carried_from,
+        # Only master_po rows own a row in primary_month_targets, so only they
+        # can be saved from the Prim sheet. The Amazon/Flipkart secondary rows
+        # take their target from month_targets (the Sec sheet) instead.
+        "target_editable": defn.get("source") == "master_po",
     })
+    if carried_from is not None:
+        row["targets"] = targets
     return _json_ready(row)
 
 
@@ -1211,6 +1301,11 @@ def _dashboard_row_from_secondary_target(defn: dict, stored: dict) -> dict:
         "logo_slug": defn.get("logo_slug") or defn["slug"],
         "platform_name": defn["platform_name"],
         "source": defn["source"],
+        # This row's target lives in month_targets (the Secondary sheet), so the
+        # Prim sheet shows it read-only and never carries it forward.
+        "targets_carried": False,
+        "targets_carried_from": None,
+        "target_editable": False,
     }
     row.update(derived)
     return _json_ready(row)
@@ -1327,6 +1422,11 @@ def primary_dashboard_result(user, month, year, only_slugs=None):
     source_map = _dashboard_sources(row_defs, DASHBOARD_ITEM_HEADS, month, year)
     for item_head in DASHBOARD_ITEM_HEADS:
         stored_by_format = _select_dashboard_rows(formats, item_head, month, year)
+        # Fallback targets from the latest earlier month, for formats this month
+        # has no saved row for. Read once per item head, never written back.
+        carry_by_format = _select_carry_forward_targets(
+            formats, item_head, month, year
+        )
         secondary_target_formats = [
             defn["target_format"]
             for defn in row_defs
@@ -1363,6 +1463,7 @@ def primary_dashboard_result(user, month, year, only_slugs=None):
                         (_format_key(defn["source_format"]), _format_key(item_head)),
                         {"done_ltrs": Decimal(0), "latest_date": None},
                     ),
+                    carry_by_format.get(_format_key(defn["format"])),
                 )
             )
 
@@ -1382,6 +1483,194 @@ def primary_dashboard_result(user, month, year, only_slugs=None):
 def primary_month_targets_dashboard(request):
     month, year = _parse_month_year(request.query_params)
     return Response(primary_dashboard_result(request.user, month, year))
+
+
+@api_view(["POST"])
+@permission_classes([require("target_sheet.edit")])
+def primary_month_targets_set_target(request):
+    """POST /api/platform/primary-month-targets/set-target
+
+    Save ONE cell — the TARGETS number — straight from the Prim Targets sheet's
+    Edit mode, so a hand-entered target is shared with every user instead of
+    living in one browser's localStorage.
+
+    Body: {slug, item_head, month, year, targets, reason?}
+
+    Month safety (this is the whole point of the endpoint):
+      * The write is keyed on (format, item_head, month, year) — the exact month
+        the sheet is showing. `primary_month_targets_unique_month` enforces one
+        row per that tuple, so July 2026 and July 2027 are different rows and
+        neither can overwrite the other.
+      * Nothing is ever written automatically. A carried-forward number shown for
+        an empty month stays unsaved until a person types one.
+      * A target is entered ONCE per month. It can be corrected only while that
+        month is still the current month; a closed month is rejected, so no past
+        figure can be rewritten.
+
+    Only `master_po`-sourced rows (the PRIM platforms) are editable here. The
+    Amazon/Flipkart secondary rows read their target from month_targets and are
+    still set on the Secondary sheet.
+    """
+    body = request.data or {}
+    slug = str(body.get("slug") or "").strip().lower()
+
+    # Resolving through _dashboard_row_defs also enforces access: it only returns
+    # rows for platforms this user is allowed to see.
+    defn = None
+    for candidate in _dashboard_row_defs(request.user):
+        key = str(candidate.get("slug") or candidate.get("key") or "").lower()
+        if key == slug:
+            defn = candidate
+            break
+    if defn is None:
+        raise PermissionDenied(f"No Primary Targets row '{slug}' available to you.")
+    if defn.get("source") != "master_po":
+        raise ValidationError(
+            f"'{slug}' takes its target from the Secondary sheet — "
+            "set it there, not on the Primary sheet."
+        )
+
+    fmt = defn["format"]
+    item_head = str(body.get("item_head") or "").strip().upper()
+    if item_head not in DASHBOARD_ITEM_HEADS:
+        raise ValidationError(f"`item_head` must be one of {DASHBOARD_ITEM_HEADS}.")
+
+    raw_targets = body.get("targets")
+    if raw_targets is None or str(raw_targets).strip() == "":
+        raise ValidationError("`targets` is required — clearing a saved target is not supported.")
+    try:
+        new_targets = Decimal(str(raw_targets).replace(",", "").strip())
+    except Exception:
+        raise ValidationError("`targets` must be a number.")
+    if new_targets < 0:
+        raise ValidationError("`targets` must be >= 0.")
+
+    month, year = _parse_month_year(body)
+    reason = str(body.get("reason") or "").strip() or None
+
+    source = _read_primary_target_source(fmt, item_head, month, year)
+    derived = _compute_derived(
+        targets=new_targets,
+        done_ltrs=source["done_ltrs"],
+        latest_date=source["latest_date"],
+        month=month,
+        year=year,
+    )
+
+    existing = _select_row(
+        """WHERE LOWER(TRIM("format")) = LOWER(TRIM(%s))
+             AND UPPER(TRIM(item_head)) = %s
+             AND month = %s AND year = %s""",
+        [fmt, item_head, month, year],
+    )
+
+    if existing:
+        # A target is set once per month; only the live month may be corrected.
+        if not _is_current_month(month, year):
+            raise ValidationError(
+                f"{fmt}/{item_head} already has a target for {month:02d}-{year}, "
+                "and that month is closed. Targets can only be corrected during "
+                "the reporting month."
+            )
+        if Decimal(str(existing["targets"] or 0)) == new_targets:
+            return Response({"ok": True, "row": existing, "unchanged": True})
+        with transaction.atomic():
+            _insert_log(existing, reason=reason, user=request.user, new_targets=new_targets)
+            with connection.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE primary_month_targets
+                       SET targets      = %s,
+                           "date"       = %s,
+                           done_ltrs    = %s,
+                           achieved_pct = %s,
+                           est_ltr      = %s,
+                           est_ltr_pct  = %s,
+                           drr          = %s,
+                           require_drr  = %s,
+                           pending_ltr  = %s,
+                           dp_ltrs      = %s,
+                           updated_at   = NOW()
+                     WHERE id = %s
+                    """,
+                    [
+                        new_targets,
+                        derived["date"],
+                        derived["done_ltrs"],
+                        derived["achieved_pct"],
+                        derived["est_ltr"],
+                        derived["est_ltr_pct"],
+                        derived["drr"],
+                        derived["require_drr"],
+                        derived["pending_ltr"],
+                        derived["dp_ltrs"],
+                        existing["id"],
+                    ],
+                )
+        row = _select_row("WHERE id = %s", [existing["id"]])
+        return Response({"ok": True, "row": row, "created": False})
+
+    # First target for this month → INSERT. The unique index means a concurrent
+    # save for the same month loses the race cleanly instead of double-inserting.
+    try:
+        with transaction.atomic(), connection.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO primary_month_targets (
+                    "format", "type", item_head, month, year, "date",
+                    targets, done_ltrs, achieved_pct,
+                    est_ltr, est_ltr_pct, drr, require_drr, pending_ltr, dp_ltrs,
+                    created_at, updated_at
+                ) VALUES (
+                    %s, %s, %s, %s, %s, %s,
+                    %s, %s, %s,
+                    %s, %s, %s, %s, %s, %s,
+                    NOW(), NOW()
+                )
+                RETURNING id
+                """,
+                [
+                    fmt,
+                    defn.get("type") or "prim",
+                    item_head,
+                    month,
+                    year,
+                    derived["date"],
+                    new_targets,
+                    derived["done_ltrs"],
+                    derived["achieved_pct"],
+                    derived["est_ltr"],
+                    derived["est_ltr_pct"],
+                    derived["drr"],
+                    derived["require_drr"],
+                    derived["pending_ltr"],
+                    derived["dp_ltrs"],
+                ],
+            )
+            new_id = cur.fetchone()[0]
+    except IntegrityError:
+        row = _select_row(
+            """WHERE LOWER(TRIM("format")) = LOWER(TRIM(%s))
+                 AND UPPER(TRIM(item_head)) = %s
+                 AND month = %s AND year = %s""",
+            [fmt, item_head, month, year],
+        )
+        return Response(
+            {
+                "ok": False,
+                "error": (
+                    f"A target for {fmt}/{item_head}/{month:02d}-{year} was saved "
+                    "by someone else just now. Reload to see it."
+                ),
+                "existing": row,
+            },
+            status=409,
+        )
+
+    return Response(
+        {"ok": True, "row": _select_row("WHERE id = %s", [new_id]), "created": True},
+        status=201,
+    )
 
 
 @api_view(["POST"])
