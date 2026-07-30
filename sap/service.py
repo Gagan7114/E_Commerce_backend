@@ -160,6 +160,72 @@ def resolve_schema(source: str | None) -> tuple[str, str]:
     return key, HANA_SCHEMAS[key]
 
 
+# A warehouse's company book is fixed when it's created in SAP, so a resolved
+# lookup is cached for a day rather than probing OWHS on every stock read.
+_WHS_SCHEMA_TTL = 86400
+# An UNRESOLVED lookup is cached far more briefly: it may just mean HANA was
+# unreachable for a moment, or that the warehouse was only just created. Without
+# this, every caller re-probes every schema — and when HANA is down each probe
+# burns the full connect timeout, so a read that is going to fall back anyway
+# would sit through (schemas × connectTimeout) first. One minute bounds that to a
+# single probe per code per minute while still picking up a new warehouse quickly.
+_WHS_SCHEMA_MISS_TTL = 60
+_WHS_SCHEMA_MISS = "__none__"
+
+
+def resolve_warehouse_schema(whs_code: str) -> tuple[str, str] | None:
+    """Which company DB owns a warehouse: (source_key, schema_name), or None.
+
+    A warehouse exists in exactly one company book, but callers shouldn't have to
+    hard-code which — that mapping is SAP's to state, and naming the wrong book
+    reads a warehouse that isn't there and yields ZERO rows silently (no error).
+    So ask OWHS in each schema, in HANA_SCHEMAS order, and take the first hit.
+
+    Returns None when the code exists in no book (a typo, or a warehouse not yet
+    created) AND when HANA is unreachable — both mean "SAP didn't confirm it", so
+    callers decide whether to fall back or surface the failure. Schemas that error
+    are skipped rather than aborting the probe, so one down book still resolves.
+    """
+    code = str(whs_code or "").strip().upper()
+    if not code:
+        return None
+
+    cache_key = f"sap:whs_schema:{code}"
+    try:
+        hit = cache.get(cache_key)
+    except Exception:
+        hit = None
+    if hit == _WHS_SCHEMA_MISS:
+        return None
+    if hit:
+        return hit[0], hit[1]
+
+    for key, schema in HANA_SCHEMAS.items():
+        try:
+            rows = select(
+                'SELECT "WhsCode" FROM OWHS WHERE UPPER("WhsCode") = ?',
+                [code],
+                schema=schema,
+            )
+        except Exception as exc:
+            logger.warning("resolve_warehouse_schema(%s): %s unreadable: %s", code, schema, exc)
+            continue
+        if rows:
+            try:
+                cache.set(cache_key, [key, schema], _WHS_SCHEMA_TTL)
+            except Exception:
+                pass
+            return key, schema
+
+    logger.warning("resolve_warehouse_schema(%s): not found in any of %s",
+                   code, ", ".join(HANA_SCHEMAS.values()))
+    try:
+        cache.set(cache_key, _WHS_SCHEMA_MISS, _WHS_SCHEMA_MISS_TTL)
+    except Exception:
+        pass
+    return None
+
+
 # Allow-listed HANA procedures the sales-analysis endpoint may call — one per
 # schema, derived from HANA_SCHEMAS so there's a single source of truth.
 SALES_ANALYSIS_PROCEDURES: dict[str, str] = {

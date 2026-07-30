@@ -27,7 +27,9 @@ class ShipmentItemSerializer(serializers.ModelSerializer):
 
     def get_source_inventory(self, obj):
         """Human inventory name for the saved source_warehouse code (e.g.
-        BH-FGM → 'Jivo Mart'). Lazy import to avoid a views↔serializers cycle."""
+        GP-FGM → 'Gupta Godown'). Resolves retired codes too, so shipments planned
+        against the old warehouses still show a name. Lazy import to avoid a
+        views↔serializers cycle."""
         try:
             from .views import _inventory_label
             return _inventory_label(obj.source_warehouse)

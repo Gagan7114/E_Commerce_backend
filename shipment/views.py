@@ -1049,31 +1049,64 @@ def _lookup_appointment_commit(appointment_id):
 
 
 # ── Live planner warehouse stock, bridged to Amazon ASINs ────────────────────
-# The planner pools finished-goods stock from these warehouses, in PREFERENCE
-# order: for each ASIN the FIRST warehouse (left→right) that has on-hand > 0 is
-# chosen as the primary fulfilment source. Warehouses: BH-FGM, GP-FG, BH-EC.
-# Planner warehouses and the company DB (schema) each lives in. Stock is pooled
-# across ALL of these. BH-FGM is in the mart book; GP-FG + BH-EC are in oil.
-_PLANNER_WAREHOUSE_SOURCES = (
-    ('BH-FGM', 'mart'),
-    ('GP-FG',  'oil'),
-    ('BH-EC',  'oil'),
-)
-# Preference order (used only to pick a primary source when nothing has on-hand).
-_PLANNER_WAREHOUSES = tuple(code for code, _src in _PLANNER_WAREHOUSE_SOURCES)
+# Finished goods ship from a SINGLE warehouse. Every stock figure the planner and
+# the inventory page show — on hand, free-to-plan, the PO stock column, plan caps —
+# reads from GP-FGM alone. It replaced the old three-warehouse pool (BH-FGM +
+# GP-FG + BH-EC), so there is no pooling or primary-source preference to resolve
+# any more: each ASIN's only possible source is this warehouse.
+#
+# To go back to multiple warehouses, list them here (preference order, first wins
+# when nothing has on-hand) — the reader below still sums across whatever is listed
+# and picks the biggest holder as the primary pick location.
+PLANNER_WAREHOUSE = 'GP-FGM'
+_PLANNER_WAREHOUSES = (PLANNER_WAREHOUSE,)
+# Company DB to read from when SAP can't tell us which book owns the warehouse
+# (HANA unreachable at lookup time) — see _warehouse_source().
+_WAREHOUSE_SOURCE_FALLBACK = 'mart'
 _WAREHOUSE_INVENTORY_LABEL = {
+    'GP-FGM': 'Gupta Godown',
+}
+# Warehouses the planner no longer reads, kept only so historic shipments (stored
+# with the warehouse they were planned against) still render a source name.
+_RETIRED_WAREHOUSE_LABEL = {
     'BH-FGM': 'Jivo Mart',
     'GP-FG':  'Gupta Godown',
     'BH-EC':  'Bhakharpur E-Commerce',
 }
-_STOCK_CACHE_KEY = 'sp:stock_detail_v2'   # shared snapshot: {'at': epoch, 'detail': {...}}
+# Shared snapshot: {'at': epoch, 'detail': {...}}. Bumped to v3 with the move to a
+# single warehouse — v2 holds stock POOLED across the retired BH-FGM + GP-FG + BH-EC,
+# and _STOCK_STALE_MAX would keep serving those figures (with retired
+# source_warehouse codes) for up to an hour after deploy. A new key starts clean.
+_STOCK_CACHE_KEY = 'sp:stock_detail_v3'
 _STOCK_TTL = 60          # seconds fresh — avoids hitting HANA on every plan / 30s refresh
 _STOCK_STALE_MAX = 3600  # keep serving a stale snapshot up to 1h if HANA is unreachable
 
 
 def _inventory_label(whs_code):
-    """Human inventory name for a warehouse code (e.g. BH-FGM → 'Jivo Mart')."""
-    return _WAREHOUSE_INVENTORY_LABEL.get(str(whs_code or '').strip().upper())
+    """Human inventory name for a warehouse code (e.g. GP-FGM → 'Gupta Godown').
+
+    Kept as a lookup (not a constant) because historic shipments store whichever
+    warehouse they were planned against — rows planned before the move to a single
+    warehouse still carry BH-FGM / GP-FG / BH-EC, and those labels must keep
+    resolving so old shipments don't render a blank source."""
+    code = str(whs_code or '').strip().upper()
+    return _WAREHOUSE_INVENTORY_LABEL.get(code) or _RETIRED_WAREHOUSE_LABEL.get(code)
+
+
+def _warehouse_source(whs_code):
+    """Company-DB key ('mart' / 'oil') to read a warehouse's stock from.
+
+    Resolved from SAP's own OWHS (cached in sap.service) rather than hard-coded:
+    naming the wrong book reads an empty warehouse and reports zero stock with no
+    error, which would silently blank the planner. Falls back to
+    ``_WAREHOUSE_SOURCE_FALLBACK`` when SAP doesn't confirm a book, so a HANA blip
+    degrades to one guessed read instead of no read at all."""
+    try:
+        from sap.service import resolve_warehouse_schema
+        found = resolve_warehouse_schema(whs_code)
+    except Exception:
+        found = None
+    return found[0] if found else _WAREHOUSE_SOURCE_FALLBACK
 
 
 def _stock_snapshot_meta():
@@ -1104,15 +1137,16 @@ def _stock_meta_payload(stock_detail):
     }
 
 
-def _bh_fgm_stock_detail():
+def _planner_stock_detail():
     """ASIN (upper) → {'onhand', 'onorder', 'source_warehouse', 'sources'}.
 
-    Pools live SAP stock across ALL planner warehouses (``_PLANNER_WAREHOUSE_SOURCES``),
-    which span two company DBs — BH-FGM (mart), GP-FG + BH-EC (oil). ``onhand`` and
-    ``onorder`` are the SUM across every warehouse and every SAP code that maps to the
-    ASIN, so the planner can ship the pooled total. ``source_warehouse`` is the single
-    warehouse holding the most on-hand (the primary pick location); ``sources`` is the
-    full {warehouse: on-hand} breakdown.
+    Reads live SAP stock for the planner warehouses (``_PLANNER_WAREHOUSES``) — now
+    just GP-FGM, whose company DB is resolved from SAP via ``_warehouse_source()``.
+    ``onhand`` and ``onorder`` are the SUM across every warehouse and every SAP code
+    that maps to the ASIN. ``source_warehouse`` is the warehouse holding the most
+    on-hand (the pick location); ``sources`` is the {warehouse: on-hand} breakdown.
+    With a single warehouse both are trivially that warehouse, but the shape is kept
+    so restoring a multi-warehouse pool needs no changes downstream.
 
     Bridge: master_sheet maps format_sku_code (ASIN) → sku_sap_code; SAP OITW gives
     OnHand / OnOrder per SAP code per warehouse (same unit as Amazon sellable units).
@@ -1134,9 +1168,10 @@ def _bh_fgm_stock_detail():
     try:
         from sap.service import select, resolve_schema
         # Query each schema once for its warehouses, then pool by SAP item code.
+        # Which schema a warehouse lives in comes from SAP, not a hard-coded map.
         by_schema = {}
-        for code, src in _PLANNER_WAREHOUSE_SOURCES:
-            by_schema.setdefault(src, []).append(code)
+        for code in _PLANNER_WAREHOUSES:
+            by_schema.setdefault(_warehouse_source(code), []).append(code)
         sap_stock = {}   # SAP code -> {WhsCode: (onhand, onorder)}
         for src, whs_list in by_schema.items():
             _s, schema = resolve_schema(src)
@@ -1260,10 +1295,10 @@ def _apply_stock_caps(items, avail_total, avail_remaining, respect, detail, rese
     still AVAILABLE (on-hand − reserved) for that ASIN so the packer plans no
     more than that. ``accepted_qty`` is left untouched so Ordered/Short stay
     correct. Stock is consumed in item order (priority) so one ASIN across rows
-    shares one pool. Each item is tagged with the ``source_warehouse`` it is
-    pooled from (the primary of BH-FGM / GP-FG / BH-EC). ASINs with no
-    planner-warehouse stock record are capped to 0 so they drop to not_loaded
-    rather than shipping unverified. Mutates ``items``.
+    shares one pool. Each item is tagged with the ``source_warehouse`` it ships
+    from (GP-FGM, the only planner warehouse). ASINs with no planner-warehouse
+    stock record are capped to 0 so they drop to not_loaded rather than shipping
+    unverified. Mutates ``items``.
     """
     for it in items:
         asin = str(it.get('asin') or '').strip().upper()
@@ -1272,24 +1307,24 @@ def _apply_stock_caps(items, avail_total, avail_remaining, respect, detail, rese
         it['sap_on_order'] = d['onorder'] if d else None       # inbound
         it['sap_reserved'] = (reserved.get(asin, 0.0) if d else None)
         it['sap_available'] = (avail_total.get(asin) if d else None)  # on-hand − reserved
-        # Which inventory this line is auto-pooled from (prefer BH-FGM; see
-        # _bh_fgm_stock_detail). None when the ASIN maps to no planner warehouse.
+        # Which inventory this line ships from (see _planner_stock_detail).
+        # None when the ASIN maps to no planner-warehouse stock at all.
         src_whs = d['source_warehouse'] if d else None
         it['source_warehouse'] = src_whs
         it['source_inventory'] = _inventory_label(src_whs)
         if not respect:
             continue
         if d is None:
-            # Not mapped to ANY planner warehouse (BH-FGM / GP-FG / BH-EC):
-            # availability can't be verified, so don't ship it blind. Cap to 0 →
-            # the packer drops it into not_loaded with this reason instead of
-            # shipping the full ordered qty unverified.
+            # No stock record in the planner warehouse: availability can't be
+            # verified, so don't ship it blind. Cap to 0 → the packer drops it into
+            # not_loaded with this reason instead of shipping the ordered qty
+            # unverified.
             it['stock_cap'] = 0.0
             it['stock_limited'] = True
             it['stock_unfit'] = (
-                'Not mapped to any planner warehouse stock (Jivo Mart / Gupta '
-                'Godown / Bhakharpur E-Commerce) — availability cannot be '
-                'verified, so it was left out of the plan.'
+                f'Not mapped to {_inventory_label(PLANNER_WAREHOUSE) or PLANNER_WAREHOUSE} '
+                f'({PLANNER_WAREHOUSE}) stock — availability cannot be verified, so it '
+                'was left out of the plan.'
             )
             continue
         avail = avail_remaining.get(asin, 0.0)
@@ -1896,7 +1931,7 @@ class AppointmentItemsView(_SafeAPIView):
         fill_param = str(request.query_params.get('maximize_fill') or '1').lower()
         maximize_fill = fill_param in ('1', 'true', 'yes', 'on')
 
-        # Respect live BH-FGM warehouse stock (default ON): cap planned qty by
+        # Respect live planner-warehouse stock (default ON): cap planned qty by
         # what's physically available. Off = plan against PO qty only.
         stock_param = str(request.query_params.get('respect_stock') or '1').lower()
         respect_stock = stock_param in ('1', 'true', 'yes', 'on')
@@ -2182,12 +2217,12 @@ class AppointmentItemsView(_SafeAPIView):
             -(x.get('accepted_qty') or 0),
         ))
 
-        # Live warehouse stock: tag every item with BH-FGM on-hand / reserved /
+        # Live warehouse stock: tag every item with planner-warehouse on-hand / reserved /
         # available / incoming, and (when respect_stock) cap the orderable qty to
         # what's AVAILABLE (on-hand − reserved by other active shipments),
         # consumed in priority order. avail_remaining is shared with the DOH
         # fillers below so one ASIN's stock isn't double-counted.
-        stock_detail = _bh_fgm_stock_detail()
+        stock_detail = _planner_stock_detail()
         reserved = _reserved_stock_by_asin()
         avail_total = {a: max(0.0, d['onhand'] - reserved.get(a, 0.0)) for a, d in stock_detail.items()}
         avail_remaining = dict(avail_total)
@@ -2679,7 +2714,7 @@ class ShipmentListCreateView(_SafeAPIView):
             # doesn't block every save — matching the "serve stale, keep working"
             # policy. Serialized by the lock, so two concurrent saves can't both pass.
             if loaded_items:
-                _save_stock = _bh_fgm_stock_detail()
+                _save_stock = _planner_stock_detail()
                 if _save_stock:
                     _reserved_other = _reserved_stock_by_asin()   # excludes this unsaved plan
                     _plan_by_asin = {}
@@ -2804,7 +2839,7 @@ class ShipmentListCreateView(_SafeAPIView):
             # Source-inventory tag for each saved line: prefer the value the
             # planner already computed (echoed by the client); else re-derive from
             # live pooled stock by ASIN. Fetched once (cached ~60s).
-            _save_stock_detail = _bh_fgm_stock_detail()
+            _save_stock_detail = _planner_stock_detail()
 
             def _make_item(item_data, not_loaded=False):
                 dte = item_data.get('days_to_expiry')
@@ -3421,7 +3456,7 @@ def _check_qty_conflicts(shipment):
     # (this one included) must not exceed live pooled on-hand. Catches drafts that each
     # fit their own PO but together over-commit the same physical stock. Skipped only
     # when live stock is unverifiable (SAP down), matching the Save-time gate.
-    _stock = _bh_fgm_stock_detail()
+    _stock = _planner_stock_detail()
     if _stock and loaded_items:
         _reserved = _reserved_stock_by_asin()   # every active shipment, incl this one
         _seen = set()
@@ -3622,10 +3657,10 @@ class POListView(_SafeAPIView):
             """, params + [page_size, offset])
             rows = _row_to_dict(cur, cur.fetchall())
 
-        # Tag each PO line with live BH-FGM stock (informational here — no cap):
+        # Tag each PO line with live planner-warehouse stock (informational here — no cap):
         # on-hand, reserved by active shipments, available (on-hand − reserved),
         # and inbound on-order.
-        stock_detail = _bh_fgm_stock_detail()
+        stock_detail = _planner_stock_detail()
         reserved = _reserved_stock_by_asin()
         # Live DRR / SOH / DOH per ASIN — the SAME snapshot the auto planner and
         # the SOH/DOH dashboard use. Without this the Manual PO picker had no
@@ -4076,7 +4111,7 @@ class ManualPlanView(_SafeAPIView):
         # Appointment-driven manual: the appointment's Vendor Central commit is
         # enforced from the DB (not from client-sent caps) — see below.
         appointment_id = str(request.data.get('appointment_id') or '').strip()
-        # Respect live BH-FGM stock by default — same constraint as the auto /
+        # Respect live planner-warehouse stock by default — same constraint as the auto /
         # appointment planner, so a manual plan can't ship more than is physically
         # available. Toggleable via respect_stock (default on).
         respect_stock = str(request.data.get('respect_stock', True)).lower() not in ('0', 'false', 'no', 'off')
@@ -4141,7 +4176,7 @@ class ManualPlanView(_SafeAPIView):
         # respect_stock, caps the shippable qty to what's AVAILABLE (on-hand −
         # reserved by other active shipments). Out-of-stock items drop to
         # not_loaded; partials are short-supplied — exactly the same rules as auto.
-        stock_detail = _bh_fgm_stock_detail()
+        stock_detail = _planner_stock_detail()
         reserved = _reserved_stock_by_asin()
         avail_total = {a: max(0.0, d['onhand'] - reserved.get(a, 0.0)) for a, d in stock_detail.items()}
         avail_remaining = dict(avail_total)
@@ -4984,30 +5019,28 @@ _SAP_INV_TTL = 60  # seconds — full-warehouse SAP read; the inventory page
 class SapInventoryView(_SafeAPIView):
     """Live SAP HANA finished-goods stock for the Shipment Planner inventory page.
 
-    Two modes, chosen by the ``?warehouse=`` query param:
-      - a specific code (BH-FGM / GP-FG / BH-EC) → just that warehouse
-      - ``ALL`` → every warehouse below, merged into one sheet. Each row already
-        carries its own WhsCode / WhsName, so the UI shows a warehouse column.
+    Stock comes from ONE warehouse — GP-FGM (see ``PLANNER_WAREHOUSE``), the same
+    warehouse the shipment planner ships from, so the two can never disagree. The
+    old three-warehouse setup (BH-FGM + GP-FG + BH-EC) is gone.
 
-    The warehouses live in two different company DBs, so each is queried in its
-    own schema (see WAREHOUSE_SOURCES):
-      - BH-FGM → mart · "Jivo Mart"     (Sonipat finished goods)
-      - GP-FG  → oil  · "Gupta Godown Basement Finished Godown"
-      - BH-EC  → oil  · "Bhakharpur Finished E-Commerce"
-    Read-only; scoped to FINISHED item group + Active items (enforced in SQL).
-    Unknown / missing warehouse falls back to the default, BH-FGM."""
+    Two modes, chosen by the ``?warehouse=`` query param:
+      - ``ALL`` → the pivoted sheet the inventory page renders. With one warehouse
+        that is a single stock column; each row still carries its own WhsCode /
+        WhsName so the UI needs no special-casing.
+      - a specific code → just that warehouse, flat.
+    Anything not in ``ALLOWED_WHS`` falls back to ``DEFAULT_WHS``, so a stale
+    bookmark pointing at a retired warehouse shows the live one rather than 404ing.
+
+    Which company DB (mart / oil) to read is resolved from SAP's OWHS, not
+    hard-coded — see ``_warehouse_source()``. Read-only; scoped to the FINISHED
+    item group + Active items (enforced in SQL)."""
     permission_classes = [IsAuthenticated]
 
-    # (warehouse code, company-DB source key). Order here is the display order
-    # for the combined ALL view. Add a warehouse in exactly one place: here.
-    WAREHOUSE_SOURCES = (
-        ('BH-FGM', 'mart'),
-        ('GP-FG',  'oil'),
-        ('BH-EC',  'oil'),
-    )
-    ALLOWED_WHS = tuple(code for code, _src in WAREHOUSE_SOURCES)
-    _WHS_SOURCE = dict(WAREHOUSE_SOURCES)
-    DEFAULT_WHS = 'BH-FGM'
+    # The single warehouse this page reads. Add a warehouse in exactly one place:
+    # extend PLANNER_WAREHOUSE / _PLANNER_WAREHOUSES at the top of this module and
+    # both the planner and this page pick it up.
+    ALLOWED_WHS = _PLANNER_WAREHOUSES
+    DEFAULT_WHS = PLANNER_WAREHOUSE
 
     # One warehouse's finished-goods stock; `?` binds the WhsCode. The same
     # unqualified SQL runs against whichever company schema the warehouse maps to.
@@ -5056,7 +5089,7 @@ class SapInventoryView(_SafeAPIView):
         The HANA driver is imported lazily so the app never hard-depends on
         hdbcli; raises on driver-missing / HANA-down so the caller surfaces it."""
         from sap.service import select, resolve_schema
-        _src, schema = resolve_schema(cls._WHS_SOURCE.get(whs_code, 'mart'))
+        _src, schema = resolve_schema(_warehouse_source(whs_code))
         return select(cls.INVENTORY_SQL, [whs_code], schema=schema)
 
     @staticmethod
@@ -5114,7 +5147,7 @@ class SapInventoryView(_SafeAPIView):
         self._enrich(rows)
         payload = {
             'warehouse': whs_code,
-            'source': self._WHS_SOURCE.get(whs_code, 'mart'),
+            'source': _warehouse_source(whs_code),
             'results': rows,
             'count': len(rows),
             'summary': self._summarize(rows),
@@ -5131,7 +5164,7 @@ class SapInventoryView(_SafeAPIView):
             self._overlay_reserved(entry['data'].get('results') or [])
             return Response(entry['data'])
         all_rows, warnings = [], []
-        for whs_code, _source in self.WAREHOUSE_SOURCES:
+        for whs_code in self.ALLOWED_WHS:
             try:
                 all_rows.extend(self._fetch_rows(whs_code))
             except Exception as e:  # one warehouse down shouldn't blank the sheet

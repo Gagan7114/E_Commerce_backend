@@ -107,9 +107,11 @@ class ShipmentItem(models.Model):
     brand = models.TextField(blank=True)
     item_head = models.TextField(blank=True)
     item = models.TextField(blank=True)
-    # Inventory/warehouse this line's stock was auto-pooled from at plan time
-    # (BH-FGM = Jivo Mart, DL-EC = Jivo Wellness). Empty for legacy rows planned
-    # before pooling, or when the ASIN mapped to no planner warehouse.
+    # Warehouse this line's stock was read from at plan time. Now always the single
+    # planner warehouse (GP-FGM); historic rows still carry whichever of the retired
+    # BH-FGM / GP-FG / BH-EC they were planned against, so don't assume one value.
+    # Empty for legacy rows planned before this was tracked, or when the ASIN mapped
+    # to no planner warehouse.
     source_warehouse = models.TextField(blank=True)
     availability_status = models.TextField(blank=True)
     po_status = models.TextField(blank=True)
