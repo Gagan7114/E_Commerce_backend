@@ -3222,6 +3222,10 @@ def category_trend(request):
     dashboard_for = (
         secondary_dashboard_result if source == "secondary" else primary_dashboard_result
     )
+    # This trend reads nothing but `total.done_ltrs`, so skip the Prim sheet's
+    # open-PO pendency columns — they cost two queries whose result is the same
+    # for every month in the window below.
+    extra_kwargs = {} if source == "secondary" else {"with_pendency": False}
 
     def _done(block):
         total = (block or {}).get("total") or {}
@@ -3234,7 +3238,7 @@ def category_trend(request):
     errors = []
     for (m, y, _) in window:
         try:
-            res = dashboard_for(request.user, m, y, only_slugs)
+            res = dashboard_for(request.user, m, y, only_slugs, **extra_kwargs)
             prem = _done(res.get("premium"))
             comm = _done(res.get("commodity"))
         except Exception as e:  # noqa: BLE001

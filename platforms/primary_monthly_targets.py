@@ -408,6 +408,75 @@ def _read_master_po_many(formats: list[str], item_heads: tuple[str, ...], month:
     }
 
 
+def _read_open_po_pending_many(
+    formats: list[str],
+    item_heads: tuple[str, ...],
+) -> dict[tuple[str, str], Decimal]:
+    """Open-PO pending litres per (format, item_head) — the sheet's PENDING LTRS.
+
+    Deliberately NOT scoped to the month on screen: this is the live open-PO
+    backlog, the same scope as each platform's Pendency Dashboard and the Home
+    Pendency card — every PO still OPEN, cancelled excluded, pending =
+    max(order - delivered, 0). Keep the WHERE clause in step with
+    `_primary_open_po_totals` in platforms/views.py so the sheet, the dashboards
+    and that card can never disagree.
+    """
+    if not formats:
+        return {}
+    format_placeholder = ",".join(["LOWER(TRIM(%s))"] * len(formats))
+    item_placeholder = ",".join(["UPPER(TRIM(%s))"] * len(item_heads))
+    sql = f"""
+        SELECT
+            UPPER(TRIM("format"::text))    AS fmt,
+            UPPER(TRIM("item_head"::text)) AS item_head,
+            COALESCE(SUM(GREATEST(
+                COALESCE("total_order_liters", 0)
+                - COALESCE("total_delivered_liters", 0), 0)), 0) AS pending_ltrs
+        FROM "master_po"
+        WHERE LOWER(TRIM("format"::text)) IN ({format_placeholder})
+          AND UPPER(TRIM("item_head"::text)) IN ({item_placeholder})
+          AND UPPER(TRIM("open_close"::text)) = 'OPEN'
+          AND UPPER(TRIM(COALESCE("po_status", "status", '')::text))
+              NOT IN ('CANCELLED', 'CANCELED', 'CANCEL')
+        GROUP BY UPPER(TRIM("format"::text)), UPPER(TRIM("item_head"::text))
+    """
+    with connection.cursor() as cur:
+        cur.execute(sql, formats + list(item_heads))
+        rows = cur.fetchall()
+    return {
+        (_format_key(fmt), _format_key(item_head)): Decimal(pending_ltrs or 0)
+        for fmt, item_head, pending_ltrs in rows
+    }
+
+
+def _read_amazon_open_po_pending(item_heads: tuple[str, ...]) -> dict[str, Decimal]:
+    """Amazon's PENDING LTRS, keyed by item_head.
+
+    Amazon lives in its own table with no `open_close` flag, so its equivalent
+    of "still open" is po_status = 'PENDING' — the normalised status that
+    excludes CANCELLED / COMPLETED / EXPIRED / MOV.
+    """
+    item_placeholder = ",".join(["UPPER(TRIM(%s))"] * len(item_heads))
+    sql = f"""
+        SELECT
+            UPPER(TRIM("item_head"::text)) AS item_head,
+            COALESCE(SUM(GREATEST(
+                COALESCE("total_order_liters", 0)
+                - COALESCE("total_delivered_liters", 0), 0)), 0) AS pending_ltrs
+        FROM reporting."Amazon PO"
+        WHERE UPPER(TRIM("item_head"::text)) IN ({item_placeholder})
+          AND UPPER(TRIM(COALESCE("po_status", '')::text)) = 'PENDING'
+        GROUP BY UPPER(TRIM("item_head"::text))
+    """
+    with connection.cursor() as cur:
+        cur.execute(sql, list(item_heads))
+        rows = cur.fetchall()
+    return {
+        _format_key(item_head): Decimal(pending_ltrs or 0)
+        for item_head, pending_ltrs in rows
+    }
+
+
 def _read_amazon_secondary_many(item_heads: tuple[str, ...], month: int, year: int) -> dict[tuple[str, str], dict]:
     month_day_suffix = f"%-{_MONTH_NAMES[month]}"
     item_placeholder = ",".join(["UPPER(TRIM(%s))"] * len(item_heads))
@@ -1362,6 +1431,8 @@ def _primary_empty_total() -> dict:
         "require_drr": 0,
         "pending_ltr": 0,
         "dp_ltrs": 0,
+        "open_pending_ltrs": 0,
+        "open_dp_ltrs": 0,
     }
 
 
@@ -1373,6 +1444,10 @@ def _primary_grand_total(rows: list[dict]) -> dict:
     s_req_drr = sum(_num(r.get("require_drr")) for r in rows)
     s_pending = sum(_num(r.get("pending_ltr")) for r in rows)
     s_dp = sum(_num(r.get("dp_ltrs")) for r in rows)
+    # Rows with no PO backlog to read (Amazon MP, Flipkart MP) carry None and
+    # contribute nothing, so the total still adds up to the column on screen.
+    s_open_pending = sum(_num(r.get("open_pending_ltrs")) for r in rows)
+    s_open_dp = sum(_num(r.get("open_dp_ltrs")) for r in rows)
     return {
         "targets": s_tgt,
         "done_ltrs": s_done,
@@ -1383,7 +1458,27 @@ def _primary_grand_total(rows: list[dict]) -> dict:
         "require_drr": s_req_drr,
         "pending_ltr": s_pending,
         "dp_ltrs": s_dp,
+        "open_pending_ltrs": s_open_pending,
+        "open_dp_ltrs": s_open_dp,
     }
+
+
+def _attach_open_pending(row: dict, pending: Decimal | None) -> dict:
+    """Fill the sheet's PENDING LTRS / DP LTRS pair on a dashboard row.
+
+    DP LTRS is the full committed picture for the month: what has already been
+    delivered plus what is still owed on open POs. `pending is None` means this
+    row has no PO table to read (Amazon MP, Flipkart MP) — both cells stay blank
+    rather than reading as a real zero.
+    """
+    if pending is None:
+        row["open_pending_ltrs"] = None
+        row["open_dp_ltrs"] = None
+        return row
+    pending_ltrs = float(pending)
+    row["open_pending_ltrs"] = pending_ltrs
+    row["open_dp_ltrs"] = _num(row.get("done_ltrs")) + pending_ltrs
+    return row
 
 
 def _num(v) -> float:
@@ -1395,13 +1490,18 @@ def _num(v) -> float:
         return 0.0
 
 
-def primary_dashboard_result(user, month, year, only_slugs=None):
+def primary_dashboard_result(user, month, year, only_slugs=None, with_pendency=True):
     """Primary (master_po-backed) PREMIUM/COMMODITY roll-up for one month — the
     same figures shown on the home Primary KPI card. Extracted from
     `primary_month_targets_dashboard` so the home Sales Trend can reuse the
     identical per-month litres for every month in its window instead of reading
     snapshots that drift. `only_slugs` restricts to those platform slugs; `None`
-    = all in scope."""
+    = all in scope.
+
+    `with_pendency=False` leaves the sheet's PENDING LTRS / DP LTRS columns out.
+    Those read the open-PO backlog, which is month-independent, so a caller that
+    loops this function over a window of months (the Sales Trend) would repeat
+    the same two queries per month for figures it never reads."""
     row_defs = _dashboard_row_defs(user)
     if only_slugs is not None:
         only = set(only_slugs)
@@ -1420,6 +1520,39 @@ def primary_dashboard_result(user, month, year, only_slugs=None):
     result: dict[str, dict] = {}
     formats = [d["format"] for d in row_defs]
     source_map = _dashboard_sources(row_defs, DASHBOARD_ITEM_HEADS, month, year)
+    # PENDING LTRS / DP LTRS. Read once for every format and item head, since the
+    # open-PO backlog is month-independent (see `_read_open_po_pending_many`).
+    pending_by_format = (
+        _read_open_po_pending_many(
+            [d["source_format"] for d in row_defs if d.get("source") == "master_po"],
+            DASHBOARD_ITEM_HEADS,
+        )
+        if with_pendency
+        else {}
+    )
+    amazon_pending_by_head = (
+        _read_amazon_open_po_pending(DASHBOARD_ITEM_HEADS)
+        if with_pendency
+        and any(d.get("source") == "amazon_sec_range_master_view" for d in row_defs)
+        else {}
+    )
+
+    def _pending_for(defn: dict, item_head: str) -> Decimal | None:
+        """This row's open-PO pending litres, or None when it has no PO source."""
+        if not with_pendency:
+            return None
+        if defn.get("source") == "master_po":
+            return pending_by_format.get(
+                (_format_key(defn["source_format"]), _format_key(item_head)),
+                Decimal(0),
+            )
+        # The Amazon row is sourced from secondary shipments but its POs live in
+        # reporting."Amazon PO", so its backlog comes from there.
+        if defn.get("source") == "amazon_sec_range_master_view":
+            return amazon_pending_by_head.get(_format_key(item_head), Decimal(0))
+        # Amazon MP / Flipkart MP are marketplace sales with no PO backlog.
+        return None
+
     for item_head in DASHBOARD_ITEM_HEADS:
         stored_by_format = _select_dashboard_rows(formats, item_head, month, year)
         # Fallback targets from the latest earlier month, for formats this month
@@ -1446,13 +1579,18 @@ def primary_dashboard_result(user, month, year, only_slugs=None):
             ):
                 continue
 
+            pending = _pending_for(defn, item_head)
+
             if defn.get("target_source") == "month_targets":
                 secondary_row = secondary_by_format.get(_format_key(defn.get("target_format")))
                 if secondary_row:
-                    rows.append(_dashboard_row_from_secondary_target(defn, secondary_row))
+                    rows.append(_attach_open_pending(
+                        _dashboard_row_from_secondary_target(defn, secondary_row),
+                        pending,
+                    ))
                     continue
 
-            rows.append(
+            rows.append(_attach_open_pending(
                 _dashboard_row_from_source(
                     defn,
                     stored_by_format.get(_format_key(defn["format"])),
@@ -1464,8 +1602,9 @@ def primary_dashboard_result(user, month, year, only_slugs=None):
                         {"done_ltrs": Decimal(0), "latest_date": None},
                     ),
                     carry_by_format.get(_format_key(defn["format"])),
-                )
-            )
+                ),
+                pending,
+            ))
 
         result[item_head.lower()] = {
             "rows": rows,
