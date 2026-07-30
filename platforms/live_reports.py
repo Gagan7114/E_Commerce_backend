@@ -76,6 +76,7 @@ _MAX_BYTES = 30 * 1024 * 1024 # reject/parse-guard: workbooks larger than 30 MB
 _MAX_ROWS = 50_000            # per-sheet row cap materialised into the grid
 _DEFAULT_PAGE_SIZE = 100
 _MAX_PAGE_SIZE = 500
+_FULL_GRID_CAP = 2000        # rows returned to the Dashboard view (full=1), un-paginated
 
 # Per-process LRU of parsed workbooks, keyed by blob sha (content-addressed).
 # Bounds memory to at most _PARSE_LRU_MAX workbooks per worker and avoids the
@@ -396,6 +397,25 @@ def live_data(request):
     requested = (request.query_params.get("sheet") or "").strip()
     sheet = requested if requested in parsed["grids"] else sheets[0]
     grid = parsed["grids"].get(sheet, [])
+
+    # Dashboard view: return the whole sheet (un-paginated, capped) so the client
+    # can interpret its structure into KPI cards / charts / tables. The Table view
+    # keeps using the paginated body below.
+    if request.query_params.get("full"):
+        return Response(
+            {
+                "report": report["key"],
+                "label": report["label"],
+                "date": report["date"],
+                "updated_at": _last_commit_iso(report),
+                "download_url": report["download_url"],
+                "sheets": sheets,
+                "sheet": sheet,
+                "grid": grid[:_FULL_GRID_CAP],
+                "rows_total": len(grid),
+                "truncated": len(grid) > _FULL_GRID_CAP,
+            }
+        )
 
     header = grid[0] if grid else []
     body = grid[1:] if len(grid) > 1 else []
