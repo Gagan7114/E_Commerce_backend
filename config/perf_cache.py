@@ -58,17 +58,26 @@ def _effective_timeout(timeout: int) -> int:
 # data even within the cache window). The param is EXCLUDED from the cache key so
 # the bust request maps to the same key as the normal request — it refreshes that
 # shared entry instead of writing a separate, useless one.
-_BUST_PARAM = "nocache"
+#
+# `fresh=1` is the deeper variant: endpoints that keep their own upstream result
+# cache (sap.views.sales_analysis skips the HANA procedure cache on it) read it
+# themselves. It only ever makes a response MORE current, never different, so it
+# belongs in the same excluded-from-key, bypass-the-read bucket — otherwise a
+# live read would fork the keyspace and leave the entry every other caller reads
+# untouched.
+_BUST_PARAMS = ("nocache", "fresh")
 
 
 def _query_items(request):
     if not hasattr(request, "GET"):
         return []
-    return [item for item in sorted(request.GET.lists()) if item[0] != _BUST_PARAM]
+    return [item for item in sorted(request.GET.lists()) if item[0] not in _BUST_PARAMS]
 
 
 def _wants_bypass(request) -> bool:
-    return bool(request.GET.get(_BUST_PARAM)) if hasattr(request, "GET") else False
+    if not hasattr(request, "GET"):
+        return False
+    return any(bool(request.GET.get(param)) for param in _BUST_PARAMS)
 
 
 def _make_key(prefix: str, request, args, kwargs, shared: bool = False) -> str:
