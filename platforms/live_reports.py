@@ -47,6 +47,7 @@ import urllib.error
 import urllib.request
 from collections import OrderedDict
 from typing import Any
+from urllib.parse import quote
 
 from django.conf import settings
 from django.core.cache import cache
@@ -169,6 +170,34 @@ def _find_report(key: str) -> dict | None:
         if r["key"] == key:
             return r
     return None
+
+
+def _last_commit_iso(report: dict) -> str | None:
+    """ISO datetime (UTC) of the commit that last published this file — i.e. when
+    the report was last updated on GitHub. Cached by sha. Best-effort: any failure
+    returns None and the UI simply omits the time.
+
+    NOTE: the source bot publishes all reports together in one daily commit, so
+    this value is the same across every report/sheet on a given day; it changes
+    day to day, not per sheet."""
+    sha = report.get("sha") or report["filename"]
+    ck = f"livereports.commit:{sha}"
+    cached = cache.get(ck)
+    if cached is not None:
+        return cached or None
+    url = (
+        f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/commits"
+        f"?path={quote(report['filename'])}&per_page=1"
+    )
+    iso = ""
+    try:
+        data = json.loads(_http_get(url).decode("utf-8"))
+        if isinstance(data, list) and data:
+            iso = ((data[0].get("commit") or {}).get("committer") or {}).get("date") or ""
+    except (_SourceError, ValueError, UnicodeDecodeError, KeyError, IndexError, TypeError):
+        iso = ""
+    cache.set(ck, iso, timeout=_FILE_TTL)
+    return iso or None
 
 
 # --- Parsing -----------------------------------------------------------------
@@ -385,6 +414,7 @@ def live_data(request):
             "report": report["key"],
             "label": report["label"],
             "date": report["date"],
+            "updated_at": _last_commit_iso(report),  # ISO UTC publish time (or null)
             "download_url": report["download_url"],
             "sheets": sheets,
             "sheet": sheet,
