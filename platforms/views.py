@@ -1618,6 +1618,11 @@ def pendency_dashboard(request, slug: str):
     # equal the full undelivered order qty. If a GRN lands later the cascade
     # flips the PO to COMPLETED and it leaves this bucket automatically.
     expired_mode = (request.query_params.get("status") or "").strip().lower() == "expired"
+    # `scope=all` asks for TOTAL pendency — every open (or expired) PO regardless
+    # of month. Without it the endpoint keeps its historical behaviour of falling
+    # back to the latest PO month, which the Summary page's "Latest POs" card
+    # still relies on.
+    scope_all = (request.query_params.get("scope") or "").strip().lower() == "all"
 
     if expired_mode:
         status_filter = (
@@ -1651,7 +1656,7 @@ def pendency_dashboard(request, slug: str):
         and re.fullmatch(r"\d{4}-\d{2}-\d{2}", raw_to)
     )
 
-    if not raw_year and not raw_po_month and not has_date_range:
+    if not scope_all and not raw_year and not raw_po_month and not has_date_range:
         latest = _dict_rows(
             '''
             SELECT
