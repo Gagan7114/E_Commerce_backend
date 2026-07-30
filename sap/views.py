@@ -19,8 +19,10 @@ from .service import (
     FG_WAREHOUSE_CODES,
     HANA_SCHEMAS,
     SALES_ANALYSIS_DEFAULT_SOURCE,
+    SALES_ANALYSIS_PROC_TTL,
     SALES_ANALYSIS_PROCEDURES,
     report_sales_analysis,
+    report_sales_analysis_live,
     resolve_schema,
     select,
 )
@@ -44,6 +46,18 @@ class SAPError(APIException):
     status_code = 500
     default_detail = "SAP HANA error"
     default_code = "sap_hana_error"
+
+
+class SAPUnavailable(SAPError):
+    """HANA itself is unreachable (VPN down, host blocked, service stopped) —
+    an infrastructure outage, not a bug in this endpoint. Separated from
+    SAPError so a live view can tell "disconnected, retrying" apart from a
+    genuine 500, and so it subclasses SAPError (existing `except SAPError`
+    handlers keep working)."""
+
+    status_code = 503
+    default_detail = "SAP HANA is unreachable"
+    default_code = "sap_unreachable"
 
 
 def _page(request) -> tuple[int, int]:
@@ -258,6 +272,15 @@ def sales_analysis(request):
             raw = str(request.query_params.get(param) or "").strip()
             filters[param] = raw.lower() if raw else None
 
+    # `fresh=1` means "go to HANA now" — it skips the proc-level result cache in
+    # addition to the response cache that `?nocache=1` already bypasses. The live
+    # page's auto-poll deliberately does NOT send it (the 120s proc cache is what
+    # keeps a roomful of open tabs from each triggering its own CALL); its
+    # explicit Refresh button does.
+    want_fresh = str(request.query_params.get("fresh") or "").strip().lower() in (
+        "1", "true", "yes",
+    )
+
     raw_source = str(request.query_params.get("source") or "").strip().lower()
     source = raw_source or SALES_ANALYSIS_DEFAULT_SOURCE
     if source not in SALES_ANALYSIS_PROCEDURES:
@@ -271,7 +294,9 @@ def sales_analysis(request):
     )
 
     try:
-        rows = report_sales_analysis(from_date, to_date, source=source)
+        rows, fetched_at, proc_cached = report_sales_analysis_live(
+            from_date, to_date, source=source, force=want_fresh
+        )
     except Exception as e:
         # Surface infrastructure failures with a human-readable hint instead
         # of dumping the raw hdbcli stack trace. rc=10060 / RTE:[89006] are
@@ -279,12 +304,23 @@ def sales_analysis(request):
         # not a backend bug, so the message points the user at the right fix.
         text = str(e)
         if "rc=10060" in text or "RTE:[89006]" in text or "Connection failed" in text:
-            raise SAPError(
+            raise SAPUnavailable(
                 "Cannot reach SAP HANA database — connection timed out. "
                 "Check VPN / network access to the HANA host and that the "
                 "SAP HANA server is running."
             )
         raise SAPError(f"SAP HANA procedure error: {e}")
+
+    # Freshness travels as an ABSOLUTE timestamp, never a precomputed age: this
+    # response body is itself cacheable by @cached_get, and a baked-in
+    # "age_seconds" would keep reporting the age it had when first computed. The
+    # client subtracts from its own clock instead.
+    live_meta = {
+        "fetched_at": fetched_at,           # UTC ISO — when these rows left HANA
+        "proc_cached": proc_cached,         # served from the 120s proc cache
+        "ttl_seconds": SALES_ANALYSIS_PROC_TTL,
+        "forced": want_fresh,
+    }
 
     columns = list(rows[0].keys()) if rows else []
     filtered = [row for row in rows if _row_matches(row, query, filters)]
@@ -329,6 +365,7 @@ def sales_analysis(request):
             "source": source,
             "from_date": from_date,
             "to_date": to_date,
+            "live": live_meta,
         })
 
     return Response({
@@ -344,6 +381,7 @@ def sales_analysis(request):
         "sources": sorted(SALES_ANALYSIS_PROCEDURES),
         "from_date": from_date,
         "to_date": to_date,
+        "live": live_meta,
     })
 
 

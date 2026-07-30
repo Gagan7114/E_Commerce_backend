@@ -15,6 +15,7 @@ from __future__ import annotations
 import logging
 import re
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from typing import Any, Iterator
 
 from django.conf import settings
@@ -179,10 +180,14 @@ def _resolve_sales_analysis_procedure(source: str | None) -> tuple[str, str]:
     return key, proc
 
 
+SALES_ANALYSIS_PROC_TTL = 120
+
+
 def report_sales_analysis(
     from_date: str,
     to_date: str,
     source: str = SALES_ANALYSIS_DEFAULT_SOURCE,
+    force: bool = False,
 ) -> list[dict]:
     """Run an allow-listed SAP HANA sales analysis procedure.
 
@@ -194,8 +199,32 @@ def report_sales_analysis(
     single HANA CALL within the cache TTL. Python filtering in the view is
     unchanged — equivalent by construction (same proc + same inputs = same rows).
 
+    `force=True` skips the read side of that cache and goes straight to HANA —
+    what a live view's explicit "Refresh" needs so the user can be certain the
+    rows came off the ERP just now. The fresh result is still written back, so
+    subsequent readers (including the auto-poll) pick it up.
+
     Logs the raw row count returned by HANA so we can verify whether the
     procedure itself caps results or our pipeline drops some downstream.
+    """
+    rows, _fetched_at, _from_cache = report_sales_analysis_live(
+        from_date, to_date, source=source, force=force
+    )
+    return rows
+
+
+def report_sales_analysis_live(
+    from_date: str,
+    to_date: str,
+    source: str = SALES_ANALYSIS_DEFAULT_SOURCE,
+    force: bool = False,
+) -> tuple[list[dict], str, bool]:
+    """Same as report_sales_analysis, but also reports HOW LIVE the rows are:
+    ``(rows, fetched_at_iso_utc, served_from_cache)``.
+
+    A live view can only honestly claim "connected" if it can say when the data
+    last came off HANA, so the timestamp travels with the cached payload rather
+    than being guessed at by the caller.
     """
     source_key, procedure = _resolve_sales_analysis_procedure(source)
 
@@ -203,12 +232,17 @@ def report_sales_analysis(
     # Filter/search/page params never change what the proc returns, so caching
     # on those (as the view-level @cached_get does) re-calls HANA needlessly.
     _proc_key = f"sap:proc:{source_key}:{from_date}:{to_date}"
-    try:
-        _cached = cache.get(_proc_key)
-    except Exception:
-        _cached = None
-    if _cached is not None:
-        return _cached
+    if not force:
+        try:
+            _cached = cache.get(_proc_key)
+        except Exception:
+            _cached = None
+        if _cached is not None:
+            # Entries written before this function grew a timestamp are plain
+            # lists; treat their age as unknown rather than crashing on them.
+            if isinstance(_cached, dict):
+                return _cached.get("rows") or [], _cached.get("fetched_at") or "", True
+            return _cached, "", True
 
     with hana_connection() as conn:
         cur = conn.cursor()
@@ -219,20 +253,26 @@ def report_sales_analysis(
         rowcount_attr = getattr(cur, "rowcount", "n/a")
         cur.close()
     result = [dict(zip(cols, r)) for r in raw_rows]
+    fetched_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
     logger.warning(
-        "[SAP] report_sales_analysis(%s, %s, source=%s) -> fetchall=%d rows, cur.rowcount=%s, cols=%d",
+        "[SAP] report_sales_analysis(%s, %s, source=%s, force=%s) -> fetchall=%d rows, cur.rowcount=%s, cols=%d",
         from_date,
         to_date,
         source_key,
+        force,
         len(raw_rows),
         rowcount_attr,
         len(cols),
     )
     try:
-        cache.set(_proc_key, result, timeout=120)
+        cache.set(
+            _proc_key,
+            {"rows": result, "fetched_at": fetched_at},
+            timeout=SALES_ANALYSIS_PROC_TTL,
+        )
     except Exception:
         pass
-    return result
+    return result, fetched_at, False
 
 
 def scalar(sql: str, params: list | tuple | None = None):
