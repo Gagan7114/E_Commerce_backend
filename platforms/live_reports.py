@@ -401,7 +401,7 @@ def live_data(request):
     # Dashboard view: return the whole sheet (un-paginated, capped) so the client
     # can interpret its structure into KPI cards / charts / tables. The Table view
     # keeps using the paginated body below.
-    if request.query_params.get("full"):
+    if str(request.query_params.get("full") or "").lower() in ("1", "true", "yes"):
         return Response(
             {
                 "report": report["key"],
