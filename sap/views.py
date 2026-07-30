@@ -1,10 +1,13 @@
 """SAP B1 (HANA) read endpoints. Mirrors FastAPI routes/sap.py."""
 
+import hashlib
 import logging
 import re
 from calendar import monthrange
 from datetime import date
 from decimal import InvalidOperation
+
+from django.core.cache import cache
 
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.exceptions import NotFound, APIException, ValidationError
@@ -21,7 +24,6 @@ from .service import (
     SALES_ANALYSIS_DEFAULT_SOURCE,
     SALES_ANALYSIS_PROC_TTL,
     SALES_ANALYSIS_PROCEDURES,
-    report_sales_analysis,
     report_sales_analysis_live,
     resolve_schema,
     select,
@@ -246,6 +248,59 @@ def _sales_analysis_summary(rows: list[dict]) -> dict:
     }
 
 
+# ── Freshness-keyed payload cache ───────────────────────────────────────────
+# The @cached_get response cache below is floored at PERFCACHE_TTL_FLOOR (300s),
+# far too stale for the live grid, so the live page sends ?nocache=1 on every
+# poll. Without this second cache that would re-run the whole O(rows) pipeline
+# once a minute per open tab: unpickling the procedure rowset, a filter pass,
+# _filter_options (one pass per filter column) and the summary — hundreds of
+# thousands of rows for the default date range.
+#
+# So cache the finished payload under the procedure's fetch timestamp. The rows
+# cannot change until the procedure cache expires, so while it is alive a poll
+# costs one small cache read; the moment new rows land the timestamp moves, the
+# key changes and the payload rebuilds. Freshness stays bounded by the procedure
+# TTL — this cache can never hold a payload older than the rows it was built
+# from. The timestamp is kept in its own tiny key so the check itself doesn't
+# have to unpickle the rowset (which is most of the cost being avoided).
+_SA_VERSION_PREFIX = "sap:sa:ver"
+_SA_PAYLOAD_PREFIX = "sap:sa:payload"
+# Export requests ask for up to 100k rows in one page; caching payloads that
+# size would trade the CPU for a memory problem (and they aren't polled).
+_SA_PAYLOAD_MAX_PAGE_SIZE = 1000
+
+
+def _sa_version_key(source: str, from_date: str, to_date: str) -> str:
+    return f"{_SA_VERSION_PREFIX}:{source}:{from_date}:{to_date}"
+
+
+def _sa_payload_key(version: str, **parts) -> str:
+    """Payload identity = every input that can change the response, plus the
+    procedure fetch timestamp. Sets are sorted so the same filter selection
+    always hashes the same way."""
+    shaped = {
+        k: sorted(v) if isinstance(v, (set, frozenset)) else v
+        for k, v in parts.items()
+    }
+    raw = f"{version}|" + "|".join(f"{k}={shaped[k]!r}" for k in sorted(shaped))
+    return f"{_SA_PAYLOAD_PREFIX}:{hashlib.md5(raw.encode('utf-8')).hexdigest()}"
+
+
+def _sa_cache_get(key: str):
+    try:
+        return cache.get(key)
+    except Exception:
+        # A flaky cache backend must only cost us the optimization.
+        return None
+
+
+def _sa_cache_set(key: str, value, timeout: int) -> None:
+    try:
+        cache.set(key, value, timeout=timeout)
+    except Exception:
+        pass
+
+
 @api_view(["GET"])
 @permission_classes([require("sap.view")])
 @cached_get(timeout=120, prefix="sap.sales_analysis")
@@ -281,6 +336,8 @@ def sales_analysis(request):
         "1", "true", "yes",
     )
 
+    aggregate = str(request.query_params.get("aggregate") or "").strip().lower()
+
     raw_source = str(request.query_params.get("source") or "").strip().lower()
     source = raw_source or SALES_ANALYSIS_DEFAULT_SOURCE
     if source not in SALES_ANALYSIS_PROCEDURES:
@@ -292,6 +349,30 @@ def sales_analysis(request):
     procedure_label = (
         SALES_ANALYSIS_PROCEDURES[source].replace('"', '')
     )
+
+    # Everything that identifies this payload except the procedure timestamp.
+    payload_parts = dict(
+        source=source,
+        from_date=from_date,
+        to_date=to_date,
+        page=page,
+        page_size=page_size,
+        query=query,
+        aggregate=aggregate,
+        **filters,
+    )
+    cacheable = page_size <= _SA_PAYLOAD_MAX_PAGE_SIZE
+    # A forced read must reach HANA, so don't consult this cache for it.
+    version = "" if want_fresh else (_sa_cache_get(_sa_version_key(source, from_date, to_date)) or "")
+    if version and cacheable:
+        hit = _sa_cache_get(_sa_payload_key(version, **payload_parts))
+        if hit is not None:
+            # `fetched_at` is the fact that matters and is already baked in; the
+            # other two describe how the ORIGINAL request was served, so restate
+            # them for this one rather than replaying stale flags.
+            payload = dict(hit)
+            payload["live"] = {**payload.get("live", {}), "proc_cached": True, "forced": False}
+            return Response(payload)
 
     try:
         rows, fetched_at, proc_cached = report_sales_analysis_live(
@@ -344,7 +425,24 @@ def sales_analysis(request):
     # to `page_size` rows shrinks the payload from megabytes to a few bytes and
     # skips the expensive filter-option build — so the card paints fast and the
     # response is small enough for the frontend to persist for instant refresh.
-    if str(request.query_params.get("aggregate") or "").strip().lower() == "item_head":
+    def _served(payload: dict) -> Response:
+        """Store the finished payload against the procedure timestamp, so the
+        next poll for the same view is a cache read instead of another full
+        pass over the rowset."""
+        if fetched_at and cacheable:
+            _sa_cache_set(
+                _sa_version_key(source, from_date, to_date),
+                fetched_at,
+                SALES_ANALYSIS_PROC_TTL,
+            )
+            _sa_cache_set(
+                _sa_payload_key(fetched_at, **payload_parts),
+                payload,
+                SALES_ANALYSIS_PROC_TTL,
+            )
+        return Response(payload)
+
+    if aggregate == "item_head":
         groups: dict[str, dict] = {}
         for row in filtered:
             head = str(_row_value(row, "U_TYPE") or "").strip().upper()
@@ -357,7 +455,7 @@ def sales_analysis(request):
             g["line_total"] += _num(row.get("LineTotal"))
             g["quantity"] += _num(row.get("Quantity"))
             g["rows"] += 1
-        return Response({
+        return _served({
             "aggregate": list(groups.values()),
             "summary": _sales_analysis_summary(filtered),
             "count": len(filtered),
@@ -368,7 +466,7 @@ def sales_analysis(request):
             "live": live_meta,
         })
 
-    return Response({
+    return _served({
         "data": filtered[offset:offset + page_size],
         "count": len(filtered),
         "page": page,
