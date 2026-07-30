@@ -9,6 +9,7 @@ from accounts.views import (
     notification_detail,
     notifications,
 )
+from platforms import live_reports as platform_live_reports
 from platforms import reports as platform_reports
 from uploads import amazon_uploads
 
@@ -21,6 +22,8 @@ urlpatterns = [
     path("api/upload/", include("uploads.urls")),
     path("api/uploads", amazon_uploads.uploads_collection, name="amazon-uploads"),
     path("api/uploads/<int:upload_id>", amazon_uploads.upload_detail, name="amazon-upload-detail"),
+    path("api/reports/live/reports", platform_live_reports.live_reports, name="reports-live-reports"),
+    path("api/reports/live/data", platform_live_reports.live_data, name="reports-live-data"),
     path("api/reports/raw", platform_reports.report_raw, name="reports-raw"),
     path("api/reports/export", platform_reports.report_export, name="reports-export"),
     path("api/reports/columns", platform_reports.report_columns, name="reports-columns"),
