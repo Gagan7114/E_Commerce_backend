@@ -3714,10 +3714,29 @@ class ShipmentSwitchVerifyView(_SafeAPIView):
     @staticmethod
     def _auto_check(shipment):
         details = shipment.switch_details if isinstance(shipment.switch_details, list) else []
-        pos = sorted({
-            str(r.get('po_number') or '').strip().upper()
-            for r in details if isinstance(r, dict)
-        } - {''})
+        # switch_details holds one row per PO+ASIN, but "has Amazon moved this?"
+        # is a PO-level question — FC and appointment are properties of the PO,
+        # not of each SKU. Collapse to one row per PO (summing units and counting
+        # lines) so a 14-SKU PO yields ONE verdict instead of 14 identical ones.
+        by_po = {}
+        for r in details:
+            if not isinstance(r, dict):
+                continue
+            po = str(r.get('po_number') or '').strip().upper()
+            if not po:
+                continue
+            slot = by_po.setdefault(po, {
+                'from_fc': r.get('from_fc'),
+                'to_fc': r.get('to_fc'),
+                'units': 0.0,
+                'sku_count': 0,
+            })
+            slot['units'] += float(r.get('units') or 0)
+            slot['sku_count'] += 1
+            # Keep the first non-empty FCs seen — they're identical per PO.
+            slot['from_fc'] = slot['from_fc'] or r.get('from_fc')
+            slot['to_fc'] = slot['to_fc'] or r.get('to_fc')
+        pos = sorted(by_po)
         if not pos:
             return []
 
@@ -3742,10 +3761,8 @@ class ShipmentSwitchVerifyView(_SafeAPIView):
         } - {''}
 
         results = []
-        for r in details:
-            if not isinstance(r, dict):
-                continue
-            po = str(r.get('po_number') or '').strip().upper()
+        for po in pos:
+            agg = by_po[po]
             found_fc = str(sheet_fc.get(po) or '').strip()
             appt = live_appt.get(po) or {}
             found_appt = str(appt.get('appointment_id') or '').strip()
@@ -3755,8 +3772,10 @@ class ShipmentSwitchVerifyView(_SafeAPIView):
             appt_ok = found_appt in target_appts if target_appts else False
             results.append({
                 'po_number': po,
-                'from_fc': r.get('from_fc'),
-                'to_fc': r.get('to_fc'),
+                'from_fc': agg['from_fc'],
+                'to_fc': agg['to_fc'],
+                'units': int(round(agg['units'])),
+                'sku_count': agg['sku_count'],
                 'expected_fc': shipment.destination_fc,
                 'found_fc': found_fc or None,
                 'fc_switched': fc_ok,
