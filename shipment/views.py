@@ -1365,6 +1365,29 @@ def _fetch_doh_filler_pool(fc, exclude_po_uppers, doh_by_asin):
                 JOIN sp_shipments s ON s.id = si.shipment_id
                 WHERE si.not_loaded = FALSE
                   AND s.status != 'rejected'
+            ),
+            billed AS (
+                -- SAP-billed units per PO+item, split greedily across sibling ASINs
+                -- that share a sap_sku_code so it's consumed once, keyed by ASIN
+                -- (see AppointmentItemsView for the rationale).
+                SELECT
+                    UPPER(TRIM(ap.po_number)) AS po_number,
+                    ap.asin,
+                    LEAST(
+                        ap.accepted_qty,
+                        GREATEST(
+                            sb.billed_qty - COALESCE(SUM(ap.accepted_qty) OVER (
+                                PARTITION BY UPPER(TRIM(ap.po_number)), UPPER(TRIM(ap.sap_sku_code))
+                                ORDER BY ap.asin
+                                ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING), 0),
+                            0
+                        )
+                    ) AS billed_qty
+                FROM reporting."Amazon PO" ap
+                JOIN sap_billing sb
+                    ON sb.po_number = UPPER(TRIM(ap.po_number))
+                   AND sb.sap_item_code = UPPER(TRIM(ap.sap_sku_code))
+                WHERE ap.accepted_qty > 0
             )
             SELECT
                 p.po_number,
@@ -1393,9 +1416,9 @@ def _fetch_doh_filler_pool(fc, exclude_po_uppers, doh_by_asin):
             LEFT JOIN locked_pairs lp
                 ON lp.asin = p.asin
                AND lp.po_number = UPPER(TRIM(p.po_number))
-            LEFT JOIN sap_billing b
+            LEFT JOIN billed b
                 ON b.po_number = UPPER(TRIM(p.po_number))
-               AND b.sap_item_code = UPPER(TRIM(p.sap_sku_code))
+               AND b.asin = p.asin
             WHERE p.status = 'Confirmed'
               AND p.availability_status = 'AC - Accepted: In stock'
               AND p.accepted_qty > 0
@@ -2068,7 +2091,12 @@ class AppointmentItemsView(_SafeAPIView):
                     -- For multi-appointment combine without selected_pos, map each
                     -- PO back to the appointment it originally came from so the
                     -- source_appointment_id below is per-appointment, not primary.
-                    SELECT DISTINCT
+                    -- DISTINCT ON (po_number): a PO listed on TWO combined
+                    -- appointments must map to exactly ONE row here, else the outer
+                    -- LEFT JOIN would emit each PO line twice and double its
+                    -- (billed-adjusted) qty into the truck. Pick the lowest
+                    -- appointment_id deterministically.
+                    SELECT DISTINCT ON (UPPER(TRIM(pv)))
                         UPPER(TRIM(pv)) AS po_number,
                         a.appointment_id
                     FROM reporting."appointment" a,
@@ -2077,6 +2105,7 @@ class AppointmentItemsView(_SafeAPIView):
                     ) AS pv
                     WHERE a.appointment_id = ANY(%s::text[])
                       AND NULLIF(TRIM(pv), '') IS NOT NULL
+                    ORDER BY UPPER(TRIM(pv)), a.appointment_id
                 ),
                 committed AS (
                     -- PO-fulfilment "committed": units already put on ANY
@@ -2103,13 +2132,34 @@ class AppointmentItemsView(_SafeAPIView):
                 billed AS (
                     -- Units already invoiced in SAP for this PO+item (net Sales
                     -- minus Sales Return, eaches), synced from RK-World Sales
-                    -- Analysis into sap_billing and matched to the PO line via its
-                    -- sap_sku_code. Per the billing rule, SAP billing is the
-                    -- authority for "done": billed units are removed from what's
-                    -- offered here (the shipped tally above is exposed for context
-                    -- but does NOT gate).
-                    SELECT po_number, sap_item_code, billed_qty
-                    FROM sap_billing
+                    -- Analysis into sap_billing. Per the billing rule, SAP billing
+                    -- is the authority for "done": billed units are removed from
+                    -- what's offered here (the shipped tally above is exposed for
+                    -- context but does NOT gate).
+                    -- sap_billing holds ONE row per (po, item), but two ASINs on a
+                    -- PO can map to the SAME sap_sku_code — subtracting the full
+                    -- billed qty from each sibling line would double-count. So split
+                    -- the billed total greedily across those sibling ASINs
+                    -- (deterministic by ASIN); the total consumed never exceeds the
+                    -- SAP figure. Keyed by ASIN so the outer join is 1:1 per line.
+                    SELECT
+                        UPPER(TRIM(ap.po_number)) AS po_number,
+                        ap.asin,
+                        LEAST(
+                            ap.accepted_qty,
+                            GREATEST(
+                                sb.billed_qty - COALESCE(SUM(ap.accepted_qty) OVER (
+                                    PARTITION BY UPPER(TRIM(ap.po_number)), UPPER(TRIM(ap.sap_sku_code))
+                                    ORDER BY ap.asin
+                                    ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING), 0),
+                                0
+                            )
+                        ) AS billed_qty
+                    FROM reporting."Amazon PO" ap
+                    JOIN sap_billing sb
+                        ON sb.po_number = UPPER(TRIM(ap.po_number))
+                       AND sb.sap_item_code = UPPER(TRIM(ap.sap_sku_code))
+                    WHERE ap.accepted_qty > 0
                 ),
                 doh_data AS (
                     -- placeholder; DOH joined in Python via _live_doh_by_asin() below
@@ -2169,7 +2219,7 @@ class AppointmentItemsView(_SafeAPIView):
                     AND c.po_number = UPPER(TRIM(p.po_number))
                 LEFT JOIN billed b
                     ON b.po_number = UPPER(TRIM(p.po_number))
-                    AND b.sap_item_code = UPPER(TRIM(p.sap_sku_code))
+                    AND b.asin = p.asin
                 WHERE p.status = 'Confirmed'
                   AND p.availability_status = 'AC - Accepted: In stock'
                   AND p.accepted_qty > 0
@@ -2471,6 +2521,29 @@ class AppointmentExtraPosView(_SafeAPIView):
 
         with connection.cursor() as cur:
             cur.execute("""
+                WITH billed AS (
+                    -- SAP-billed units per PO+item, split greedily across sibling
+                    -- ASINs that share a sap_sku_code so it's consumed once, keyed by
+                    -- ASIN (see AppointmentItemsView for the rationale).
+                    SELECT
+                        UPPER(TRIM(ap.po_number)) AS po_number,
+                        ap.asin,
+                        LEAST(
+                            ap.accepted_qty,
+                            GREATEST(
+                                sb.billed_qty - COALESCE(SUM(ap.accepted_qty) OVER (
+                                    PARTITION BY UPPER(TRIM(ap.po_number)), UPPER(TRIM(ap.sap_sku_code))
+                                    ORDER BY ap.asin
+                                    ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING), 0),
+                                0
+                            )
+                        ) AS billed_qty
+                    FROM reporting."Amazon PO" ap
+                    JOIN sap_billing sb
+                        ON sb.po_number = UPPER(TRIM(ap.po_number))
+                       AND sb.sap_item_code = UPPER(TRIM(ap.sap_sku_code))
+                    WHERE ap.accepted_qty > 0
+                )
                 SELECT
                     p.po_number,
                     MAX(p.sku_name) AS product_name,
@@ -2501,9 +2574,9 @@ class AppointmentExtraPosView(_SafeAPIView):
                         ORDER BY p.days_to_expiry NULLS LAST, p.asin
                     ) AS skus
                 FROM reporting."Amazon PO" p
-                LEFT JOIN sap_billing b
+                LEFT JOIN billed b
                     ON b.po_number = UPPER(TRIM(p.po_number))
-                   AND b.sap_item_code = UPPER(TRIM(p.sap_sku_code))
+                   AND b.asin = p.asin
                 WHERE p.fulfillment_center = %s
                   AND p.status = 'Confirmed'
                   AND p.po_status = 'PENDING'
@@ -4403,7 +4476,27 @@ class DOHAutoFillView(_SafeAPIView):
                 billed AS (
                     -- SAP-billed units per PO+item (billing rule: the authority for
                     -- "done"; committed_qty is exposed for context but does not gate).
-                    SELECT po_number, sap_item_code, billed_qty FROM sap_billing
+                    -- Split the per-(po,item) billed total greedily across sibling
+                    -- ASINs that share a sap_sku_code so it's consumed once, keyed by
+                    -- ASIN (see AppointmentItemsView for the rationale).
+                    SELECT
+                        UPPER(TRIM(ap.po_number)) AS po_number,
+                        ap.asin,
+                        LEAST(
+                            ap.accepted_qty,
+                            GREATEST(
+                                sb.billed_qty - COALESCE(SUM(ap.accepted_qty) OVER (
+                                    PARTITION BY UPPER(TRIM(ap.po_number)), UPPER(TRIM(ap.sap_sku_code))
+                                    ORDER BY ap.asin
+                                    ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING), 0),
+                                0
+                            )
+                        ) AS billed_qty
+                    FROM reporting."Amazon PO" ap
+                    JOIN sap_billing sb
+                        ON sb.po_number = UPPER(TRIM(ap.po_number))
+                       AND sb.sap_item_code = UPPER(TRIM(ap.sap_sku_code))
+                    WHERE ap.accepted_qty > 0
                 )
                 SELECT
                     p.po_number, p.asin,
@@ -4427,7 +4520,7 @@ class DOHAutoFillView(_SafeAPIView):
                     AND c.fc_key = UPPER(TRIM(COALESCE(p.fulfillment_center, '')))
                 LEFT JOIN billed b
                     ON b.po_number = UPPER(TRIM(p.po_number))
-                    AND b.sap_item_code = UPPER(TRIM(p.sap_sku_code))
+                    AND b.asin = p.asin
                 WHERE {po_where_sql} AND (p.accepted_qty - COALESCE(b.billed_qty, 0)) > 0
             """, po_params)
             po_raw = _row_to_dict(cur, cur.fetchall())

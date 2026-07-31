@@ -21,7 +21,7 @@ import threading
 from decimal import Decimal, InvalidOperation
 
 from django.core.cache import cache
-from django.db import transaction
+from django.db import connection, transaction
 from django.utils import timezone
 
 from sap.models import SapBilling
@@ -37,6 +37,9 @@ BILLING_WINDOW_MONTHS = 6          # how far back to pull billing
 SYNC_STALE_SECONDS = 15 * 60       # auto-resync when older than this
 _LAST_SYNC_KEY = "sap_billing:last_sync"
 _SYNC_LOCK_KEY = "sap_billing:syncing"
+# Postgres session advisory-lock key — serializes the rebuild ACROSS gunicorn
+# workers (the LocMem cache lock only de-dupes threads within one worker).
+_PG_LOCK_KEY = 8274_10031
 
 
 def _norm(s) -> str:
@@ -73,7 +76,24 @@ def sync_rk_billing(months: int = BILLING_WINDOW_MONTHS, force: bool = True) -> 
     """Pull RK-World Sales/Sales-Return from SAP and rebuild ``sap_billing``.
 
     Returns a summary dict. Raises on an unreachable SAP source (caller decides
-    whether to swallow — the background path does)."""
+    whether to swallow — the background path does).
+
+    A Postgres session advisory lock makes the whole pull+rebuild single-flight
+    across workers: if another worker (or a cron run) already holds it, this call
+    returns ``{"skipped": True}`` without touching SAP or the table."""
+    with connection.cursor() as cur:
+        cur.execute("SELECT pg_try_advisory_lock(%s)", [_PG_LOCK_KEY])
+        if not cur.fetchone()[0]:
+            logger.info("sap_billing sync skipped — another worker holds the advisory lock")
+            return {"skipped": True}
+    try:
+        return _do_sync(months, force)
+    finally:
+        with connection.cursor() as cur:
+            cur.execute("SELECT pg_advisory_unlock(%s)", [_PG_LOCK_KEY])
+
+
+def _do_sync(months: int, force: bool) -> dict:
     frm, to = _window(months)
     rows = report_sales_analysis(frm, to, source="mart", force=force)
 
@@ -93,20 +113,31 @@ def sync_rk_billing(months: int = BILLING_WINDOW_MONTHS, force: bool = True) -> 
         if not item:
             continue
         considered += 1
-        sign = Decimal(-1) if typ == "sales return" else Decimal(1)
-        net = _dec(r.get("Quantity")) * sign
+        # The proc already returns Sales-Return rows with NEGATIVE Quantity/LineTotal
+        # (see sap/distributor_inventory.py:244-248), so summing the raw signed values
+        # nets returns out. Do NOT flip the sign — that would ADD returns to billed.
+        is_return = typ == "sales return"
+        net = _dec(r.get("Quantity"))
         entry = agg.setdefault((po, item), {"qty": Decimal(0), "invoices": {}})
         entry["qty"] += net
         doc = str(r.get("DocNum") or "")
+        # Key invoices by (DocNum, kind): an A/R invoice (Sales) and a credit memo
+        # (Sales Return) can share a numeric DocNum but are distinct SAP documents.
+        ikey = (doc, "return" if is_return else "sales")
         dd = r.get("DocDate")
         dd_iso = dd.date().isoformat() if hasattr(dd, "date") else (str(dd)[:10] if dd else None)
         inv = entry["invoices"].setdefault(
-            doc, {"doc_num": doc, "doc_date": dd_iso, "qty": Decimal(0), "amount": Decimal(0), "type": "Sales"}
+            ikey,
+            {
+                "doc_num": doc,
+                "doc_date": dd_iso,
+                "qty": Decimal(0),
+                "amount": Decimal(0),
+                "type": "Sales Return" if is_return else "Sales",
+            },
         )
         inv["qty"] += net
-        inv["amount"] += _dec(r.get("LineTotal")) * sign
-        if typ == "sales return":
-            inv["type"] = "Sales Return"
+        inv["amount"] += _dec(r.get("LineTotal"))
 
     now = timezone.now()
     objs = []

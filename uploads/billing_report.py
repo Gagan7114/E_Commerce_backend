@@ -121,18 +121,37 @@ def amazon_po_billing(request):
             except (ValueError, TypeError):
                 inv = []
         acc = float(r["accepted_qty"] or 0)
-        bl = float(r["billed_qty"] or 0)
         sh = float(r["shipped_qty"] or 0)
-        shp = float(r["shippable_qty"] or 0)
         g["lines"].append({
             "asin": r["asin"], "item": r["item"], "sap_item_code": r["sap_sku_code"],
-            "accepted": acc, "billed": bl, "shipped": sh, "shippable": shp,
-            "fully_billed": bool(r["fully_billed"]), "invoices": inv or [],
+            "accepted": acc, "billed": float(r["billed_qty"] or 0), "shipped": sh,
+            "shippable": 0.0, "fully_billed": False, "invoices": inv or [],
+            "_sku_key": str(r["sap_sku_code"] or "").strip().upper(),
         })
-        g["accepted"] += acc
-        g["billed"] += bl
         g["shipped"] += sh
-        g["shippable"] += shp
+
+    # sap_billing has ONE net-billed row per (po, item); the join repeats it on every
+    # Amazon line that shares a sap_sku_code (two ASINs can map to one SAP code).
+    # Allocate that single billed total across the sibling lines greedily (by ASIN,
+    # consumed once) so billed is never double-counted and per-line billed <= accepted
+    # (hence a PO's billed can never exceed its accepted). Then roll up to the PO.
+    for g in pos.values():
+        by_sku: dict = {}
+        for ln in g["lines"]:
+            by_sku.setdefault(ln["_sku_key"], []).append(ln)
+        for sku_lines in by_sku.values():
+            remaining = max((ln["billed"] for ln in sku_lines), default=0.0)  # the sku's net billed
+            for ln in sorted(sku_lines, key=lambda x: str(x["asin"] or "")):
+                alloc = min(ln["accepted"], remaining) if remaining > 0 else 0.0
+                remaining -= alloc
+                ln["billed"] = alloc
+                ln["shippable"] = max(ln["accepted"] - alloc, 0.0)
+                ln["fully_billed"] = ln["accepted"] > 0 and alloc >= ln["accepted"]
+        for ln in g["lines"]:
+            ln.pop("_sku_key", None)
+        g["accepted"] = sum(ln["accepted"] for ln in g["lines"])
+        g["billed"] = sum(ln["billed"] for ln in g["lines"])
+        g["shippable"] = sum(ln["shippable"] for ln in g["lines"])
 
     grouped = []
     for g in pos.values():
