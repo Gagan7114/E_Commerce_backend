@@ -4079,6 +4079,37 @@ class AsinCatalogView(_SafeAPIView):
         return Response(catalog)
 
 
+# SAP-billed units per (PO, ASIN). sap_billing holds one row per (po, item), but
+# several ASINs can share a sap_sku_code — the window function walks them in ASIN
+# order and consumes the billed quantity once, so it is never double-counted.
+# Same rule the appointment/extra-PO/DOH paths already apply; shared here so the
+# PO list's count and page queries can't drift apart.
+_BILLED_CTE = """
+                    SELECT
+                        UPPER(TRIM(bp.po_number)) AS po_number,
+                        bp.asin,
+                        LEAST(
+                            bp.accepted_qty,
+                            GREATEST(
+                                sb.billed_qty - COALESCE(SUM(bp.accepted_qty) OVER (
+                                    PARTITION BY UPPER(TRIM(bp.po_number)), UPPER(TRIM(bp.sap_sku_code))
+                                    ORDER BY bp.asin
+                                    ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING), 0),
+                                0
+                            )
+                        ) AS billed_qty
+                    FROM reporting."Amazon PO" bp
+                    JOIN sap_billing sb
+                        ON sb.po_number = UPPER(TRIM(bp.po_number))
+                       AND sb.sap_item_code = UPPER(TRIM(bp.sap_sku_code))
+                    WHERE bp.accepted_qty > 0
+"""
+
+# Only lines with an OPEN (unbilled) balance are shippable. Applied to both the
+# count and the page query so pagination totals match the rows returned.
+_OPEN_LINE_SQL = "GREATEST(COALESCE(ap.accepted_qty, 0) - COALESCE(b.billed_qty, 0), 0) > 0"
+
+
 class POListView(_SafeAPIView):
     """Paginated list of POs from reporting."Amazon PO"."""
     permission_classes = [IsAuthenticated]
@@ -4116,12 +4147,19 @@ class POListView(_SafeAPIView):
 
         with connection.cursor() as cur:
             cur.execute(f"""
-                SELECT COUNT(*) FROM reporting."Amazon PO" ap WHERE {where_sql}
+                WITH billed AS ({_BILLED_CTE})
+                SELECT COUNT(*)
+                FROM reporting."Amazon PO" ap
+                LEFT JOIN billed b
+                    ON b.po_number = UPPER(TRIM(ap.po_number))
+                   AND b.asin = ap.asin
+                WHERE {where_sql} AND {_OPEN_LINE_SQL}
             """, params)
             total = cur.fetchone()[0]
 
             cur.execute(f"""
-                WITH po_appt AS (
+                WITH billed AS ({_BILLED_CTE}),
+                po_appt AS (
                     -- A PO's EFFECTIVE FC is the FC of the appointment it's booked on.
                     -- A "swapped/flipped" PO (its Amazon-sheet FC differs from the FC of
                     -- the appointment it sits on) physically ships to the appointment FC,
@@ -4137,7 +4175,12 @@ class POListView(_SafeAPIView):
                 SELECT
                     ap.po_number, ap.asin, ap.merchant_sku, ap.sku_code, ap.sap_sku_code,
                     ap.sku_name        AS product_name,
-                    ap.accepted_qty, ap.cancelled_qty, ap.requested_qty, ap.received_qty,
+                    -- accepted_qty is the OPEN (unbilled) balance, matching every other
+                    -- PO path; ordered_qty keeps the original for display/audit.
+                    GREATEST(COALESCE(ap.accepted_qty, 0) - COALESCE(b.billed_qty, 0), 0) AS accepted_qty,
+                    ap.accepted_qty    AS ordered_qty,
+                    COALESCE(b.billed_qty, 0) AS billed_qty,
+                    ap.cancelled_qty, ap.requested_qty, ap.received_qty,
                     ap.fulfillment_center AS destination_fc,
                     pa.appt_fc            AS appt_fc,
                     ap.availability_status,
@@ -4155,11 +4198,17 @@ class POListView(_SafeAPIView):
                     COALESCE(NULLIF(ap.city,''), fcm.city)   AS city,
                     COALESCE(NULLIF(ap.state,''), fcm.state) AS state
                 FROM reporting."Amazon PO" ap
+                LEFT JOIN billed b
+                    ON b.po_number = UPPER(TRIM(ap.po_number))
+                   AND b.asin = ap.asin
                 LEFT JOIN po_appt pa
                     ON pa.po_up = UPPER(TRIM(ap.po_number))
                 LEFT JOIN public.fc_city_state_channel_master fcm
                     ON UPPER(TRIM(fcm.fc::text)) = UPPER(TRIM(ap.fulfillment_center::text))
                 WHERE {where_sql}
+                  -- Fully-billed lines have nothing left to ship: hide them entirely
+                  -- rather than offering a pickable row with 0 open units.
+                  AND {_OPEN_LINE_SQL}
                 ORDER BY ap.order_date DESC NULLS LAST, ap.po_number
                 LIMIT %s OFFSET %s
             """, params + [page_size, offset])
