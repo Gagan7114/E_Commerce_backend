@@ -57,7 +57,16 @@ def _window(months: int = BILLING_WINDOW_MONTHS) -> tuple[str, str]:
 
 
 def last_sync_at() -> str | None:
-    return cache.get(_LAST_SYNC_KEY)
+    """Last successful sync time — cache fast-path, else the table's own timestamp
+    (robust across per-worker LocMem caches, since a wholesale rebuild stamps every
+    row's updated_at with the sync time)."""
+    cached = cache.get(_LAST_SYNC_KEY)
+    if cached:
+        return cached
+    from django.db.models import Max
+
+    latest = SapBilling.objects.aggregate(m=Max("updated_at")).get("m")
+    return latest.isoformat() if latest else None
 
 
 def sync_rk_billing(months: int = BILLING_WINDOW_MONTHS, force: bool = True) -> dict:
@@ -134,7 +143,7 @@ def ensure_billing_fresh() -> None:
     """Fire a background resync if the table is stale (> SYNC_STALE_SECONDS) or
     never synced. Single-flight via a cache lock; serves current data immediately.
     Safe to call on every planner/billing read."""
-    last = cache.get(_LAST_SYNC_KEY)
+    last = last_sync_at()  # table-backed, so all workers agree on freshness
     stale = True
     if last:
         try:
