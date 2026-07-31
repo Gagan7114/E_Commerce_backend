@@ -5649,9 +5649,11 @@ _ADS_SUMMARY_UNION = """
     -- lateral can never fan out the ads rows. A SKU never priced in ANY month →
     -- ads_sale 0.
     -- `use_max_date` mirrors each platform ads dashboard's summary method:
-    -- TRUE  → cumulative month-to-date snapshot (Swiggy/Zepto/BigBasket/Flipkart)
-    --         so the summary keeps ONLY the latest (max) date's rows;
-    -- FALSE → per-day/range (Amazon/Blinkit) + brand fund + SecMaster → summed.
+    -- TRUE  → cumulative month-to-date snapshot (Swiggy/Zepto/BigBasket/Flipkart
+    --         ads + the Amazon COUPON master) so the summary keeps ONLY the
+    --         latest (max) date's rows;
+    -- FALSE → per-day/range (Amazon/Blinkit ads) + the Blinkit/Swiggy/Zepto brand
+    --         fund masters + SecMaster → summed.
     -- Keep this in sync with summary_use_max_date on the per-platform dashboards.
     SELECT 'Blinkit'::text AS platform, b.item_head, b.category, b.sub_category, b.item,
            (COALESCE(b.direct_qty_sold, 0) + COALESCE(b.indirect_qty_sold, 0))::numeric AS qty,
@@ -5782,9 +5784,16 @@ _ADS_SUMMARY_UNION = """
            COALESCE(brand_fund_spent, 0)::numeric, 0::numeric, 0::numeric, 0::numeric, year, month, date, FALSE, 'other'::text
       FROM zepto_brandfund_master
     UNION ALL
+    -- Amazon has no brand-fund ledger; its "Brand Fund" column is coupon
+    -- budget_spent. use_max_date=TRUE: amazon_coupon_master is a CUMULATIVE daily
+    -- snapshot — every pull re-writes each coupon's running total for that date,
+    -- so SUMming across dates over-counts by ~one× per snapshot date (July 2026:
+    -- ₹15,05,605 summed vs the true ₹81,891). Keep ONLY the latest (max) date,
+    -- matching the Amazon Coupon Dashboard, which reports one snapshot at a time
+    -- for exactly this reason (see _amazon_coupon_dashboard_response).
     SELECT 'Amazon', item_head, category, sub_category, NULL::text,
            0::numeric, 0::numeric, 0::numeric,
-           COALESCE(budget_spent, 0)::numeric, 0::numeric, 0::numeric, 0::numeric, year, month, date, FALSE, 'other'::text
+           COALESCE(budget_spent, 0)::numeric, 0::numeric, 0::numeric, 0::numeric, year, month, date, TRUE, 'other'::text
       FROM amazon_coupon_master
     UNION ALL
     -- Amazon delivered quantity + delivered sale from the DAILY master view
@@ -12659,6 +12668,269 @@ def _inventory_drr_dashboard_response(request, slug: str):
         "value_source_note": "VALUE and OPS use SecMaster.sales_amt_exc to match the DRR workbook.",
         "doh_note": "DOH follows the DRR sheet: current SOH units divided by DRR qty.",
     })
+
+
+# ── BigBasket Sales Explorer ────────────────────────────────────────────────
+# The rest of the Secondary section is month-bound (SEC / DRR pick a reporting
+# month). Sales Explorer answers the other question — "how did THESE days go" —
+# over an arbitrary FROM → TO window, with an item-head filter that takes
+# SEVERAL heads at once instead of one. Feeds a daily line chart plus the item
+# table under it. BigBasket only.
+_SALES_EXPLORER_ITEM_HEADS = ("PREMIUM", "COMMODITY", "OTHER")
+# secmaster_mv."format" squashed to a slug — same normalisation the DRR /
+# SOH-DOH queries use ('BIG BASKET', 'Big-Basket', … all collapse to this).
+_SALES_EXPLORER_SALES_FORMAT = "bigbasket"
+
+
+def _parse_sales_explorer_date(value, field_name: str) -> date | None:
+    value = str(value or "").strip()
+    if not value:
+        return None
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+        raise ValidationError(f"`{field_name}` must be YYYY-MM-DD.")
+    try:
+        return date.fromisoformat(value)
+    except ValueError:
+        raise ValidationError(f"`{field_name}` must be a valid calendar date.")
+
+
+def _parse_sales_explorer_item_heads(params) -> list[str]:
+    """`sales_of=PREMIUM,COMMODITY` → ['PREMIUM', 'COMMODITY'].
+
+    Empty (or the legacy single value 'ALL') means every head — the caller then
+    skips the filter entirely rather than listing all three.
+    """
+    raw = str(params.get("sales_of") or "").strip()
+    picked = {p.strip().upper() for p in raw.split(",") if p.strip()}
+    if not picked or "ALL" in picked:
+        return []
+    unknown = sorted(p for p in picked if p not in _SALES_EXPLORER_ITEM_HEADS)
+    if unknown:
+        raise ValidationError(
+            "`sales_of` must be a comma-separated list of "
+            f"{', '.join(_SALES_EXPLORER_ITEM_HEADS)} — got {', '.join(unknown)}."
+        )
+    # Canonical order, so two requests picking the same heads share a cache key.
+    return [head for head in _SALES_EXPLORER_ITEM_HEADS if head in picked]
+
+
+@api_view(["GET"])
+@permission_classes([require("platform.secondary.view")])
+@cached_get(timeout=60, prefix="plat.bb_sales_explorer")
+def bigbasket_sales_explorer(request):
+    _ensure_scope(request.user, "bigbasket")
+    return _bigbasket_sales_explorer_response(request)
+
+
+def _bigbasket_sales_explorer_response(request):
+    sale_date_expr = '"date"::date'
+    fmt = _SALES_EXPLORER_SALES_FORMAT
+    format_where = (
+        'REGEXP_REPLACE(LOWER(TRIM("format"::text)), \'[^a-z0-9]+\', \'\', \'g\') = %s'
+    )
+
+    item_heads = _parse_sales_explorer_item_heads(request.query_params)
+    from_date = _parse_sales_explorer_date(request.query_params.get("from_date"), "from_date")
+    to_date = _parse_sales_explorer_date(request.query_params.get("to_date"), "to_date")
+    if from_date and to_date and from_date > to_date:
+        raise ValidationError("`from_date` cannot be after `to_date`.")
+
+    bounds = _dict_rows(
+        f"""
+        SELECT
+            MIN({sale_date_expr}) AS min_date,
+            MAX({sale_date_expr}) AS max_date
+        FROM secmaster_mv
+        WHERE {format_where}
+          AND ({sale_date_expr}) IS NOT NULL
+        """,
+        [fmt],
+    )
+    data_min = (bounds[0] if bounds else {}).get("min_date")
+    data_max = (bounds[0] if bounds else {}).get("max_date")
+
+    # Nothing to pick a default window from — hand back an empty shell so the
+    # page renders its own "no data" state instead of erroring.
+    if data_max is None:
+        return Response({
+            "platform": "bigbasket",
+            "dashboard_title": "BigBasket Sales Explorer",
+            "source": "SecMaster",
+            "from_date": from_date.isoformat() if from_date else None,
+            "to_date": to_date.isoformat() if to_date else None,
+            "data_min_date": None,
+            "data_max_date": None,
+            "max_date": None,
+            "sales_max_date": None,
+            "defaulted_range": from_date is None and to_date is None,
+            "sales_of": item_heads,
+            "sales_of_options": list(_SALES_EXPLORER_ITEM_HEADS),
+            "days": 0,
+            "daily": [],
+            "rows": [],
+            "items": [],
+            "totals": _sales_explorer_empty_totals(),
+            "total": _sales_explorer_empty_totals(),
+        })
+
+    # Default window: the latest sales day's whole month, up to that day — the
+    # same period the SEC / DRR pages open on, just expressed as a range.
+    defaulted_range = from_date is None and to_date is None
+    if to_date is None:
+        to_date = data_max
+    if from_date is None:
+        from_date = max(date(to_date.year, to_date.month, 1), data_min)
+    if from_date > to_date:
+        from_date = to_date
+
+    head_filter = ""
+    head_params: list = []
+    if item_heads:
+        placeholders = ", ".join(["%s"] * len(item_heads))
+        head_filter = (
+            "AND COALESCE(NULLIF(UPPER(TRIM(\"item_head\"::text)), ''), 'OTHER') "
+            f"IN ({placeholders})"
+        )
+        head_params = list(item_heads)
+
+    window_params = [fmt, from_date, to_date]
+
+    daily_raw = _dict_rows(
+        f"""
+        SELECT
+            {sale_date_expr} AS sale_date,
+            COALESCE(SUM("sales_amt_exc"), 0) AS value,
+            COALESCE(SUM("ltr_sold"), 0) AS ltr,
+            COALESCE(SUM("quantity"), 0) AS qty
+        FROM secmaster_mv
+        WHERE {format_where}
+          AND ({sale_date_expr}) BETWEEN %s AND %s
+          {head_filter}
+        GROUP BY {sale_date_expr}
+        ORDER BY {sale_date_expr}
+        """,
+        window_params + head_params,
+    )
+    daily_by_date = {row["sale_date"]: row for row in daily_raw}
+
+    # Every calendar day in the window gets a point, so a dead day reads as a
+    # zero rather than silently closing the gap in the line.
+    daily = []
+    cursor_date = from_date
+    while cursor_date <= to_date:
+        row = daily_by_date.get(cursor_date, {})
+        daily.append({
+            "date": cursor_date.isoformat(),
+            "display_date": cursor_date.strftime("%d-%m-%Y"),
+            "day": cursor_date.day,
+            "value": _num(row.get("value")),
+            "ltr": _num(row.get("ltr")),
+            "qty": _num(row.get("qty")),
+        })
+        cursor_date += timedelta(days=1)
+
+    item_rows = _dict_rows(
+        f"""
+        SELECT
+            COALESCE(NULLIF(UPPER(TRIM("item_head"::text)), ''), 'OTHER') AS item_head,
+            COALESCE(MIN(NULLIF(TRIM("item"::text), '')), 'UNMAPPED') AS item,
+            MIN(NULLIF(TRIM("category"::text), '')) AS category,
+            MIN(NULLIF(TRIM("sub_category"::text), '')) AS sub_category,
+            COALESCE(SUM("quantity"), 0) AS qty,
+            COALESCE(SUM("ltr_sold"), 0) AS ltr,
+            COALESCE(SUM("sales_amt_exc"), 0) AS value,
+            COUNT(DISTINCT NULLIF(TRIM("sku_code"::text), '')) AS sku_count
+        FROM secmaster_mv
+        WHERE {format_where}
+          AND ({sale_date_expr}) BETWEEN %s AND %s
+          {head_filter}
+        GROUP BY
+            COALESCE(NULLIF(UPPER(TRIM("item_head"::text)), ''), 'OTHER'),
+            UPPER(TRIM(COALESCE("item"::text, '')))
+        ORDER BY
+            CASE COALESCE(NULLIF(UPPER(TRIM("item_head"::text)), ''), 'OTHER')
+                WHEN 'PREMIUM' THEN 1
+                WHEN 'COMMODITY' THEN 2
+                WHEN 'OTHER' THEN 3
+                ELSE 4
+            END,
+            COALESCE(SUM("ltr_sold"), 0) DESC
+        """,
+        window_params + head_params,
+    )
+
+    span_days = (to_date - from_date).days + 1
+    items = []
+    for row in item_rows:
+        qty = _num(row.get("qty"))
+        ltr = _num(row.get("ltr"))
+        value = _num(row.get("value"))
+        items.append({
+            "item_head": row.get("item_head") or "OTHER",
+            "item": row.get("item") or "UNMAPPED",
+            "product": row.get("item") or "UNMAPPED",
+            "category": row.get("category") or "",
+            "sub_category": row.get("sub_category") or "",
+            "sku_count": int(row.get("sku_count") or 0),
+            "qty": qty,
+            "ltr": ltr,
+            "value": value,
+            # Per-day averages across the picked window — the range equivalent of
+            # the DRR page's month-to-date run rate.
+            "avg_qty": _safe_div(qty, span_days),
+            "avg_ltr": _safe_div(ltr, span_days),
+            "avg_value": _safe_div(value, span_days),
+        })
+
+    total_qty = sum(row["qty"] for row in items)
+    total_ltr = sum(row["ltr"] for row in items)
+    total_value = sum(row["value"] for row in items)
+    totals = {
+        "qty": total_qty,
+        "ltr": total_ltr,
+        "value": total_value,
+        "avg_qty": _safe_div(total_qty, span_days),
+        "avg_ltr": _safe_div(total_ltr, span_days),
+        "avg_value": _safe_div(total_value, span_days),
+        "sku_count": sum(row["sku_count"] for row in items),
+        "items": len(items),
+    }
+
+    sales_max_date = max(daily_by_date) if daily_by_date else None
+
+    return Response({
+        "platform": "bigbasket",
+        "dashboard_title": "BigBasket Sales Explorer",
+        "source": "SecMaster",
+        "from_date": from_date.isoformat(),
+        "to_date": to_date.isoformat(),
+        "data_min_date": data_min.isoformat() if data_min else None,
+        "data_max_date": data_max.isoformat() if data_max else None,
+        "max_date": data_max.isoformat() if data_max else None,
+        "sales_max_date": sales_max_date.isoformat() if sales_max_date else None,
+        "defaulted_range": defaulted_range,
+        "sales_of": item_heads,
+        "sales_of_options": list(_SALES_EXPLORER_ITEM_HEADS),
+        "days": span_days,
+        "daily": daily,
+        "rows": items,
+        "items": items,
+        "totals": totals,
+        "total": totals,
+    })
+
+
+def _sales_explorer_empty_totals() -> dict:
+    return {
+        "qty": 0.0,
+        "ltr": 0.0,
+        "value": 0.0,
+        "avg_qty": 0.0,
+        "avg_ltr": 0.0,
+        "avg_value": 0.0,
+        "sku_count": 0,
+        "items": 0,
+    }
 
 
 def _amazon_drr_dashboard_response(request):

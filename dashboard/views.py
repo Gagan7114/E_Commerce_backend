@@ -5092,9 +5092,18 @@ _REALISE_BRANDFUND_SOURCES = {
 # running month total, so SUMming across dates over-counts (by ~one× per
 # snapshot date). Their spend is read at the latest (max) date only, mirroring
 # `summary_use_max_date` on the per-platform Ads dashboards (platforms/views.py).
-# amazon/blinkit ad masters are per-day and stay summable; every brand-fund
-# master is per-day too.
+# amazon/blinkit ad masters are per-day and stay summable; the dedicated
+# blinkit/swiggy/zepto brand-fund masters are per-day too.
 _REALISE_CUMULATIVE_ADS = {"swiggy", "zepto", "bigbasket"}
+
+# Brand-fund sources that are cumulative snapshots. Amazon is the odd one out:
+# its "brand fund" is amazon_coupon_master.budget_spent, and that table is a
+# CUMULATIVE daily snapshot (each pull rewrites every coupon's running total for
+# that date), so it must be read at the latest date only — exactly like the
+# cumulative ad masters above. SUMming it over-counts by ~one× per snapshot date
+# (July 2026: ₹15,05,605 summed vs the true ₹81,891). The Amazon Coupon Dashboard
+# and the Ads Summary both pin to MAX(date) for the same reason.
+_REALISE_CUMULATIVE_FUND = {"amazon"}
 
 
 def _realise_ads_brandfund(platform, month_num, year, group_by, cat_filter=None):
@@ -5158,7 +5167,7 @@ def _realise_ads_brandfund(platform, month_num, year, group_by, cat_filter=None)
                     errors.append({"source": table, "error": str(e)})
 
     collect(ads, ads_srcs, _REALISE_CUMULATIVE_ADS)
-    collect(fund, fund_srcs, frozenset())
+    collect(fund, fund_srcs, _REALISE_CUMULATIVE_FUND)
     return ads, fund, errors
 
 
@@ -5468,8 +5477,9 @@ def _realise_ads_brandfund_totals(platform, month_num, year, cat_filter=None):
         dropped (the platform dashboards bucket it as '(Unmapped)').
       * NO format filter — the masters are single-platform; their unmapped rows
         carry a NULL format that must still be counted.
-      * Cumulative ad snapshots (swiggy/zepto/bigbasket) are read at the latest
-        date only; per-day ad masters and every brand-fund master are summed.
+      * Cumulative snapshots — ads for swiggy/zepto/bigbasket, brand fund for
+        amazon (the coupon master) — are read at the latest date only; the
+        per-day ad masters and the blinkit/swiggy/zepto fund masters are summed.
     Returns (ads_total, fund_total)."""
     month_name = calendar.month_name[month_num].upper()
     if platform:
@@ -5504,9 +5514,11 @@ def _realise_ads_brandfund_totals(platform, month_num, year, cat_filter=None):
                 ads_total += source_total(cur, table, spend_col, slug in _REALISE_CUMULATIVE_ADS)
             except Exception:  # noqa: BLE001
                 pass  # a missing/odd source contributes 0, never breaks the KPI
-        for _slug, (table, spend_col, _fmt) in fund_srcs.items():
+        for slug, (table, spend_col, _fmt) in fund_srcs.items():
             try:
-                fund_total += source_total(cur, table, spend_col, False)
+                fund_total += source_total(
+                    cur, table, spend_col, slug in _REALISE_CUMULATIVE_FUND
+                )
             except Exception:  # noqa: BLE001
                 pass
         # Flipkart ads — from the FSN SKU report, matching the Ads Summary. Added

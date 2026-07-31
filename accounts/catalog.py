@@ -25,6 +25,9 @@ PERMISSION_CATALOG: tuple[tuple[str, str], ...] = (
     # and assigned ONLY directly to selected users — keeping it out of the
     # catalog keeps it out of the Super Admin "*" (all-catalog-permissions) grant,
     # so it can't leak to everyone who is in the Super Admin group.
+    # `pricing.view` (gates the Pricing section) follows the exact same rule —
+    # seeded by accounts migration 0017 and granted directly to the same users
+    # who hold the Shipment Planner code. Do not add either one here.
     # Platform — scope codes (which platform slug the user is allowed on)
     ("platform.*.access", "Access every platform (admin wildcard)"),
     ("platform.blinkit.access", "Access Blinkit platform"),

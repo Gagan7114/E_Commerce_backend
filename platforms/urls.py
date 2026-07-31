@@ -80,6 +80,11 @@ urlpatterns = [
     path("swiggy/drr-dashboard", views.swiggy_drr_dashboard, name="platform-swiggy-drr-dashboard"),
     path("bigbasket/drr-dashboard", views.bigbasket_drr_dashboard, name="platform-bigbasket-drr-dashboard"),
     path(
+        "bigbasket/sales-explorer",
+        views.bigbasket_sales_explorer,
+        name="platform-bigbasket-sales-explorer",
+    ),
+    path(
         "bigbasket/range-dashboard",
         views.bigbasket_range_dashboard,
         {"slug": "bigbasket"},

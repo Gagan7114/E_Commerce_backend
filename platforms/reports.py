@@ -5,21 +5,18 @@ Exposes a whitelisted set of database views as JSON for the global Reports page
 SELECT <cols> FROM <view> WHERE <filters> LIMIT N.
 """
 
-import io
 import re
-from datetime import date, datetime
-from decimal import Decimal
+from itertools import chain, count
 
-from django.db import connection
-from django.http import HttpResponse
-from openpyxl import Workbook
-from openpyxl.cell import WriteOnlyCell
+from django.db import connection, transaction
+from django.http import StreamingHttpResponse
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.exceptions import ValidationError
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
 from . import reports_sap
+from .xlsx_stream import stream_xlsx
 
 
 REPORT_VIEW_CATALOG = {
@@ -143,31 +140,11 @@ def _format_filter(col: str, formats: list[str]) -> tuple[str, list]:
 # xlsx hard cap is 1,048,576 rows (incl. the header) — stay safely under it.
 EXPORT_MAX_ROWS = 1_000_000
 
-
-def _coerce_cell(ws, v):
-    """Make a DB value safe for an openpyxl write-only cell.
-
-    Pure DATE columns (po_date, po_expiry_date, delivery_date, appointment_date,
-    ...) are written as genuine Excel dates but displayed in dd-mm-yyyy (Indian
-    format) via an explicit number format, so the downloaded file reads
-    14-07-2026 instead of openpyxl's default 2026-07-14. They stay real dates,
-    so Excel can still sort/filter them as dates. `ws` is the write-only sheet
-    the cell will be appended to (WriteOnlyCell needs it).
-    """
-    if isinstance(v, Decimal):
-        return float(v)
-    # datetime is a subclass of date, so it must be checked first. Timestamps
-    # keep their existing behaviour (openpyxl's default format); only tz-aware
-    # ones need stripping because openpyxl can't store a timezone.
-    if isinstance(v, datetime):
-        return v.replace(tzinfo=None) if v.tzinfo is not None else v
-    if isinstance(v, date):
-        cell = WriteOnlyCell(ws, value=v)
-        cell.number_format = "DD-MM-YYYY"
-        return cell
-    if isinstance(v, (bytes, bytearray, memoryview)):
-        return bytes(v).decode("utf-8", "replace")
-    return v
+# Rows pulled per round trip from the export's server-side cursor. Cursor names
+# are unique per export so a reused pooled connection (CONN_MAX_AGE) can never
+# collide with a declared cursor an abandoned download left behind.
+EXPORT_FETCH_SIZE = 5000
+_EXPORT_CURSOR_SEQ = count(1)
 
 
 def _build_filters(catalog, fmt, date_from, date_to):
@@ -375,17 +352,76 @@ def report_raw(request):
     })
 
 
+def _sql_export_rows(sql, params, columns, labels, counter):
+    """Yield the header row, then every result row, straight off the database.
+
+    A *server-side* cursor (DECLARE/FETCH, hence the surrounding transaction) is
+    what makes this a stream: psycopg's normal cursor pulls the entire result set
+    into the worker before the first row is readable — 428k rows means ~15s of
+    dead air and a few hundred MB of RSS before a single byte reaches the client.
+    Declared, the first rows arrive in milliseconds and memory stays flat.
+    `counter` is the shared row tally the Filters sheet reports afterwards."""
+    connection.ensure_connection()
+    with transaction.atomic():
+        name = f"report_export_{next(_EXPORT_CURSOR_SEQ)}"
+        with connection.connection.cursor(name=name) as cur:
+            cur.itersize = EXPORT_FETCH_SIZE
+            cur.execute(sql, params)
+            keys = columns or [c.name for c in (cur.description or [])]
+            yield labels if labels and len(labels) == len(keys) else keys
+            while True:
+                chunk = cur.fetchmany(EXPORT_FETCH_SIZE)
+                if not chunk:
+                    break
+                counter[0] += len(chunk)
+                yield from chunk
+
+
+def _sap_export_rows(view_raw, date_from, date_to, columns, labels, counter):
+    """Same contract as _sql_export_rows for the SAP-backed views.
+
+    SAP has no cursor to stream, so fetch_for still materialises its rows; the
+    generator only keeps the workbook writer's interface uniform."""
+    try:
+        sap_rows, _ = reports_sap.fetch_for(
+            view_raw,
+            from_date=date_from,
+            to_date=date_to,
+            page=0,
+            page_size=EXPORT_MAX_ROWS,
+        )
+    except ValueError as exc:
+        raise ValidationError(str(exc))
+    keys = columns or (list(sap_rows[0].keys()) if sap_rows else [])
+    yield labels if labels and len(labels) == len(keys) else keys
+    for r in sap_rows[:EXPORT_MAX_ROWS]:
+        counter[0] += 1
+        yield [r.get(k) for k in keys]
+
+
+def _filters_rows(filters, counter):
+    """The Filters sheet: the on-screen filters, then the real exported count.
+
+    Written after the data sheet, so `counter` is final by the time it runs."""
+    for pair in filters or []:
+        if isinstance(pair, (list, tuple)) and len(pair) >= 2:
+            yield [str(pair[0]), "" if pair[1] is None else str(pair[1])]
+    yield ["Total Rows", counter[0]]
+
+
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
 def report_export(request):
     """Stream ALL matching rows for the current report as one .xlsx file.
 
     The /raw endpoint caps at 50k for the on-screen table; this runs a single
-    query and writes every row with openpyxl in write-only mode (bounded memory,
-    chunked fetch), so big exports — hundreds of thousands of rows — come down as
-    one Excel file. One query = one consistent snapshot, so there are no
-    pagination gaps/duplicates. Body: {view, columns[], labels[], platform,
-    date_from, date_to, filters[[k,v]...], filename}."""
+    query and streams every row into the .xlsx as it arrives (see
+    platforms/xlsx_stream), so big exports — hundreds of thousands of rows — come
+    down as one Excel file that starts downloading immediately instead of being
+    assembled in memory first while the proxy times out. One query = one
+    consistent snapshot, so there are no pagination gaps/duplicates. Body:
+    {view, columns[], labels[], platform, date_from, date_to,
+    filters[[k,v]...], filename}."""
     data = request.data or {}
     view_raw = (data.get("view") or "").strip()
     columns = [str(c).strip() for c in (data.get("columns") or []) if str(c).strip()]
@@ -397,26 +433,9 @@ def report_export(request):
     if date_to and not _DATE.match(date_to):
         raise ValidationError("`date_to` must be YYYY-MM-DD.")
 
-    wb = Workbook(write_only=True)
-    ws = wb.create_sheet("Report")
-    total = 0
-
+    counter = [0]
     if reports_sap.is_sap_view(view_raw):
-        try:
-            sap_rows, _ = reports_sap.fetch_for(
-                view_raw,
-                from_date=date_from,
-                to_date=date_to,
-                page=0,
-                page_size=EXPORT_MAX_ROWS,
-            )
-        except ValueError as exc:
-            raise ValidationError(str(exc))
-        keys = columns or (list(sap_rows[0].keys()) if sap_rows else [])
-        ws.append(labels if labels and len(labels) == len(keys) else keys)
-        for r in sap_rows[:EXPORT_MAX_ROWS]:
-            ws.append([_coerce_cell(ws, r.get(k)) for k in keys])
-            total += 1
+        rows = _sap_export_rows(view_raw, date_from, date_to, columns, labels, counter)
     else:
         view = _safe_view(view_raw)
         catalog = REPORT_VIEW_CATALOG[view]
@@ -430,36 +449,31 @@ def report_export(request):
             f'SELECT {select_clause} FROM "{physical}" {where_clause} '
             f"LIMIT {EXPORT_MAX_ROWS}"
         )
-        with connection.cursor() as cur:
-            cur.execute(sql, params)
-            keys = columns or [c[0] for c in (cur.description or [])]
-            ws.append(labels if labels and len(labels) == len(keys) else keys)
-            while True:
-                chunk = cur.fetchmany(2000)
-                if not chunk:
-                    break
-                for row in chunk:
-                    ws.append([_coerce_cell(ws, v) for v in row])
-                    total += 1
+        rows = _sql_export_rows(sql, params, columns, labels, counter)
 
-    # Filters sheet — mirror the on-screen filters, then the real exported count.
-    ws2 = wb.create_sheet("Filters")
-    for pair in data.get("filters") or []:
-        if isinstance(pair, (list, tuple)) and len(pair) >= 2:
-            ws2.append([str(pair[0]), "" if pair[1] is None else str(pair[1])])
-    ws2.append(["Total Rows", total])
+    # Pull the header row here, inside the view, so a bad query or an unreachable
+    # SAP host still becomes a normal JSON error response. Once the streaming
+    # response starts, the status line is already sent and a failure could only
+    # show up as a truncated download.
+    header = next(rows)
+    rows = chain([header], rows)
 
-    buf = io.BytesIO()
-    wb.save(buf)
     raw_name = (data.get("filename") or f"report_{view_raw}").strip() or "report"
     filename = re.sub(r'[\\/:*?"<>|]+', "_", raw_name)
     if not filename.lower().endswith(".xlsx"):
         filename += ".xlsx"
-    resp = HttpResponse(
-        buf.getvalue(),
+    resp = StreamingHttpResponse(
+        stream_xlsx([
+            ("Report", rows),
+            ("Filters", _filters_rows(data.get("filters"), counter)),
+        ]),
         content_type=(
             "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         ),
     )
     resp["Content-Disposition"] = f'attachment; filename="{filename}"'
+    # nginx buffers proxied responses by default, which would hold the whole
+    # export back and re-create the very timeout this streams around.
+    resp["X-Accel-Buffering"] = "no"
+    resp["Cache-Control"] = "no-store"
     return resp

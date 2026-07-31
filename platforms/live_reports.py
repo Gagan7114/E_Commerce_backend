@@ -55,6 +55,8 @@ from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
+from accounts.permissions import require
+
 try:  # openpyxl is a hard dependency, but guard like the rest of the codebase does.
     from openpyxl import load_workbook
 except ImportError:  # pragma: no cover
@@ -333,8 +335,15 @@ def _page_params(request) -> tuple[int, int]:
 
 
 # --- Views -------------------------------------------------------------------
+# Permission code that gates the whole Pricing section. Granted only to selected
+# users (plus superusers) — see accounts/migrations/0017. A user who can't see
+# the section can't reach its data either.
+PRICING_PERMISSION = "pricing.view"
+CanViewPricing = require(PRICING_PERMISSION)
+
+
 @api_view(["GET"])
-@permission_classes([IsAuthenticated])
+@permission_classes([IsAuthenticated, CanViewPricing])
 def live_reports(request):
     """List the available reports (latest dated file per report)."""
     try:
@@ -361,7 +370,7 @@ def live_reports(request):
 
 
 @api_view(["GET"])
-@permission_classes([IsAuthenticated])
+@permission_classes([IsAuthenticated, CanViewPricing])
 def live_data(request):
     """Return one sheet of a report as a raw grid.
 

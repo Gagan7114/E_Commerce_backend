@@ -1325,17 +1325,23 @@ def coupon(q: ParsedQuery) -> DataResult:
     table = "amazon_coupon_master"
     text = q.text.lower()
     where, params = [], []
+    # amazon_coupon_master is a CUMULATIVE daily snapshot — every pull rewrites
+    # each coupon's running total for that date — so a date range must be pinned
+    # to its LATEST snapshot, never SUMmed (summing over-counts by ~one× per
+    # snapshot date; July 2026 read ₹15,05,605 instead of ₹81,891). Same method as
+    # the Amazon Coupon Dashboard and the Ads Summary Brand Fund column.
     if q.date_from and q.date_to:
-        where.append("date BETWEEN %s AND %s")
-        span = f" ({q.date_label})"
+        _c, r, _t = safe_sql.run_select(
+            f"SELECT MAX(date) FROM {table} WHERE date BETWEEN %s AND %s",
+            [q.date_from, q.date_to], max_rows=1)
+        latest = r[0][0] if r else None
+        span = f" ({q.date_label}, snapshot as of {latest})"
     else:
         _c, r, _t = safe_sql.run_select(f"SELECT MAX(date) FROM {table}", [], max_rows=1)
         latest = r[0][0] if r else None
-        where.append("date = %s")
-        params.append(latest)
         span = f" (as of {latest})"
-    if q.date_from and q.date_to:
-        params.extend([q.date_from, q.date_to])
+    where.append("date = %s")
+    params.append(latest)
     wsql = " WHERE " + " AND ".join(where)
 
     if ("premium" in text or "commodity" in text or "split" in text) and "coupon" in text:
