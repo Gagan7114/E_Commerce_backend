@@ -1372,11 +1372,12 @@ def _fetch_doh_filler_pool(fc, exclude_po_uppers, doh_by_asin):
                 p.merchant_sku        AS internal_sku,
                 p.sap_sku_code,
                 p.sku_name            AS product_name,
-                p.accepted_qty,
+                GREATEST(p.accepted_qty - COALESCE(b.billed_qty, 0), 0) AS accepted_qty,
+                COALESCE(b.billed_qty, 0) AS billed_qty,
                 p.case_pack,
                 p.per_liter,
                 p.cost_price,
-                p.total_accepted_liters,
+                round(GREATEST(p.accepted_qty - COALESCE(b.billed_qty, 0), 0) * COALESCE(p.per_liter, 0), 4) AS total_accepted_liters,
                 p.days_to_expiry,
                 p.expiry_date,
                 p.category,
@@ -1392,6 +1393,9 @@ def _fetch_doh_filler_pool(fc, exclude_po_uppers, doh_by_asin):
             LEFT JOIN locked_pairs lp
                 ON lp.asin = p.asin
                AND lp.po_number = UPPER(TRIM(p.po_number))
+            LEFT JOIN sap_billing b
+                ON b.po_number = UPPER(TRIM(p.po_number))
+               AND b.sap_item_code = UPPER(TRIM(p.sap_sku_code))
             WHERE p.status = 'Confirmed'
               AND p.availability_status = 'AC - Accepted: In stock'
               AND p.accepted_qty > 0
@@ -1401,6 +1405,7 @@ def _fetch_doh_filler_pool(fc, exclude_po_uppers, doh_by_asin):
               AND p.fulfillment_center = %s
               AND NOT (UPPER(TRIM(p.po_number)) = ANY(%s::text[]))
               AND lp.asin IS NULL
+              AND (p.accepted_qty - COALESCE(b.billed_qty, 0)) > 0
         """, [fc, exclude_list])
         raw = _row_to_dict(cur, cur.fetchall())
 
@@ -2095,6 +2100,17 @@ class AppointmentItemsView(_SafeAPIView):
                     GROUP BY si.asin,
                              UPPER(TRIM(si.po_number))
                 ),
+                billed AS (
+                    -- Units already invoiced in SAP for this PO+item (net Sales
+                    -- minus Sales Return, eaches), synced from RK-World Sales
+                    -- Analysis into sap_billing and matched to the PO line via its
+                    -- sap_sku_code. Per the billing rule, SAP billing is the
+                    -- authority for "done": billed units are removed from what's
+                    -- offered here (the shipped tally above is exposed for context
+                    -- but does NOT gate).
+                    SELECT po_number, sap_item_code, billed_qty
+                    FROM sap_billing
+                ),
                 doh_data AS (
                     -- placeholder; DOH joined in Python via _live_doh_by_asin() below
                     SELECT NULL::text AS asin
@@ -2105,15 +2121,18 @@ class AppointmentItemsView(_SafeAPIView):
                     p.merchant_sku        AS internal_sku,
                     p.sap_sku_code,
                     p.sku_name            AS product_name,
-                    -- Orderable amount this plan = leftover after prior commitments.
-                    (p.accepted_qty - COALESCE(c.committed_qty, 0)) AS accepted_qty,
+                    -- Orderable amount this plan = accepted minus what SAP has
+                    -- already billed. committed_qty (planner-shipped) is exposed for
+                    -- context but does NOT reduce this, per the billing rule.
+                    GREATEST(p.accepted_qty - COALESCE(b.billed_qty, 0), 0) AS accepted_qty,
                     p.accepted_qty        AS original_accepted_qty,
                     COALESCE(c.committed_qty, 0) AS committed_qty,
+                    COALESCE(b.billed_qty, 0)    AS billed_qty,
                     p.case_pack,
                     p.per_liter,
                     p.cost_price,
                     -- Liters for the leftover so the packer fills against remaining.
-                    round((p.accepted_qty - COALESCE(c.committed_qty, 0)) * COALESCE(p.per_liter, 0), 4) AS total_accepted_liters,
+                    round(GREATEST(p.accepted_qty - COALESCE(b.billed_qty, 0), 0) * COALESCE(p.per_liter, 0), 4) AS total_accepted_liters,
                     p.days_to_expiry,
                     p.expiry_date,
                     p.category,
@@ -2148,11 +2167,14 @@ class AppointmentItemsView(_SafeAPIView):
                 LEFT JOIN committed c
                     ON c.asin = p.asin
                     AND c.po_number = UPPER(TRIM(p.po_number))
+                LEFT JOIN billed b
+                    ON b.po_number = UPPER(TRIM(p.po_number))
+                    AND b.sap_item_code = UPPER(TRIM(p.sap_sku_code))
                 WHERE p.status = 'Confirmed'
                   AND p.availability_status = 'AC - Accepted: In stock'
                   AND p.accepted_qty > 0
                   AND p.po_status = 'PENDING'
-                  AND (p.accepted_qty - COALESCE(c.committed_qty, 0)) > 0
+                  AND (p.accepted_qty - COALESCE(b.billed_qty, 0)) > 0
             """, [appointment_id, candidate_pos, all_appt_ids, primary_fc_value])
             raw = _row_to_dict(cur, cur.fetchall())
 
@@ -2453,8 +2475,8 @@ class AppointmentExtraPosView(_SafeAPIView):
                     p.po_number,
                     MAX(p.sku_name) AS product_name,
                     COUNT(DISTINCT p.asin) AS sku_count,
-                    SUM(COALESCE(p.accepted_qty, 0))::bigint AS total_accepted_qty,
-                    ROUND(SUM(COALESCE(p.accepted_qty, 0) * COALESCE(p.per_liter, 0))::numeric, 2) AS total_liters,
+                    SUM(GREATEST(COALESCE(p.accepted_qty, 0) - COALESCE(b.billed_qty, 0), 0))::bigint AS total_accepted_qty,
+                    ROUND(SUM(GREATEST(COALESCE(p.accepted_qty, 0) - COALESCE(b.billed_qty, 0), 0) * COALESCE(p.per_liter, 0))::numeric, 2) AS total_liters,
                     MIN(p.days_to_expiry) AS earliest_days_to_expiry,
                     MAX(p.order_date)     AS order_date,
                     MAX(p.item_head)      AS item_head,
@@ -2468,16 +2490,20 @@ class AppointmentExtraPosView(_SafeAPIView):
                             'internal_sku', p.merchant_sku,
                             'sap_sku_code', p.sap_sku_code,
                             'item_head', p.item_head,
-                            'accepted_qty', p.accepted_qty,
+                            'accepted_qty', GREATEST(COALESCE(p.accepted_qty, 0) - COALESCE(b.billed_qty, 0), 0),
+                            'billed_qty', COALESCE(b.billed_qty, 0),
                             'case_pack', p.case_pack,
                             'per_liter', p.per_liter,
-                            'total_liters', ROUND((COALESCE(p.accepted_qty, 0) * COALESCE(p.per_liter, 0))::numeric, 2),
+                            'total_liters', ROUND((GREATEST(COALESCE(p.accepted_qty, 0) - COALESCE(b.billed_qty, 0), 0) * COALESCE(p.per_liter, 0))::numeric, 2),
                             'days_to_expiry', p.days_to_expiry,
                             'expiry_date', p.expiry_date
                         )
                         ORDER BY p.days_to_expiry NULLS LAST, p.asin
                     ) AS skus
                 FROM reporting."Amazon PO" p
+                LEFT JOIN sap_billing b
+                    ON b.po_number = UPPER(TRIM(p.po_number))
+                   AND b.sap_item_code = UPPER(TRIM(p.sap_sku_code))
                 WHERE p.fulfillment_center = %s
                   AND p.status = 'Confirmed'
                   AND p.po_status = 'PENDING'
@@ -2485,6 +2511,7 @@ class AppointmentExtraPosView(_SafeAPIView):
                   AND COALESCE(p.accepted_qty, 0) > 0
                   AND NOT (UPPER(TRIM(p.po_number)) = ANY(%s::text[]))
                 GROUP BY p.po_number
+                HAVING SUM(GREATEST(COALESCE(p.accepted_qty, 0) - COALESCE(b.billed_qty, 0), 0)) > 0
                 ORDER BY MIN(p.days_to_expiry) NULLS LAST, p.po_number
             """, [fc, sorted(own_pos)])
             raw = _row_to_dict(cur, cur.fetchall())
@@ -4372,16 +4399,22 @@ class DOHAutoFillView(_SafeAPIView):
                     GROUP BY si.asin,
                              UPPER(TRIM(si.po_number)),
                              UPPER(TRIM(COALESCE(si.destination_fc, '')))
+                ),
+                billed AS (
+                    -- SAP-billed units per PO+item (billing rule: the authority for
+                    -- "done"; committed_qty is exposed for context but does not gate).
+                    SELECT po_number, sap_item_code, billed_qty FROM sap_billing
                 )
                 SELECT
                     p.po_number, p.asin,
                     p.merchant_sku       AS internal_sku,
                     p.sku_name           AS product_name,
-                    (p.accepted_qty - COALESCE(c.committed_qty, 0)) AS accepted_qty,
+                    GREATEST(p.accepted_qty - COALESCE(b.billed_qty, 0), 0) AS accepted_qty,
                     p.accepted_qty       AS original_accepted_qty,
                     COALESCE(c.committed_qty, 0) AS committed_qty,
+                    COALESCE(b.billed_qty, 0)    AS billed_qty,
                     p.case_pack, p.per_liter,
-                    round((p.accepted_qty - COALESCE(c.committed_qty, 0)) * COALESCE(p.per_liter, 0), 4) AS total_accepted_liters,
+                    round(GREATEST(p.accepted_qty - COALESCE(b.billed_qty, 0), 0) * COALESCE(p.per_liter, 0), 4) AS total_accepted_liters,
                     p.days_to_expiry, p.expiry_date,
                     p.fulfillment_center AS destination_fc,
                     p.category, p.sub_category, p.brand,
@@ -4392,7 +4425,10 @@ class DOHAutoFillView(_SafeAPIView):
                     ON c.asin = p.asin
                     AND c.po_number = UPPER(TRIM(p.po_number))
                     AND c.fc_key = UPPER(TRIM(COALESCE(p.fulfillment_center, '')))
-                WHERE {po_where_sql} AND (p.accepted_qty - COALESCE(c.committed_qty, 0)) > 0
+                LEFT JOIN billed b
+                    ON b.po_number = UPPER(TRIM(p.po_number))
+                    AND b.sap_item_code = UPPER(TRIM(p.sap_sku_code))
+                WHERE {po_where_sql} AND (p.accepted_qty - COALESCE(b.billed_qty, 0)) > 0
             """, po_params)
             po_raw = _row_to_dict(cur, cur.fetchall())
 
