@@ -1381,7 +1381,8 @@ def _reserved_detail_by_asin():
     return detail
 
 
-def _apply_stock_caps(items, avail_total, avail_remaining, respect, detail, reserved):
+def _apply_stock_caps(items, avail_total, avail_remaining, respect, detail, reserved,
+                      enforce_expiry=False):
     """Tag each item with live stock figures (on-hand, reserved-elsewhere,
     available, incoming on-order). When ``respect``, set ``stock_cap`` = units
     still AVAILABLE (on-hand − reserved) for that ASIN so the packer plans no
@@ -1391,7 +1392,15 @@ def _apply_stock_caps(items, avail_total, avail_remaining, respect, detail, rese
     from (GP-FGM, the only planner warehouse). ASINs with no planner-warehouse
     stock record are capped to 0 so they drop to not_loaded rather than shipping
     unverified. Mutates ``items``.
+
+    ``enforce_expiry`` must MATCH what the caller passes to the packer: when the
+    packer will refuse a line on cancellation-deadline grounds, that line must not
+    reserve pool stock here. Near-expiry POs sort FIRST (FEFO boosts their score),
+    so without this an expiry-doomed line drains the ASIN's whole pool and a
+    shippable fresh PO of the same ASIN reads "No free stock" — zero units ship
+    although the stock was there.
     """
+    today = timezone.localdate() if enforce_expiry else None
     for it in items:
         asin = str(it.get('asin') or '').strip().upper()
         d = detail.get(asin)
@@ -1404,6 +1413,11 @@ def _apply_stock_caps(items, avail_total, avail_remaining, respect, detail, rese
         src_whs = d['source_warehouse'] if d else None
         it['source_warehouse'] = src_whs
         it['source_inventory'] = _inventory_label(src_whs)
+        # A line the packer will expiry-block gets the informational tags above but
+        # neither a stock_cap nor a pool drain — and, deliberately, no stock_unfit:
+        # the reason shown must be the deadline, not a stock shortfall it didn't have.
+        if enforce_expiry and _expiry_block_reason(it, today) is not None:
+            continue
         if not respect:
             continue
         if d is None:
@@ -2318,7 +2332,8 @@ class AppointmentItemsView(_SafeAPIView):
         reserved = _reserved_stock_by_asin()
         avail_total = {a: max(0.0, d['onhand'] - reserved.get(a, 0.0)) for a, d in stock_detail.items()}
         avail_remaining = dict(avail_total)
-        _apply_stock_caps(items, avail_total, avail_remaining, respect_stock, stock_detail, reserved)
+        _apply_stock_caps(items, avail_total, avail_remaining, respect_stock, stock_detail, reserved,
+                          enforce_expiry=True)
 
         # Appointment POs come FIRST and in full: pack the appointment's own POs
         # (highest priority_score first) straight into the truck, limited only by
@@ -2360,7 +2375,8 @@ class AppointmentItemsView(_SafeAPIView):
                 })
                 doh_pool = _fetch_doh_filler_pool(primary_fc, appt_po_uppers, doh_by_asin)
                 # Cap fillers by the same live stock (shared remaining pool).
-                _apply_stock_caps(doh_pool, avail_total, avail_remaining, respect_stock, stock_detail, reserved)
+                _apply_stock_caps(doh_pool, avail_total, avail_remaining, respect_stock, stock_detail, reserved,
+                                  enforce_expiry=True)
                 if doh_pool:
                     loaded, _doh_unfit = _filler_pass(
                         loaded, doh_pool, capacity,
@@ -2386,9 +2402,14 @@ class AppointmentItemsView(_SafeAPIView):
 
         # Surface the stock reason: out-of-stock items get it as their not-loaded
         # reason; partially-stocked items get it as their short reason.
+        # expiry_blocked lines keep their deadline reason — the expiry gate forces
+        # planned_qty to 0, so without the guard this overwrite would relabel every
+        # such line as a stock problem and send the planner chasing inventory for a
+        # PO that is about to be cancelled.
         if respect_stock:
             for it in not_loaded:
-                if it.get('stock_unfit') and float(it.get('planned_qty') or 0) <= 0:
+                if (it.get('stock_unfit') and not it.get('expiry_blocked')
+                        and float(it.get('planned_qty') or 0) <= 0):
                     it['unfit_reason'] = it['stock_unfit']
             for it in loaded:
                 if it.get('stock_limited') and it.get('stock_unfit') and not it.get('short_reason'):
@@ -4296,7 +4317,8 @@ class ManualPlanView(_SafeAPIView):
             })
             doh_by_asin, _ = _live_doh_by_asin()
             doh_pool = _fetch_doh_filler_pool(fc, selected_po_uppers, doh_by_asin)
-            _apply_stock_caps(doh_pool, avail_total, avail_remaining, respect_stock, stock_detail, reserved)
+            _apply_stock_caps(doh_pool, avail_total, avail_remaining, respect_stock, stock_detail, reserved,
+                                  enforce_expiry=True)
             if doh_pool:
                 loaded, _doh_unfit = _filler_pass(
                     loaded, doh_pool, capacity,
