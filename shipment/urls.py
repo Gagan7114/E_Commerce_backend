@@ -13,6 +13,7 @@ urlpatterns = [
     path('appointment-commits/manual-import/', views.AppointmentCommitManualImportView.as_view(), name='appointment-commits-manual-import'),
     path('fc-channel/', views.SetFcChannelView.as_view(), name='fc-channel-set'),
     path('fc-switch-group/', views.FcSwitchGroupView.as_view(), name='fc-switch-group'),
+    path('po-appointments/', views.PoAppointmentsView.as_view(), name='po-appointments'),
     path('appointment-commits/import/', views.AppointmentCommitImportView.as_view(), name='appointment-commits-import'),
     path('shipments/', views.ShipmentListCreateView.as_view(), name='shipment-list-create'),
     path('shipments/stats/', views.ShipmentStatsView.as_view(), name='shipment-stats'),

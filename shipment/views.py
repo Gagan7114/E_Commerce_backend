@@ -2298,36 +2298,39 @@ class AppointmentItemsView(_SafeAPIView):
             r['drr_unit'] = live.get('drr_unit', 0) or 0
             r['drr_ltr']  = live.get('drr_ltr', 0) or 0
             r['doh']      = live.get('doh', 0) or 0
-            # Flip / switch detection: the PO's actual (sheet) FC differs from the
-            # appointment FC it's being shipped on. Either way it ships to the
-            # appointment's FC, but the two mean very different things:
+            # Flip / switch detection. A line ships to the PRIMARY appointment's
+            # FC no matter where it came from, but how it got here matters:
             #
-            #   FLIP   — the PO is genuinely ON this appointment (Amazon already
-            #            moved it). Nothing to request; we just tag and log it.
-            #   SWITCH — the planner pulled in a sister-FC PO that is NOT on this
-            #            appointment. Amazon has NOT moved it yet, so this needs
-            #            the switching request → email → verification cycle before
-            #            the shipment may be submitted.
+            #   FLIP   — the PO is on a selected appointment AT THIS FC while its
+            #            Amazon-sheet FC is the sister (Amazon already moved it).
+            #            Nothing to request; tag + log, as before.
+            #   SWITCH — Amazon has NOT moved it yet and must: either a planner-
+            #            added sister-FC PO that's on none of the selected
+            #            appointments, or a PO whose own appointment (a combined
+            #            one) sits at a sister FC. Both need the switching
+            #            request → email → verification cycle before Submit.
             actual_fc = str(r.get('fulfillment_center') or '').strip()
-            if actual_fc and actual_fc.upper() != appt_fc_up:
-                on_appt = bool(r.get('is_appointment_po'))
+            on_appt = bool(r.get('is_appointment_po'))
+            src_aid = str(r.get('source_appointment_id') or '').strip()
+            src_fc = str((appts_by_id.get(src_aid) or {}).get('destination_fc') or '').strip()
+            fc_mismatch = bool(actual_fc) and actual_fc.upper() != appt_fc_up
+            # PO rides on a combined appointment that itself sits at a sister FC.
+            appt_mismatch = on_appt and bool(src_fc) and src_fc.upper() != appt_fc_up
+            if fc_mismatch:
                 r['is_flipped'] = True
                 r['flipped_from'] = actual_fc
                 r['flipped_to'] = primary_fc_value
                 r['destination_fc'] = primary_fc_value  # ships to the appointment's FC
-                r['is_switch'] = not on_appt
-                r['switch_from_fc'] = actual_fc if not on_appt else None
-                r['switch_to_fc'] = primary_fc_value if not on_appt else None
-                r['home_fc'] = actual_fc
                 flips_seen.append((r.get('po_number'), actual_fc, primary_fc_value))
             else:
                 r['is_flipped'] = False
                 r['flipped_from'] = None
                 r['flipped_to'] = None
-                r['is_switch'] = False
-                r['switch_from_fc'] = None
-                r['switch_to_fc'] = None
-                r['home_fc'] = actual_fc or primary_fc_value
+            r['home_fc'] = actual_fc or primary_fc_value
+            is_switch = (fc_mismatch and not on_appt) or appt_mismatch
+            r['is_switch'] = is_switch
+            r['switch_from_fc'] = (actual_fc or src_fc) if is_switch else None
+            r['switch_to_fc'] = primary_fc_value if is_switch else None
         _record_po_flips(flips_seen)
 
         # Which appointment each SWITCHED PO currently sits on at its home FC —
@@ -4671,15 +4674,25 @@ class ManualPlanView(_SafeAPIView):
         # clear "No per-liter data…" reason AND a proper computed priority badge.
         # This makes manual handle missing per-litre identically to auto.
 
-        # A single truck ships from ONE fulfillment center. Reject mixed-FC payloads
-        # (the auto planner enforces this too) so a direct API call can't bypass it.
+        # A single truck delivers to ONE fulfillment center — but sister FCs on
+        # the same channel may MIX (that mix is an FC switch: the sister-FC rows
+        # get re-pointed to the truck's FC and go through the switching
+        # request/verification cycle before submit). Cross-channel payloads are
+        # still rejected so a direct API call can't bypass the rule.
         fcs = {str(it.get('destination_fc') or '').strip().upper()
                for it in selected_items if it.get('destination_fc')}
         if len(fcs) > 1:
-            return Response(
-                {'error': f'Items span multiple fulfillment centers ({", ".join(sorted(fcs))}); a truck must be a single FC.'},
-                status=400,
-            )
+            _, group = _fc_switch_group(sorted(fcs)[0])
+            group_up = {f.upper() for f in group}
+            if not fcs.issubset(group_up):
+                return Response(
+                    {'error': (
+                        f'Items span fulfillment centers on different channels '
+                        f'({", ".join(sorted(fcs))}); a truck can only mix sister '
+                        f'FCs on the same channel (an FC switch).'
+                    )},
+                    status=400,
+                )
 
         for item in selected_items:
             bucket, score, reason = _compute_priority(
@@ -5361,6 +5374,23 @@ def _is_switch(from_fc, to_fc):
         return False
     _, group = _fc_switch_group(b)
     return a in group
+
+
+class PoAppointmentsView(_SafeAPIView):
+    """{PO → its current (latest) appointment} for a comma-separated PO list.
+
+    Powers the manual planner's Switching popup: a manually selected sister-FC
+    PO needs its "from appointment" named on the switching request, and the
+    client doesn't have that mapping (the auto planner gets it inline).
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        raw = request.query_params.get('pos') or ''
+        pos = [p.strip() for p in raw.replace(';', ',').split(',') if p.strip()]
+        if not pos:
+            return Response({'appointments': {}})
+        return Response({'appointments': _appointments_for_pos(pos[:200])})
 
 
 class FcSwitchGroupView(_SafeAPIView):
