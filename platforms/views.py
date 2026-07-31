@@ -5901,9 +5901,25 @@ def marketing_ads_summary(request):
         # both filters unchanged.
         src_filter = "src <> 'fsn'" if key == "platform" else "src <> 'flipkart_ads'"
         dim_selects.append(
-            f"SELECT '{key}' AS dim, {grp} AS grp, {metric_sums} "
+            f"SELECT '{key}' AS dim, {grp} AS grp, NULL::text AS sub, {metric_sums} "
             f"FROM adscte WHERE {src_filter} GROUP BY {grp}"
         )
+    # Platform → Item Head drill: powers the Platform table's expandable rows
+    # and the extra sheet its export writes. One more GROUP BY over the already
+    # MATERIALIZED CTE, so it costs a scan of a few hundred cached rows.
+    #
+    # It deliberately reuses the `platform` dimension's src filter (src <> 'fsn')
+    # rather than the item dimensions' one, so each platform's item-head rows sum
+    # EXACTLY to the platform row they expand from. The trade-off is Flipkart:
+    # its campaign-level rows carry no item head and collect under '(Unmapped)'.
+    # Reconciling with the parent row matters more here than splitting Flipkart,
+    # since the drill is read as a breakdown OF that row.
+    _ads_item_head = "COALESCE(NULLIF(TRIM(item_head::text), ''), '(Unmapped)')"
+    dim_selects.append(
+        f"SELECT 'platform_item_head' AS dim, platform AS grp, "
+        f"{_ads_item_head} AS sub, {metric_sums} "
+        f"FROM adscte WHERE src <> 'fsn' GROUP BY platform, {_ads_item_head}"
+    )
     # Pre-aggregate the union to the dashboard's grain (platform + the 4 SKU
     # dimensions) inside the CTE. This collapses secmaster's unused city/date
     # grain (~830k rows → a few hundred) ONCE, so the 5 per-dimension GROUP BYs
@@ -5928,23 +5944,32 @@ def marketing_ads_summary(request):
     )
 
     breakdowns = {key: [] for key, _ in _ADS_SUMMARY_DIMENSIONS}
+    platform_item_head = []
     with connection.cursor() as cur:
         cur.execute(sql, list(params))
         for r in cur.fetchall():
-            breakdowns[r[0]].append({
-                "group": r[1],
-                "qty_sold": float(r[2]),
-                "impressions": float(r[3]),
-                "ad_spent": float(r[4]),
-                "brand_fund": float(r[5]),
-                "sec_qty": float(r[6]),
-                "sec_value": float(r[7]),
-                "ads_sale": float(r[8]),
-            })
+            # r = (dim, grp, sub, qty, impressions, ad_spent, brand_fund,
+            #      sec_qty, sec_value, ads_sale); `sub` is NULL for every
+            #      single-dimension row and carries the item head for the drill.
+            metrics = {
+                "qty_sold": float(r[3]),
+                "impressions": float(r[4]),
+                "ad_spent": float(r[5]),
+                "brand_fund": float(r[6]),
+                "sec_qty": float(r[7]),
+                "sec_value": float(r[8]),
+                "ads_sale": float(r[9]),
+            }
+            if r[0] == "platform_item_head":
+                platform_item_head.append({"platform": r[1], "group": r[2], **metrics})
+            else:
+                breakdowns[r[0]].append({"group": r[1], **metrics})
 
     # Default display order: highest ad spend first (the table re-sorts on click).
     for lst in breakdowns.values():
         lst.sort(key=lambda d: (d["ad_spent"], d["qty_sold"]), reverse=True)
+    # Drill rows group by platform, then highest ad spend first within it.
+    platform_item_head.sort(key=lambda d: (d["platform"], -d["ad_spent"], -d["qty_sold"]))
 
     metric_keys = (
         "qty_sold", "impressions", "ad_spent",
@@ -5962,6 +5987,10 @@ def marketing_ads_summary(request):
         "group_by": group_by,
         "dimensions": [{"key": k, "label": l} for k, l in _ADS_SUMMARY_DIMENSIONS],
         "breakdowns": breakdowns,
+        # Flat list of {platform, group, ...metrics} — the Platform table's
+        # per-row item-head drill. Flat (not nested) so the frontend can both
+        # group it per platform and write it straight to an export sheet.
+        "platform_item_head": platform_item_head,
         "rows": breakdowns.get(group_by, any_rows),
         "filters": filters,
     })
