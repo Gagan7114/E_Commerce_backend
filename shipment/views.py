@@ -3610,6 +3610,26 @@ class ShipmentSwitchEmailView(_SafeAPIView):
         if not to:
             return Response({'error': 'At least one recipient (to) is required.'}, status=400)
 
+        # Refuse rather than lie. With no EMAIL_HOST configured the settings fall
+        # back to the console backend: send() "succeeds", we would stamp
+        # switch_email_sent_at, and the UI would report a delivered request that
+        # only ever reached the server log. Fail loudly so a misconfigured
+        # deployment is obvious the first time someone tries to send.
+        if not getattr(settings, 'EMAIL_HOST', ''):
+            shipment.switch_state = Shipment.SwitchState.EMAIL_FAILED
+            shipment.save(update_fields=['switch_state', 'updated_at'])
+            return Response(
+                {
+                    'error': 'Email is not configured on this server.',
+                    'detail': ('No EMAIL_HOST is set, so the switching request cannot be '
+                               'delivered. Add the EMAIL_* settings to the server .env and '
+                               'restart the app, then re-send from All Shipments → Switching. '
+                               'The draft itself is saved.'),
+                    'switch_state': shipment.switch_state,
+                },
+                status=503,
+            )
+
         subject = str(request.data.get('subject') or '').strip() or (
             f'FC switching request — shipment {shipment.id}'
             f'{f" · appointment {shipment.appointment_id}" if shipment.appointment_id else ""}'
