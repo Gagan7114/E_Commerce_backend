@@ -1348,7 +1348,12 @@ def _transform_amazon_po(cur, upload_id: int) -> tuple[int, int]:
         ),
         calculated AS (
             SELECT e.*,
-                   e.cancellation_deadline AS expiry_calc,
+                   -- Expiry = Amazon's cancellation deadline, falling back to the
+                   -- delivery window end when that column is empty. Amazon only
+                   -- fills the deadline once it CONFIRMS a PO, so every
+                   -- Unconfirmed line arrived with a blank expiry (0 of ~20k)
+                   -- even though the sheet carries a window end for it.
+                   COALESCE(e.cancellation_deadline, e.window_end) AS expiry_calc,
                    CASE
                        WHEN e.vendor_code = '0M7KK' THEN 'RK WORLD'
                        ELSE e.vendor_code
