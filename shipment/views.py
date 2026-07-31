@@ -2778,7 +2778,10 @@ class AppointmentExtraPosView(_SafeAPIView):
                     COUNT(DISTINCT p.asin) AS sku_count,
                     SUM(GREATEST(COALESCE(p.accepted_qty, 0) - COALESCE(b.billed_qty, 0), 0))::bigint AS total_accepted_qty,
                     ROUND(SUM(GREATEST(COALESCE(p.accepted_qty, 0) - COALESCE(b.billed_qty, 0), 0) * COALESCE(p.per_liter, 0))::numeric, 2) AS total_liters,
-                    MIN(p.days_to_expiry) AS earliest_days_to_expiry,
+                    -- Live days-to-cancellation, NOT the stored days_to_expiry:
+                    -- that column is baked at PO-upload time and clamped at 0, so a
+                    -- PO cancelled weeks ago still reads "expires in 0d" here.
+                    MIN(p.expiry_date - CURRENT_DATE) AS earliest_days_to_expiry,
                     MAX(p.order_date)     AS order_date,
                     MAX(p.item_head)      AS item_head,
                     -- Per-SKU breakdown so the picker can expand a PO and show every
@@ -2796,10 +2799,10 @@ class AppointmentExtraPosView(_SafeAPIView):
                             'case_pack', p.case_pack,
                             'per_liter', p.per_liter,
                             'total_liters', ROUND((GREATEST(COALESCE(p.accepted_qty, 0) - COALESCE(b.billed_qty, 0), 0) * COALESCE(p.per_liter, 0))::numeric, 2),
-                            'days_to_expiry', p.days_to_expiry,
+                            'days_to_expiry', (p.expiry_date - CURRENT_DATE),
                             'expiry_date', p.expiry_date
                         )
-                        ORDER BY p.days_to_expiry NULLS LAST, p.asin
+                        ORDER BY (p.expiry_date - CURRENT_DATE) NULLS LAST, p.asin
                     ) AS skus
                 FROM reporting."Amazon PO" p
                 LEFT JOIN billed b
@@ -2811,10 +2814,16 @@ class AppointmentExtraPosView(_SafeAPIView):
                   AND p.availability_status = 'AC - Accepted: In stock'
                   AND COALESCE(p.accepted_qty, 0) > 0
                   AND NOT (UPPER(TRIM(p.po_number)) = ANY(%s::text[]))
+                  -- Near-expiry gate, same rule as the planner (MIN_DAYS_TO_EXPIRY):
+                  -- ticking a PO here feeds it straight into the plan, so offering one
+                  -- that cancels before the truck can land would walk straight past the
+                  -- gate. A missing deadline is excluded too -- it cannot be verified.
+                  AND p.expiry_date IS NOT NULL
+                  AND (p.expiry_date - CURRENT_DATE) > %s
                 GROUP BY p.po_number
                 HAVING SUM(GREATEST(COALESCE(p.accepted_qty, 0) - COALESCE(b.billed_qty, 0), 0)) > 0
-                ORDER BY MIN(p.days_to_expiry) NULLS LAST, p.po_number
-            """, [switch_group_up, sorted(own_pos)])
+                ORDER BY MIN(p.expiry_date - CURRENT_DATE) NULLS LAST, p.po_number
+            """, [switch_group_up, sorted(own_pos), MIN_DAYS_TO_EXPIRY])
             raw = _row_to_dict(cur, cur.fetchall())
 
         # Enrich each SKU with live DOH (the same rolling-window snapshot the
