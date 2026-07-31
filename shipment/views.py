@@ -1549,6 +1549,52 @@ def _record_po_flips(flips):
         pass
 
 
+def _appointments_for_pos(po_uppers):
+    """{PO (upper) → its current appointment} for the given POs.
+
+    A switching request has to state where each PO is being moved FROM — not just
+    which FC, but which appointment slot it currently occupies, so the person
+    actioning it on Amazon's side knows exactly what to cancel/re-book. A PO can
+    be pending with no booked slot; those are simply absent from the result.
+
+    When a PO appears on several appointments we take the LATEST one — that's the
+    live booking; earlier rows are superseded history.
+    """
+    pos = sorted({str(p or '').strip().upper() for p in (po_uppers or [])} - {''})
+    if not pos:
+        return {}
+    try:
+        with connection.cursor() as cur:
+            cur.execute("""
+                SELECT DISTINCT ON (po_upper)
+                    po_upper, appointment_id, appointment_time, destination_fc, status
+                FROM (
+                    SELECT UPPER(TRIM(pv)) AS po_upper,
+                           a.appointment_id, a.appointment_time,
+                           a.destination_fc, a.status
+                    FROM reporting."appointment" a,
+                    LATERAL unnest(
+                        regexp_split_to_array(COALESCE(a.pos, ''), '\\s*[,;]\\s*')
+                    ) AS pv
+                    WHERE NULLIF(TRIM(pv), '') IS NOT NULL
+                ) x
+                WHERE po_upper = ANY(%s::text[])
+                ORDER BY po_upper, appointment_time DESC NULLS LAST
+            """, [pos])
+            return {
+                r[0]: {
+                    'appointment_id': r[1],
+                    'appointment_time': r[2].isoformat() if r[2] else None,
+                    'destination_fc': r[3],
+                    'status': r[4],
+                }
+                for r in cur.fetchall()
+            }
+    except Exception:
+        # Source-appointment lookup is descriptive only — never block planning.
+        return {}
+
+
 def _row_eligibility_reason(row):
     """
     Per-(PO, ASIN) reason string for the eligibility detail drawer.
@@ -2028,8 +2074,14 @@ class AppointmentItemsView(_SafeAPIView):
         if appt['status'] != 'Confirmed':
             return Response({'error': 'Appointment is not Confirmed'}, status=400)
 
-        # FC consistency check across all combined appointments
+        # Channel consistency check across all combined appointments. Appointments
+        # at DIFFERENT FCs may now be combined onto one truck as long as those FCs
+        # are sisters on the same channel (DED3 + DED5) — that combination IS the
+        # switch. Everything loads to the primary appointment's FC. Cross-channel
+        # stays a hard error: CORE stock can't satisfy a FRESH appointment.
         primary_fc_value = appt['destination_fc']
+        switch_channel, switch_group = _fc_switch_group(primary_fc_value)
+        switch_group_up = [f.upper() for f in switch_group]
         for aid in extra_ids:
             other = appts_by_id.get(aid)
             if not other:
@@ -2042,13 +2094,17 @@ class AppointmentItemsView(_SafeAPIView):
                     {'error': f'Appointment {aid} is not Confirmed'},
                     status=400,
                 )
-            if other['destination_fc'] != primary_fc_value:
+            other_fc = str(other['destination_fc'] or '').strip()
+            if other_fc.upper() != str(primary_fc_value or '').strip().upper() \
+                    and other_fc.upper() not in switch_group_up:
                 return Response(
                     {
                         'error': (
-                            f'Cannot combine appointments at different FCs '
-                            f'({appointment_id} at {primary_fc_value} vs '
-                            f'{aid} at {other["destination_fc"]})'
+                            f'Cannot combine appointments across channels '
+                            f'({appointment_id} at {primary_fc_value}'
+                            f'{f" · {switch_channel}" if switch_channel else ""} vs '
+                            f'{aid} at {other_fc}). Only fulfilment centers on the '
+                            f'same channel can be switched onto one truck.'
                         ),
                     },
                     status=400,
@@ -2205,11 +2261,13 @@ class AppointmentItemsView(_SafeAPIView):
                 FROM appt_pos ap
                 JOIN reporting."Amazon PO" p
                     ON UPPER(TRIM(p.po_number)) = ap.po_number
-                    -- PO at the appointment's FC (normal) OR a PO genuinely on the
-                    -- appointment but at another FC (a "flip" — intentionally moved
-                    -- to this FC). Planner-added extras still require an FC match.
+                    -- PO at the appointment's FC (normal), at a SISTER FC on the
+                    -- same channel (a switch the planner deliberately added — e.g.
+                    -- a DED5 PO pulled onto a DED3 truck), or a PO genuinely on the
+                    -- appointment but at another FC (a flip). Cross-channel FCs are
+                    -- excluded here, so an illegal mix can never enter the pool.
                     AND (
-                        p.fulfillment_center = %s
+                        UPPER(TRIM(p.fulfillment_center)) = ANY(%s::text[])
                         OR EXISTS (SELECT 1 FROM appt_po_map m2 WHERE m2.po_number = ap.po_number)
                     )
                 LEFT JOIN appt_po_map m
@@ -2225,7 +2283,7 @@ class AppointmentItemsView(_SafeAPIView):
                   AND p.accepted_qty > 0
                   AND p.po_status = 'PENDING'
                   AND (p.accepted_qty - COALESCE(b.billed_qty, 0)) > 0
-            """, [appointment_id, candidate_pos, all_appt_ids, primary_fc_value])
+            """, [appointment_id, candidate_pos, all_appt_ids, switch_group_up])
             raw = _row_to_dict(cur, cur.fetchall())
 
         # Attach LIVE DOH/DRR/SOH (matches SOH/DOH dashboard exactly)
@@ -2240,20 +2298,53 @@ class AppointmentItemsView(_SafeAPIView):
             r['drr_unit'] = live.get('drr_unit', 0) or 0
             r['drr_ltr']  = live.get('drr_ltr', 0) or 0
             r['doh']      = live.get('doh', 0) or 0
-            # Flip detection: PO's actual (sheet) FC differs from the appointment FC
-            # it's being shipped on. Tag it and ship it to the appointment's FC.
+            # Flip / switch detection: the PO's actual (sheet) FC differs from the
+            # appointment FC it's being shipped on. Either way it ships to the
+            # appointment's FC, but the two mean very different things:
+            #
+            #   FLIP   — the PO is genuinely ON this appointment (Amazon already
+            #            moved it). Nothing to request; we just tag and log it.
+            #   SWITCH — the planner pulled in a sister-FC PO that is NOT on this
+            #            appointment. Amazon has NOT moved it yet, so this needs
+            #            the switching request → email → verification cycle before
+            #            the shipment may be submitted.
             actual_fc = str(r.get('fulfillment_center') or '').strip()
             if actual_fc and actual_fc.upper() != appt_fc_up:
+                on_appt = bool(r.get('is_appointment_po'))
                 r['is_flipped'] = True
                 r['flipped_from'] = actual_fc
                 r['flipped_to'] = primary_fc_value
                 r['destination_fc'] = primary_fc_value  # ships to the appointment's FC
+                r['is_switch'] = not on_appt
+                r['switch_from_fc'] = actual_fc if not on_appt else None
+                r['switch_to_fc'] = primary_fc_value if not on_appt else None
+                r['home_fc'] = actual_fc
                 flips_seen.append((r.get('po_number'), actual_fc, primary_fc_value))
             else:
                 r['is_flipped'] = False
                 r['flipped_from'] = None
                 r['flipped_to'] = None
+                r['is_switch'] = False
+                r['switch_from_fc'] = None
+                r['switch_to_fc'] = None
+                r['home_fc'] = actual_fc or primary_fc_value
         _record_po_flips(flips_seen)
+
+        # Which appointment each SWITCHED PO currently sits on at its home FC —
+        # the "from appointment" the switching request has to name. Resolved in one
+        # query over every switched PO; POs with no live appointment simply carry
+        # None (a PO can be pending without a booked slot).
+        _switch_pos = sorted({
+            str(r.get('po_number') or '').strip().upper()
+            for r in raw if r.get('is_switch')
+        } - {''})
+        if _switch_pos:
+            src_appts = _appointments_for_pos(_switch_pos)
+            for r in raw:
+                if r.get('is_switch'):
+                    r['switch_from_appointment'] = src_appts.get(
+                        str(r.get('po_number') or '').strip().upper()
+                    )
 
         if not raw:
             return Response({
@@ -2504,12 +2595,31 @@ class AppointmentExtraPosView(_SafeAPIView):
         if not appt_rows:
             return Response({'error': 'Appointment not found'}, status=404)
 
-        fcs = {r[2] for r in appt_rows if r[2]}
-        if len(fcs) > 1:
-            return Response({'error': 'Combined appointments must share an FC'}, status=400)
-        fc = next(iter(fcs), None)
+        # The primary appointment's FC is the one the truck delivers to; combined
+        # appointments may sit at sister FCs on the same channel (that combination
+        # is itself a switch). Cross-channel combining stays an error.
+        primary_fc = next(
+            (r[2] for r in appt_rows if r[0] == appointment_id and r[2]), None
+        )
+        fc = primary_fc or next((r[2] for r in appt_rows if r[2]), None)
         if not fc:
-            return Response({'extra_pos': [], 'count': 0, 'fc': None})
+            return Response({'extra_pos': [], 'switch_pos': [], 'count': 0, 'fc': None})
+
+        switch_channel, switch_group = _fc_switch_group(fc)
+        switch_group_up = [f.upper() for f in switch_group]
+        offenders = sorted({
+            r[2] for r in appt_rows
+            if r[2] and str(r[2]).strip().upper() not in switch_group_up
+        })
+        if offenders:
+            return Response(
+                {'error': (
+                    f'Combined appointments must share a channel — {fc}'
+                    f'{f" ({switch_channel})" if switch_channel else ""} '
+                    f'cannot be combined with {", ".join(offenders)}.'
+                )},
+                status=400,
+            )
 
         # Collect the appointments' own POs to exclude from the "extra" list.
         own_pos = set()
@@ -2547,6 +2657,9 @@ class AppointmentExtraPosView(_SafeAPIView):
                 SELECT
                     p.po_number,
                     MAX(p.sku_name) AS product_name,
+                    -- The PO's own (home) FC. Equal to the appointment FC for a
+                    -- plain extra; a sister FC for a switchable one.
+                    MAX(p.fulfillment_center) AS home_fc,
                     COUNT(DISTINCT p.asin) AS sku_count,
                     SUM(GREATEST(COALESCE(p.accepted_qty, 0) - COALESCE(b.billed_qty, 0), 0))::bigint AS total_accepted_qty,
                     ROUND(SUM(GREATEST(COALESCE(p.accepted_qty, 0) - COALESCE(b.billed_qty, 0), 0) * COALESCE(p.per_liter, 0))::numeric, 2) AS total_liters,
@@ -2577,7 +2690,7 @@ class AppointmentExtraPosView(_SafeAPIView):
                 LEFT JOIN billed b
                     ON b.po_number = UPPER(TRIM(p.po_number))
                    AND b.asin = p.asin
-                WHERE p.fulfillment_center = %s
+                WHERE UPPER(TRIM(p.fulfillment_center)) = ANY(%s::text[])
                   AND p.status = 'Confirmed'
                   AND p.po_status = 'PENDING'
                   AND p.availability_status = 'AC - Accepted: In stock'
@@ -2586,7 +2699,7 @@ class AppointmentExtraPosView(_SafeAPIView):
                 GROUP BY p.po_number
                 HAVING SUM(GREATEST(COALESCE(p.accepted_qty, 0) - COALESCE(b.billed_qty, 0), 0)) > 0
                 ORDER BY MIN(p.days_to_expiry) NULLS LAST, p.po_number
-            """, [fc, sorted(own_pos)])
+            """, [switch_group_up, sorted(own_pos)])
             raw = _row_to_dict(cur, cur.fetchall())
 
         # Enrich each SKU with live DOH (the same rolling-window snapshot the
@@ -2606,10 +2719,42 @@ class AppointmentExtraPosView(_SafeAPIView):
                 sk['doh'] = (round(float(live['doh']), 1)
                              if live and live.get('doh') is not None else None)
 
+        # Split the pool: POs already at this FC are plain extras (add them and
+        # nothing else happens); POs at a sister FC are SWITCH candidates — adding
+        # one commits the plan to the switching request/verification cycle, so the
+        # UI must present it separately and never silently mix the two.
+        fc_up = str(fc).strip().upper()
+        extras, switches = [], []
+        for r in raw:
+            home = str(r.get('home_fc') or '').strip()
+            if home.upper() == fc_up:
+                r['is_switch'] = False
+                extras.append(r)
+            else:
+                r['is_switch'] = True
+                r['switch_from_fc'] = home
+                r['switch_to_fc'] = fc
+                switches.append(r)
+
+        # Where each switchable PO sits today — the "from appointment" the request
+        # has to name. Only looked up for switches; plain extras don't move.
+        if switches:
+            src = _appointments_for_pos([r.get('po_number') for r in switches])
+            for r in switches:
+                r['switch_from_appointment'] = src.get(
+                    str(r.get('po_number') or '').strip().upper()
+                )
+
         return Response({
             'fc': fc,
-            'count': len(raw),
-            'extra_pos': [_serialize_row(r) for r in raw],
+            'channel': switch_channel,
+            'switch_fcs': switch_group[1:],
+            # `count` / `extra_pos` keep their original same-FC meaning so an
+            # older frontend build sees exactly what it saw before.
+            'count': len(extras),
+            'extra_pos': [_serialize_row(r) for r in extras],
+            'switch_count': len(switches),
+            'switch_pos': [_serialize_row(r) for r in switches],
         })
 
 
@@ -2644,6 +2789,13 @@ class ShipmentListCreateView(_SafeAPIView):
         status_filter = request.query_params.get('status')
         if status_filter:
             qs = qs.filter(status=status_filter)
+        # Switching section: ?switch_state=any → every shipment in the switching
+        # flow (waiting / email_failed / verified / rejected); or a specific state.
+        switch_filter = request.query_params.get('switch_state')
+        if switch_filter == 'any':
+            qs = qs.exclude(switch_state='')
+        elif switch_filter:
+            qs = qs.filter(switch_state=switch_filter)
         serializer = ShipmentListSerializer(qs, many=True)
         return Response(serializer.data)
 
@@ -2673,6 +2825,36 @@ class ShipmentListCreateView(_SafeAPIView):
             fcs = [i.get('destination_fc') for i in loaded_items if i.get('destination_fc')]
             explicit_fc = Counter(fcs).most_common(1)[0][0] if fcs else ''
         destination_fc = explicit_fc or ''
+
+        # FC switching: the edited rows from the Switching popup. Non-empty ⇒
+        # this draft contains sister-FC POs Amazon hasn't moved yet, so it saves
+        # as switch_state='waiting' and Submit stays blocked until a manager
+        # verifies the switch happened. Server-side re-validation (not trust):
+        # every row must be a legal same-channel move into this truck's FC.
+        switch_details = data.get('switch_details') or []
+        if not isinstance(switch_details, list):
+            switch_details = []
+        switch_details = [r for r in switch_details if isinstance(r, dict)]
+        if switch_details:
+            bad = [
+                str(r.get('po_number') or '?')
+                for r in switch_details
+                if not _is_switch(r.get('from_fc'), r.get('to_fc'))
+                or str(r.get('to_fc') or '').strip().upper()
+                   != str(destination_fc or '').strip().upper()
+            ]
+            if bad:
+                return Response(
+                    {
+                        'error': 'Invalid switch rows',
+                        'detail': (
+                            'These POs are not legal same-channel switches into '
+                            f'{destination_fc}: {", ".join(sorted(set(bad)))}. '
+                            'Only sister FCs on the same channel can be switched.'
+                        ),
+                    },
+                    status=400,
+                )
 
         # Resolve planning_mode: explicit from frontend wins; otherwise infer from payload shape
         planning_mode = data.get('planning_mode')
@@ -2934,6 +3116,8 @@ class ShipmentListCreateView(_SafeAPIView):
                 notes=data.get('notes', ''),
                 status=Shipment.Status.DRAFT,
                 created_by=request.user,
+                switch_state=(Shipment.SwitchState.WAITING if switch_details else ''),
+                switch_details=switch_details,
             )
 
             # Source-inventory tag for each saved line: prefer the value the
@@ -3239,6 +3423,24 @@ class ShipmentSubmitView(_SafeAPIView):
         if shipment.status != Shipment.Status.DRAFT:
             return Response({'error': 'Only draft shipments can be submitted'}, status=400)
 
+        # Switching gate: a draft carrying sister-FC switches may not go up for
+        # approval until a manager has VERIFIED that Amazon actually moved the
+        # POs (Switching section → Verify). This is the server-side enforcement
+        # of "further should be executed only after verification".
+        if shipment.switch_state and shipment.switch_state != Shipment.SwitchState.VERIFIED:
+            return Response(
+                {
+                    'error': 'Switching not verified',
+                    'switch_state': shipment.switch_state,
+                    'detail': (
+                        'This shipment switches POs between fulfilment centers and is '
+                        f'currently "{shipment.get_switch_state_display()}". Verify the '
+                        'switch in the Switching section before submitting.'
+                    ),
+                },
+                status=409,
+            )
+
         conflicts = _check_qty_conflicts(shipment)
         if conflicts:
             return Response({'error': 'Quantity conflicts detected', 'conflicts': conflicts}, status=409)
@@ -3266,6 +3468,230 @@ class ShipmentSubmitView(_SafeAPIView):
         # Record when it was put up for approval. auto_now fields are only written
         # when named in update_fields, so include updated_at explicitly.
         shipment.save(update_fields=['status', 'updated_at'])
+        return Response(ShipmentListSerializer(shipment).data)
+
+
+class ShipmentSwitchEmailView(_SafeAPIView):
+    """Send (or re-send) the switching-request email for a shipment.
+
+    Multipart POST: `pdf` + `excel` file parts (built client-side — same jsPDF /
+    exceljs stack as every other planner export) plus `to` (comma-separated,
+    required), `cc` (optional), `subject`, `body`. Sends via the configured SMTP
+    backend, then stamps switch_email_to / switch_email_sent_at and moves
+    email_failed → waiting. SMTP failure ⇒ switch_state='email_failed' + 502 so
+    the UI offers Retry; the draft itself is never lost either way.
+    """
+    permission_classes = [IsAuthenticated]
+    parser_classes = [MultiPartParser, FormParser]
+
+    MAX_BYTES = 10 * 1024 * 1024  # 10 MB per attachment
+
+    @staticmethod
+    def _emails(raw):
+        return [e.strip() for e in str(raw or '').replace(';', ',').split(',') if e.strip()]
+
+    def post(self, request, pk):
+        try:
+            shipment = Shipment.objects.get(pk=pk)
+        except Shipment.DoesNotExist:
+            return Response({'error': 'Not found'}, status=404)
+        if not shipment.switch_state:
+            return Response({'error': 'This shipment has no FC switch to notify about.'}, status=400)
+        if shipment.switch_state == Shipment.SwitchState.VERIFIED:
+            return Response({'error': 'Switch already verified — nothing left to send.'}, status=400)
+
+        to = self._emails(request.data.get('to'))
+        cc = self._emails(request.data.get('cc'))
+        if not to:
+            return Response({'error': 'At least one recipient (to) is required.'}, status=400)
+
+        subject = str(request.data.get('subject') or '').strip() or (
+            f'FC switching request — shipment {shipment.id}'
+            f'{f" · appointment {shipment.appointment_id}" if shipment.appointment_id else ""}'
+        )
+        body = str(request.data.get('body') or '').strip() or (
+            'Please find attached the FC switching request for shipment '
+            f'{shipment.id} (destination {shipment.destination_fc or "—"}). '
+            'The attached PDF and Excel list every PO to be moved, with its '
+            'source and target fulfilment center and appointment.'
+        )
+
+        attachments = []
+        for field, fallback_name, ctype in (
+            ('pdf', f'switching-request-{shipment.id}.pdf', 'application/pdf'),
+            ('excel', f'switching-request-{shipment.id}.xlsx',
+             'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'),
+        ):
+            f = request.FILES.get(field)
+            if f is None:
+                continue
+            if f.size > self.MAX_BYTES:
+                return Response({'error': f'{field} attachment exceeds 10 MB.'}, status=400)
+            attachments.append((f.name or fallback_name, f.read(), ctype))
+        if not attachments:
+            return Response({'error': 'Attach the switching PDF and/or Excel before sending.'}, status=400)
+
+        from django.core.mail import EmailMessage
+        from django.utils import timezone as _tz
+        try:
+            msg = EmailMessage(subject=subject, body=body, to=to, cc=cc or None)
+            for name, content, ctype in attachments:
+                msg.attach(name, content, ctype)
+            msg.send(fail_silently=False)
+        except Exception as exc:
+            logging.getLogger(__name__).exception('Switch email failed for shipment %s', pk)
+            shipment.switch_state = Shipment.SwitchState.EMAIL_FAILED
+            shipment.switch_email_to = ', '.join(to + [f'cc:{c}' for c in cc])
+            shipment.save(update_fields=['switch_state', 'switch_email_to', 'updated_at'])
+            return Response(
+                {'error': 'Could not send the switching email.',
+                 'detail': str(exc),
+                 'switch_state': shipment.switch_state},
+                status=502,
+            )
+
+        shipment.switch_state = Shipment.SwitchState.WAITING
+        shipment.switch_email_to = ', '.join(to + [f'cc:{c}' for c in cc])
+        shipment.switch_email_sent_at = _tz.now()
+        shipment.save(update_fields=[
+            'switch_state', 'switch_email_to', 'switch_email_sent_at', 'updated_at',
+        ])
+        return Response({
+            'ok': True,
+            'switch_state': shipment.switch_state,
+            'switch_email_to': shipment.switch_email_to,
+            'switch_email_sent_at': shipment.switch_email_sent_at.isoformat(),
+        })
+
+
+class ShipmentSwitchVerifyView(_SafeAPIView):
+    """Verify (or reject) a shipment's FC switch.
+
+    GET  — auto-check, any authenticated user: for every switched PO, re-read the
+           live Amazon PO sheet and the target appointment's PO list, and report
+           whether Amazon has actually actioned the move. Pure read; no writes.
+    POST — manager-only decision: {action: 'verify'|'reject', note?}. 'verify'
+           stamps who/when + freezes the auto-check snapshot and unblocks Submit;
+           'reject' parks it as Switch Rejected (draft stays editable/re-sendable).
+    """
+    permission_classes = [IsAuthenticated]
+
+    @staticmethod
+    def _auto_check(shipment):
+        details = shipment.switch_details if isinstance(shipment.switch_details, list) else []
+        pos = sorted({
+            str(r.get('po_number') or '').strip().upper()
+            for r in details if isinstance(r, dict)
+        } - {''})
+        if not pos:
+            return []
+
+        # Live sheet FC per PO (a PO's lines share one FC on the Amazon PO sheet).
+        sheet_fc = {}
+        with connection.cursor() as cur:
+            cur.execute("""
+                SELECT UPPER(TRIM(po_number)), MAX(TRIM(fulfillment_center))
+                FROM reporting."Amazon PO"
+                WHERE UPPER(TRIM(po_number)) = ANY(%s::text[])
+                GROUP BY UPPER(TRIM(po_number))
+            """, [pos])
+            sheet_fc = {r[0]: (r[1] or '') for r in cur.fetchall()}
+
+        # Which appointment each PO sits on NOW (latest booking).
+        live_appt = _appointments_for_pos(pos)
+
+        target_fc = str(shipment.destination_fc or '').strip().upper()
+        target_appts = {
+            str(shipment.appointment_id or '').strip(),
+            *(x.strip() for x in (shipment.additional_appointment_ids or '').split(',')),
+        } - {''}
+
+        results = []
+        for r in details:
+            if not isinstance(r, dict):
+                continue
+            po = str(r.get('po_number') or '').strip().upper()
+            found_fc = str(sheet_fc.get(po) or '').strip()
+            appt = live_appt.get(po) or {}
+            found_appt = str(appt.get('appointment_id') or '').strip()
+            fc_ok = bool(found_fc) and found_fc.upper() == target_fc
+            # Appointment check is corroborating, not mandatory — Amazon may move
+            # the PO's FC before (or without) the appointment sheet catching up.
+            appt_ok = found_appt in target_appts if target_appts else False
+            results.append({
+                'po_number': po,
+                'from_fc': r.get('from_fc'),
+                'to_fc': r.get('to_fc'),
+                'expected_fc': shipment.destination_fc,
+                'found_fc': found_fc or None,
+                'fc_switched': fc_ok,
+                'found_appointment_id': found_appt or None,
+                'found_appointment_time': appt.get('appointment_time'),
+                'on_target_appointment': appt_ok,
+                'passed': fc_ok,
+            })
+        return results
+
+    def get(self, request, pk):
+        try:
+            shipment = Shipment.objects.get(pk=pk)
+        except Shipment.DoesNotExist:
+            return Response({'error': 'Not found'}, status=404)
+        if not shipment.switch_state:
+            return Response({'error': 'This shipment has no FC switch.'}, status=400)
+        results = self._auto_check(shipment)
+        return Response({
+            'shipment_id': shipment.id,
+            'switch_state': shipment.switch_state,
+            'results': results,
+            'all_passed': bool(results) and all(r['passed'] for r in results),
+        })
+
+    def post(self, request, pk):
+        # Manager-gated by hand (not permission_classes) so the GET auto-check
+        # stays open to every planner while the decision itself is restricted.
+        if not IsShipmentManager().has_permission(request, self):
+            return Response({'error': IsShipmentManager.message}, status=403)
+        try:
+            shipment = Shipment.objects.get(pk=pk)
+        except Shipment.DoesNotExist:
+            return Response({'error': 'Not found'}, status=404)
+        if not shipment.switch_state:
+            return Response({'error': 'This shipment has no FC switch.'}, status=400)
+        if shipment.switch_state == Shipment.SwitchState.VERIFIED:
+            return Response({'error': 'Switch already verified.'}, status=400)
+
+        action = str(request.data.get('action') or '').strip().lower()
+        note = str(request.data.get('note') or '').strip()
+        if action not in ('verify', 'reject'):
+            return Response({'error': "action must be 'verify' or 'reject'."}, status=400)
+
+        from django.utils import timezone as _tz
+        if action == 'reject':
+            shipment.switch_state = Shipment.SwitchState.REJECTED
+            shipment.switch_verify_note = note
+            shipment.switch_verified_by = request.user
+            shipment.switch_verified_at = _tz.now()
+            shipment.save(update_fields=[
+                'switch_state', 'switch_verify_note', 'switch_verified_by',
+                'switch_verified_at', 'updated_at',
+            ])
+            return Response(ShipmentListSerializer(shipment).data)
+
+        # verify: freeze the evidence alongside the human decision. The manager
+        # may verify even when the auto-check still fails (their call — e.g.
+        # the sheet sync lags reality), but the snapshot records what the data
+        # said at that moment either way.
+        results = self._auto_check(shipment)
+        shipment.switch_state = Shipment.SwitchState.VERIFIED
+        shipment.switch_verify_snapshot = results
+        shipment.switch_verify_note = note
+        shipment.switch_verified_by = request.user
+        shipment.switch_verified_at = _tz.now()
+        shipment.save(update_fields=[
+            'switch_state', 'switch_verify_snapshot', 'switch_verify_note',
+            'switch_verified_by', 'switch_verified_at', 'updated_at',
+        ])
         return Response(ShipmentListSerializer(shipment).data)
 
 
@@ -4760,6 +5186,7 @@ class PoShipmentLookupView(_SafeAPIView):
                 'shipment__planned_liters', 'shipment__load_percentage',
                 'shipment__created_at', 'shipment__rejection_reason',
                 'shipment__dispatch_date_planned', 'shipment__created_by__email',
+                'shipment__switch_state',
             )
         )
 
@@ -4782,6 +5209,10 @@ class PoShipmentLookupView(_SafeAPIView):
                 'shipment_id': s.id,
                 'status': s.status,
                 'status_label': self.STATUS_LABELS.get(s.status, s.status or '—'),
+                # Non-empty when the holding shipment is in the switching flow —
+                # lets the blocked-row dialog say "held by a draft Waiting for
+                # Switching" instead of a bare "in a draft".
+                'switch_state': s.switch_state or '',
                 'appointment_id': s.appointment_id or '',
                 'destination_fc': s.destination_fc or '',
                 'truck_size': s.truck_size or '',
@@ -4889,6 +5320,72 @@ def _fc_channel_map():
     c['at'] = now
     c['data'] = m
     return m
+
+
+def _fc_switch_group(fc):
+    """Every FC that `fc` may be SWITCHED with — i.e. all FCs on the same sales
+    channel (DED3 ↔ DED5, both CORE). Returns (channel, [FC, ...]) with the FC
+    itself always first.
+
+    A "switch" is the team deliberately re-pointing a PO (and its appointment)
+    from one fulfilment center to a sister center on the same channel, because
+    Amazon treats them as interchangeable for the same demand. Cross-channel
+    switching is never allowed — CORE stock can't satisfy a FRESH appointment.
+
+    An FC with no channel row returns (None, [fc]) — no channel means no known
+    sisters, so it can only ever ship to itself. Failing closed here is what
+    keeps an unmapped FC from silently becoming switchable with everything.
+    """
+    fc_up = str(fc or '').strip().upper()
+    if not fc_up:
+        return None, []
+    channel_map = _fc_channel_map()
+    channel = (channel_map.get(fc_up) or '').strip()
+    if not channel:
+        return None, [fc_up]
+    ch_up = channel.upper()
+    sisters = sorted(
+        f for f, ch in channel_map.items()
+        if f != fc_up and (ch or '').strip().upper() == ch_up
+    )
+    return channel, [fc_up] + sisters
+
+
+def _is_switch(from_fc, to_fc):
+    """True when moving from_fc → to_fc is a legal same-channel switch (and the
+    two FCs actually differ). Used to tell a real switch apart from a plain
+    same-FC line and from an illegal cross-channel mix."""
+    a = str(from_fc or '').strip().upper()
+    b = str(to_fc or '').strip().upper()
+    if not a or not b or a == b:
+        return False
+    _, group = _fc_switch_group(b)
+    return a in group
+
+
+class FcSwitchGroupView(_SafeAPIView):
+    """Which FCs a given FC may switch with (same channel).
+
+    Powers the planner UI: it needs the group to label the "Switch from …"
+    picker, to decide whether a mixed-FC selection is a legal switch or an
+    illegal cross-channel mix, and to build the switching summary.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        fc = request.query_params.get('fc') or ''
+        channel, group = _fc_switch_group(fc)
+        home = group[0] if group else ''
+        return Response({
+            'fc': home,
+            'channel': channel,
+            # Everything shippable for this FC, itself included.
+            'fcs': group,
+            # Just the sisters — what the UI offers as "switch to / switch from".
+            'sisters': group[1:],
+            # Prefill for the switching email's To field (editable per-send).
+            'default_email_to': list(getattr(settings, 'SWITCH_NOTIFY_DEFAULT_TO', [])),
+        })
 
 
 class ShipmentRecordView(_SafeAPIView):

@@ -138,6 +138,10 @@ class ShipmentListSerializer(serializers.ModelSerializer):
             'vehicle_type', 'vehicle_number', 'driver_name', 'driver_phone',
             'dispatch_date_planned', 'notes', 'is_stale_draft', 'summary',
             'approved_by_email',
+            # FC switching: state drives the tag + Verify button in the
+            # Switching section; details feed its from→to table.
+            'switch_state', 'switch_details', 'switch_email_to',
+            'switch_email_sent_at', 'switch_verified_at',
         ]
 
     def get_created_by_email(self, obj):

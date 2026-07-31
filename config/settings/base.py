@@ -164,6 +164,28 @@ HANA = {
     "query_timeout_s": env.int("HANA_QUERY_TIMEOUT_S", default=30),
 }
 
+# --- Outbound email (FC-switching notifications) ----------------------------
+# Used by the shipment planner's Switching flow to mail the switch request
+# (PDF + Excel attached) to the Amazon-side team. With no EMAIL_HOST configured
+# the backend falls back to the console backend — mails print to the server log
+# instead of erroring, so dev/unconfigured prod degrades loudly but safely.
+EMAIL_HOST = env("EMAIL_HOST", default="")
+EMAIL_BACKEND = (
+    "django.core.mail.backends.smtp.EmailBackend"
+    if EMAIL_HOST
+    else "django.core.mail.backends.console.EmailBackend"
+)
+EMAIL_PORT = env.int("EMAIL_PORT", default=587)
+EMAIL_HOST_USER = env("EMAIL_HOST_USER", default="")
+EMAIL_HOST_PASSWORD = env("EMAIL_HOST_PASSWORD", default="")
+EMAIL_USE_TLS = env.bool("EMAIL_USE_TLS", default=True)
+EMAIL_USE_SSL = env.bool("EMAIL_USE_SSL", default=False)
+EMAIL_TIMEOUT = env.int("EMAIL_TIMEOUT", default=15)
+DEFAULT_FROM_EMAIL = env("DEFAULT_FROM_EMAIL", default=EMAIL_HOST_USER or "noreply@localhost")
+# Default To-list for switching mails (comma-separated). The UI prefills these;
+# the sender can edit per-send.
+SWITCH_NOTIFY_DEFAULT_TO = _clean_env_list("SWITCH_NOTIFY_DEFAULT_TO", default=[])
+
 FIREBASE_CREDENTIALS_FILE = env("FIREBASE_CREDENTIALS_FILE", default="")
 FIREBASE_NOTIFICATIONS_ENABLED = env.bool("FIREBASE_NOTIFICATIONS_ENABLED", default=False)
 FIREBASE_DOH_TOPIC = env("FIREBASE_DOH_TOPIC", default="inventory_doh_alerts")
