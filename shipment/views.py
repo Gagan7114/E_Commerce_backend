@@ -2775,7 +2775,12 @@ class AppointmentExtraPosView(_SafeAPIView):
                     -- The PO's own (home) FC. Equal to the appointment FC for a
                     -- plain extra; a sister FC for a switchable one.
                     MAX(p.fulfillment_center) AS home_fc,
-                    COUNT(DISTINCT p.asin) AS sku_count,
+                    -- Count only SKUs that still have something to ship. A PO is
+                    -- listed while ANY line has leftover qty, so without this the
+                    -- count includes fully-billed lines the planner can never load.
+                    COUNT(DISTINCT p.asin) FILTER (
+                        WHERE GREATEST(COALESCE(p.accepted_qty, 0) - COALESCE(b.billed_qty, 0), 0) > 0
+                    ) AS sku_count,
                     SUM(GREATEST(COALESCE(p.accepted_qty, 0) - COALESCE(b.billed_qty, 0), 0))::bigint AS total_accepted_qty,
                     ROUND(SUM(GREATEST(COALESCE(p.accepted_qty, 0) - COALESCE(b.billed_qty, 0), 0) * COALESCE(p.per_liter, 0))::numeric, 2) AS total_liters,
                     -- Live days-to-cancellation, NOT the stored days_to_expiry:
@@ -2785,8 +2790,11 @@ class AppointmentExtraPosView(_SafeAPIView):
                     MAX(p.order_date)     AS order_date,
                     MAX(p.item_head)      AS item_head,
                     -- Per-SKU breakdown so the picker can expand a PO and show every
-                    -- ASIN with its (short) item name and line detail.
-                    json_agg(
+                    -- ASIN with its (short) item name and line detail. FULLY-BILLED
+                    -- lines are excluded: SAP has already invoiced them, the planner's
+                    -- candidate query drops them, and listing them made the picker
+                    -- show (and tick) rows with QTY 0 that can never ship.
+                    COALESCE(json_agg(
                         json_build_object(
                             'asin', p.asin,
                             'item', p.item,
@@ -2803,7 +2811,9 @@ class AppointmentExtraPosView(_SafeAPIView):
                             'expiry_date', p.expiry_date
                         )
                         ORDER BY (p.expiry_date - CURRENT_DATE) NULLS LAST, p.asin
-                    ) AS skus
+                    ) FILTER (
+                        WHERE GREATEST(COALESCE(p.accepted_qty, 0) - COALESCE(b.billed_qty, 0), 0) > 0
+                    ), '[]'::json) AS skus
                 FROM reporting."Amazon PO" p
                 LEFT JOIN billed b
                     ON b.po_number = UPPER(TRIM(p.po_number))
