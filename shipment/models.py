@@ -35,6 +35,19 @@ class Shipment(models.Model):
         APPOINTMENT = 'appointment', 'With Appointment'
         DOH = 'doh', 'With DOH'
 
+    class SwitchState(models.TextChoices):
+        """Lifecycle of an FC switch (a PO deliberately moved to a sister FC on
+        the same channel, e.g. DED5 → DED3).
+
+        Deliberately NOT part of `status` — a switching shipment is still a
+        draft, so every existing status filter, stat card, approval queue and
+        stock-lock query keeps working untouched. This runs alongside.
+        """
+        WAITING = 'waiting', 'Waiting for Switching'
+        EMAIL_FAILED = 'email_failed', 'Switch Email Failed'
+        VERIFIED = 'verified', 'Switch Verified'
+        REJECTED = 'rejected', 'Switch Rejected'
+
     appointment_id = models.TextField(blank=True)
     appointment_time = models.DateTimeField(null=True)
     destination_fc = models.TextField(blank=True)
@@ -65,6 +78,35 @@ class Shipment(models.Model):
     notes = models.TextField(blank=True)
     status = models.CharField(max_length=32, choices=Status.choices, default=Status.DRAFT)
     rejection_reason = models.TextField(blank=True)
+    # --- FC switching (sister-FC swap, e.g. DED5 → DED3) -------------------
+    # '' = this shipment involves no switch (the overwhelming default).
+    # A non-empty state means at least one loaded PO was pulled from a sister
+    # FC and Amazon must action the move: the shipment saves as a normal draft
+    # but Submit is blocked until switch_state == 'verified'.
+    switch_state = models.CharField(
+        max_length=24, choices=SwitchState.choices, blank=True, default=''
+    )
+    # Frozen rows from the Switching popup at save time (per-PO from/to FC +
+    # from/to appointment + units/cartons/liters + remark), exactly what was
+    # emailed. Shape: [{po_number, asin?, product_name?, from_fc, to_fc,
+    # from_appointment_id, from_appointment_time, to_appointment_id,
+    # to_appointment_time, units, cartons, liters, remark}]
+    switch_details = models.JSONField(default=list, blank=True)
+    switch_email_to = models.TextField(blank=True)
+    switch_email_sent_at = models.DateTimeField(null=True, blank=True)
+    switch_verified_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='switch_verified_shipments',
+    )
+    switch_verified_at = models.DateTimeField(null=True, blank=True)
+    switch_verify_note = models.TextField(blank=True)
+    # Result of the automated re-check against the live Amazon PO sheet at the
+    # moment of verification (per-PO pass/fail + what was actually found), so
+    # the decision is auditable later even after the sheet moves on.
+    switch_verify_snapshot = models.JSONField(default=list, blank=True)
     created_by = models.ForeignKey(
         settings.AUTH_USER_MODEL,
         on_delete=models.SET_NULL,
@@ -91,6 +133,14 @@ class Shipment(models.Model):
             # appointment / PO-list aggregates. Without this it was a sequential
             # scan of sp_shipments every time.
             models.Index(fields=['status'], name='sp_shipments_status_idx'),
+            # The Switching section filters on switch_state, which is '' for
+            # almost every shipment — a partial index keeps that lookup off the
+            # main table without bloating writes.
+            models.Index(
+                fields=['switch_state'],
+                condition=~models.Q(switch_state=''),
+                name='sp_shipments_switch_idx',
+            ),
         ]
 
 

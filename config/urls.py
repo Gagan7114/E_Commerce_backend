@@ -12,6 +12,7 @@ from accounts.views import (
 from platforms import live_reports as platform_live_reports
 from platforms import reports as platform_reports
 from uploads import amazon_uploads
+from uploads import billing_report
 
 urlpatterns = [
     path("admin/", admin.site.urls),
@@ -39,6 +40,7 @@ urlpatterns = [
         amazon_uploads.amazon_po_sku_pendency,
         name="amazon-po-sku-pendency",
     ),
+    path("api/reports/amazon-po/billing", billing_report.amazon_po_billing, name="amazon-po-billing"),
     path("api/reports/amazon-po", amazon_uploads.amazon_po_report, name="amazon-po-report"),
     path(
         "api/reports/amazon-po/filter-options",
