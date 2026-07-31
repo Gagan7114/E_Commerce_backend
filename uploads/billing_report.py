@@ -65,6 +65,11 @@ def amazon_po_billing(request):
             "(p.po_number ILIKE %s OR p.asin ILIKE %s OR p.item ILIKE %s OR p.sap_sku_code ILIKE %s)"
         )
         params += [f"%{search}%"] * 4
+    # Restrict to a specific PO list (used by the appointment panel).
+    po_list = [x.strip().upper() for x in (q.get("po") or "").replace(";", ",").split(",") if x.strip()]
+    if po_list:
+        where.append("UPPER(TRIM(p.po_number)) = ANY(%s)")
+        params.append(po_list)
 
     sql = f"""
       WITH billed AS (
