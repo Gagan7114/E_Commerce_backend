@@ -5,7 +5,7 @@ import json
 import math
 import time
 import uuid
-from datetime import date as _date, timedelta
+from datetime import date as _date, datetime as _datetime, timedelta
 from decimal import Decimal
 
 import logging
@@ -14,6 +14,7 @@ from django.conf import settings
 from django.core.exceptions import PermissionDenied
 from django.db import connection, transaction, DatabaseError
 from django.http import Http404, HttpResponse
+from django.utils import timezone
 from rest_framework import status
 from rest_framework.exceptions import APIException
 from rest_framework.permissions import IsAuthenticated, AllowAny, BasePermission
@@ -222,15 +223,99 @@ def _item_head_bucket(item):
     return 'OTHER'
 
 
-def _pack_into_capacity(items, capacity_lt):
+# ── Near-expiry PO gate ──────────────────────────────────────────────────────
+# `expiry_date` is the Amazon PO's CANCELLATION DEADLINE, not product shelf life
+# (no batch-level shelf-life data exists anywhere in this system). Amazon cancels
+# the PO on that date, so a truck that cannot reach the FC before then is wasted
+# space: the units ship, get rejected on arrival, and come back.
+#
+# A line is blocked when its deadline is this many days away or fewer. 3 blocks
+# 3, 2 and 1 days out, plus today (0) and anything already past; 4+ days is
+# plannable. Raise this if transit to the FCs gets slower.
+MIN_DAYS_TO_EXPIRY = 3
+
+
+def _days_to_expiry_live(item, today=None):
+    """Days from today until this PO line's cancellation deadline, or None when
+    the line carries no deadline at all.
+
+    Deliberately recomputed from ``expiry_date`` instead of reading the stored
+    ``days_to_expiry`` column. That integer is baked at PO-upload time as
+    GREATEST(deadline - CURRENT_DATE, 0), which breaks a gate two ways: it
+    loosens by a day for every day since the last PO upload, and the clamp at 0
+    makes a PO that expired last week indistinguishable from one expiring today.
+    """
+    raw = item.get('expiry_date')
+    if raw is None or raw == '':
+        return None
+    if isinstance(raw, _datetime):
+        raw = raw.date()
+    elif isinstance(raw, str):
+        try:
+            raw = _date.fromisoformat(raw[:10])
+        except ValueError:
+            return None
+    elif not isinstance(raw, _date):
+        return None
+    return (raw - (today or timezone.localdate())).days
+
+
+def _expiry_block_reason(item, today=None):
+    """Why this line can't be planned on cancellation-deadline grounds, as a
+    sentence for the not-loaded table — or None when it is safe to ship.
+
+    A line with NO deadline on record is blocked too: we cannot confirm the PO
+    will still be open when the truck lands, and shipping against an
+    unverifiable deadline is precisely the risk this gate exists to remove.
+    """
+    dte = _days_to_expiry_live(item, today)
+    if dte is None:
+        return ('No PO cancellation deadline on record — cannot confirm this PO '
+                'will still be open when the load arrives, so it was left out of '
+                'the plan.')
+    if dte < 0:
+        days = abs(dte)
+        return (f'PO was cancelled {days} day{"" if days == 1 else "s"} ago — '
+                f'Amazon will reject this load.')
+    if dte == 0:
+        return ('PO cancels today — a truck dispatched now cannot arrive in time, '
+                'so it was left out of the plan.')
+    if dte <= MIN_DAYS_TO_EXPIRY:
+        return (f'PO cancels in {dte} day{"" if dte == 1 else "s"} — inside the '
+                f'{MIN_DAYS_TO_EXPIRY}-day cutoff for reaching the FC in time, so '
+                f'it was left out of the plan.')
+    return None
+
+
+def _pack_into_capacity(items, capacity_lt, enforce_expiry=True):
     """
     Greedy pack a list of pre-sorted items into the given liter capacity.
     Returns (loaded_subset, not_loaded_subset, used_liters).
     Mutates each item with planned_qty / planned_liters.
+
+    ``enforce_expiry`` gates out lines whose PO cancels too soon to reach the FC
+    (see MIN_DAYS_TO_EXPIRY). It is ON for everything the planner picks itself.
+    ManualPlanView turns it OFF because there a human explicitly chose the line
+    and was warned at click time — but note the DOH filler pass keeps it ON even
+    in manual mode, since nobody chose those rows.
     """
     remaining = float(capacity_lt)
     loaded, not_loaded = [], []
+    # One 'today' for the whole pack so a run spanning midnight can't classify
+    # two lines of the same PO differently.
+    today = timezone.localdate() if enforce_expiry else None
     for item in items:
+        # Checked before anything else: if the PO won't exist when the truck
+        # arrives, no amount of stock or capacity makes the line shippable.
+        if enforce_expiry:
+            expiry_unfit = _expiry_block_reason(item, today)
+            if expiry_unfit:
+                item['planned_qty'] = 0
+                item['planned_liters'] = 0
+                item['unfit_reason'] = expiry_unfit
+                item['expiry_blocked'] = True
+                not_loaded.append(item)
+                continue
         per_liter    = float(item.get('per_liter') or 0)
         accepted_qty = float(item.get('accepted_qty') or 0)
         # Effective shippable units = ordered, capped by live stock when set.
@@ -329,7 +414,8 @@ def _pack_into_capacity(items, capacity_lt):
     return loaded, not_loaded, used
 
 
-def _auto_plan_truck(items, truck_size, capacity_override=None, priority=None, strict=False):
+def _auto_plan_truck(items, truck_size, capacity_override=None, priority=None, strict=False,
+                     enforce_expiry=True):
     """
     Plan a truck load.
 
@@ -349,11 +435,13 @@ def _auto_plan_truck(items, truck_size, capacity_override=None, priority=None, s
         reports requested vs actually-used per bucket so users see the trade-off.
 
     When `priority` is None, falls back to a flat greedy pack across all items.
+
+    `enforce_expiry` is passed straight to the packer — see _pack_into_capacity.
     """
     capacity = _resolve_capacity(truck_size, capacity_override)
 
     if not priority:
-        loaded, not_loaded, used = _pack_into_capacity(items, capacity)
+        loaded, not_loaded, used = _pack_into_capacity(items, capacity, enforce_expiry)
         planned = round(used, 4)
         load_pct = round((planned / capacity * 100) if capacity > 0 else 0, 2)
         return loaded, not_loaded, capacity, planned, load_pct, None
@@ -396,7 +484,7 @@ def _auto_plan_truck(items, truck_size, capacity_override=None, priority=None, s
             priority_actual[k] = {'requested_liters': 0, 'used_liters': 0}
             bucket_used[k] = 0.0
             continue
-        l, nl, used = _pack_into_capacity(bucket_items, cap_k)
+        l, nl, used = _pack_into_capacity(bucket_items, cap_k, enforce_expiry)
         loaded_all.extend(l)
         not_loaded_all.extend(nl)
         priority_actual[k] = {'requested_liters': cap_k, 'used_liters': round(used, 4)}
@@ -420,7 +508,7 @@ def _auto_plan_truck(items, truck_size, capacity_override=None, priority=None, s
                 ),
             )
             spill_loaded, spill_not_loaded, spill_used = _pack_into_capacity(
-                spill_pool, leftover_capacity
+                spill_pool, leftover_capacity, enforce_expiry
             )
             # Credit the spill to whichever bucket each spilled item belongs to,
             # so adherence reporting reflects the real bucket split that shipped.
@@ -872,6 +960,10 @@ def _filler_pass(loaded, leftover_pool, capacity, primary_fc=None, mark_key='_fi
 
     Returns (new_loaded, new_not_loaded). Items that didn't fit go back into
     not-loaded so the UI can still surface them.
+
+    The near-expiry gate is always ON here, including on a manual plan: fillers
+    are chosen by the planner, not by a human, so there is no one to have made an
+    informed override. Only rows a user explicitly picked can bypass it.
     """
     planned_lt = sum(float(it.get('planned_liters') or 0) for it in loaded)
     remaining = float(capacity) - planned_lt
@@ -4182,8 +4274,13 @@ class ManualPlanView(_SafeAPIView):
         avail_remaining = dict(avail_total)
         _apply_stock_caps(selected_items, avail_total, avail_remaining, respect_stock, stock_detail, reserved)
 
+        # enforce_expiry=False: every row here was explicitly clicked by a planner,
+        # who was warned at selection time that the PO cancels inside the cutoff.
+        # Silently dropping it server-side would make the picker lie about what it
+        # just accepted. The DOH filler pass below still enforces the gate, since
+        # nobody chose those rows.
         loaded, not_loaded, capacity, planned_liters, load_pct, priority_actual = _auto_plan_truck(
-            selected_items, truck_size, capacity_override
+            selected_items, truck_size, capacity_override, enforce_expiry=False
         )
 
         # DOH filler — top up leftover truck capacity with same-FC PENDING in-stock
