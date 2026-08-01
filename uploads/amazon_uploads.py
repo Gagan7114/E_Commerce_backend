@@ -34,7 +34,7 @@ from rest_framework.response import Response
 
 from accounts.permissions import can_access_platform, has_permission_code, require
 from config.perf_cache import cached_get
-from sap.billing import SAP_BILLING_SPLIT_SQL, ensure_billing_fresh
+from sap.billing import dispatched_qty_sql, ensure_billing_fresh
 
 try:
     from openpyxl import load_workbook
@@ -3522,15 +3522,44 @@ _SKU_PENDENCY_HAS_INVOICE = """EXISTS (
       AND sb.sap_item_code = UPPER(TRIM(reporting."Amazon PO".sap_sku_code))
 )"""
 
+# "Nothing left to be pending about": every accepted unit of this (PO, item) is
+# already on a SAP invoice. That — not "has an invoice at all" — is what makes a
+# line stop being outstanding.
+#
+# The distinction only started mattering when invoiced stock became plannable. A
+# 100-unit line with 90 invoiced still has 10 genuinely outstanding units; hiding
+# it because it appears in sap_billing hid 6.8k such eaches across 55 lines while
+# the planner was happily offering them.
+#
+# Compared at the (PO, item) level on both sides, because sap_billing bills per
+# SAP item while this table has a row per ASIN — two ASINs sharing one item split
+# a single billed_qty between them. Summing the item's accepted units keeps the
+# comparison honest; a shared item with anything left keeps all its ASIN rows
+# visible, which errs toward showing outstanding stock rather than hiding it.
+_SKU_PENDENCY_FULLY_INVOICED = """EXISTS (
+    SELECT 1 FROM sap_billing sb
+    WHERE sb.po_number = UPPER(TRIM(reporting."Amazon PO".po_number))
+      AND sb.sap_item_code = UPPER(TRIM(reporting."Amazon PO".sap_sku_code))
+      AND sb.billed_qty >= (
+          SELECT COALESCE(SUM(x.accepted_qty), 0)
+          FROM reporting."Amazon PO" x
+          WHERE UPPER(TRIM(x.po_number)) = sb.po_number
+            AND UPPER(TRIM(x.sap_sku_code)) = sb.sap_item_code
+      )
+)"""
+
 # "Dispatched": at least one of this line's invoices carries an OINV dispatch
 # stamp (bilty / vehicle / dispatch date — see sap.billing.DISPATCH_FIELDS), so
 # the load has physically left. A strict subset of has_invoice: every dispatched
 # line is also invoiced, which is why the two toggles nest the way they do below.
+# Correlated straight against sap_billing with the shared expression, rather
+# than joining SAP_BILLING_SPLIT_SQL: that subquery re-derives every row of the
+# table (dispatch notes included) once per outer row, which cost ~2s here.
 _SKU_PENDENCY_IS_DISPATCHED = f"""EXISTS (
-    SELECT 1 FROM {SAP_BILLING_SPLIT_SQL} sb
+    SELECT 1 FROM sap_billing sb
     WHERE sb.po_number = UPPER(TRIM(reporting."Amazon PO".po_number))
       AND sb.sap_item_code = UPPER(TRIM(reporting."Amazon PO".sap_sku_code))
-      AND sb.dispatched_qty > 0
+      AND ({dispatched_qty_sql("sb")}) > 0
 )"""
 
 
@@ -3577,15 +3606,16 @@ def amazon_po_sku_pendency(request):
         )
         params.extend([f"%{search[:200]}%"] * 10)
 
-    # Two independent toggles over three kinds of line: clean (no invoice),
-    # invoiced-but-still-in-the-warehouse, and dispatched. Both off = only clean
-    # outstanding lines, which is what this page has always shown. Each toggle
-    # adds its own kind back, tinted differently by the UI; both flags are
+    # Two independent toggles over three kinds of line: still has un-invoiced
+    # units, fully invoiced but still in the warehouse, and dispatched. Both off
+    # shows everything with units genuinely outstanding — including a line that
+    # is PARTLY invoiced, which is the whole point of _FULLY_INVOICED. Each
+    # toggle adds its own kind back, tinted differently by the UI; both flags are
     # returned on every row either way.
     #
     # Dispatched is a subset of invoiced, so the conditions are written as what
     # to EXCLUDE rather than what to include — "show invoiced" is exactly "hide
-    # dispatched", since clean + invoiced is everything that has not left.
+    # dispatched", since outstanding + invoiced is everything that has not left.
     _truthy = ("1", "true", "yes", "on")
     show_invoiced = str(q.get("have_invoice") or "").strip().lower() in _truthy
     show_dispatched = str(q.get("dispatched") or "").strip().lower() in _truthy
@@ -3594,11 +3624,16 @@ def amazon_po_sku_pendency(request):
     elif show_invoiced:
         where.append(f"NOT {_SKU_PENDENCY_IS_DISPATCHED}")
     elif show_dispatched:
+        # "Hide only what is fully invoiced and still sitting here." Same rows as
+        # the OR form, ~20% quicker, and it reads as the one thing being hidden.
+        # This branch costs ~1.5s against ~40ms for the others: it has to check
+        # both predicates on every row. It is a toggle people flip occasionally
+        # and the response is cached, so that is left alone deliberately.
         where.append(
-            f"(NOT {_SKU_PENDENCY_HAS_INVOICE} OR {_SKU_PENDENCY_IS_DISPATCHED})"
+            f"NOT ({_SKU_PENDENCY_FULLY_INVOICED} AND NOT {_SKU_PENDENCY_IS_DISPATCHED})"
         )
     else:
-        where.append(f"NOT {_SKU_PENDENCY_HAS_INVOICE}")
+        where.append(f"NOT {_SKU_PENDENCY_FULLY_INVOICED}")
 
     _add_pendency_eq(where, params, "category", q.get("category"))
     _add_pendency_eq(where, params, "sub_category", q.get("sub_category"))

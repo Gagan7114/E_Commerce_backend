@@ -84,23 +84,34 @@ DISPATCH_FIELDS = (
 #    behaviour, so the window between deploying and the first sync can never
 #    hand an already-dispatched load back to the planner. It self-heals on the
 #    next sync.
-SAP_BILLING_SPLIT_SQL = """(
+def dispatched_qty_sql(alias: str = "b0") -> str:
+    """The dispatched-units expression for one sap_billing row, aliased `alias`.
+
+    Exposed on its own so a caller that only needs the number can correlate
+    straight against sap_billing instead of joining SAP_BILLING_SPLIT_SQL —
+    which, evaluated per outer row, re-derives the whole table (notes included)
+    and cost ~2s on the pendency page.
+    """
+    return f"""CASE
+            WHEN EXISTS (
+                SELECT 1 FROM jsonb_array_elements(COALESCE({alias}.invoices, '[]'::jsonb)) e
+                WHERE NOT jsonb_exists(e, 'dispatched')
+            ) THEN {alias}.billed_qty
+            ELSE GREATEST(COALESCE((
+                SELECT SUM((e->>'qty')::numeric)
+                FROM jsonb_array_elements(COALESCE({alias}.invoices, '[]'::jsonb)) e
+                WHERE (e->>'dispatched')::boolean IS TRUE
+                   OR e->>'type' = 'Sales Return'
+            ), 0), 0)
+        END"""
+
+
+SAP_BILLING_SPLIT_SQL = f"""(
     SELECT
         b0.po_number,
         b0.sap_item_code,
         b0.billed_qty,
-        CASE
-            WHEN EXISTS (
-                SELECT 1 FROM jsonb_array_elements(COALESCE(b0.invoices, '[]'::jsonb)) e
-                WHERE NOT jsonb_exists(e, 'dispatched')
-            ) THEN b0.billed_qty
-            ELSE GREATEST(COALESCE((
-                SELECT SUM((e->>'qty')::numeric)
-                FROM jsonb_array_elements(COALESCE(b0.invoices, '[]'::jsonb)) e
-                WHERE (e->>'dispatched')::boolean IS TRUE
-                   OR e->>'type' = 'Sales Return'
-            ), 0), 0)
-        END AS dispatched_qty,
+        {dispatched_qty_sql("b0")} AS dispatched_qty,
         -- Why a line is gated, in the planner's words. NULL means "not
         -- dispatched", so this doubles as the flag. Non-null even when SAP
         -- stamped the dispatch without any of the details.
