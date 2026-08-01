@@ -23,6 +23,7 @@ from rest_framework.views import APIView
 from rest_framework.parsers import MultiPartParser, FormParser
 
 from accounts.permissions import has_permission_code
+from sap.billing import SAP_BILLING_SPLIT_SQL
 from .models import Shipment, ShipmentAuditLog, ShipmentItem, ShipmentDeletionLog
 from .serializers import (
     ShipmentAuditLogSerializer,
@@ -32,6 +33,14 @@ from .serializers import (
 )
 
 TRUCK_CAPACITIES = {'10_ton': 10000.0, '15_ton': 15000.0}
+
+# Everywhere the planner asks "what is still shippable", it joins sap_billing
+# through this split rather than the bare table. `dispatched_qty` is what the
+# truck can never carry again (the load physically left, stamped by the OINV
+# dispatch fields); `billed_qty` stays available so a line can still be TAGGED as
+# already invoiced. Invoiced-but-not-dispatched units are plannable — that is the
+# whole point of the split.
+_BILLING_JOIN = f"JOIN {SAP_BILLING_SPLIT_SQL} sb"
 
 # Accounts allowed to delete an APPROVED shipment — a destructive admin action
 # that permanently removes the shipment and frees its committed PO rows + stock.
@@ -1553,7 +1562,7 @@ def _fetch_doh_filler_pool(fc, exclude_po_uppers, doh_by_asin, family=None, asin
                     LEAST(
                         ap.accepted_qty,
                         GREATEST(
-                            sb.billed_qty - COALESCE(SUM(ap.accepted_qty) OVER (
+                            sb.dispatched_qty - COALESCE(SUM(ap.accepted_qty) OVER (
                                 PARTITION BY UPPER(TRIM(ap.po_number)), UPPER(TRIM(ap.sap_sku_code))
                                 ORDER BY ap.asin
                                 ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING), 0),
@@ -1561,7 +1570,7 @@ def _fetch_doh_filler_pool(fc, exclude_po_uppers, doh_by_asin, family=None, asin
                         )
                     ) AS billed_qty
                 FROM reporting."Amazon PO" ap
-                JOIN sap_billing sb
+                {_BILLING_JOIN}
                     ON sb.po_number = UPPER(TRIM(ap.po_number))
                    AND sb.sap_item_code = UPPER(TRIM(ap.sap_sku_code))
                 WHERE ap.accepted_qty > 0
@@ -2455,15 +2464,18 @@ class AppointmentItemsView(_SafeAPIView):
                         LEAST(
                             ap.accepted_qty,
                             GREATEST(
-                                sb.billed_qty - COALESCE(SUM(ap.accepted_qty) OVER (
+                                sb.dispatched_qty - COALESCE(SUM(ap.accepted_qty) OVER (
                                     PARTITION BY UPPER(TRIM(ap.po_number)), UPPER(TRIM(ap.sap_sku_code))
                                     ORDER BY ap.asin
                                     ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING), 0),
                                 0
                             )
-                        ) AS billed_qty
+                        ) AS billed_qty,
+                        -- Tag only: units invoiced in SAP that have not left yet.
+                        -- Still shippable; the planner just gets told about them.
+                        (sb.billed_qty > sb.dispatched_qty) AS has_invoiced
                     FROM reporting."Amazon PO" ap
-                    JOIN sap_billing sb
+                    {_BILLING_JOIN}
                         ON sb.po_number = UPPER(TRIM(ap.po_number))
                        AND sb.sap_item_code = UPPER(TRIM(ap.sap_sku_code))
                     WHERE ap.accepted_qty > 0
@@ -2482,6 +2494,7 @@ class AppointmentItemsView(_SafeAPIView):
                     -- already billed. committed_qty (planner-shipped) is exposed for
                     -- context but does NOT reduce this, per the billing rule.
                     GREATEST(p.accepted_qty - COALESCE(b.billed_qty, 0), 0) AS accepted_qty,
+                    COALESCE(b.has_invoiced, false) AS has_invoiced,
                     p.accepted_qty        AS original_accepted_qty,
                     COALESCE(c.committed_qty, 0) AS committed_qty,
                     COALESCE(b.billed_qty, 0)    AS billed_qty,
@@ -2980,7 +2993,7 @@ class AppointmentExtraPosView(_SafeAPIView):
                     own_pos.add(p)
 
         with connection.cursor() as cur:
-            cur.execute("""
+            cur.execute(f"""
                 WITH billed AS (
                     -- SAP-billed units per PO+item, split greedily across sibling
                     -- ASINs that share a sap_sku_code so it's consumed once, keyed by
@@ -2991,15 +3004,18 @@ class AppointmentExtraPosView(_SafeAPIView):
                         LEAST(
                             ap.accepted_qty,
                             GREATEST(
-                                sb.billed_qty - COALESCE(SUM(ap.accepted_qty) OVER (
+                                sb.dispatched_qty - COALESCE(SUM(ap.accepted_qty) OVER (
                                     PARTITION BY UPPER(TRIM(ap.po_number)), UPPER(TRIM(ap.sap_sku_code))
                                     ORDER BY ap.asin
                                     ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING), 0),
                                 0
                             )
-                        ) AS billed_qty
+                        ) AS billed_qty,
+                        -- Tag only: units invoiced in SAP that have not left yet.
+                        -- Still shippable; the planner just gets told about them.
+                        (sb.billed_qty > sb.dispatched_qty) AS has_invoiced
                     FROM reporting."Amazon PO" ap
-                    JOIN sap_billing sb
+                    {_BILLING_JOIN}
                         ON sb.po_number = UPPER(TRIM(ap.po_number))
                        AND sb.sap_item_code = UPPER(TRIM(ap.sap_sku_code))
                     WHERE ap.accepted_qty > 0
@@ -3039,6 +3055,7 @@ class AppointmentExtraPosView(_SafeAPIView):
                             'item_head', p.item_head,
                             'accepted_qty', GREATEST(COALESCE(p.accepted_qty, 0) - COALESCE(b.billed_qty, 0), 0),
                             'billed_qty', COALESCE(b.billed_qty, 0),
+                            'has_invoiced', COALESCE(b.has_invoiced, false),
                             'case_pack', p.case_pack,
                             'per_liter', p.per_liter,
                             'total_liters', ROUND((GREATEST(COALESCE(p.accepted_qty, 0) - COALESCE(b.billed_qty, 0), 0) * COALESCE(p.per_liter, 0))::numeric, 2),
@@ -4338,30 +4355,44 @@ class AsinCatalogView(_SafeAPIView):
 # order and consumes the billed quantity once, so it is never double-counted.
 # Same rule the appointment/extra-PO/DOH paths already apply; shared here so the
 # PO list's count and page queries can't drift apart.
-_BILLED_CTE = """
+_BILLED_CTE = f"""
                     SELECT
                         UPPER(TRIM(bp.po_number)) AS po_number,
                         bp.asin,
                         LEAST(
                             bp.accepted_qty,
                             GREATEST(
-                                sb.billed_qty - COALESCE(SUM(bp.accepted_qty) OVER (
+                                sb.dispatched_qty - COALESCE(SUM(bp.accepted_qty) OVER (
                                     PARTITION BY UPPER(TRIM(bp.po_number)), UPPER(TRIM(bp.sap_sku_code))
                                     ORDER BY bp.asin
                                     ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING), 0),
                                 0
                             )
-                        ) AS billed_qty
+                        ) AS billed_qty,
+                        -- Tag only: this (PO, item) has units invoiced in SAP that
+                        -- have NOT gone out yet. They stay shippable — the planner
+                        -- just gets told they are already on an invoice.
+                        (sb.billed_qty > sb.dispatched_qty) AS has_invoiced,
+                        -- Non-null only when this (PO, item) has a load on the
+                        -- road; carries the why for the PO-search reveal below.
+                        sb.dispatch_note
                     FROM reporting."Amazon PO" bp
-                    JOIN sap_billing sb
+                    {_BILLING_JOIN}
                         ON sb.po_number = UPPER(TRIM(bp.po_number))
                        AND sb.sap_item_code = UPPER(TRIM(bp.sap_sku_code))
                     WHERE bp.accepted_qty > 0
 """
 
-# Only lines with an OPEN (unbilled) balance are shippable. Applied to both the
-# count and the page query so pagination totals match the rows returned.
+# Only lines with an OPEN balance are shippable. Applied to both the count and
+# the page query so pagination totals match the rows returned.
 _OPEN_LINE_SQL = "GREATEST(COALESCE(ap.accepted_qty, 0) - COALESCE(b.billed_qty, 0), 0) > 0"
+
+# A dispatched line has nothing left to ship, so the rule above hides it — which
+# is right for browsing and wrong for looking one up. When the planner types a PO
+# number they are asking a question about THAT PO, and "no rows" is a bad answer
+# when the truthful one is "it went out on Tuesday". So a PO-number search (and
+# only that) also returns dispatched lines; the UI greys them and shows the why.
+_OPEN_OR_DISPATCHED_SQL = f"({_OPEN_LINE_SQL} OR b.dispatch_note IS NOT NULL)"
 
 
 class POListView(_SafeAPIView):
@@ -4398,6 +4429,10 @@ class POListView(_SafeAPIView):
             params.append(f'%{asin}%')
 
         where_sql = ' AND '.join(where)
+        # Looking a PO up is a different act to browsing the list — see
+        # _OPEN_OR_DISPATCHED_SQL. Same expression on the count and the page, or
+        # the pager would promise rows the query never returns.
+        shippable_sql = _OPEN_OR_DISPATCHED_SQL if po_number else _OPEN_LINE_SQL
 
         with connection.cursor() as cur:
             cur.execute(f"""
@@ -4407,7 +4442,7 @@ class POListView(_SafeAPIView):
                 LEFT JOIN billed b
                     ON b.po_number = UPPER(TRIM(ap.po_number))
                    AND b.asin = ap.asin
-                WHERE {where_sql} AND {_OPEN_LINE_SQL}
+                WHERE {where_sql} AND {shippable_sql}
             """, params)
             total = cur.fetchone()[0]
 
@@ -4431,6 +4466,8 @@ class POListView(_SafeAPIView):
                     ap.sku_name        AS product_name,
                     -- accepted_qty is the OPEN (unbilled) balance, matching every other
                     -- PO path; ordered_qty keeps the original for display/audit.
+                    COALESCE(b.has_invoiced, false) AS has_invoiced,
+                    b.dispatch_note    AS dispatch_note,
                     GREATEST(COALESCE(ap.accepted_qty, 0) - COALESCE(b.billed_qty, 0), 0) AS accepted_qty,
                     ap.accepted_qty    AS ordered_qty,
                     COALESCE(b.billed_qty, 0) AS billed_qty,
@@ -4460,9 +4497,11 @@ class POListView(_SafeAPIView):
                 LEFT JOIN public.fc_city_state_channel_master fcm
                     ON UPPER(TRIM(fcm.fc::text)) = UPPER(TRIM(ap.fulfillment_center::text))
                 WHERE {where_sql}
-                  -- Fully-billed lines have nothing left to ship: hide them entirely
-                  -- rather than offering a pickable row with 0 open units.
-                  AND {_OPEN_LINE_SQL}
+                  -- Lines with nothing left to ship are hidden rather than
+                  -- offered as a pickable row with 0 open units — unless the
+                  -- planner searched a PO number, when a dispatched line is the
+                  -- answer to their question.
+                  AND {shippable_sql}
                 ORDER BY ap.order_date DESC NULLS LAST, ap.po_number
                 LIMIT %s OFFSET %s
             """, params + [page_size, offset])
@@ -5212,15 +5251,18 @@ class DOHAutoFillView(_SafeAPIView):
                         LEAST(
                             ap.accepted_qty,
                             GREATEST(
-                                sb.billed_qty - COALESCE(SUM(ap.accepted_qty) OVER (
+                                sb.dispatched_qty - COALESCE(SUM(ap.accepted_qty) OVER (
                                     PARTITION BY UPPER(TRIM(ap.po_number)), UPPER(TRIM(ap.sap_sku_code))
                                     ORDER BY ap.asin
                                     ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING), 0),
                                 0
                             )
-                        ) AS billed_qty
+                        ) AS billed_qty,
+                        -- Tag only: units invoiced in SAP that have not left yet.
+                        -- Still shippable; the planner just gets told about them.
+                        (sb.billed_qty > sb.dispatched_qty) AS has_invoiced
                     FROM reporting."Amazon PO" ap
-                    JOIN sap_billing sb
+                    {_BILLING_JOIN}
                         ON sb.po_number = UPPER(TRIM(ap.po_number))
                        AND sb.sap_item_code = UPPER(TRIM(ap.sap_sku_code))
                     WHERE ap.accepted_qty > 0
@@ -5230,6 +5272,7 @@ class DOHAutoFillView(_SafeAPIView):
                     p.merchant_sku       AS internal_sku,
                     p.sku_name           AS product_name,
                     GREATEST(p.accepted_qty - COALESCE(b.billed_qty, 0), 0) AS accepted_qty,
+                    COALESCE(b.has_invoiced, false) AS has_invoiced,
                     p.accepted_qty       AS original_accepted_qty,
                     COALESCE(c.committed_qty, 0) AS committed_qty,
                     COALESCE(b.billed_qty, 0)    AS billed_qty,

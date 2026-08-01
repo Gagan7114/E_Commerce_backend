@@ -34,7 +34,7 @@ from rest_framework.response import Response
 
 from accounts.permissions import can_access_platform, has_permission_code, require
 from config.perf_cache import cached_get
-from sap.billing import ensure_billing_fresh
+from sap.billing import SAP_BILLING_SPLIT_SQL, ensure_billing_fresh
 
 try:
     from openpyxl import load_workbook
@@ -3499,8 +3499,9 @@ SKU_PENDENCY_COLUMNS = (
     "total_accepted_liters",
     "total_delivered_liters",
     "remaining_ltrs",
-    # Derived, not stored — see _SKU_PENDENCY_HAS_INVOICE.
+    # Derived, not stored — see _SKU_PENDENCY_HAS_INVOICE / _IS_DISPATCHED.
     "has_invoice",
+    "is_dispatched",
 )
 
 # PENDING is the whole point of a "pendency" list (mirrors TRIM(PO Status)="Pending").
@@ -3519,6 +3520,17 @@ _SKU_PENDENCY_HAS_INVOICE = """EXISTS (
     SELECT 1 FROM sap_billing sb
     WHERE sb.po_number = UPPER(TRIM(reporting."Amazon PO".po_number))
       AND sb.sap_item_code = UPPER(TRIM(reporting."Amazon PO".sap_sku_code))
+)"""
+
+# "Dispatched": at least one of this line's invoices carries an OINV dispatch
+# stamp (bilty / vehicle / dispatch date — see sap.billing.DISPATCH_FIELDS), so
+# the load has physically left. A strict subset of has_invoice: every dispatched
+# line is also invoiced, which is why the two toggles nest the way they do below.
+_SKU_PENDENCY_IS_DISPATCHED = f"""EXISTS (
+    SELECT 1 FROM {SAP_BILLING_SPLIT_SQL} sb
+    WHERE sb.po_number = UPPER(TRIM(reporting."Amazon PO".po_number))
+      AND sb.sap_item_code = UPPER(TRIM(reporting."Amazon PO".sap_sku_code))
+      AND sb.dispatched_qty > 0
 )"""
 
 
@@ -3565,11 +3577,27 @@ def amazon_po_sku_pendency(request):
         )
         params.extend([f"%{search[:200]}%"] * 10)
 
-    # Already-invoiced lines are hidden by default — they are not outstanding.
-    # `have_invoice=1` brings them back (the UI tints them so they stay
-    # distinguishable). The flag itself is always returned either way.
-    show_invoiced = str(q.get("have_invoice") or "").strip().lower() in ("1", "true", "yes", "on")
-    if not show_invoiced:
+    # Two independent toggles over three kinds of line: clean (no invoice),
+    # invoiced-but-still-in-the-warehouse, and dispatched. Both off = only clean
+    # outstanding lines, which is what this page has always shown. Each toggle
+    # adds its own kind back, tinted differently by the UI; both flags are
+    # returned on every row either way.
+    #
+    # Dispatched is a subset of invoiced, so the conditions are written as what
+    # to EXCLUDE rather than what to include — "show invoiced" is exactly "hide
+    # dispatched", since clean + invoiced is everything that has not left.
+    _truthy = ("1", "true", "yes", "on")
+    show_invoiced = str(q.get("have_invoice") or "").strip().lower() in _truthy
+    show_dispatched = str(q.get("dispatched") or "").strip().lower() in _truthy
+    if show_invoiced and show_dispatched:
+        pass                                             # everything
+    elif show_invoiced:
+        where.append(f"NOT {_SKU_PENDENCY_IS_DISPATCHED}")
+    elif show_dispatched:
+        where.append(
+            f"(NOT {_SKU_PENDENCY_HAS_INVOICE} OR {_SKU_PENDENCY_IS_DISPATCHED})"
+        )
+    else:
         where.append(f"NOT {_SKU_PENDENCY_HAS_INVOICE}")
 
     _add_pendency_eq(where, params, "category", q.get("category"))
@@ -3603,7 +3631,10 @@ def amazon_po_sku_pendency(request):
                 "total_delivered_liters",
                 "remaining_ltrs",
             ),
-            column_exprs={"has_invoice": _SKU_PENDENCY_HAS_INVOICE},
+            column_exprs={
+                "has_invoice": _SKU_PENDENCY_HAS_INVOICE,
+                "is_dispatched": _SKU_PENDENCY_IS_DISPATCHED,
+            },
         )
     )
 
