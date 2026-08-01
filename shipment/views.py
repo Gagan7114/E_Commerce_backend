@@ -222,6 +222,54 @@ def _item_head_bucket(item):
     return 'OTHER'
 
 
+# ── Product family ───────────────────────────────────────────────────────────
+# A family is a PRODUCT group ("all mustard"), which is a different axis to the
+# PREMIUM/COMMODITY/OTHER item_head split: mustard spans both (MUSTARD KACCHI
+# GHANI is COMMODITY, YELLOW MUSTARD is PREMIUM), so item_head cannot express it.
+#
+# `category` on reporting."Amazon PO" is the family level and is real data, not a
+# name match — category='MUSTARD' covers 12 ASINs across every pack size. One SKU
+# escapes it: FIRST PRESSED MUSTARD is filed under category='FIRST PRESSED'
+# (its sibling is FIRST PRESSED SUNFLOWER, so the whole category can't be
+# adopted). Matching sub_category as well catches it.
+#
+# Bundles are correctly left out by both halves: 'CANOLA 5L + MUSTARD 1L' carries
+# category='CANOLA', because the bundle is sold as canola. Only the item NAME
+# mentions mustard, and the name is deliberately not part of the predicate.
+#
+# Only litre-based families are offered. The packer hard-filters
+# `per_liter IS NOT NULL AND per_liter > 0`, so a family of seeds, spices, gift
+# packs, tea or coffee would build an empty truck with no explanation.
+PRODUCT_FAMILIES = [
+    'MUSTARD', 'OLIVE', 'CANOLA', 'SUNFLOWER', 'GROUNDNUT', 'RICE BRAN',
+    'SOYABEAN', 'COCONUT', 'SESAME OIL', 'BLENDED', 'GHEE', 'DRINKS',
+]
+
+
+def _normalise_family(raw):
+    """The requested family, or None when it isn't one we can ship a truck of.
+
+    Unknown values return None rather than raising: an unrecognised family must
+    leave the planner behaving exactly as it did before the parameter existed,
+    never silently plan against a predicate that matches nothing.
+    """
+    name = str(raw or '').strip().upper()
+    return name if name in PRODUCT_FAMILIES else None
+
+
+def _family_sql(family, alias='p'):
+    """(sql, params) matching one product family, or ('', []) for no family.
+
+    Compute-on-read over columns that already exist — no new column, so no
+    migration (this repo applies those by hand).
+    """
+    if not family:
+        return '', []
+    sql = (f"(UPPER(TRIM({alias}.category)) = %s "
+           f"OR UPPER(TRIM({alias}.sub_category)) LIKE %s)")
+    return sql, [family, f'%{family}%']
+
+
 # ── Near-expiry PO gate ──────────────────────────────────────────────────────
 # `expiry_date` is the Amazon PO's CANCELLATION DEADLINE, not product shelf life
 # (no batch-level shelf-life data exists anywhere in this system). Amazon cancels
@@ -1004,7 +1052,8 @@ def _filler_pass(loaded, leftover_pool, capacity, primary_fc=None, mark_key='_fi
     return list(loaded) + filler_loaded, filler_unfit + wrong_fc
 
 
-def _enforce_commit_caps(loaded, not_loaded, commit_caps, key_field='appointment_id'):
+def _enforce_commit_caps(loaded, not_loaded, commit_caps, key_field='appointment_id',
+                         family=None):
     """Trim ``loaded`` so each capped group respects its Vendor Central commit,
     allowing up to CAP_TOLERANCE (7%) over:
     sum(planned_qty) ≤ units_cap×1.07 AND sum(planned_qty/case_pack) ≤ cartons_cap×1.07.
@@ -1039,6 +1088,16 @@ def _enforce_commit_caps(loaded, not_loaded, commit_caps, key_field='appointment
         (pair[1].get('days_to_expiry') or 999),
         -(pair[1].get('accepted_qty') or 0),
     ))
+
+    # A single-family truck is built from POs that may belong to other
+    # appointments, but it is still charged to the anchor appointment's commit —
+    # a commit that was sized for a mixed load. So this cap bites far more often
+    # in family mode, and "Capped at Vendor Central commit" alone would read as
+    # a bug in the family filter. Name the real reason.
+    family_note = (
+        f' This is a {family}-only truck built from POs across the FC group, but the'
+        f' commit belongs to the appointment and was sized for a mixed load.'
+    ) if family else ''
 
     totals = {k: {'u': 0.0, 'c': 0.0} for k in norm_caps}
     keep_flags = [True] * len(loaded)
@@ -1090,7 +1149,7 @@ def _enforce_commit_caps(loaded, not_loaded, commit_caps, key_field='appointment
                     f'Capped at Vendor Central commit for this {label} '
                     f'(cap: {int(cap.get("units") or 0)} units / '
                     f'{int(cap.get("cartons") or 0)} cartons, +7% allowed) — '
-                    f'{short} units short-supplied.'
+                    f'{short} units short-supplied.{family_note}'
                 )
                 t['u'] += allow
                 t['c'] += allow / cp
@@ -1105,6 +1164,7 @@ def _enforce_commit_caps(loaded, not_loaded, commit_caps, key_field='appointment
                     f'Exceeds Vendor Central commit cap for this {label} '
                     f'(cap: {int(cap.get("units") or 0)} units / '
                     f'{int(cap.get("cartons") or 0)} cartons, +7% allowed).'
+                    f'{family_note}'
                 )
                 extras.append(removed)
 
@@ -1447,7 +1507,7 @@ def _apply_stock_caps(items, avail_total, avail_remaining, respect, detail, rese
             )
 
 
-def _fetch_doh_filler_pool(fc, exclude_po_uppers, doh_by_asin):
+def _fetch_doh_filler_pool(fc, exclude_po_uppers, doh_by_asin, family=None):
     """
     Pull all PENDING in-stock POs at the given FC that ARE NOT already in the
     `exclude_po_uppers` set (typically the current appointment's own POs) and
@@ -1457,13 +1517,19 @@ def _fetch_doh_filler_pool(fc, exclude_po_uppers, doh_by_asin):
     Used as a second-stage filler pool when an appointment-anchored plan
     leaves capacity on the truck — these are 'extra' POs at the same FC that
     can ride the same truck, ranked by DOH urgency.
+
+    `family` confines the filler to one product family. Without it, asking for a
+    truck of mustard returns mustard plus whatever DOH-urgent olive fits — the
+    opposite of the request. With it the truck may leave short, which is the
+    deliberate trade: family purity over a full truck.
     """
     if not fc:
         return []
     exclude_list = [str(x).strip().upper() for x in (exclude_po_uppers or []) if x]
+    family_sql, family_params = _family_sql(family)
 
     with connection.cursor() as cur:
-        cur.execute("""
+        cur.execute(f"""
             WITH locked_pairs AS (
                 SELECT DISTINCT si.asin, UPPER(TRIM(si.po_number)) AS po_number
                 FROM sp_items si
@@ -1534,7 +1600,8 @@ def _fetch_doh_filler_pool(fc, exclude_po_uppers, doh_by_asin):
               AND NOT (UPPER(TRIM(p.po_number)) = ANY(%s::text[]))
               AND lp.asin IS NULL
               AND (p.accepted_qty - COALESCE(b.billed_qty, 0)) > 0
-        """, [fc, exclude_list])
+              {f'AND {family_sql}' if family_sql else ''}
+        """, [fc, exclude_list] + family_params)
         raw = _row_to_dict(cur, cur.fetchall())
 
     pool = []
@@ -2148,6 +2215,19 @@ class AppointmentItemsView(_SafeAPIView):
             if x.strip()
         ]
 
+        # Product focus: build a single-family truck (e.g. all mustard). The pool
+        # is REPLACED — derived below from every open matching PO in the anchor
+        # FC's switch group, not from the appointment's own PO list — and the
+        # line-level filter keeps non-family lines off mixed POs.
+        product_family = _normalise_family(request.query_params.get('product_family'))
+        # Optional narrowing within the family: only these ASINs. Lets the planner
+        # pick MUSTARD and then drop the pack sizes they don't want.
+        family_asins = sorted({
+            x.strip().upper()
+            for x in (request.query_params.get('family_asins') or '').split(',')
+            if x.strip()
+        }) if product_family else []
+
         with connection.cursor() as cur:
             cur.execute("""
                 SELECT DISTINCT ON (appointment_id)
@@ -2232,12 +2312,71 @@ class AppointmentItemsView(_SafeAPIView):
             """, [all_appt_ids])
             appt_pos_set = {r[0] for r in cur.fetchall() if r[0]}
 
-        # Final candidate-PO list: caller's explicit selection (if any) else the
-        # appointment's own POs.
-        candidate_pos = selected_pos if selected_pos else sorted(appt_pos_set)
+        # Final candidate-PO list: an explicit product family REPLACES the pool
+        # with every open PO of that family across the FC switch group; else the
+        # caller's explicit selection; else the appointment's own POs.
+        family_sql, family_params = _family_sql(product_family)
+        family_pos = []
+        if product_family:
+            # Scoped to switch_group_up, so a cross-channel PO can never enter the
+            # pool — the same gate the JOIN below applies, enforced early so the
+            # candidate list itself is already legal.
+            asin_clause = 'AND UPPER(TRIM(p.asin)) = ANY(%s::text[])' if family_asins else ''
+            with connection.cursor() as cur:
+                cur.execute(f"""
+                    SELECT DISTINCT UPPER(TRIM(p.po_number)) AS po_number
+                    FROM reporting."Amazon PO" p
+                    WHERE p.status = 'Confirmed'
+                      AND p.availability_status = 'AC - Accepted: In stock'
+                      AND p.accepted_qty > 0
+                      AND p.po_status = 'PENDING'
+                      AND p.per_liter IS NOT NULL
+                      AND p.per_liter > 0
+                      AND UPPER(TRIM(p.fulfillment_center)) = ANY(%s::text[])
+                      AND {family_sql}
+                      {asin_clause}
+                """, [switch_group_up] + family_params + ([family_asins] if family_asins else []))
+                family_pos = sorted({r[0] for r in cur.fetchall() if r[0]})
+            candidate_pos = family_pos
+        else:
+            candidate_pos = selected_pos if selected_pos else sorted(appt_pos_set)
+
+        # A family with no open POs anywhere in the group is a dead end — say so
+        # rather than falling back to the appointment and quietly shipping the
+        # wrong thing.
+        if product_family and not candidate_pos:
+            return Response({
+                'appointment': appt,
+                'loaded_items': [],
+                'not_loaded_items': [],
+                'product_family': {
+                    'family': product_family,
+                    'asins': family_asins,
+                    'po_count': 0,
+                    'switch_group': switch_group_up,
+                },
+                'load_summary': {
+                    'truck_size': truck_size,
+                    'capacity': _resolve_capacity(truck_size, capacity_override),
+                    'planned_liters': 0,
+                    'load_percentage': 0,
+                },
+                'message': (
+                    f'No open {product_family} POs at '
+                    f'{", ".join(switch_group_up) or primary_fc_value}. '
+                    'Every matching PO is billed, cancelled, out of stock or already planned.'
+                ),
+            })
+
+        # Line-level family filter. A PO pulled in for its mustard may also carry
+        # olive; without this the truck would ship that olive too.
+        line_family_sql, line_family_params = _family_sql(product_family)
+        line_family_clause = f'AND {line_family_sql}' if line_family_sql else ''
+        line_asin_clause = 'AND UPPER(TRIM(p.asin)) = ANY(%s::text[])' if family_asins else ''
+        line_asin_params = [family_asins] if family_asins else []
 
         with connection.cursor() as cur:
-            cur.execute("""
+            cur.execute(f"""
                 WITH appt_pos AS (
                     -- Candidate PO pool. When the caller passed selected_pos the
                     -- list is the explicit selection; otherwise it's the union of
@@ -2388,7 +2527,10 @@ class AppointmentItemsView(_SafeAPIView):
                   AND p.accepted_qty > 0
                   AND p.po_status = 'PENDING'
                   AND (p.accepted_qty - COALESCE(b.billed_qty, 0)) > 0
-            """, [appointment_id, candidate_pos, all_appt_ids, switch_group_up])
+                  {line_family_clause}
+                  {line_asin_clause}
+            """, [appointment_id, candidate_pos, all_appt_ids, switch_group_up]
+                 + line_family_params + line_asin_params)
             raw = _row_to_dict(cur, cur.fetchall())
 
         # Attach LIVE DOH/DRR/SOH (matches SOH/DOH dashboard exactly)
@@ -2538,7 +2680,9 @@ class AppointmentItemsView(_SafeAPIView):
                     for it in items
                     if it.get('po_number')
                 })
-                doh_pool = _fetch_doh_filler_pool(primary_fc, appt_po_uppers, doh_by_asin)
+                doh_pool = _fetch_doh_filler_pool(
+                    primary_fc, appt_po_uppers, doh_by_asin, family=product_family,
+                )
                 # Cap fillers by the same live stock (shared remaining pool).
                 _apply_stock_caps(doh_pool, avail_total, avail_remaining, respect_stock, stock_detail, reserved,
                                   enforce_expiry=True)
@@ -2561,7 +2705,9 @@ class AppointmentItemsView(_SafeAPIView):
         # Apply Vendor Central commit caps as the FINAL filter so anything
         # that maximize_fill pulled in respects the per-appointment cap too.
         if commit_caps:
-            loaded, not_loaded = _enforce_commit_caps(loaded, not_loaded, commit_caps)
+            loaded, not_loaded = _enforce_commit_caps(
+                loaded, not_loaded, commit_caps, family=product_family,
+            )
             planned_liters = round(sum(float(it.get('planned_liters') or 0) for it in loaded), 4)
             load_pct = round((planned_liters / capacity * 100) if capacity > 0 else 0, 2)
 
@@ -2668,6 +2814,15 @@ class AppointmentItemsView(_SafeAPIView):
             'not_loaded_items': not_loaded,
             'priority_requested': priority,
             'priority_actual': priority_actual,
+            # Echoed so the UI can say what it actually planned against — which
+            # family, narrowed to which ASINs, and how many POs that reached
+            # across the switch group.
+            'product_family': ({
+                'family': product_family,
+                'asins': family_asins,
+                'po_count': len(candidate_pos),
+                'switch_group': switch_group_up,
+            } if product_family else None),
             'load_summary': {
                 'truck_size': truck_size,
                 'capacity': capacity,
@@ -2677,6 +2832,78 @@ class AppointmentItemsView(_SafeAPIView):
             'truck_suggestion': truck_suggestion,
             'trucks_needed': trucks_needed,
             'trucks_breakdown': trucks_breakdown,
+        })
+
+
+class AppointmentFamiliesView(_SafeAPIView):
+    """Product families that could actually fill a truck for this appointment.
+
+    Every family is counted against the anchor FC's switch group with the same
+    gates the planner itself applies (Confirmed / in stock / PENDING / unbilled /
+    has a litre value), so the dropdown can never offer a family that would plan
+    an empty truck. ASINs are returned alongside for the narrowing step.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, appointment_id):
+        with connection.cursor() as cur:
+            cur.execute("""
+                SELECT destination_fc FROM reporting."appointment"
+                WHERE appointment_id = %s
+                ORDER BY appointment_time DESC NULLS LAST LIMIT 1
+            """, [appointment_id])
+            row = cur.fetchone()
+        if not row:
+            return Response({'error': 'Appointment not found'}, status=404)
+
+        _channel, switch_group = _fc_switch_group(row[0])
+        switch_group_up = [f.upper() for f in switch_group]
+
+        out = []
+        with connection.cursor() as cur:
+            for family in PRODUCT_FAMILIES:
+                fam_sql, fam_params = _family_sql(family)
+                cur.execute(f"""
+                    WITH billed AS ({_BILLED_CTE})
+                    SELECT
+                        COUNT(DISTINCT UPPER(TRIM(p.po_number)))                AS po_count,
+                        COALESCE(SUM(GREATEST(p.accepted_qty
+                                 - COALESCE(b.billed_qty, 0), 0)), 0)           AS units,
+                        COALESCE(SUM(GREATEST(p.accepted_qty
+                                 - COALESCE(b.billed_qty, 0), 0)
+                                 * COALESCE(p.per_liter, 0)), 0)                AS liters,
+                        COALESCE(json_agg(DISTINCT jsonb_build_object(
+                            'asin', p.asin, 'item', p.item, 'item_head', p.item_head
+                        )) FILTER (WHERE p.asin IS NOT NULL), '[]')             AS asins
+                    FROM reporting."Amazon PO" p
+                    LEFT JOIN billed b
+                        ON b.po_number = UPPER(TRIM(p.po_number)) AND b.asin = p.asin
+                    WHERE p.status = 'Confirmed'
+                      AND p.availability_status = 'AC - Accepted: In stock'
+                      AND p.accepted_qty > 0
+                      AND p.po_status = 'PENDING'
+                      AND p.per_liter IS NOT NULL
+                      AND p.per_liter > 0
+                      AND UPPER(TRIM(p.fulfillment_center)) = ANY(%s::text[])
+                      AND (p.accepted_qty - COALESCE(b.billed_qty, 0)) > 0
+                      AND {fam_sql}
+                """, [switch_group_up] + fam_params)
+                po_count, units, liters, asins = cur.fetchone()
+                if not po_count:
+                    continue
+                out.append({
+                    'family': family,
+                    'po_count': int(po_count),
+                    'units': int(units or 0),
+                    'liters': round(float(liters or 0), 2),
+                    'asins': asins if isinstance(asins, list) else json.loads(asins or '[]'),
+                })
+
+        out.sort(key=lambda f: -f['liters'])
+        return Response({
+            'families': out,
+            'fc': row[0],
+            'switch_group': switch_group_up,
         })
 
 
