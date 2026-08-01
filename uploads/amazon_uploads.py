@@ -34,6 +34,7 @@ from rest_framework.response import Response
 
 from accounts.permissions import can_access_platform, has_permission_code, require
 from config.perf_cache import cached_get
+from sap.billing import ensure_billing_fresh
 
 try:
     from openpyxl import load_workbook
@@ -3498,10 +3499,27 @@ SKU_PENDENCY_COLUMNS = (
     "total_accepted_liters",
     "total_delivered_liters",
     "remaining_ltrs",
+    # Derived, not stored — see _SKU_PENDENCY_HAS_INVOICE.
+    "has_invoice",
 )
 
 # PENDING is the whole point of a "pendency" list (mirrors TRIM(PO Status)="Pending").
 _SKU_PENDENCY_PENDING = "UPPER(TRIM(COALESCE(po_status, ''))) = 'PENDING'"
+
+# "Already invoiced in SAP": this PO+item appears in sap_billing, which holds the
+# RK-World (CardCode CUSTA000048 = R K WORLDINFOCOM PVT LTD) Sales / Sales-Return
+# rows from REPORT_SALES_ANALYSIS keyed on UPPER(TRIM(U_MART_DOC_NO)) — exactly the
+# Mart / Type=Sales / CardName filter this flag is meant to express.
+#
+# Matched per (PO, item) rather than per PO: billing is item-wise within a PO, so a
+# partly-billed PO still has genuinely outstanding SKUs that belong on a pendency
+# list. Correlated EXISTS instead of a JOIN because both tables have a po_number
+# column, which would make the selected columns ambiguous.
+_SKU_PENDENCY_HAS_INVOICE = """EXISTS (
+    SELECT 1 FROM sap_billing sb
+    WHERE sb.po_number = UPPER(TRIM(reporting."Amazon PO".po_number))
+      AND sb.sap_item_code = UPPER(TRIM(reporting."Amazon PO".sap_sku_code))
+)"""
 
 
 def _add_pendency_eq(
@@ -3518,6 +3536,15 @@ def _add_pendency_eq(
 @permission_classes([_CanViewSkuPendency])
 @cached_get(timeout=60, prefix="amzpo.sku_pendency")
 def amazon_po_sku_pendency(request):
+    # This page reads sap_billing to decide what's already invoiced, so it has to
+    # keep that table current itself — otherwise the flag is only as fresh as
+    # someone's last visit to the SAP Sales page. Background thread, single-flight,
+    # serves the current data immediately: never delays this request.
+    try:
+        ensure_billing_fresh()
+    except Exception:  # a billing refresh must never break pendency
+        logger.warning("pendency: billing freshness check failed", exc_info=True)
+
     page, page_size, offset = _page_params(request)
     q = request.query_params
     where: list[str] = [_SKU_PENDENCY_PENDING]
@@ -3537,6 +3564,13 @@ def amazon_po_sku_pendency(request):
             ")"
         )
         params.extend([f"%{search[:200]}%"] * 10)
+
+    # Already-invoiced lines are hidden by default — they are not outstanding.
+    # `have_invoice=1` brings them back (the UI tints them so they stay
+    # distinguishable). The flag itself is always returned either way.
+    show_invoiced = str(q.get("have_invoice") or "").strip().lower() in ("1", "true", "yes", "on")
+    if not show_invoiced:
+        where.append(f"NOT {_SKU_PENDENCY_HAS_INVOICE}")
 
     _add_pendency_eq(where, params, "category", q.get("category"))
     _add_pendency_eq(where, params, "sub_category", q.get("sub_category"))
@@ -3569,6 +3603,7 @@ def amazon_po_sku_pendency(request):
                 "total_delivered_liters",
                 "remaining_ltrs",
             ),
+            column_exprs={"has_invoice": _SKU_PENDENCY_HAS_INVOICE},
         )
     )
 
