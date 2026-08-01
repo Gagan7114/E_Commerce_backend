@@ -3136,8 +3136,6 @@ def _batch_upload(body, *, forced_table: str | None = None):
     if replace_by_primary_key:
         unique_key = ""
 
-    missing_rates = _collect_zepto_missing_rates(data) if table == "zeptoSec" else []
-
     if table == "amazon_mp":
         sci_error = _amazon_mp_reject_sci_notation(data)
         if sci_error is not None:
@@ -3375,11 +3373,6 @@ def _batch_upload(body, *, forced_table: str | None = None):
         "duplicates": updated + skipped,
         "failed": failed,
         "error": last_error,
-        "warnings": [
-            f"Landing rate missing for {r['item']}, {r['month_label']} ({r['rows']} rows)"
-            for r in missing_rates
-        ],
-        "missing_rates": missing_rates,
         "pincode_sync": pincode_sync,
         "pruned_ranges": pruned_ranges,
         "skipped_stale": skipped_stale,
@@ -3423,63 +3416,6 @@ def _parse_date(value):
 
 def _format_dmy(value):
     return value.strftime("%d-%m-%Y") if value else None
-
-
-def _month_label(value: date) -> str:
-    return value.strftime("%B %Y")
-
-
-def _collect_zepto_missing_rates(data) -> list[dict]:
-    missing = {}
-    with connection.cursor() as cur:
-        for row in data:
-            sku_code = str(row.get("SKU Number") or "").strip()
-            row_date = _parse_date(row.get("Date"))
-            if not sku_code or row_date is None:
-                continue
-            rate_month = row_date.replace(day=1).isoformat()
-            cur.execute(
-                """
-                SELECT 1
-                FROM monthly_landing_rate
-                WHERE UPPER(TRIM(sku_code::text)) = UPPER(TRIM(%s))
-                  AND REGEXP_REPLACE(LOWER(TRIM(format::text)), '[^a-z0-9]+', '', 'g') = 'zepto'
-                  AND month = %s
-                LIMIT 1
-                """,
-                [sku_code, rate_month],
-            )
-            if cur.fetchone():
-                continue
-
-            cur.execute(
-                """
-                SELECT item, product_name
-                FROM master_sheet
-                WHERE UPPER(TRIM(format_sku_code::text)) = UPPER(TRIM(%s))
-                LIMIT 1
-                """,
-                [sku_code],
-            )
-            master = cur.fetchone()
-            label = (
-                str(master[0] or master[1] or "").strip()
-                if master
-                else str(row.get("SKU Name") or sku_code).strip()
-            )
-            key = (sku_code.upper(), rate_month, label)
-            hit = missing.setdefault(
-                key,
-                {
-                    "sku_code": sku_code,
-                    "item": label,
-                    "month": rate_month,
-                    "month_label": _month_label(row_date),
-                    "rows": 0,
-                },
-            )
-            hit["rows"] += 1
-    return list(missing.values())
 
 
 def _jsonable(value):
@@ -3591,6 +3527,43 @@ def flipkart_grocery_upload_status(request):
 
 
 def _ensure_fk_grocery_master(cur):
+    """First-run bootstrap for the table + its upsert index.
+
+    Both statements are probed before they run rather than leaning on their
+    IF NOT EXISTS clauses. Postgres checks table *ownership* on CREATE INDEX
+    before it checks whether the index already exists, so IF NOT EXISTS never
+    gets to no-op: if the table is owned by another role (it is owned by
+    `postgres` in the shared DB, while the app connects as its own role) every
+    upload dies with "must be owner of table flipkart_grocery_master" even
+    though the index has been in place all along. Ownership can't be granted,
+    so skip the DDL entirely once the objects exist — which is also the right
+    thing regardless of permissions, since this ran on every upload batch.
+    """
+    cur.execute("SELECT to_regclass('public.flipkart_grocery_master')")
+    table_exists = (cur.fetchone() or [None])[0] is not None
+
+    if not table_exists:
+        _create_fk_grocery_master(cur)
+
+    cur.execute(
+        """
+        SELECT 1
+        FROM pg_indexes
+        WHERE schemaname = 'public'
+          AND tablename = 'flipkart_grocery_master'
+          AND indexname = 'flipkart_grocery_master_sku_date_uq'
+        """
+    )
+    if cur.fetchone() is None:
+        cur.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS flipkart_grocery_master_sku_date_uq
+            ON "flipkart_grocery_master" ("sku_id", "real_date")
+            """
+        )
+
+
+def _create_fk_grocery_master(cur):
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS "flipkart_grocery_master" (
@@ -3614,12 +3587,6 @@ def _ensure_fk_grocery_master(cur):
             "sub_category" VARCHAR,
             "item_head" VARCHAR
         )
-        """
-    )
-    cur.execute(
-        """
-        CREATE UNIQUE INDEX IF NOT EXISTS flipkart_grocery_master_sku_date_uq
-        ON "flipkart_grocery_master" ("sku_id", "real_date")
         """
     )
 
