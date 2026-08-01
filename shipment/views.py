@@ -1507,7 +1507,7 @@ def _apply_stock_caps(items, avail_total, avail_remaining, respect, detail, rese
             )
 
 
-def _fetch_doh_filler_pool(fc, exclude_po_uppers, doh_by_asin, family=None):
+def _fetch_doh_filler_pool(fc, exclude_po_uppers, doh_by_asin, family=None, asins=None):
     """
     Pull all PENDING in-stock POs at the given FC that ARE NOT already in the
     `exclude_po_uppers` set (typically the current appointment's own POs) and
@@ -1522,11 +1522,17 @@ def _fetch_doh_filler_pool(fc, exclude_po_uppers, doh_by_asin, family=None):
     truck of mustard returns mustard plus whatever DOH-urgent olive fits — the
     opposite of the request. With it the truck may leave short, which is the
     deliberate trade: family purity over a full truck.
+
+    `asins` narrows further to specific packs. It has to be applied here too: the
+    filler is the one path that can put a line on the truck without going through
+    the candidate pool, so filtering only the pool lets maximize-fill quietly
+    re-add the very pack sizes the planner just excluded.
     """
     if not fc:
         return []
     exclude_list = [str(x).strip().upper() for x in (exclude_po_uppers or []) if x]
     family_sql, family_params = _family_sql(family)
+    asin_list = [str(a).strip().upper() for a in (asins or []) if str(a).strip()]
 
     with connection.cursor() as cur:
         cur.execute(f"""
@@ -1601,7 +1607,8 @@ def _fetch_doh_filler_pool(fc, exclude_po_uppers, doh_by_asin, family=None):
               AND lp.asin IS NULL
               AND (p.accepted_qty - COALESCE(b.billed_qty, 0)) > 0
               {f'AND {family_sql}' if family_sql else ''}
-        """, [fc, exclude_list] + family_params)
+              {'AND UPPER(TRIM(p.asin)) = ANY(%s::text[])' if asin_list else ''}
+        """, [fc, exclude_list] + family_params + ([asin_list] if asin_list else []))
         raw = _row_to_dict(cur, cur.fetchall())
 
     pool = []
@@ -2681,7 +2688,8 @@ class AppointmentItemsView(_SafeAPIView):
                     if it.get('po_number')
                 })
                 doh_pool = _fetch_doh_filler_pool(
-                    primary_fc, appt_po_uppers, doh_by_asin, family=product_family,
+                    primary_fc, appt_po_uppers, doh_by_asin,
+                    family=product_family, asins=family_asins,
                 )
                 # Cap fillers by the same live stock (shared remaining pool).
                 _apply_stock_caps(doh_pool, avail_total, avail_remaining, respect_stock, stock_detail, reserved,
