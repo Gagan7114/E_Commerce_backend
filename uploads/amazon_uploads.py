@@ -34,6 +34,7 @@ from rest_framework.response import Response
 
 from accounts.permissions import can_access_platform, has_permission_code, require
 from config.perf_cache import cached_get
+from sap.billing import ensure_billing_fresh
 
 try:
     from openpyxl import load_workbook
@@ -3535,6 +3536,15 @@ def _add_pendency_eq(
 @permission_classes([_CanViewSkuPendency])
 @cached_get(timeout=60, prefix="amzpo.sku_pendency")
 def amazon_po_sku_pendency(request):
+    # This page reads sap_billing to decide what's already invoiced, so it has to
+    # keep that table current itself — otherwise the flag is only as fresh as
+    # someone's last visit to the SAP Sales page. Background thread, single-flight,
+    # serves the current data immediately: never delays this request.
+    try:
+        ensure_billing_fresh()
+    except Exception:  # a billing refresh must never break pendency
+        logger.warning("pendency: billing freshness check failed", exc_info=True)
+
     page, page_size, offset = _page_params(request)
     q = request.query_params
     where: list[str] = [_SKU_PENDENCY_PENDING]
