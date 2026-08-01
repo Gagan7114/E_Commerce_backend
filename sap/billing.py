@@ -25,7 +25,7 @@ from django.db import connection, transaction
 from django.utils import timezone
 
 from sap.models import SapBilling
-from sap.service import report_sales_analysis
+from sap.service import HANA_SCHEMAS, report_sales_analysis, select
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +53,72 @@ def _dec(v) -> Decimal:
         return Decimal(0)
 
 
+# ── Dispatch ────────────────────────────────────────────────────────────────
+# An invoice counts as DISPATCHED once the warehouse stamps any of these OINV
+# header fields — the load has physically left, so those units can never go on
+# another truck. Verified against 60 days of RK invoices (289 invoices, 254
+# dispatched): U_Dipatch_Date / U_BiltyDate / U_VehicleNoM are always written
+# together, U_BilltyNumber is missing on 7 of them, and U_DriverName is never
+# used at all — so the rule has to be ANY-of, not all-of, and must not lean on
+# any single field.
+DISPATCH_FIELDS = (
+    "U_Dipatch_Date",
+    "U_BiltyDate",
+    "U_BilltyNumber",
+    "U_VehicleNoM",
+    "U_DriverName",
+)
+
+
+# Reading the split back out. `dispatched_qty` is computed on read instead of
+# living in its own column: a new column means a migration, and migrations here
+# are applied by hand against prod. The invoices JSONB already carries the per
+# invoice stamp, so the split costs nothing but this expression.
+#
+# Two rules are baked in:
+#  * Credit notes free up DISPATCHED units first — a return means the goods came
+#    back and can ship again — so Sales Return rows (always negative) land in the
+#    same sum. GREATEST clamps the case where returns exceed what went out.
+#  * A row whose invoices predate this feature has no `dispatched` key at all.
+#    Those fall back to billed_qty, i.e. the old "invoiced is not plannable"
+#    behaviour, so the window between deploying and the first sync can never
+#    hand an already-dispatched load back to the planner. It self-heals on the
+#    next sync.
+SAP_BILLING_SPLIT_SQL = """(
+    SELECT
+        b0.po_number,
+        b0.sap_item_code,
+        b0.billed_qty,
+        CASE
+            WHEN EXISTS (
+                SELECT 1 FROM jsonb_array_elements(COALESCE(b0.invoices, '[]'::jsonb)) e
+                WHERE NOT jsonb_exists(e, 'dispatched')
+            ) THEN b0.billed_qty
+            ELSE GREATEST(COALESCE((
+                SELECT SUM((e->>'qty')::numeric)
+                FROM jsonb_array_elements(COALESCE(b0.invoices, '[]'::jsonb)) e
+                WHERE (e->>'dispatched')::boolean IS TRUE
+                   OR e->>'type' = 'Sales Return'
+            ), 0), 0)
+        END AS dispatched_qty,
+        -- Why a line is gated, in the planner's words. NULL means "not
+        -- dispatched", so this doubles as the flag. Non-null even when SAP
+        -- stamped the dispatch without any of the details.
+        (
+            SELECT COALESCE(NULLIF(concat_ws(' · ',
+                       'Dispatched ' || NULLIF(e->'dispatch'->>'dispatch_date', ''),
+                       'vehicle '    || NULLIF(e->'dispatch'->>'vehicle', ''),
+                       'bilty '      || NULLIF(e->'dispatch'->>'bilty_no', '')
+                   ), ''), 'Dispatched')
+            FROM jsonb_array_elements(COALESCE(b0.invoices, '[]'::jsonb)) e
+            WHERE (e->>'dispatched')::boolean IS TRUE
+            ORDER BY e->'dispatch'->>'dispatch_date' DESC NULLS LAST
+            LIMIT 1
+        ) AS dispatch_note
+    FROM sap_billing b0
+)"""
+
+
 def _window(months: int = BILLING_WINDOW_MONTHS) -> tuple[str, str]:
     today = timezone.now().date()
     frm = (today - datetime.timedelta(days=months * 31)).replace(day=1)
@@ -70,6 +136,67 @@ def last_sync_at() -> str | None:
 
     latest = SapBilling.objects.aggregate(m=Max("updated_at")).get("m")
     return latest.isoformat() if latest else None
+
+
+def _fetch_dispatch_map(frm: str, to: str) -> dict[str, dict]:
+    """``DocNum -> {dispatched, dispatch_date, bilty_no, vehicle, transporter}``
+    for every RK A/R invoice in the window.
+
+    The dispatch stamp lives on the OINV *header*, not on the sales-analysis
+    procedure, so it takes its own read. One truck covers many invoices across
+    many POs (one bilty/vehicle repeats over several DocNums), which is why this
+    is keyed per invoice document and never per PO.
+
+    Raises rather than returning empty on failure — see the caller: an empty map
+    would silently mark every dispatched load as available to plan again.
+    """
+    rows = select(
+        """
+        SELECT "DocNum",
+               "U_Dipatch_Date"    AS "DISPATCH_DATE",
+               "U_BiltyDate"       AS "BILTY_DATE",
+               "U_BilltyNumber"    AS "BILTY_NO",
+               "U_VehicleNoM"      AS "VEHICLE",
+               TO_VARCHAR("U_DriverName") AS "DRIVER",
+               "U_TransporterName" AS "TRANSPORTER"
+        FROM OINV
+        WHERE "CardCode" = ?
+          AND "CANCELED" = 'N'
+          AND "DocDate" >= ?
+        """,
+        [RK_CARDCODE, frm],
+        schema=HANA_SCHEMAS["mart"],
+    )
+
+    out: dict[str, dict] = {}
+    for r in rows:
+        doc = str(r.get("DocNum") or "").strip()
+        if not doc:
+            continue
+        values = {
+            "dispatch_date": _date_str(r.get("DISPATCH_DATE")),
+            "bilty_date": _date_str(r.get("BILTY_DATE")),
+            "bilty_no": str(r.get("BILTY_NO") or "").strip(),
+            "vehicle": str(r.get("VEHICLE") or "").strip(),
+            "driver": str(r.get("DRIVER") or "").strip(),
+            "transporter": str(r.get("TRANSPORTER") or "").strip(),
+        }
+        # ANY of the five stamps means the load went out. `transporter` is
+        # deliberately NOT one of them — it is sometimes pre-filled at booking.
+        dispatched = any(
+            values[k]
+            for k in ("dispatch_date", "bilty_date", "bilty_no", "vehicle", "driver")
+        )
+        out[doc] = {"dispatched": dispatched, **values}
+    return out
+
+
+def _date_str(v) -> str:
+    if not v:
+        return ""
+    if hasattr(v, "date"):
+        return v.date().isoformat()
+    return str(v)[:10]
 
 
 def sync_rk_billing(months: int = BILLING_WINDOW_MONTHS, force: bool = True) -> dict:
@@ -96,6 +223,12 @@ def sync_rk_billing(months: int = BILLING_WINDOW_MONTHS, force: bool = True) -> 
 def _do_sync(months: int, force: bool) -> dict:
     frm, to = _window(months)
     rows = report_sales_analysis(frm, to, source="mart", force=force)
+    # Deliberately NOT wrapped in try/except: if the dispatch read fails we must
+    # abort the whole rebuild. Writing the table without it would mark every
+    # already-dispatched load as plannable again, and the planner would happily
+    # put goods that are on a truck onto a second one. Aborting leaves the
+    # previous (correct) rows in place — the rebuild is one transaction.
+    dispatch = _fetch_dispatch_map(frm, to)
 
     # (po, item) -> {"qty": Decimal(net), "invoices": {doc_num: {...}}}
     agg: dict[tuple[str, str], dict] = {}
@@ -141,14 +274,30 @@ def _do_sync(months: int, force: bool) -> dict:
 
     now = timezone.now()
     objs = []
+    dispatched_lines = 0
     for (po, item), entry in agg.items():
         net_qty = entry["qty"]
         if net_qty < 0:               # more returns than sales — clamp (unusual)
             net_qty = Decimal(0)
-        invoices = [
-            {**iv, "qty": float(iv["qty"]), "amount": round(float(iv["amount"]), 2)}
-            for iv in entry["invoices"].values()
-        ]
+        invoices = []
+        line_dispatched = False
+        for (doc, kind), iv in entry["invoices"].items():
+            row = {**iv, "qty": float(iv["qty"]), "amount": round(float(iv["amount"]), 2)}
+            # Only A/R invoices carry a dispatch stamp. Credit notes (Sales
+            # Return) are ORIN documents with their own numbering, so a lookup
+            # by DocNum would be meaningless — and a return is the opposite of
+            # a dispatch anyway.
+            info = dispatch.get(doc) if kind == "sales" else None
+            row["dispatched"] = bool(info and info["dispatched"])
+            if row["dispatched"]:
+                line_dispatched = True
+                row["dispatch"] = {
+                    k: info[k]
+                    for k in ("dispatch_date", "bilty_no", "vehicle", "transporter")
+                    if info.get(k)
+                }
+            invoices.append(row)
+        dispatched_lines += 1 if line_dispatched else 0
         objs.append(SapBilling(po_number=po, sap_item_code=item, billed_qty=net_qty, invoices=invoices))
 
     # Wholesale rebuild inside one transaction — MVCC keeps readers on the old
@@ -163,6 +312,9 @@ def _do_sync(months: int, force: bool) -> dict:
         "sap_rows": len(rows),
         "rk_po_lines_considered": considered,
         "keys_written": len(objs),
+        "invoices_seen": len(dispatch),
+        "invoices_dispatched": sum(1 for d in dispatch.values() if d["dispatched"]),
+        "lines_with_dispatch": dispatched_lines,
         "synced_at": now.isoformat(),
         "window": [frm, to],
     }
