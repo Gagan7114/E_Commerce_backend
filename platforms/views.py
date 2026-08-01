@@ -12962,6 +12962,374 @@ def _sales_explorer_empty_totals() -> dict:
     }
 
 
+# ── Monthly Sales Explorer ──────────────────────────────────────────────────
+# Sales Explorer's month-wise twin: same item table and same "Show By" units,
+# but the window is a SET of whole months (ticked off a checkbox list) instead
+# of a FROM → TO day range, and the line chart plots one point per month.
+# Averages are per month here, not per day, and every row carries the growth
+# from the first picked month to the last.
+#
+# Unlike Sales Explorer this one runs for four platforms. Each entry maps the
+# platform slug to (secmaster_mv "format" squashed to a slug, display name) —
+# BigBasket's raw format value is 'BIG BASKET', hence the mapping rather than a
+# bare slug reuse. Flipkart and JioMart are deliberately absent: they carry no
+# sales value in this view, so the Values mode would read as a column of zeroes.
+_MONTHLY_EXPLORER_FORMATS = {
+    "bigbasket": ("bigbasket", "BigBasket"),
+    "blinkit": ("blinkit", "Blinkit"),
+    "swiggy": ("swiggy", "Swiggy"),
+    "zepto": ("zepto", "Zepto"),
+}
+_MONTHLY_EXPLORER_MAX_MONTHS = 36
+# How many trailing months the page opens on when the caller names none.
+_MONTHLY_EXPLORER_DEFAULT_MONTHS = 6
+
+
+def _parse_explorer_months(params) -> list[str]:
+    """`months=2026-05,2026-07` → ['2026-05', '2026-07'].
+
+    Empty means "the caller has no opinion" — the view then defaults to the
+    most recent months that actually hold sales. Order is normalised oldest →
+    newest so two requests picking the same months share one cache key.
+    """
+    raw = str(params.get("months") or params.get("month_list") or "").strip()
+    picked = {p.strip() for p in raw.split(",") if p.strip()}
+    if not picked or "ALL" in {p.upper() for p in picked}:
+        return []
+    bad = sorted(p for p in picked if not re.fullmatch(r"\d{4}-\d{2}", p))
+    if bad:
+        raise ValidationError(
+            f"`months` must be a comma-separated list of YYYY-MM — got {', '.join(bad)}."
+        )
+    for token in picked:
+        month = int(token[5:])
+        if not 1 <= month <= 12:
+            raise ValidationError(f"`{token}` is not a valid month.")
+    if len(picked) > _MONTHLY_EXPLORER_MAX_MONTHS:
+        raise ValidationError(
+            f"`months` takes at most {_MONTHLY_EXPLORER_MAX_MONTHS} months at once."
+        )
+    return sorted(picked)
+
+
+def _month_token_to_date(token: str) -> date:
+    return date(int(token[:4]), int(token[5:]), 1)
+
+
+def _month_token_label(token: str) -> str:
+    """'2026-07' → 'Jul 2026' (the label the pickers and chart show)."""
+    return _month_token_to_date(token).strftime("%b %Y")
+
+
+@api_view(["GET"])
+@permission_classes([require("platform.secondary.view")])
+@cached_get(timeout=60, prefix="plat.monthly_sales_explorer")
+def platform_monthly_sales_explorer(request, slug: str):
+    slug = str(slug or "").strip().lower()
+    if slug not in _MONTHLY_EXPLORER_FORMATS:
+        raise ValidationError(
+            "Monthly Sales Explorer is available for "
+            f"{', '.join(sorted(_MONTHLY_EXPLORER_FORMATS))} only."
+        )
+    _ensure_scope(request.user, slug)
+    return _monthly_sales_explorer_response(request, slug)
+
+
+def _monthly_sales_explorer_response(request, slug: str):
+    sale_date_expr = '"date"::date'
+    month_expr = f"date_trunc('month', {sale_date_expr})::date"
+    fmt, platform_label = _MONTHLY_EXPLORER_FORMATS[slug]
+    format_where = (
+        'REGEXP_REPLACE(LOWER(TRIM("format"::text)), \'[^a-z0-9]+\', \'\', \'g\') = %s'
+    )
+    # A sales month cannot be in the future. Blinkit's feed carries a handful of
+    # forward-dated rows (Sep–Dec 2026, ~280 rows each); without this the picker
+    # would offer them and the page would open on a window that is almost all
+    # phantom. The current month itself stays — it is legitimately partial.
+    live_months = f"AND {month_expr} <= date_trunc('month', CURRENT_DATE)::date"
+    dashboard_title = f"{platform_label} Monthly Sales Explorer"
+
+    item_heads = _parse_sales_explorer_item_heads(request.query_params)
+    requested_months = _parse_explorer_months(request.query_params)
+
+    # Every month that holds sales for this platform — the checkbox list is built
+    # from this, so a user can never tick a month with nothing behind it.
+    month_rows = _dict_rows(
+        f"""
+        SELECT DISTINCT {month_expr} AS month_start
+        FROM secmaster_mv
+        WHERE {format_where}
+          AND ({sale_date_expr}) IS NOT NULL
+          {live_months}
+        ORDER BY 1
+        """,
+        [fmt],
+    )
+    available = [row["month_start"].strftime("%Y-%m") for row in month_rows]
+    available_options = [
+        {"value": token, "label": _month_token_label(token)} for token in available
+    ]
+
+    bounds = _dict_rows(
+        f"""
+        SELECT MAX({sale_date_expr}) AS max_date
+        FROM secmaster_mv
+        WHERE {format_where}
+          AND ({sale_date_expr}) IS NOT NULL
+          {live_months}
+        """,
+        [fmt],
+    )
+    data_max = (bounds[0] if bounds else {}).get("max_date")
+
+    if not available:
+        return Response({
+            "platform": slug,
+            "dashboard_title": dashboard_title,
+            "source": "SecMaster",
+            "months": [],
+            "month_labels": [],
+            "months_options": [],
+            "defaulted_months": requested_months == [],
+            "sales_of": item_heads,
+            "sales_of_options": list(_SALES_EXPLORER_ITEM_HEADS),
+            "month_count": 0,
+            "days": 0,
+            "max_date": None,
+            "sales_max_date": None,
+            "growth_available": False,
+            "growth_from": None,
+            "growth_to": None,
+            "growth_partial": False,
+            "monthly": [],
+            "rows": [],
+            "items": [],
+            "totals": _sales_explorer_empty_totals(),
+            "total": _sales_explorer_empty_totals(),
+        })
+
+    # A month the caller named that holds no sales is dropped rather than
+    # plotted as a zero — the picker only ever offers real months, so this only
+    # fires for hand-written URLs.
+    months = [token for token in requested_months if token in available]
+    defaulted_months = not months
+    if defaulted_months:
+        months = available[-_MONTHLY_EXPLORER_DEFAULT_MONTHS:]
+
+    month_starts = [_month_token_to_date(token) for token in months]
+    month_placeholders = ", ".join(["%s"] * len(month_starts))
+    month_filter = f"AND {month_expr} IN ({month_placeholders})"
+
+    head_filter = ""
+    head_params: list = []
+    if item_heads:
+        placeholders = ", ".join(["%s"] * len(item_heads))
+        head_filter = (
+            "AND COALESCE(NULLIF(UPPER(TRIM(\"item_head\"::text)), ''), 'OTHER') "
+            f"IN ({placeholders})"
+        )
+        head_params = list(item_heads)
+
+    window_params = [fmt, *month_starts, *head_params]
+
+    monthly_raw = _dict_rows(
+        f"""
+        SELECT
+            {month_expr} AS month_start,
+            COALESCE(SUM("sales_amt_exc"), 0) AS value,
+            COALESCE(SUM("ltr_sold"), 0) AS ltr,
+            COALESCE(SUM("quantity"), 0) AS qty,
+            COUNT(DISTINCT {sale_date_expr}) AS selling_days,
+            MAX({sale_date_expr}) AS last_date
+        FROM secmaster_mv
+        WHERE {format_where}
+          {month_filter}
+          {head_filter}
+        GROUP BY 1
+        ORDER BY 1
+        """,
+        window_params,
+    )
+    monthly_by_token = {
+        row["month_start"].strftime("%Y-%m"): row for row in monthly_raw
+    }
+
+    # One point per ticked month, in calendar order. A month the item-head
+    # filter emptied still gets its point (as a zero) so the selection the user
+    # made is the selection the chart shows.
+    #
+    # `is_partial` marks a month the data does not cover to its last day — in
+    # practice the running one. It matters: Blinkit on the 1st has a single day
+    # in the current month, so growth against it reads -96% unless the page can
+    # say the month isn't finished yet.
+    monthly = []
+    for token in months:
+        row = monthly_by_token.get(token, {})
+        start = _month_token_to_date(token)
+        month_end = date(start.year, start.month, monthrange(start.year, start.month)[1])
+        monthly.append({
+            "month": token,
+            "month_start": start.isoformat(),
+            "display_month": _month_token_label(token),
+            "short_month": start.strftime("%b"),
+            "year": start.year,
+            "selling_days": int(row.get("selling_days") or 0),
+            "is_partial": bool(data_max and month_end > data_max),
+            "value": _num(row.get("value")),
+            "ltr": _num(row.get("ltr")),
+            "qty": _num(row.get("qty")),
+        })
+
+    # Growth is measured across the picked window: the LAST month against the
+    # FIRST. Split out per row here so the browser can re-derive it for the
+    # Category / Sub Category roll-ups without another round trip. One month
+    # picked means there is nothing to compare against — the columns come back
+    # as zeroes and the page hides growth entirely (`growth_available`).
+    first_start, last_start = month_starts[0], month_starts[-1]
+    growth_select = f"""
+            COALESCE(SUM("quantity")      FILTER (WHERE {month_expr} = %s), 0) AS first_qty,
+            COALESCE(SUM("ltr_sold")      FILTER (WHERE {month_expr} = %s), 0) AS first_ltr,
+            COALESCE(SUM("sales_amt_exc") FILTER (WHERE {month_expr} = %s), 0) AS first_value,
+            COALESCE(SUM("quantity")      FILTER (WHERE {month_expr} = %s), 0) AS last_qty,
+            COALESCE(SUM("ltr_sold")      FILTER (WHERE {month_expr} = %s), 0) AS last_ltr,
+            COALESCE(SUM("sales_amt_exc") FILTER (WHERE {month_expr} = %s), 0) AS last_value,
+    """
+    growth_params = [first_start] * 3 + [last_start] * 3
+
+    item_rows = _dict_rows(
+        f"""
+        SELECT
+            COALESCE(NULLIF(UPPER(TRIM("item_head"::text)), ''), 'OTHER') AS item_head,
+            COALESCE(MIN(NULLIF(TRIM("item"::text), '')), 'UNMAPPED') AS item,
+            MIN(NULLIF(TRIM("category"::text), '')) AS category,
+            MIN(NULLIF(TRIM("sub_category"::text), '')) AS sub_category,
+            COALESCE(SUM("quantity"), 0) AS qty,
+            COALESCE(SUM("ltr_sold"), 0) AS ltr,
+            COALESCE(SUM("sales_amt_exc"), 0) AS value,
+            {growth_select}
+            COUNT(DISTINCT NULLIF(TRIM("sku_code"::text), '')) AS sku_count
+        FROM secmaster_mv
+        WHERE {format_where}
+          {month_filter}
+          {head_filter}
+        GROUP BY
+            COALESCE(NULLIF(UPPER(TRIM("item_head"::text)), ''), 'OTHER'),
+            UPPER(TRIM(COALESCE("item"::text, '')))
+        ORDER BY
+            CASE COALESCE(NULLIF(UPPER(TRIM("item_head"::text)), ''), 'OTHER')
+                WHEN 'PREMIUM' THEN 1
+                WHEN 'COMMODITY' THEN 2
+                WHEN 'OTHER' THEN 3
+                ELSE 4
+            END,
+            COALESCE(SUM("ltr_sold"), 0) DESC
+        """,
+        # The FILTER placeholders sit in the SELECT list, which the driver binds
+        # positionally — so their params come BEFORE the WHERE clause's.
+        [*growth_params, fmt, *month_starts, *head_params],
+    )
+
+    month_count = len(months)
+    # Calendar days behind the selection, with the running month cut off at the
+    # last day that has data — reported for context only. Averages here are per
+    # MONTH, not per day: older SecMaster months land as a single monthly
+    # snapshot row, so dividing those by 30 would understate them badly.
+    total_days = 0
+    for start in month_starts:
+        month_end = date(start.year, start.month, monthrange(start.year, start.month)[1])
+        if data_max and month_end > data_max:
+            month_end = data_max
+        if month_end >= start:
+            total_days += (month_end - start).days + 1
+
+    growth_available = month_count >= 2
+
+    items = []
+    for row in item_rows:
+        qty = _num(row.get("qty"))
+        ltr = _num(row.get("ltr"))
+        value = _num(row.get("value"))
+        items.append({
+            "item_head": row.get("item_head") or "OTHER",
+            "item": row.get("item") or "UNMAPPED",
+            "product": row.get("item") or "UNMAPPED",
+            "category": row.get("category") or "",
+            "sub_category": row.get("sub_category") or "",
+            "sku_count": int(row.get("sku_count") or 0),
+            "qty": qty,
+            "ltr": ltr,
+            "value": value,
+            # Per-MONTH averages — the month-wise answer to Sales Explorer's
+            # per-day run rate.
+            "avg_qty": _safe_div(qty, month_count),
+            "avg_ltr": _safe_div(ltr, month_count),
+            "avg_value": _safe_div(value, month_count),
+            # First and last picked month, so the page can show the growth
+            # between them and re-derive it for rolled-up groups.
+            "first_qty": _num(row.get("first_qty")),
+            "first_ltr": _num(row.get("first_ltr")),
+            "first_value": _num(row.get("first_value")),
+            "last_qty": _num(row.get("last_qty")),
+            "last_ltr": _num(row.get("last_ltr")),
+            "last_value": _num(row.get("last_value")),
+        })
+
+    def _sum(key: str) -> float:
+        return sum(row[key] for row in items)
+
+    total_qty = _sum("qty")
+    total_ltr = _sum("ltr")
+    total_value = _sum("value")
+    totals = {
+        "qty": total_qty,
+        "ltr": total_ltr,
+        "value": total_value,
+        "avg_qty": _safe_div(total_qty, month_count),
+        "avg_ltr": _safe_div(total_ltr, month_count),
+        "avg_value": _safe_div(total_value, month_count),
+        "first_qty": _sum("first_qty"),
+        "first_ltr": _sum("first_ltr"),
+        "first_value": _sum("first_value"),
+        "last_qty": _sum("last_qty"),
+        "last_ltr": _sum("last_ltr"),
+        "last_value": _sum("last_value"),
+        "sku_count": sum(row["sku_count"] for row in items),
+        "items": len(items),
+    }
+
+    last_dates = [row["last_date"] for row in monthly_raw if row.get("last_date")]
+    sales_max_date = max(last_dates) if last_dates else None
+
+    return Response({
+        "platform": slug,
+        "dashboard_title": dashboard_title,
+        "source": "SecMaster",
+        "months": months,
+        "month_labels": [_month_token_label(token) for token in months],
+        "months_options": available_options,
+        "defaulted_months": defaulted_months,
+        "sales_of": item_heads,
+        "sales_of_options": list(_SALES_EXPLORER_ITEM_HEADS),
+        "month_count": month_count,
+        "days": total_days,
+        "max_date": data_max.isoformat() if data_max else None,
+        "sales_max_date": sales_max_date.isoformat() if sales_max_date else None,
+        "growth_available": growth_available,
+        "growth_from": _month_token_label(months[0]) if growth_available else None,
+        "growth_to": _month_token_label(months[-1]) if growth_available else None,
+        # True when either end of the growth comparison is a month the data
+        # doesn't cover in full — the page says so rather than presenting a
+        # part-month drop as a real one.
+        "growth_partial": growth_available
+        and bool(monthly[0]["is_partial"] or monthly[-1]["is_partial"]),
+        "monthly": monthly,
+        "rows": items,
+        "items": items,
+        "totals": totals,
+        "total": totals,
+    })
+
+
 def _amazon_drr_dashboard_response(request):
     month, year, defaulted_to_latest = _parse_sec_month_year(
         request.query_params,
