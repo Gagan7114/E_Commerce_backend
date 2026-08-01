@@ -3619,7 +3619,14 @@ def amazon_po_sku_pendency(request):
     _truthy = ("1", "true", "yes", "on")
     show_invoiced = str(q.get("have_invoice") or "").strip().lower() in _truthy
     show_dispatched = str(q.get("dispatched") or "").strip().lower() in _truthy
-    if show_invoiced and show_dispatched:
+    only_invoiced = str(q.get("only_invoiced") or "").strip().lower() in _truthy
+    if only_invoiced:
+        # "Only invoiced + dispatched": JUST the lines whose every accepted unit
+        # is already on a SAP invoice (dispatched is a subset of these), with all
+        # outstanding lines hidden — the exact inverse of the default view. Takes
+        # precedence over the other two toggles (the UI disables them).
+        where.append(_SKU_PENDENCY_FULLY_INVOICED)
+    elif show_invoiced and show_dispatched:
         pass                                             # everything
     elif show_invoiced:
         where.append(f"NOT {_SKU_PENDENCY_IS_DISPATCHED}")
