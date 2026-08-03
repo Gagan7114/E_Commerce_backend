@@ -1403,17 +1403,43 @@ def _transform_amazon_po(cur, upload_id: int) -> tuple[int, int]:
                             AND COALESCE(c.accepted_quantity, 0) = 0
                             AND COALESCE(c.received_quantity, 0) = 0
                             AND COALESCE(c.cancelled_quantity, 0) = 0 THEN 'MOV'
-                       -- GS-5: Confirmed + AC + accepted>0 + received>=accepted (fully received) → COMPLETED
+                       -- Remainder logic (mirrors the ops Excel): cancelled units are
+                       -- CONSUMED — outstanding = accepted − received − cancelled. A line
+                       -- closes when that hits zero; how it closes depends on receipts.
+                       -- GS-5: nothing received and the cancellation covers every accepted
+                       -- unit → CANCELLED. (A PARTIAL cancellation is NOT cancelled — its
+                       -- un-cancelled remainder stays open via GS-5b/5c below.)
                        WHEN TRIM(COALESCE(c.status, '')) = 'Confirmed'
                             AND TRIM(COALESCE(c.availability, '')) = 'AC - Accepted: In stock'
                             AND COALESCE(c.accepted_quantity, 0) > 0
-                            AND COALESCE(c.received_quantity, 0) >= COALESCE(c.accepted_quantity, 0) THEN 'COMPLETED'
-                       -- GS-5b: Confirmed + AC + accepted>0 + 0<received<accepted (partial receipt) → still PENDING
+                            AND COALESCE(c.received_quantity, 0) = 0
+                            AND COALESCE(c.cancelled_quantity, 0) >= COALESCE(c.accepted_quantity, 0) THEN 'CANCELLED'
+                       -- GS-5a: some received and received+cancelled cover accepted → COMPLETED
+                       -- (e.g. 24 accepted = 20 received + 4 cancelled: nothing left to supply).
                        WHEN TRIM(COALESCE(c.status, '')) = 'Confirmed'
                             AND TRIM(COALESCE(c.availability, '')) = 'AC - Accepted: In stock'
                             AND COALESCE(c.accepted_quantity, 0) > 0
                             AND COALESCE(c.received_quantity, 0) > 0
-                            AND COALESCE(c.received_quantity, 0) < COALESCE(c.accepted_quantity, 0) THEN 'PENDING'
+                            AND COALESCE(c.received_quantity, 0) + COALESCE(c.cancelled_quantity, 0)
+                                >= COALESCE(c.accepted_quantity, 0) THEN 'COMPLETED'
+                       -- GS-5b: units still outstanding and the cancellation deadline passed →
+                       -- EXPIRED (the Excel re-checks the date on the remainder; partial
+                       -- receipts no longer pin a dead line to PENDING).
+                       WHEN TRIM(COALESCE(c.status, '')) = 'Confirmed'
+                            AND TRIM(COALESCE(c.availability, '')) = 'AC - Accepted: In stock'
+                            AND COALESCE(c.accepted_quantity, 0) > 0
+                            AND COALESCE(c.received_quantity, 0) + COALESCE(c.cancelled_quantity, 0)
+                                < COALESCE(c.accepted_quantity, 0)
+                            AND c.expiry_calc IS NOT NULL
+                            AND c.expiry_calc < CURRENT_DATE THEN 'EXPIRED'
+                       -- GS-5c: units still outstanding, deadline not passed → PENDING.
+                       -- Subsumes the old GS-9 (received=0 cancelled=0) and the old GS-14
+                       -- (partial cancel), which are removed below.
+                       WHEN TRIM(COALESCE(c.status, '')) = 'Confirmed'
+                            AND TRIM(COALESCE(c.availability, '')) = 'AC - Accepted: In stock'
+                            AND COALESCE(c.accepted_quantity, 0) > 0
+                            AND COALESCE(c.received_quantity, 0) + COALESCE(c.cancelled_quantity, 0)
+                                < COALESCE(c.accepted_quantity, 0) THEN 'PENDING'
                        -- GS-6: Closed + OS + accepted=0 received=0 cancelled=0
                        WHEN TRIM(COALESCE(c.status, '')) = 'Closed'
                             AND TRIM(COALESCE(c.availability, '')) = 'OS - Cancelled: Out of stock'
@@ -1432,12 +1458,8 @@ def _transform_amazon_po(cur, upload_id: int) -> tuple[int, int]:
                             AND COALESCE(c.accepted_quantity, 0) = 0
                             AND COALESCE(c.received_quantity, 0) = 0
                             AND COALESCE(c.cancelled_quantity, 0) = 0 THEN 'PENDING'
-                       -- GS-9: Confirmed + AC + accepted>0 received=0 cancelled=0
-                       WHEN TRIM(COALESCE(c.status, '')) = 'Confirmed'
-                            AND TRIM(COALESCE(c.availability, '')) = 'AC - Accepted: In stock'
-                            AND COALESCE(c.accepted_quantity, 0) > 0
-                            AND COALESCE(c.received_quantity, 0) = 0
-                            AND COALESCE(c.cancelled_quantity, 0) = 0 THEN 'PENDING'
+                       -- (old GS-9 removed — GS-5c above already classifies
+                       -- received=0 cancelled=0 lines by their remainder.)
                        -- GS-10: Closed + AC + accepted>0 received=0 cancelled>0
                        WHEN TRIM(COALESCE(c.status, '')) = 'Closed'
                             AND TRIM(COALESCE(c.availability, '')) = 'AC - Accepted: In stock'
@@ -1462,12 +1484,9 @@ def _transform_amazon_po(cur, upload_id: int) -> tuple[int, int]:
                             AND COALESCE(c.accepted_quantity, 0) = 0
                             AND COALESCE(c.received_quantity, 0) > 0
                             AND COALESCE(c.cancelled_quantity, 0) > 0 THEN 'COMPLETED'
-                       -- GS-14: Confirmed + AC + accepted>0 received=0 cancelled>0
-                       WHEN TRIM(COALESCE(c.status, '')) = 'Confirmed'
-                            AND TRIM(COALESCE(c.availability, '')) = 'AC - Accepted: In stock'
-                            AND COALESCE(c.accepted_quantity, 0) > 0
-                            AND COALESCE(c.received_quantity, 0) = 0
-                            AND COALESCE(c.cancelled_quantity, 0) > 0 THEN 'CANCELLED'
+                       -- (old GS-14 removed — a partial cancellation is no longer
+                       -- CANCELLED: GS-5 handles full cancellation, GS-5b/5c keep the
+                       -- un-cancelled remainder open.)
                        -- GS-15: Confirmed + AC + requested>0 accepted=0 received=0 cancelled=0
                        WHEN TRIM(COALESCE(c.status, '')) = 'Confirmed'
                             AND TRIM(COALESCE(c.availability, '')) = 'AC - Accepted: In stock'
