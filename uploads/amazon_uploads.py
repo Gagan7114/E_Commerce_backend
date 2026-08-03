@@ -3626,9 +3626,14 @@ def amazon_po_sku_pendency(request):
     # toggle adds its own kind back, tinted differently by the UI; both flags are
     # returned on every row either way.
     #
-    # Dispatched is a subset of invoiced, so the conditions are written as what
-    # to EXCLUDE rather than what to include — "show invoiced" is exactly "hide
-    # dispatched", since outstanding + invoiced is everything that has not left.
+    # Each condition is written as what to EXCLUDE rather than what to include,
+    # since the default hides the smallest set and every toggle only adds rows.
+    #
+    # Dispatched is NOT a subset of FULLY invoiced, which is easy to assume and
+    # wrong: a partly-invoiced line can have some of its units already gone.
+    # There are 46 such lines today. They are outstanding, so they show by
+    # default — which means "hide dispatched" and "show invoiced" are different
+    # sets, and writing either as the other makes a toggle REMOVE rows.
     _truthy = ("1", "true", "yes", "on")
     show_invoiced = str(q.get("have_invoice") or "").strip().lower() in _truthy
     show_dispatched = str(q.get("dispatched") or "").strip().lower() in _truthy
@@ -3642,7 +3647,14 @@ def amazon_po_sku_pendency(request):
     elif show_invoiced and show_dispatched:
         pass                                             # everything
     elif show_invoiced:
-        where.append(f"NOT {_SKU_PENDENCY_IS_DISPATCHED}")
+        # "Add back what is fully invoiced but still in the warehouse", i.e. hide
+        # only what is fully invoiced AND has left. Previously `NOT dispatched`,
+        # which also hid the 46 dispatched-but-partly-invoiced lines that the
+        # default view shows — so switching this ON dropped the count from 751 to
+        # 730 instead of raising it.
+        where.append(
+            f"NOT ({_SKU_PENDENCY_FULLY_INVOICED} AND {_SKU_PENDENCY_IS_DISPATCHED})"
+        )
     elif show_dispatched:
         # "Hide only what is fully invoiced and still sitting here." Same rows as
         # the OR form, ~20% quicker, and it reads as the one thing being hidden.
