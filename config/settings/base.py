@@ -165,6 +165,16 @@ HANA = {
 }
 
 # --- Outbound email (FC-switching notifications) ----------------------------
+# Reject a shipment whose lines span sister FCs but that carries NO switching
+# record. Such a save skips the Submit gate entirely and is invisible to the
+# manager verification, so it must not be possible — but turning the check on
+# blind is risky: prod and local share one database, and a false positive stops
+# real planners immediately. OFF logs every would-be rejection instead, so the
+# exemptions (flips, blank FCs) can be proved against real traffic first.
+SHIPMENT_STRICT_SWITCH_ENFORCEMENT = env.bool(
+    "SHIPMENT_STRICT_SWITCH_ENFORCEMENT", default=False
+)
+
 # Used by the shipment planner's Switching flow to mail the switch request
 # (PDF + Excel attached) to the Amazon-side team. With no EMAIL_HOST configured
 # the backend falls back to the console backend — mails print to the server log

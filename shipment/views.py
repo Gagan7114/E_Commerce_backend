@@ -3306,25 +3306,98 @@ class ShipmentListCreateView(_SafeAPIView):
             switch_details = []
         switch_details = [r for r in switch_details if isinstance(r, dict)]
         if switch_details:
-            bad = [
-                str(r.get('po_number') or '?')
-                for r in switch_details
-                if not _is_switch(r.get('from_fc'), r.get('to_fc'))
-                or str(r.get('to_fc') or '').strip().upper()
-                   != str(destination_fc or '').strip().upper()
-            ]
+            # Two kinds of move, validated differently. 'fc' is the original rule:
+            # from and to must be different sister FCs on one channel. 'appointment'
+            # is a PO already AT this FC being re-slotted from another booking —
+            # from_fc == to_fc there, which _is_switch rejects by design, so
+            # validating it as an FC switch made appointment moves unsavable.
+            target = str(destination_fc or '').strip().upper()
+            bad = []
+            for r in switch_details:
+                po = str(r.get('po_number') or '?')
+                kind = str(r.get('switch_kind') or 'fc').strip().lower()
+                if str(r.get('to_fc') or '').strip().upper() != target:
+                    bad.append(po)
+                elif kind == 'appointment':
+                    # Must name where it is moving FROM, or nobody can action it.
+                    frm = str(r.get('from_appointment_id') or '').strip()
+                    if not frm or frm == str(appointment_id or '').strip():
+                        bad.append(po)
+                elif not _is_switch(r.get('from_fc'), r.get('to_fc')):
+                    bad.append(po)
             if bad:
                 return Response(
                     {
                         'error': 'Invalid switch rows',
                         'detail': (
-                            'These POs are not legal same-channel switches into '
+                            'These POs are not legal switches into '
                             f'{destination_fc}: {", ".join(sorted(set(bad)))}. '
-                            'Only sister FCs on the same channel can be switched.'
+                            'An FC switch must come from a sister FC on the same '
+                            'channel; an appointment move must name the appointment '
+                            'it is being taken from.'
                         ),
                     },
                     status=400,
                 )
+
+        # The inverse check. Above validates the switch rows that WERE sent; nothing
+        # validated their absence, so a payload with sister-FC lines and
+        # switch_details omitted saved with switch_state='' — sailing past the
+        # Submit 409 and never reaching a manager. Manual mode is about to start
+        # producing exactly that shape, so close it here rather than in one client.
+        #
+        # Flips are exempt for the same reason they aren't switches: the PO rides
+        # one of this shipment's appointments and Amazon has already moved it. Get
+        # that exemption wrong and this rejects ordinary appointment plans, which
+        # is why it only logs until SHIPMENT_STRICT_SWITCH_ENFORCEMENT is set.
+        if loaded_items and destination_fc:
+            _target = str(destination_fc).strip().upper()
+            _, _grp = _fc_switch_group(destination_fc)
+            _grp_up = {f.upper() for f in _grp}
+            _declared = {
+                str(r.get('po_number') or '').strip().upper() for r in switch_details
+            } - {''}
+            _appt_ids = {str(appointment_id or '').strip()} | {
+                x.strip() for x in str(data.get('additional_appointment_ids') or '').split(',')
+            } - {''}
+            _pos = [str(it.get('po_number') or '').strip().upper() for it in loaded_items]
+            _sheet = _sheet_fc_for_pos(_pos)
+            _booked = _appointments_for_pos(_pos)
+
+            _offside, _cross = set(), set()
+            for _po in {p for p in _pos if p}:
+                _home = str(_sheet.get(_po) or '').strip().upper()
+                if not _home or _home == _target or _po in _declared:
+                    continue
+                if _home not in _grp_up:
+                    _cross.add(_po)                      # different channel entirely
+                    continue
+                _bk = str((_booked.get(_po) or {}).get('appointment_id') or '').strip()
+                if _bk and _bk in _appt_ids:
+                    continue                             # flip — already moved
+                _offside.add(_po)
+
+            if _cross or _offside:
+                _msg = (
+                    f'shipment save spans FCs without a switching record — '
+                    f'destination={destination_fc} cross_channel={sorted(_cross)} '
+                    f'undeclared_switches={sorted(_offside)} user={request.user}'
+                )
+                if getattr(settings, 'SHIPMENT_STRICT_SWITCH_ENFORCEMENT', False):
+                    logger.warning('REJECTED: %s', _msg)
+                    return Response(
+                        {
+                            'error': 'Missing switching record',
+                            'detail': (
+                                'These POs are not at '
+                                f'{destination_fc} and carry no switching request: '
+                                f'{", ".join(sorted(_cross | _offside))}. '
+                                'Raise the switch before saving.'
+                            ),
+                        },
+                        status=400,
+                    )
+                logger.warning('WOULD REJECT (enforcement off): %s', _msg)
 
         # Resolve planning_mode: explicit from frontend wins; otherwise infer from payload shape
         planning_mode = data.get('planning_mode')
@@ -3690,6 +3763,32 @@ class ShipmentDetailView(_SafeAPIView):
             return Response({'error': 'Not found'}, status=404)
         if shipment.status not in (Shipment.Status.DRAFT, Shipment.Status.REJECTED):
             return Response({'error': 'Only draft or rejected shipments can be edited'}, status=400)
+
+        # A pending switch is verified against the shipment's CURRENT destination and
+        # appointments, read live (_auto_check). Editing either while the request is
+        # outstanding silently changes the answer: a switch that had not happened can
+        # be made to "pass" by moving the target to where the PO already is, and the
+        # frozen switch_details — which is what was emailed and what the approver
+        # reads — goes stale with no record of the edit. Lock those two fields until
+        # the switch is resolved; everything else stays editable.
+        if shipment.switch_state and shipment.switch_state != Shipment.SwitchState.VERIFIED:
+            _locked = [
+                f for f in ('destination_fc', 'appointment_id', 'additional_appointment_ids')
+                if f in request.data
+                and str(request.data.get(f) or '').strip() != str(getattr(shipment, f, '') or '').strip()
+            ]
+            if _locked:
+                return Response(
+                    {
+                        'error': 'Switching request is still open',
+                        'detail': (
+                            f'{", ".join(_locked)} cannot change while this shipment is '
+                            f'awaiting switch verification — the request already sent names '
+                            f'the current destination. Resolve or reject the switch first.'
+                        ),
+                    },
+                    status=409,
+                )
 
         allowed = [
             'driver_name', 'driver_phone', 'vehicle_number', 'vehicle_type',
@@ -4532,12 +4631,22 @@ class POListView(_SafeAPIView):
                     -- the appointment it sits on) physically ships to the appointment FC,
                     -- so it should be treated as belonging to that FC everywhere — incl.
                     -- appearing on every appointment at that FC.
-                    SELECT UPPER(TRIM(pv)) AS po_up,
-                           MAX(UPPER(TRIM(a.destination_fc))) AS appt_fc
+                    --
+                    -- DISTINCT ON the LATEST booking, not MAX(): the manual picker
+                    -- has to name which appointment a PO currently sits on so it can
+                    -- label an appointment-switch, and MAX() over FCs would pair an
+                    -- FC from one booking with an id from another. This is the same
+                    -- "latest wins" rule _appointments_for_pos already uses, so the
+                    -- picker and the switching request agree on the source slot.
+                    SELECT DISTINCT ON (UPPER(TRIM(pv)))
+                           UPPER(TRIM(pv)) AS po_up,
+                           UPPER(TRIM(a.destination_fc)) AS appt_fc,
+                           a.appointment_id AS appt_id,
+                           a.appointment_time AS appt_time
                     FROM reporting."appointment" a,
                          LATERAL unnest(regexp_split_to_array(COALESCE(a.pos, ''), '\s*[,;]\s*')) AS pv
                     WHERE a.status = 'Confirmed' AND NULLIF(TRIM(pv), '') IS NOT NULL
-                    GROUP BY UPPER(TRIM(pv))
+                    ORDER BY UPPER(TRIM(pv)), a.appointment_time DESC NULLS LAST
                 )
                 SELECT
                     ap.po_number, ap.asin, ap.merchant_sku, ap.sku_code, ap.sap_sku_code,
@@ -4552,6 +4661,13 @@ class POListView(_SafeAPIView):
                     ap.cancelled_qty, ap.requested_qty, ap.received_qty,
                     ap.fulfillment_center AS destination_fc,
                     pa.appt_fc            AS appt_fc,
+                    -- Which slot the PO is booked on, so the picker can label a
+                    -- move from another appointment without a second round-trip.
+                    pa.appt_id            AS appt_id,
+                    pa.appt_time          AS appt_time,
+                    -- The FC the Amazon sheet still shows. appt_fc is where it will
+                    -- actually ship; these differing IS the switch/flip signal.
+                    ap.fulfillment_center AS sheet_fc,
                     ap.availability_status,
                     ap.status, ap.po_status, ap.item_status,
                     -- Remaining QTY / LTR come straight from Amazon's uploaded
