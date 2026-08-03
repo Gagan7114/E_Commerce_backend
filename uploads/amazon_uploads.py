@@ -3505,7 +3505,20 @@ SKU_PENDENCY_COLUMNS = (
 )
 
 # PENDING is the whole point of a "pendency" list (mirrors TRIM(PO Status)="Pending").
-_SKU_PENDENCY_PENDING = "UPPER(TRIM(COALESCE(po_status, ''))) = 'PENDING'"
+#
+# The second clause drops lines that are FINISHED even though Amazon still calls the
+# PO pending: quantity was accepted and then fully received and/or cancelled, so
+# nothing remains to ship. Amazon leaves the status at PENDING in that state, which
+# is why status alone isn't enough — this is exactly the rule the Google Sheet
+# applies, and without it the two disagree.
+#
+# `accepted_qty > 0` is load-bearing. Lines awaiting a decision carry
+# accepted_qty = 0 AND remaining_qty = 0 (289 rows today) and ARE still pending —
+# testing remaining_qty alone would wrongly delete every one of them.
+_SKU_PENDENCY_PENDING = (
+    "UPPER(TRIM(COALESCE(po_status, ''))) = 'PENDING'"
+    " AND NOT (COALESCE(accepted_qty, 0) > 0 AND COALESCE(remaining_qty, 0) <= 0)"
+)
 
 # "Already invoiced in SAP": this PO+item appears in sap_billing, which holds the
 # RK-World (CardCode CUSTA000048 = R K WORLDINFOCOM PVT LTD) Sales / Sales-Return
