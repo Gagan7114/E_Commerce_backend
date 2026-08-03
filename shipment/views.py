@@ -1783,6 +1783,90 @@ def _appointments_for_pos(po_uppers):
         return {}
 
 
+def _sheet_fc_for_pos(po_uppers):
+    """{PO (upper) → its FC on the Amazon PO sheet, live}.
+
+    A PO's lines all share one fulfilment centre on the sheet, so this is a
+    PO-level fact. Read fresh rather than trusted from the client: whether a row
+    is a switch depends on where Amazon says the PO lives RIGHT NOW, and a plan
+    assembled minutes ago may already be stale.
+
+    Swallows errors and returns {} for the same reason as _appointments_for_pos —
+    a lookup that only describes the plan must never stop it being made. Callers
+    must treat an empty result as "unknown", never as "no switches".
+    """
+    pos = sorted({str(p or '').strip().upper() for p in (po_uppers or [])} - {''})
+    if not pos:
+        return {}
+    try:
+        with connection.cursor() as cur:
+            cur.execute("""
+                SELECT UPPER(TRIM(po_number)), MAX(TRIM(fulfillment_center))
+                FROM reporting."Amazon PO"
+                WHERE UPPER(TRIM(po_number)) = ANY(%s::text[])
+                GROUP BY UPPER(TRIM(po_number))
+            """, [pos])
+            return {r[0]: (r[1] or '') for r in cur.fetchall()}
+    except Exception:
+        return {}
+
+
+def _tag_manual_switches(items, target_fc, target_appt_ids=()):
+    """Tag each manually-picked line with is_switch / switch_kind, in place.
+
+    Manual mode used to send no switch information at all: Plan Review re-derived
+    it by comparing each line's FC to whichever FC held the most lines. That
+    guess moves when you add a line. The server knows the answer, so it says it,
+    and both planners end up using one predicate.
+
+    Two kinds of move need a request to Amazon, and they are NOT the same thing:
+
+      'fc'          — the PO lives at a sister FC and must be moved to this
+                      truck's FC.
+      'appointment' — the PO is already at this FC but booked on a DIFFERENT
+                      appointment, so it has to be re-slotted.
+
+    A FLIP is deliberately NOT a switch: the PO is on one of this truck's
+    appointments while the sheet still shows the sister FC, meaning Amazon has
+    already moved it and there is nothing to ask for. Same rule as the auto
+    planner (see AppointmentItemsView), so the two cannot disagree.
+
+    Returns the set of POs that need a switch, for the caller's summary.
+    """
+    target = str(target_fc or '').strip().upper()
+    appt_ids = {str(a).strip() for a in (target_appt_ids or ())} - {''}
+    pos = [str(it.get('po_number') or '').strip().upper() for it in (items or [])]
+
+    sheet_fc = _sheet_fc_for_pos(pos)
+    live_appt = _appointments_for_pos(pos)
+
+    switched = set()
+    for it in items or []:
+        po = str(it.get('po_number') or '').strip().upper()
+        # Fall back to the FC the client sent when the live lookup came back
+        # empty, so a transient DB error degrades to today's behaviour rather
+        # than silently declaring nothing a switch.
+        home = str(sheet_fc.get(po) or it.get('destination_fc') or '').strip()
+        booked = str((live_appt.get(po) or {}).get('appointment_id') or '').strip()
+        on_appt = bool(booked) and booked in appt_ids
+
+        kind = ''
+        if home and target and home.upper() != target:
+            kind = '' if on_appt else 'fc'          # on_appt ⇒ flip ⇒ silent
+        elif booked and appt_ids and not on_appt:
+            kind = 'appointment'
+
+        it['home_fc'] = home or target
+        it['is_switch'] = bool(kind)
+        it['switch_kind'] = kind
+        it['switch_from_fc'] = home if kind == 'fc' else None
+        it['switch_to_fc'] = target if kind else None
+        it['switch_from_appointment'] = live_appt.get(po) if kind else None
+        if kind:
+            switched.add(po)
+    return switched
+
+
 def _row_eligibility_reason(row):
     """
     Per-(PO, ASIN) reason string for the eligibility detail drawer.
@@ -3993,15 +4077,9 @@ class ShipmentSwitchVerifyView(_SafeAPIView):
             return []
 
         # Live sheet FC per PO (a PO's lines share one FC on the Amazon PO sheet).
-        sheet_fc = {}
-        with connection.cursor() as cur:
-            cur.execute("""
-                SELECT UPPER(TRIM(po_number)), MAX(TRIM(fulfillment_center))
-                FROM reporting."Amazon PO"
-                WHERE UPPER(TRIM(po_number)) = ANY(%s::text[])
-                GROUP BY UPPER(TRIM(po_number))
-            """, [pos])
-            sheet_fc = {r[0]: (r[1] or '') for r in cur.fetchall()}
+        # Same helper the manual planner tags with, so verification can't disagree
+        # with what the plan said was a switch.
+        sheet_fc = _sheet_fc_for_pos(pos)
 
         # Which appointment each PO sits on NOW (latest booking).
         live_appt = _appointments_for_pos(pos)
@@ -5015,6 +5093,34 @@ class ManualPlanView(_SafeAPIView):
                     status=400,
                 )
 
+        # Where this truck is actually going. The planner states it outright;
+        # anything else is a fallback for callers that don't yet send it.
+        # Plurality is the last resort ONLY — it is the guess this change exists
+        # to remove, since adding one line can change which FC "wins" and
+        # therefore which rows count as switches.
+        target_fc = str(request.data.get('destination_fc') or '').strip()
+        target_appt_ids = {appointment_id} - {''}
+        if appointment_id:
+            with connection.cursor() as cur:
+                cur.execute("""
+                    SELECT destination_fc FROM reporting."appointment"
+                    WHERE appointment_id = %s
+                    ORDER BY appointment_time DESC NULLS LAST LIMIT 1
+                """, [appointment_id])
+                row = cur.fetchone()
+            if row and not target_fc:
+                target_fc = str(row[0] or '').strip()
+        if not target_fc and fcs:
+            from collections import Counter
+            target_fc = Counter(
+                str(it.get('destination_fc') or '').strip()
+                for it in selected_items if it.get('destination_fc')
+            ).most_common(1)[0][0]
+
+        # Tag every line before planning, so is_switch travels with the rows the
+        # packer keeps AND the ones it sets aside.
+        switched_pos = _tag_manual_switches(selected_items, target_fc, target_appt_ids)
+
         for item in selected_items:
             bucket, score, reason = _compute_priority(
                 item.get('drr_unit', 0), item.get('soh_unit', 0),
@@ -5096,6 +5202,13 @@ class ManualPlanView(_SafeAPIView):
             planned_liters = round(sum(float(it.get('planned_liters') or 0) for it in loaded), 4)
             load_pct = round((planned_liters / capacity * 100) if capacity > 0 else 0, 2)
 
+        # Only POs that actually made it onto the truck need a switching request —
+        # a sister-FC PO the packer set aside isn't being moved anywhere.
+        loaded_switch_pos = sorted({
+            str(it.get('po_number') or '').strip().upper()
+            for it in loaded if it.get('is_switch')
+        } - {''})
+
         return Response({
             'loaded_items': loaded,
             'not_loaded_items': not_loaded,
@@ -5104,6 +5217,20 @@ class ManualPlanView(_SafeAPIView):
             'appointment_commit': appt_cap,
             'respect_stock': respect_stock,
             'stock_snapshot': _stock_meta_payload(stock_detail),
+            # Stated, not inferred: Plan Review used to guess the truck's FC from
+            # whichever one held the most lines, which changes as lines are added.
+            'target_fc': target_fc,
+            'switch_summary': {
+                'pos': loaded_switch_pos,
+                'po_count': len(loaded_switch_pos),
+                'line_count': sum(1 for it in loaded if it.get('is_switch')),
+                'kinds': sorted({
+                    it.get('switch_kind') for it in loaded if it.get('switch_kind')
+                }),
+                # POs tagged at selection time but dropped by the packer — listed so
+                # the UI never asks Amazon to move something that isn't shipping.
+                'dropped_pos': sorted(switched_pos - set(loaded_switch_pos)),
+            },
             'load_summary': {
                 'truck_size': truck_size,
                 'capacity': capacity,
