@@ -1762,8 +1762,18 @@ def _appointments_for_pos(po_uppers):
     actioning it on Amazon's side knows exactly what to cancel/re-book. A PO can
     be pending with no booked slot; those are simply absent from the result.
 
-    When a PO appears on several appointments we take the LATEST one — that's the
-    live booking; earlier rows are superseded history.
+    Only CONFIRMED slots from today onwards count. A booking that has already
+    happened, or that was cancelled, cannot be switched away from — there is
+    nothing left to re-book — so treating it as the PO's current appointment
+    invented switching work: an ordinary PO at the truck's own FC was tagged as
+    an appointment move away from a slot that closed weeks ago, and the whole
+    draft then waited on a manager to approve it. Live data made that the normal
+    case, not an edge one: of ~716 appointment rows only a handful are both
+    Confirmed and still ahead.
+
+    When a PO appears on several qualifying appointments we take the EARLIEST —
+    the next one it is due on. (Previously the latest, which with past rows in
+    scope meant the most recently expired.)
     """
     pos = sorted({str(p or '').strip().upper() for p in (po_uppers or [])} - {''})
     if not pos:
@@ -1782,9 +1792,12 @@ def _appointments_for_pos(po_uppers):
                         regexp_split_to_array(COALESCE(a.pos, ''), '\\s*[,;]\\s*')
                     ) AS pv
                     WHERE NULLIF(TRIM(pv), '') IS NOT NULL
+                      AND a.status = 'Confirmed'
+                      AND a.appointment_time IS NOT NULL
+                      AND DATE(a.appointment_time) >= CURRENT_DATE
                 ) x
                 WHERE po_upper = ANY(%s::text[])
-                ORDER BY po_upper, appointment_time DESC NULLS LAST
+                ORDER BY po_upper, appointment_time ASC
             """, [pos])
             return {
                 r[0]: {
@@ -4663,7 +4676,13 @@ class POListView(_SafeAPIView):
                     FROM reporting."appointment" a,
                          LATERAL unnest(regexp_split_to_array(COALESCE(a.pos, ''), '\s*[,;]\s*')) AS pv
                     WHERE a.status = 'Confirmed' AND NULLIF(TRIM(pv), '') IS NOT NULL
-                    ORDER BY UPPER(TRIM(pv)), a.appointment_time DESC NULLS LAST
+                      -- Same window as _appointments_for_pos: a slot that has
+                      -- already passed cannot be switched away from, so it must
+                      -- not appear as the PO's booking here either, or the picker
+                      -- and the planner disagree about what is a switch.
+                      AND a.appointment_time IS NOT NULL
+                      AND DATE(a.appointment_time) >= CURRENT_DATE
+                    ORDER BY UPPER(TRIM(pv)), a.appointment_time ASC
                 )
                 SELECT
                     ap.po_number, ap.asin, ap.merchant_sku, ap.sku_code, ap.sap_sku_code,
