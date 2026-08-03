@@ -3765,7 +3765,15 @@ class ShipmentListCreateView(_SafeAPIView):
                     appointment_id=str(item_data.get('source_appointment_id') or appointment_id or ''),
                     po_number=item_data.get('po_number') or '',
                     asin=item_data.get('asin') or '',
-                    internal_sku=item_data.get('internal_sku') or item_data.get('merchant_sku') or '',
+                    # sap_sku_code as the last fallback: merchant_sku is NULL on
+                    # every row of reporting."Amazon PO" (0 of 10,247), and
+                    # internal_sku is just an alias of it, so this column saved
+                    # empty on all 66 existing items and the SAP Code column read
+                    # blank on every shipment page. The SAP item code (FG0000011…)
+                    # is the identifier that actually exists, and it goes in the
+                    # column already there — no new field to migrate by hand.
+                    internal_sku=(item_data.get('internal_sku') or item_data.get('merchant_sku')
+                                  or item_data.get('sap_sku_code') or ''),
                     product_name=item_data.get('product_name') or item_data.get('sku_name') or '',
                     destination_fc=item_data.get('destination_fc') or '',
                     category=item_data.get('category') or '',
@@ -5262,6 +5270,51 @@ class ManualPlanView(_SafeAPIView):
 
         if not selected_items:
             return Response({'error': 'No items selected'}, status=400)
+
+        # Identity + demand columns, stamped here rather than taken on trust from
+        # the picker's payload. The auto planner reads sap_sku_code straight off
+        # reporting."Amazon PO" and attaches live DOH/DRR/SOH per ASIN; manual was
+        # forwarding whatever fields the selected row happened to carry, so Plan
+        # Review's SAP Code column came through empty on every manual plan and any
+        # row sourced from somewhere without DOH showed a blank instead of its
+        # cover. Same two sources as auto, so both screens agree.
+        # (merchant_sku is NULL for every Amazon PO row, so sap_sku_code is the
+        # only real identifier here — internal_sku is filled for symmetry only.)
+        _sel_pos = sorted({str(it.get('po_number') or '').strip().upper()
+                           for it in selected_items} - {''})
+        _sku_by_key = {}
+        if _sel_pos:
+            with connection.cursor() as cur:
+                cur.execute(
+                    '''
+                    SELECT DISTINCT ON (UPPER(TRIM(po_number)), UPPER(TRIM(asin)))
+                           UPPER(TRIM(po_number)) AS po,
+                           UPPER(TRIM(asin))      AS asin,
+                           sap_sku_code,
+                           merchant_sku
+                      FROM reporting."Amazon PO"
+                     WHERE UPPER(TRIM(po_number)) = ANY(%s::text[])
+                    ''',
+                    [_sel_pos],
+                )
+                for po, asin, sap_code, merch in cur.fetchall():
+                    _sku_by_key[(po, asin)] = (sap_code, merch)
+
+        _doh_by_asin, _ = _live_doh_by_asin()
+        for it in selected_items:
+            key = (str(it.get('po_number') or '').strip().upper(),
+                   str(it.get('asin') or '').strip().upper())
+            sap_code, merch = _sku_by_key.get(key, (None, None))
+            if sap_code:
+                it['sap_sku_code'] = sap_code
+            if merch:
+                it['internal_sku'] = merch
+            live = _doh_by_asin.get(key[1], {})
+            it['soh_unit'] = live.get('soh_unit', 0) or 0
+            it['soh_ltr'] = live.get('soh_ltr', 0) or 0
+            it['drr_unit'] = live.get('drr_unit', 0) or 0
+            it['drr_ltr'] = live.get('drr_ltr', 0) or 0
+            it['doh'] = live.get('doh', 0) or 0
 
         # No-per-litre items are NOT stripped out here. They flow through the same
         # packer as the auto planner (_pack_into_capacity), which ships zero-volume
