@@ -282,7 +282,13 @@ def _family_sql(families, alias='p'):
     half for every family in one pass, so adding a second family costs no extra
     predicate.
     """
-    fams = [f for f in (families or []) if f]
+    # Accept a bare string as well as a list. Iterating a string yields its
+    # CHARACTERS, so a caller passing 'MUSTARD' would build
+    # `sub_category LIKE ANY('%M%','%U%','%S%'…)` — which matches nearly every
+    # product on the sheet and silently widens the focus instead of narrowing it.
+    if isinstance(families, str):
+        families = [families]
+    fams = [str(f).strip().upper() for f in (families or []) if str(f).strip()]
     if not fams:
         return '', []
     sql = (f"(UPPER(TRIM({alias}.category)) = ANY(%s::text[]) "
@@ -2978,7 +2984,7 @@ class AppointmentFamiliesView(_SafeAPIView):
         out = []
         with connection.cursor() as cur:
             for family in PRODUCT_FAMILIES:
-                fam_sql, fam_params = _family_sql(family)
+                fam_sql, fam_params = _family_sql([family])
                 cur.execute(f"""
                     WITH billed AS ({_BILLED_CTE})
                     SELECT
