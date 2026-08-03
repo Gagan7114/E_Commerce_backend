@@ -1467,7 +1467,7 @@ def _reserved_detail_by_asin():
 
 
 def _apply_stock_caps(items, avail_total, avail_remaining, respect, detail, reserved,
-                      enforce_expiry=False):
+                      enforce_expiry=False, allow_unbacked=False):
     """Tag each item with live stock figures (on-hand, reserved-elsewhere,
     available, incoming on-order). When ``respect``, set ``stock_cap`` = units
     still AVAILABLE (on-hand − reserved) for that ASIN so the packer plans no
@@ -1484,6 +1484,14 @@ def _apply_stock_caps(items, avail_total, avail_remaining, respect, detail, rese
     so without this an expiry-doomed line drains the ASIN's whole pool and a
     shippable fresh PO of the same ASIN reads "No free stock" — zero units ship
     although the stock was there.
+
+    ``allow_unbacked`` (manual planner only): a line with NOTHING available is left
+    uncapped and tagged ``stock_unbacked`` instead of being zeroed into not_loaded.
+    Somebody hand-picked that PO knowing the warehouse is empty and expecting the
+    stock to land before dispatch — the cap has nothing to protect, since a pool of
+    zero can't be double-committed. Lines that DO have stock are still capped to it
+    exactly as before: that cap is what stops the same physical units being planned
+    onto two trucks, and it stays on whichever way this flag is set.
     """
     today = timezone.localdate() if enforce_expiry else None
     for it in items:
@@ -1506,6 +1514,18 @@ def _apply_stock_caps(items, avail_total, avail_remaining, respect, detail, rese
         if not respect:
             continue
         if d is None:
+            if allow_unbacked:
+                # Hand-picked with no stock record at all. Left uncapped for the
+                # same reason as an empty pool below — there is nothing here to
+                # over-allocate — but flagged so the save-time re-check knows these
+                # units were never counted against live stock.
+                it['stock_unbacked'] = True
+                it['stock_note'] = (
+                    f'Not mapped to {_inventory_label(PLANNER_WAREHOUSE) or PLANNER_WAREHOUSE} '
+                    f'({PLANNER_WAREHOUSE}) stock — planned on the ordered quantity, '
+                    'availability could not be verified.'
+                )
+                continue
             # No stock record in the planner warehouse: availability can't be
             # verified, so don't ship it blind. Cap to 0 → the packer drops it into
             # not_loaded with this reason instead of shipping the ordered qty
@@ -1520,6 +1540,13 @@ def _apply_stock_caps(items, avail_total, avail_remaining, respect, detail, rese
             continue
         avail = avail_remaining.get(asin, 0.0)
         orderable = float(it.get('accepted_qty') or 0)
+        if allow_unbacked and avail <= 1e-6:
+            # Empty pool. No cap and no drain (there is nothing to drain), so the
+            # line plans at its ordered quantity instead of dropping to not_loaded.
+            it['stock_unbacked'] = True
+            _where = f'{_inventory_label(src_whs) or src_whs} ({src_whs})' if src_whs else 'the warehouse'
+            it['stock_note'] = f'No free stock in {_where} today — planned on the ordered quantity.'
+            continue
         it['stock_cap'] = avail
         # Reserve what this row could ship so later rows of the same ASIN see less.
         avail_remaining[asin] = max(0.0, avail - min(orderable, max(0.0, avail)))
@@ -3572,13 +3599,26 @@ class ShipmentListCreateView(_SafeAPIView):
                 _save_stock = _planner_stock_detail()
                 if _save_stock:
                     _reserved_other = _reserved_stock_by_asin()   # excludes this unsaved plan
+                    # Units the manual planner deliberately planned against an EMPTY
+                    # pool (stock_unbacked, see _apply_stock_caps) never counted on
+                    # live stock, so they are excluded from the comparison — this
+                    # guard is about stock that exists being promised twice, and
+                    # zero can't be promised twice. The stock-BACKED remainder of the
+                    # same ASIN is still checked in full, so a line that genuinely
+                    # relied on 100 units still fails if another plan took them.
                     _plan_by_asin = {}
+                    _unbacked_by_asin = {}
                     for it in loaded_items:
                         a = str(it.get('asin') or '').strip().upper()
-                        if a:
-                            _plan_by_asin[a] = _plan_by_asin.get(a, 0.0) + float(it.get('planned_qty') or 0)
+                        if not a:
+                            continue
+                        qty = float(it.get('planned_qty') or 0)
+                        _plan_by_asin[a] = _plan_by_asin.get(a, 0.0) + qty
+                        if it.get('stock_unbacked'):
+                            _unbacked_by_asin[a] = _unbacked_by_asin.get(a, 0.0) + qty
                     stock_conflicts = []
-                    for a, want in _plan_by_asin.items():
+                    for a, total in _plan_by_asin.items():
+                        want = total - _unbacked_by_asin.get(a, 0.0)
                         if want <= 1e-6:
                             continue
                         d = _save_stock.get(a)
@@ -5191,10 +5231,14 @@ class ManualPlanView(_SafeAPIView):
         # Appointment-driven manual: the appointment's Vendor Central commit is
         # enforced from the DB (not from client-sent caps) — see below.
         appointment_id = str(request.data.get('appointment_id') or '').strip()
-        # Respect live planner-warehouse stock by default — same constraint as the auto /
-        # appointment planner, so a manual plan can't ship more than is physically
-        # available. Toggleable via respect_stock (default on).
-        respect_stock = str(request.data.get('respect_stock', True)).lower() not in ('0', 'false', 'no', 'off')
+        # Manual planning follows live warehouse stock the same way auto does, with
+        # one deliberate difference: a line with NOTHING available is planned at its
+        # ordered quantity rather than zeroed (see allow_unbacked in
+        # _apply_stock_caps). Somebody picked that PO on purpose. Partial stock is
+        # still capped to what is free, which is what keeps the same units off two
+        # trucks. There is no request flag: the old respect_stock=0 escape hatch let
+        # a caller lift the cap off lines that DID have stock, which is not the same
+        # thing and is not wanted.
         # DOH filler (from the Plan Review "DOH filler" button) — top up leftover truck
         # capacity with same-FC PENDING in-stock POs NOT in this selection, ranked by
         # DOH urgency. Same engine as the auto planner. Off by default.
@@ -5289,16 +5333,17 @@ class ManualPlanView(_SafeAPIView):
             -(float(x.get('accepted_qty') or 0)),
         ))
 
-        # Live warehouse stock cap — identical to the appointment / auto planner.
-        # Tags each item with on-hand / reserved / available / incoming and, when
-        # respect_stock, caps the shippable qty to what's AVAILABLE (on-hand −
-        # reserved by other active shipments). Out-of-stock items drop to
-        # not_loaded; partials are short-supplied — exactly the same rules as auto.
+        # Live warehouse stock cap. Tags each item with on-hand / reserved /
+        # available / incoming and caps the shippable qty to what's AVAILABLE
+        # (on-hand − reserved by other active shipments), so partials are
+        # short-supplied exactly as in auto. Out-of-stock items do NOT drop to
+        # not_loaded here — allow_unbacked keeps them at the ordered quantity.
         stock_detail = _planner_stock_detail()
         reserved = _reserved_stock_by_asin()
         avail_total = {a: max(0.0, d['onhand'] - reserved.get(a, 0.0)) for a, d in stock_detail.items()}
         avail_remaining = dict(avail_total)
-        _apply_stock_caps(selected_items, avail_total, avail_remaining, respect_stock, stock_detail, reserved)
+        _apply_stock_caps(selected_items, avail_total, avail_remaining, True, stock_detail, reserved,
+                          allow_unbacked=True)
 
         # enforce_expiry=False: every row here was explicitly clicked by a planner,
         # who was warned at selection time that the PO cancels inside the cutoff.
@@ -5322,7 +5367,9 @@ class ManualPlanView(_SafeAPIView):
             })
             doh_by_asin, _ = _live_doh_by_asin()
             doh_pool = _fetch_doh_filler_pool(fc, selected_po_uppers, doh_by_asin)
-            _apply_stock_caps(doh_pool, avail_total, avail_remaining, respect_stock, stock_detail, reserved,
+            # No allow_unbacked here: nobody picked these. The filler exists to use
+            # up spare capacity with POs that CAN ship today, so a dry one stays out.
+            _apply_stock_caps(doh_pool, avail_total, avail_remaining, True, stock_detail, reserved,
                                   enforce_expiry=True)
             if doh_pool:
                 loaded, _doh_unfit = _filler_pass(
@@ -5367,7 +5414,7 @@ class ManualPlanView(_SafeAPIView):
             'priority_actual': priority_actual,
             'commit_caps': commit_caps,
             'appointment_commit': appt_cap,
-            'respect_stock': respect_stock,
+            'respect_stock': True,
             'stock_snapshot': _stock_meta_payload(stock_detail),
             # Stated, not inferred: Plan Review used to guess the truck's FC from
             # whichever one held the most lines, which changes as lines are added.
