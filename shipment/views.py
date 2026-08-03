@@ -255,28 +255,39 @@ PRODUCT_FAMILIES = [
 ]
 
 
-def _normalise_family(raw):
-    """The requested family, or None when it isn't one we can ship a truck of.
+def _normalise_families(raw):
+    """The requested families as a sorted list, dropping anything unshippable.
 
-    Unknown values return None rather than raising: an unrecognised family must
+    Accepts a comma-separated list so one truck can carry several products (a
+    ghee-and-mustard run, say) rather than being limited to one.
+
+    Unrecognised names are dropped rather than raising: an unknown family must
     leave the planner behaving exactly as it did before the parameter existed,
-    never silently plan against a predicate that matches nothing.
+    never silently plan against a predicate that matches nothing. An all-unknown
+    list therefore comes back empty, which reads as "no focus".
     """
-    name = str(raw or '').strip().upper()
-    return name if name in PRODUCT_FAMILIES else None
+    names = {
+        str(x).strip().upper()
+        for x in str(raw or '').split(',')
+        if str(x).strip()
+    }
+    return sorted(names & set(PRODUCT_FAMILIES))
 
 
-def _family_sql(family, alias='p'):
-    """(sql, params) matching one product family, or ('', []) for no family.
+def _family_sql(families, alias='p'):
+    """(sql, params) matching ANY of these product families, or ('', []) for none.
 
     Compute-on-read over columns that already exist — no new column, so no
-    migration (this repo applies those by hand).
+    migration (this repo applies those by hand). LIKE ANY covers the sub_category
+    half for every family in one pass, so adding a second family costs no extra
+    predicate.
     """
-    if not family:
+    fams = [f for f in (families or []) if f]
+    if not fams:
         return '', []
-    sql = (f"(UPPER(TRIM({alias}.category)) = %s "
-           f"OR UPPER(TRIM({alias}.sub_category)) LIKE %s)")
-    return sql, [family, f'%{family}%']
+    sql = (f"(UPPER(TRIM({alias}.category)) = ANY(%s::text[]) "
+           f"OR UPPER(TRIM({alias}.sub_category)) LIKE ANY(%s::text[]))")
+    return sql, [fams, [f'%{f}%' for f in fams]]
 
 
 # ── Near-expiry PO gate ──────────────────────────────────────────────────────
@@ -1516,7 +1527,7 @@ def _apply_stock_caps(items, avail_total, avail_remaining, respect, detail, rese
             )
 
 
-def _fetch_doh_filler_pool(fc, exclude_po_uppers, doh_by_asin, family=None, asins=None):
+def _fetch_doh_filler_pool(fc, exclude_po_uppers, doh_by_asin, families=None, asins=None):
     """
     Pull all PENDING in-stock POs at the given FC that ARE NOT already in the
     `exclude_po_uppers` set (typically the current appointment's own POs) and
@@ -1527,10 +1538,10 @@ def _fetch_doh_filler_pool(fc, exclude_po_uppers, doh_by_asin, family=None, asin
     leaves capacity on the truck — these are 'extra' POs at the same FC that
     can ride the same truck, ranked by DOH urgency.
 
-    `family` confines the filler to one product family. Without it, asking for a
-    truck of mustard returns mustard plus whatever DOH-urgent olive fits — the
-    opposite of the request. With it the truck may leave short, which is the
-    deliberate trade: family purity over a full truck.
+    `families` confines the filler to the chosen product families. Without it,
+    asking for a truck of mustard returns mustard plus whatever DOH-urgent olive
+    fits — the opposite of the request. With it the truck may leave short, which
+    is the deliberate trade: staying on-product over a full truck.
 
     `asins` narrows further to specific packs. It has to be applied here too: the
     filler is the one path that can put a line on the truck without going through
@@ -1540,7 +1551,7 @@ def _fetch_doh_filler_pool(fc, exclude_po_uppers, doh_by_asin, family=None, asin
     if not fc:
         return []
     exclude_list = [str(x).strip().upper() for x in (exclude_po_uppers or []) if x]
-    family_sql, family_params = _family_sql(family)
+    family_sql, family_params = _family_sql(families)
     asin_list = [str(a).strip().upper() for a in (asins or []) if str(a).strip()]
 
     with connection.cursor() as cur:
@@ -2319,14 +2330,14 @@ class AppointmentItemsView(_SafeAPIView):
         # is REPLACED — derived below from every open matching PO in the anchor
         # FC's switch group, not from the appointment's own PO list — and the
         # line-level filter keeps non-family lines off mixed POs.
-        product_family = _normalise_family(request.query_params.get('product_family'))
+        product_families = _normalise_families(request.query_params.get('product_family'))
         # Optional narrowing within the family: only these ASINs. Lets the planner
         # pick MUSTARD and then drop the pack sizes they don't want.
         family_asins = sorted({
             x.strip().upper()
             for x in (request.query_params.get('family_asins') or '').split(',')
             if x.strip()
-        }) if product_family else []
+        }) if product_families else []
 
         with connection.cursor() as cur:
             cur.execute("""
@@ -2415,9 +2426,9 @@ class AppointmentItemsView(_SafeAPIView):
         # Final candidate-PO list: an explicit product family REPLACES the pool
         # with every open PO of that family across the FC switch group; else the
         # caller's explicit selection; else the appointment's own POs.
-        family_sql, family_params = _family_sql(product_family)
+        family_sql, family_params = _family_sql(product_families)
         family_pos = []
-        if product_family:
+        if product_families:
             # Scoped to switch_group_up, so a cross-channel PO can never enter the
             # pool — the same gate the JOIN below applies, enforced early so the
             # candidate list itself is already legal.
@@ -2444,13 +2455,13 @@ class AppointmentItemsView(_SafeAPIView):
         # A family with no open POs anywhere in the group is a dead end — say so
         # rather than falling back to the appointment and quietly shipping the
         # wrong thing.
-        if product_family and not candidate_pos:
+        if product_families and not candidate_pos:
             return Response({
                 'appointment': appt,
                 'loaded_items': [],
                 'not_loaded_items': [],
                 'product_family': {
-                    'family': product_family,
+                    'families': product_families,
                     'asins': family_asins,
                     'po_count': 0,
                     'switch_group': switch_group_up,
@@ -2462,7 +2473,7 @@ class AppointmentItemsView(_SafeAPIView):
                     'load_percentage': 0,
                 },
                 'message': (
-                    f'No open {product_family} POs at '
+                    f'No open {" / ".join(product_families)} POs at '
                     f'{", ".join(switch_group_up) or primary_fc_value}. '
                     'Every matching PO is billed, cancelled, out of stock or already planned.'
                 ),
@@ -2470,7 +2481,7 @@ class AppointmentItemsView(_SafeAPIView):
 
         # Line-level family filter. A PO pulled in for its mustard may also carry
         # olive; without this the truck would ship that olive too.
-        line_family_sql, line_family_params = _family_sql(product_family)
+        line_family_sql, line_family_params = _family_sql(product_families)
         line_family_clause = f'AND {line_family_sql}' if line_family_sql else ''
         line_asin_clause = 'AND UPPER(TRIM(p.asin)) = ANY(%s::text[])' if family_asins else ''
         line_asin_params = [family_asins] if family_asins else []
@@ -2786,7 +2797,7 @@ class AppointmentItemsView(_SafeAPIView):
                 })
                 doh_pool = _fetch_doh_filler_pool(
                     primary_fc, appt_po_uppers, doh_by_asin,
-                    family=product_family, asins=family_asins,
+                    families=product_families, asins=family_asins,
                 )
                 # Cap fillers by the same live stock (shared remaining pool).
                 _apply_stock_caps(doh_pool, avail_total, avail_remaining, respect_stock, stock_detail, reserved,
@@ -2811,7 +2822,7 @@ class AppointmentItemsView(_SafeAPIView):
         # that maximize_fill pulled in respects the per-appointment cap too.
         if commit_caps:
             loaded, not_loaded = _enforce_commit_caps(
-                loaded, not_loaded, commit_caps, family=product_family,
+                loaded, not_loaded, commit_caps, family=(' / '.join(product_families) or None),
             )
             planned_liters = round(sum(float(it.get('planned_liters') or 0) for it in loaded), 4)
             load_pct = round((planned_liters / capacity * 100) if capacity > 0 else 0, 2)
@@ -2923,11 +2934,11 @@ class AppointmentItemsView(_SafeAPIView):
             # family, narrowed to which ASINs, and how many POs that reached
             # across the switch group.
             'product_family': ({
-                'family': product_family,
+                'families': product_families,
                 'asins': family_asins,
                 'po_count': len(candidate_pos),
                 'switch_group': switch_group_up,
-            } if product_family else None),
+            } if product_families else None),
             'load_summary': {
                 'truck_size': truck_size,
                 'capacity': capacity,
