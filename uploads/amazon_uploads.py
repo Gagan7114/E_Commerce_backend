@@ -3095,8 +3095,13 @@ def _paginated_select(
         results = _rows_to_dicts(cur)
         column_totals = None
         if total_columns:
+            # Sum the SAME expression the rows are built from. Summing the stored
+            # column instead would make a computed column's header total disagree
+            # with the rows under it.
             sum_sql = ", ".join(
-                f'COALESCE(SUM("{col}"::numeric), 0) AS "{col}"'
+                f'COALESCE(SUM(({column_exprs[col]})::numeric), 0) AS "{col}"'
+                if col in column_exprs
+                else f'COALESCE(SUM("{col}"::numeric), 0) AS "{col}"'
                 for col in total_columns
             )
             cur.execute(f"SELECT {sum_sql} FROM {table_sql}{where_sql}", params)
@@ -3554,6 +3559,37 @@ _SKU_PENDENCY_HAS_INVOICE = """EXISTS (
       AND sb.sap_item_code = UPPER(TRIM(reporting."Amazon PO".sap_sku_code))
 )"""
 
+# Does the master sheet state a litre value for this SKU, rather than leaving it
+# for us to infer from the pack text?
+#
+# At upload, per_liter falls back to parsing "500 MLS" -> 0.5 when
+# `Per UNIT Value` is blank. Every other litre figure in this system — the sales
+# dashboards, the penetration report, and the operators' own Google Sheet — uses
+# `Per UNIT Value` DIRECTLY, so a SKU with the column blank counts as zero
+# litres there and as a real number here. That single difference accounted for
+# the whole 854.01 L / 415.92 L gap between this page and the sheet.
+#
+# So this page now follows the same rule as everything around it: no stated
+# value, no litres. It is not the ideal answer — 81 beverage lines genuinely do
+# occupy volume — but a page that disagrees with every other report is worse
+# than one that is consistently conservative. The real fix is to fill
+# `Per UNIT Value` on those master-sheet rows, after which this predicate is
+# true for them and the litres come back everywhere at once.
+_SKU_PENDENCY_HAS_STATED_LITRE = """EXISTS (
+    SELECT 1 FROM public.master_sheet ms
+    WHERE UPPER(TRIM(ms.format)) = 'AMAZON'
+      AND UPPER(TRIM(ms.format_sku_code)) = UPPER(TRIM(reporting."Amazon PO".asin))
+      AND COALESCE(ms.per_unit_value, 0) <> 0
+)"""
+
+
+def _stated_litres(column: str) -> str:
+    """`column`, but only where the master sheet actually states a litre value."""
+    return (
+        f'CASE WHEN {_SKU_PENDENCY_HAS_STATED_LITRE}'
+        f' THEN reporting."Amazon PO"."{column}" ELSE 0 END'
+    )
+
 # "Nothing left to be pending about": every accepted unit of this (PO, item) is
 # already on a SAP invoice. That — not "has an invoice at all" — is what makes a
 # line stop being outstanding.
@@ -3720,6 +3756,13 @@ def amazon_po_sku_pendency(request):
             column_exprs={
                 "has_invoice": _SKU_PENDENCY_HAS_INVOICE,
                 "is_dispatched": _SKU_PENDENCY_IS_DISPATCHED,
+                # Litres only where the master sheet states a value — the rule the
+                # sales dashboards and the operators' sheet already follow. See
+                # _SKU_PENDENCY_HAS_STATED_LITRE.
+                "total_order_liters": _stated_litres("total_order_liters"),
+                "total_accepted_liters": _stated_litres("total_accepted_liters"),
+                "total_delivered_liters": _stated_litres("total_delivered_liters"),
+                "remaining_ltrs": _stated_litres("remaining_ltrs"),
             },
         )
     )
