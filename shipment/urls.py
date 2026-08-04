@@ -1,9 +1,7 @@
 from django.urls import path
 from . import views
-from .analytics import ShipmentAnalyticsView
 
 urlpatterns = [
-    path('analytics/', ShipmentAnalyticsView.as_view(), name='shipment-analytics'),
     path('appointments/dates/', views.AppointmentDatesView.as_view(), name='appointment-dates'),
     path('appointments/', views.AppointmentListView.as_view(), name='appointment-list'),
     path('appointments/<str:appointment_id>/items/', views.AppointmentItemsView.as_view(), name='appointment-items'),
