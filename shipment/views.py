@@ -3289,6 +3289,64 @@ class AppointmentExtraPosView(_SafeAPIView):
 # Shipment CRUD
 # ---------------------------------------------------------------------------
 
+# How recently a matching draft must have been created to count as the same
+# save. Long enough to cover a slow response, a reload and a re-click; short
+# enough that planning the same truck again tomorrow is a new truck.
+DUPLICATE_DRAFT_WINDOW_MINUTES = 30
+
+
+def _plan_line_signature(pairs):
+    """Canonical fingerprint of a set of loaded lines: sorted (PO, ASIN, qty).
+
+    Quantity is rounded to 4dp so a float that survived a JSON round-trip still
+    matches the value stored in the DB column (also 4dp).
+    """
+    return sorted(
+        (str(po or '').strip().upper(), str(asin or '').strip().upper(), round(float(qty or 0), 4))
+        for po, asin, qty in pairs
+    )
+
+
+def _find_duplicate_draft(user, loaded_items, destination_fc, appointment_id):
+    """A draft this user just created with exactly these loaded lines, or None.
+
+    Deliberately conservative — it must never return a shipment that is not the
+    same save being repeated:
+      * DRAFT only. Anything submitted, approved or dispatched is off limits.
+      * Same creator. One planner's save can never be handed to another.
+      * Same destination FC and appointment, so two trucks that happen to carry
+        identical lines to different places stay separate.
+      * EXACT line match, quantities included. One unit different is a different
+        truck and gets its own draft.
+      * Inside a short window, so re-planning the same load later is not
+        silently swallowed.
+    """
+    if not loaded_items:
+        return None
+    want = _plan_line_signature(
+        (it.get('po_number'), it.get('asin'), it.get('planned_qty')) for it in loaded_items
+    )
+    if not want:
+        return None
+    cutoff = timezone.now() - timedelta(minutes=DUPLICATE_DRAFT_WINDOW_MINUTES)
+    recent = (
+        Shipment.objects
+        .filter(status=Shipment.Status.DRAFT, created_by=user, created_at__gte=cutoff)
+        .order_by('-created_at')[:20]
+    )
+    for cand in recent:
+        if str(cand.destination_fc or '').strip().upper() != str(destination_fc or '').strip().upper():
+            continue
+        if str(cand.appointment_id or '').strip() != str(appointment_id or '').strip():
+            continue
+        got = _plan_line_signature(
+            cand.items.filter(not_loaded=False).values_list('po_number', 'asin', 'planned_qty')
+        )
+        if got == want:
+            return cand
+    return None
+
+
 class ShipmentListCreateView(_SafeAPIView):
     permission_classes = [IsAuthenticated]
 
@@ -3472,6 +3530,34 @@ class ShipmentListCreateView(_SafeAPIView):
         with transaction.atomic():
             with connection.cursor() as _lock_cur:
                 _lock_cur.execute('SELECT pg_advisory_xact_lock(%s)', [SHIPMENT_CLAIM_LOCK])
+
+            # Idempotent create: the same truck saved twice is ONE truck.
+            #
+            # The page guards this in memory, and now across a refresh, but that
+            # guard lives in a single tab. A second tab, cleared storage, a
+            # double-click, or a retry after a slow response all arrive here
+            # again with the same plan and used to produce a second draft. The
+            # over-commit check below only catches that when the plan claims a
+            # PO's FULL ordered quantity — a plan taking 400 of 1,000 units
+            # duplicates cleanly at 800 and nothing objects.
+            #
+            # FIRST inside the lock, deliberately: a genuine repeat would
+            # otherwise be measured against the units its own first draft
+            # already claimed and rejected as an over-commit, which is a
+            # confusing error for what is really just the same save arriving
+            # twice. The lock is transaction-scoped, so a concurrent double
+            # submit blocks here until the first commits and then sees it.
+            #
+            # Narrow on purpose — drafts only, same creator, same FC and
+            # appointment, exact line match, short window — so two genuinely
+            # separate trucks can never be merged into one.
+            _dup = _find_duplicate_draft(request.user, loaded_items, destination_fc, appointment_id)
+            if _dup is not None:
+                logger.info(
+                    'Duplicate draft suppressed: returning shipment %s to %s instead of creating a second',
+                    _dup.id, getattr(request.user, 'username', request.user),
+                )
+                return Response(ShipmentSerializer(_dup).data, status=200)
 
             # Lock re-check at draft time. Between the moment the plan was
             # generated and this Save call, another planner may have claimed some
