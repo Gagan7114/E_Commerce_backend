@@ -3526,6 +3526,13 @@ SKU_PENDENCY_COLUMNS = (
     # Derived, not stored — see _SKU_PENDENCY_HAS_INVOICE / _IS_DISPATCHED.
     "has_invoice",
     "is_dispatched",
+    # Invoiced detail — see the _PENDENCY_INVOICED_* expressions.
+    "invoiced_status",
+    "invoiced_qty",
+    "invoiced_ltrs",
+    "invoice_nos",
+    "invoice_count",
+    "invoice_detail",
 )
 
 # PENDING is the whole point of a "pendency" list (mirrors TRIM(PO Status)="Pending").
@@ -3623,6 +3630,83 @@ _SKU_PENDENCY_FULLY_INVOICED = """EXISTS (
 # Correlated straight against sap_billing with the shared expression, rather
 # than joining SAP_BILLING_SPLIT_SQL: that subquery re-derives every row of the
 # table (dispatch notes included) once per outer row, which cost ~2s here.
+# ── Invoiced detail columns ──────────────────────────────────────────────────
+#
+# sap_billing holds ONE row per (po, sap_item_code) with the NET billed qty and
+# an `invoices` JSONB array of {doc_num, doc_date, qty, amount, type, dispatched}.
+#
+# Two ASINs on one PO can map to the SAME sap_sku_code — 90 such pairs exist —
+# so the pair's billed qty must NOT be shown whole against each sibling row or
+# the column totals double-count. It is split greedily in ASIN order, capped by
+# each row's own accepted qty, which is the identical rule the shipment planner
+# applies (see the billing CTE in shipment/views.py). Same rule both sides means
+# this page and the planner can never disagree about how much is invoiced.
+_PENDENCY_BILLED_PAIR = """COALESCE((
+    SELECT sb.billed_qty FROM sap_billing sb
+    WHERE sb.po_number = UPPER(TRIM(reporting."Amazon PO".po_number))
+      AND sb.sap_item_code = UPPER(TRIM(reporting."Amazon PO".sap_sku_code))
+), 0)"""
+
+# What earlier sibling ASINs on the same (po, item) already consumed.
+_PENDENCY_BILLED_PRIOR = """COALESCE((
+    SELECT SUM(x.accepted_qty) FROM reporting."Amazon PO" x
+    WHERE UPPER(TRIM(x.po_number)) = UPPER(TRIM(reporting."Amazon PO".po_number))
+      AND UPPER(TRIM(x.sap_sku_code)) = UPPER(TRIM(reporting."Amazon PO".sap_sku_code))
+      AND COALESCE(x.accepted_qty, 0) > 0
+      AND x.asin < reporting."Amazon PO".asin
+), 0)"""
+
+# This row's own share of the pair's billed quantity.
+_PENDENCY_INVOICED_QTY = (
+    f'LEAST(COALESCE(reporting."Amazon PO".accepted_qty, 0), '
+    f'GREATEST({_PENDENCY_BILLED_PAIR} - {_PENDENCY_BILLED_PRIOR}, 0))'
+)
+
+# Invoiced when the share covers the whole accepted quantity, short-invoiced
+# when it covers only part. Blank when nothing is billed against this row —
+# including the 11 lines whose sales were fully cancelled by returns, where the
+# net is zero and calling them "invoiced" would be wrong.
+_PENDENCY_INVOICED_STATUS = f"""CASE
+    WHEN {_PENDENCY_INVOICED_QTY} <= 0 THEN ''
+    WHEN {_PENDENCY_INVOICED_QTY} >= COALESCE(reporting."Amazon PO".accepted_qty, 0)
+        THEN 'Invoiced'
+    ELSE 'Short invoiced'
+END"""
+
+# Litres follow the same stated-value rule as every other litre on this page:
+# no per_unit_value in the master sheet, no litres. See _SKU_PENDENCY_HAS_STATED_LITRE.
+_PENDENCY_INVOICED_LTRS = (
+    f'CASE WHEN {_SKU_PENDENCY_HAS_STATED_LITRE} '
+    f'THEN {_PENDENCY_INVOICED_QTY} * COALESCE(reporting."Amazon PO".per_liter, 0) '
+    f'ELSE 0 END'
+)
+
+# The invoice documents themselves are per (po, item) and are NOT split — an
+# invoice covering two sibling ASINs genuinely appears against both.
+_PENDENCY_INVOICE_NOS = """COALESCE((
+    SELECT string_agg(DISTINCT e->>'doc_num', ', ' ORDER BY e->>'doc_num')
+    FROM sap_billing sb, jsonb_array_elements(sb.invoices) e
+    WHERE sb.po_number = UPPER(TRIM(reporting."Amazon PO".po_number))
+      AND sb.sap_item_code = UPPER(TRIM(reporting."Amazon PO".sap_sku_code))
+), '')"""
+
+_PENDENCY_INVOICE_COUNT = """COALESCE((
+    SELECT COUNT(DISTINCT e->>'doc_num')
+    FROM sap_billing sb, jsonb_array_elements(sb.invoices) e
+    WHERE sb.po_number = UPPER(TRIM(reporting."Amazon PO".po_number))
+      AND sb.sap_item_code = UPPER(TRIM(reporting."Amazon PO".sap_sku_code))
+), 0)"""
+
+# Per-invoice breakdown for the click-through panel. Returned whole so the UI
+# never has to make a second call to expand a row.
+_PENDENCY_INVOICE_DETAIL = """COALESCE((
+    SELECT jsonb_agg(e ORDER BY e->>'doc_date', e->>'doc_num')
+    FROM sap_billing sb, jsonb_array_elements(sb.invoices) e
+    WHERE sb.po_number = UPPER(TRIM(reporting."Amazon PO".po_number))
+      AND sb.sap_item_code = UPPER(TRIM(reporting."Amazon PO".sap_sku_code))
+), '[]'::jsonb)"""
+
+
 _SKU_PENDENCY_IS_DISPATCHED = f"""EXISTS (
     SELECT 1 FROM sap_billing sb
     WHERE sb.po_number = UPPER(TRIM(reporting."Amazon PO".po_number))
@@ -3752,10 +3836,18 @@ def amazon_po_sku_pendency(request):
                 "total_accepted_liters",
                 "total_delivered_liters",
                 "remaining_ltrs",
+                "invoiced_qty",
+                "invoiced_ltrs",
             ),
             column_exprs={
                 "has_invoice": _SKU_PENDENCY_HAS_INVOICE,
                 "is_dispatched": _SKU_PENDENCY_IS_DISPATCHED,
+                "invoiced_status": _PENDENCY_INVOICED_STATUS,
+                "invoiced_qty": _PENDENCY_INVOICED_QTY,
+                "invoiced_ltrs": _PENDENCY_INVOICED_LTRS,
+                "invoice_nos": _PENDENCY_INVOICE_NOS,
+                "invoice_count": _PENDENCY_INVOICE_COUNT,
+                "invoice_detail": _PENDENCY_INVOICE_DETAIL,
                 # Litres only where the master sheet states a value — the rule the
                 # sales dashboards and the operators' sheet already follow. See
                 # _SKU_PENDENCY_HAS_STATED_LITRE.
