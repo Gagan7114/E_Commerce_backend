@@ -3529,6 +3529,7 @@ SKU_PENDENCY_COLUMNS = (
     # Invoiced detail — see the _PENDENCY_INVOICED_* expressions.
     "invoiced_status",
     "invoiced_qty",
+    "invoiced_short_qty",
     "invoiced_ltrs",
     "invoice_nos",
     "invoice_count",
@@ -3671,6 +3672,17 @@ _PENDENCY_INVOICED_STATUS = f"""CASE
     WHEN {_PENDENCY_INVOICED_QTY} >= COALESCE(reporting."Amazon PO".accepted_qty, 0)
         THEN 'Invoiced'
     ELSE 'Short invoiced'
+END"""
+
+# How much of the accepted quantity is still NOT invoiced — but only on lines
+# that are part-invoiced. A line with no invoice at all is not "short"; it simply
+# has not been billed yet, and reporting its whole accepted quantity here would
+# swamp the column and its total with rows that have nothing to do with short
+# invoicing.
+_PENDENCY_SHORT_QTY = f"""CASE
+    WHEN {_PENDENCY_INVOICED_QTY} <= 0 THEN 0
+    ELSE GREATEST(COALESCE(reporting."Amazon PO".accepted_qty, 0)
+                  - {_PENDENCY_INVOICED_QTY}, 0)
 END"""
 
 # Litres follow the same stated-value rule as every other litre on this page:
@@ -3837,6 +3849,7 @@ def amazon_po_sku_pendency(request):
                 "total_delivered_liters",
                 "remaining_ltrs",
                 "invoiced_qty",
+                "invoiced_short_qty",
                 "invoiced_ltrs",
             ),
             column_exprs={
@@ -3844,6 +3857,7 @@ def amazon_po_sku_pendency(request):
                 "is_dispatched": _SKU_PENDENCY_IS_DISPATCHED,
                 "invoiced_status": _PENDENCY_INVOICED_STATUS,
                 "invoiced_qty": _PENDENCY_INVOICED_QTY,
+                "invoiced_short_qty": _PENDENCY_SHORT_QTY,
                 "invoiced_ltrs": _PENDENCY_INVOICED_LTRS,
                 "invoice_nos": _PENDENCY_INVOICE_NOS,
                 "invoice_count": _PENDENCY_INVOICE_COUNT,
