@@ -3789,7 +3789,18 @@ def amazon_po_sku_pendency(request):
     show_invoiced = str(q.get("have_invoice") or "").strip().lower() in _truthy
     show_dispatched = str(q.get("dispatched") or "").strip().lower() in _truthy
     only_invoiced = str(q.get("only_invoiced") or "").strip().lower() in _truthy
-    if only_invoiced:
+    only_short = str(q.get("only_short") or "").strip().lower() in _truthy
+    if only_short:
+        # "Only short invoiced": lines that HAVE been billed but not for every
+        # accepted unit. Expressed as shortfall > 0, which already carries both
+        # halves of that test — see _PENDENCY_SHORT_QTY, which is zero on a line
+        # with no invoice at all, so the unbilled majority cannot leak in.
+        #
+        # First in the chain and mutually exclusive with "Invoiced Only": these
+        # are opposite questions (what is part-done vs what is finished), and
+        # letting both apply at once would always return nothing.
+        where.append(f"{_PENDENCY_SHORT_QTY} > 0")
+    elif only_invoiced:
         # "Only invoiced + dispatched": JUST the lines whose every accepted unit
         # is already on a SAP invoice (dispatched is a subset of these), with all
         # outstanding lines hidden — the exact inverse of the default view. Takes
