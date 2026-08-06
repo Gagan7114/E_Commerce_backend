@@ -1433,6 +1433,166 @@ def _reserved_stock_by_asin():
     return reserved
 
 
+def _committed_stock_by_asin(exclude_shipment_id=None):
+    """ASIN (upper) → units held by shipments that have PASSED the stock gate.
+
+    Drafts are excluded deliberately. A draft holds nothing until the stock it
+    plans actually exists: it has not cleared the gate, so it has no claim, and
+    a speculative draft must not block a real plan from seeing the inventory.
+
+    The consequence is accepted and by design: two drafts for the same ASIN can
+    both read "ready" off one delivery. The gate is evaluated live at submit, so
+    whichever is submitted first takes the units and the other flips straight
+    back to waiting — the over-commit surfaces there rather than being prevented
+    up front.
+
+    Dispatched/delivered are excluded for the same reason _reserved_stock_by_asin
+    excludes them: those units have physically left and are already reflected in
+    the SAP on-hand figure, so counting them would subtract them twice.
+    """
+    held = {}
+    sql = """
+        SELECT UPPER(TRIM(si.asin)) AS asin, SUM(COALESCE(si.planned_qty, 0)) AS qty
+        FROM sp_items si
+        JOIN sp_shipments s ON s.id = si.shipment_id
+        WHERE si.not_loaded = FALSE
+          AND si.asin IS NOT NULL
+          AND s.status IN ('pending_approval', 'approved')
+    """
+    params = []
+    if exclude_shipment_id is not None:
+        sql += " AND s.id <> %s"
+        params.append(exclude_shipment_id)
+    sql += " GROUP BY UPPER(TRIM(si.asin))"
+    with connection.cursor() as cur:
+        cur.execute(sql, params)
+        for asin, qty in cur.fetchall():
+            held[asin] = float(qty or 0)
+    return held
+
+
+def _stock_gate_bulk(shipments):
+    """{shipment_id: gate} for many shipments, in a fixed number of queries.
+
+    The per-shipment helper is fine for one row but would run a query each on a
+    list; this pulls the stock picture once and does the arithmetic in Python.
+    """
+    shipments = list(shipments)
+    if not shipments:
+        return {}
+    detail = _planner_stock_detail()
+    if not detail:
+        return {sh.id: {'ready': True, 'short_units': 0, 'short_lines': 0, 'detail': []}
+                for sh in shipments}
+
+    # One pass for everything already committed, then each shipment's own share
+    # is subtracted back out rather than re-querying per row.
+    held_all = _committed_stock_by_asin()
+    own = {}
+    ids = [sh.id for sh in shipments]
+    with connection.cursor() as cur:
+        cur.execute(
+            """
+            SELECT si.shipment_id, UPPER(TRIM(si.asin)), SUM(COALESCE(si.planned_qty, 0))
+              FROM sp_items si
+              JOIN sp_shipments s ON s.id = si.shipment_id
+             WHERE si.not_loaded = FALSE AND si.asin IS NOT NULL
+               AND si.shipment_id = ANY(%s)
+             GROUP BY 1, 2
+            """,
+            [ids],
+        )
+        for sid, asin, qty in cur.fetchall():
+            own.setdefault(sid, {})[asin] = float(qty or 0)
+
+    counted = {'pending_approval', 'approved'}
+    out = {}
+    for sh in shipments:
+        want = own.get(sh.id, {})
+        mine_counted = sh.status in counted
+        short = []
+        for asin, need in sorted(want.items()):
+            if need <= 1e-6:
+                continue
+            onhand = float((detail.get(asin) or {}).get('onhand') or 0)
+            committed = float(held_all.get(asin, 0.0))
+            if mine_counted:
+                committed -= need          # do not hold stock against yourself
+            free = max(0.0, onhand - max(0.0, committed))
+            if need > free + 1e-6:
+                short.append({
+                    'asin': asin,
+                    'planned': round(need, 2),
+                    'on_hand': round(onhand, 2),
+                    'committed_elsewhere': round(max(0.0, committed), 2),
+                    'available': round(free, 2),
+                    'short': round(need - free, 2),
+                })
+        out[sh.id] = {
+            'ready': not short,
+            'short_units': round(sum(r['short'] for r in short), 2),
+            'short_lines': len(short),
+            'detail': short,
+        }
+    return out
+
+
+def _shipment_stock_shortfall(shipment):
+    """Per-ASIN shortfall between what this shipment plans and what is free NOW.
+
+    Computed on every read rather than stored. Stock is a fact about the world
+    that changes without anyone touching the shipment — a saved "waiting for
+    stock" flag would need a nightly job to clear it and would be wrong in
+    between. Derived, it is correct the instant the inventory table updates,
+    which is what makes a draft become submittable by itself overnight.
+
+    Returns [] when there is nothing short, so truthiness reads as "blocked".
+    """
+    items = [i for i in shipment.items.all() if not i.not_loaded]
+    want = {}
+    for it in items:
+        asin = str(it.asin or '').strip().upper()
+        if asin:
+            want[asin] = want.get(asin, 0.0) + float(it.planned_qty or 0)
+    want = {a: q for a, q in want.items() if q > 1e-6}
+    if not want:
+        return []
+
+    detail = _planner_stock_detail()
+    if not detail:
+        # Stock is entirely unverifiable (SAP down and no snapshot). Same policy
+        # as the save-time re-check: an outage must not block every shipment.
+        return []
+
+    held = _committed_stock_by_asin(exclude_shipment_id=shipment.id)
+    short = []
+    for asin, need in sorted(want.items()):
+        onhand = float((detail.get(asin) or {}).get('onhand') or 0)
+        committed = float(held.get(asin, 0.0))
+        free = max(0.0, onhand - committed)
+        if need > free + 1e-6:
+            short.append({
+                'asin': asin,
+                'planned': round(need, 2),
+                'on_hand': round(onhand, 2),
+                'committed_elsewhere': round(committed, 2),
+                'available': round(free, 2),
+                'short': round(need - free, 2),
+            })
+    return short
+
+
+def _stock_gate(shipment):
+    """{'ready': bool, 'short_units': float, 'short_lines': int, 'detail': [...]}"""
+    short = _shipment_stock_shortfall(shipment)
+    return {
+        'ready': not short,
+        'short_units': round(sum(r['short'] for r in short), 2),
+        'short_lines': len(short),
+        'detail': short,
+    }
+
+
 def _reserved_detail_by_asin():
     """ASIN (upper) → [{shipment_id, status, qty, destination_fc, appointment_id}]:
     the per-shipment breakdown BEHIND ``planned_reserved`` (same active-shipment
@@ -2334,6 +2494,18 @@ class AppointmentItemsView(_SafeAPIView):
         fill_param = str(request.query_params.get('maximize_fill') or '1').lower()
         maximize_fill = fill_param in ('1', 'true', 'yes', 'on')
 
+        # Plan without stock (default OFF). A line with NOTHING available is
+        # planned at its ordered quantity instead of being capped to zero and
+        # dropped — the same allow_unbacked rule the manual planner uses. NOT
+        # respect_stock=0: that also lifts the cap off lines that DO have stock,
+        # which is a different thing and lets the same physical units be planned
+        # onto two trucks. Partial stock still caps to what is free.
+        #
+        # The draft it produces cannot be submitted until the stock actually
+        # arrives — see _shipment_stock_shortfall and the submit gate.
+        unbacked_param = str(request.query_params.get('allow_unbacked') or '0').lower()
+        allow_unbacked = unbacked_param in ('1', 'true', 'yes', 'on')
+
         # DOH filler (stage 2 of maximize-fill): top up leftover capacity with
         # same-FC PENDING POs that are NOT on this appointment, ranked by DOH
         # urgency. Default ON, which is what it has always done — this only
@@ -2810,7 +2982,7 @@ class AppointmentItemsView(_SafeAPIView):
         reserved = _reserved_stock_by_asin()
         avail_total = {a: max(0.0, d['onhand'] - reserved.get(a, 0.0)) for a, d in stock_detail.items()}
         avail_remaining = dict(avail_total)
-        _apply_stock_caps(items, avail_total, avail_remaining, respect_stock, stock_detail, reserved,
+        _apply_stock_caps(items, avail_total, avail_remaining, respect_stock, stock_detail, reserved, allow_unbacked=allow_unbacked,
                           enforce_expiry=True)
 
         # Appointment POs come FIRST and in full: pack the appointment's own POs
@@ -2856,6 +3028,8 @@ class AppointmentItemsView(_SafeAPIView):
                     families=product_families, asins=family_asins,
                 )
                 # Cap fillers by the same live stock (shared remaining pool).
+                # No allow_unbacked here: nobody picked these, and a filler
+                # exists to use spare capacity with POs that can ship today.
                 _apply_stock_caps(doh_pool, avail_total, avail_remaining, respect_stock, stock_detail, reserved,
                                   enforce_expiry=True)
                 if doh_pool:
@@ -2982,6 +3156,7 @@ class AppointmentItemsView(_SafeAPIView):
             'filler_count': filler_count,
             'doh_filler_count': doh_filler_count,
             'doh_fill': doh_fill,
+            'allow_unbacked': allow_unbacked,
             'commit_caps': commit_caps,
             'loaded_items': loaded,
             'not_loaded_items': not_loaded,
@@ -3392,7 +3567,14 @@ class ShipmentListCreateView(_SafeAPIView):
             qs = qs.exclude(switch_state='')
         elif switch_filter:
             qs = qs.filter(switch_state=switch_filter)
-        serializer = ShipmentListSerializer(qs, many=True)
+        # The stock gate is computed here, once for the whole page, and handed
+        # to the serializer. It is what lets a draft become submittable on its
+        # own: the list already polls, so a delivery overnight flips the badge
+        # with nobody touching the shipment.
+        rows = list(qs)
+        serializer = ShipmentListSerializer(
+            rows, many=True, context={'stock_gates': _stock_gate_bulk(rows)},
+        )
         return Response(serializer.data)
 
     def post(self, request):
@@ -4185,6 +4367,29 @@ class ShipmentSubmitView(_SafeAPIView):
                 status=409,
             )
 
+        # Stock gate. A draft may be PLANNED against stock that has not arrived —
+        # that is the point of the planner's without-stock mode — but it may not
+        # go up for approval until the units actually exist. Evaluated live, so a
+        # delivery overnight clears it with nobody doing anything.
+        #
+        # Hard block, no override: "only submitted once stock is verified" is a
+        # guarantee, not a convention.
+        gate = _stock_gate(shipment)
+        if not gate['ready']:
+            return Response(
+                {
+                    'error': 'Stock not available yet',
+                    'stock_gate': gate,
+                    'detail': (
+                        f"{gate['short_lines']} item(s) are short by "
+                        f"{int(round(gate['short_units']))} units against live warehouse "
+                        'stock. This draft can wait — it becomes submittable on its own '
+                        'once the stock arrives.'
+                    ),
+                },
+                status=409,
+            )
+
         conflicts = _check_qty_conflicts(shipment)
         if conflicts:
             return Response({'error': 'Quantity conflicts detected', 'conflicts': conflicts}, status=409)
@@ -4193,7 +4398,7 @@ class ShipmentSubmitView(_SafeAPIView):
         # Record when it was put up for approval. auto_now fields are only written
         # when named in update_fields, so include updated_at explicitly.
         shipment.save(update_fields=['status', 'updated_at'])
-        return Response(ShipmentListSerializer(shipment).data)
+        return Response(ShipmentListSerializer(shipment, context={'stock_gates': _stock_gate_bulk([shipment])}).data)
 
 
 class ShipmentSwitchEmailView(_SafeAPIView):
@@ -4434,7 +4639,7 @@ class ShipmentSwitchVerifyView(_SafeAPIView):
                 'switch_state', 'switch_verify_note', 'switch_verified_by',
                 'switch_verified_at', 'updated_at',
             ])
-            return Response(ShipmentListSerializer(shipment).data)
+            return Response(ShipmentListSerializer(shipment, context={'stock_gates': _stock_gate_bulk([shipment])}).data)
 
         # verify: freeze the evidence alongside the human decision. The manager
         # may verify even when the auto-check still fails (their call — e.g.
@@ -4450,7 +4655,7 @@ class ShipmentSwitchVerifyView(_SafeAPIView):
             'switch_state', 'switch_verify_snapshot', 'switch_verify_note',
             'switch_verified_by', 'switch_verified_at', 'updated_at',
         ])
-        return Response(ShipmentListSerializer(shipment).data)
+        return Response(ShipmentListSerializer(shipment, context={'stock_gates': _stock_gate_bulk([shipment])}).data)
 
 
 class ShipmentApproveView(_SafeAPIView):
@@ -4458,12 +4663,30 @@ class ShipmentApproveView(_SafeAPIView):
 
     def post(self, request, pk):
         try:
-            shipment = Shipment.objects.get(pk=pk)
+            shipment = Shipment.objects.prefetch_related('items').get(pk=pk)
         except Shipment.DoesNotExist:
             return Response({'error': 'Not found'}, status=404)
 
         if shipment.status != Shipment.Status.PENDING_APPROVAL:
             return Response({'error': 'Shipment is not pending approval'}, status=400)
+
+        # Re-checked here as well as at submit: time passes between the two, and
+        # another shipment can take the stock in between. Cheap, and it is the
+        # last gate before the units are committed for real.
+        gate = _stock_gate(shipment)
+        if not gate['ready']:
+            return Response(
+                {
+                    'error': 'Stock not available yet',
+                    'stock_gate': gate,
+                    'detail': (
+                        f"{gate['short_lines']} item(s) are short by "
+                        f"{int(round(gate['short_units']))} units against live warehouse "
+                        'stock, so this cannot be approved yet.'
+                    ),
+                },
+                status=409,
+            )
 
         conflicts = _check_qty_conflicts(shipment)
         if conflicts:
@@ -4472,7 +4695,7 @@ class ShipmentApproveView(_SafeAPIView):
         shipment.status = Shipment.Status.APPROVED
         shipment.approved_by = request.user
         shipment.save(update_fields=['status', 'approved_by'])
-        return Response(ShipmentListSerializer(shipment).data)
+        return Response(ShipmentListSerializer(shipment, context={'stock_gates': _stock_gate_bulk([shipment])}).data)
 
 
 class ShipmentRejectView(_SafeAPIView):
@@ -4491,7 +4714,7 @@ class ShipmentRejectView(_SafeAPIView):
         shipment.status = Shipment.Status.REJECTED
         shipment.rejection_reason = reason
         shipment.save(update_fields=['status', 'rejection_reason'])
-        return Response(ShipmentListSerializer(shipment).data)
+        return Response(ShipmentListSerializer(shipment, context={'stock_gates': _stock_gate_bulk([shipment])}).data)
 
 
 class ShipmentDispatchView(_SafeAPIView):
@@ -4508,7 +4731,7 @@ class ShipmentDispatchView(_SafeAPIView):
 
         shipment.status = Shipment.Status.DISPATCHED
         shipment.save(update_fields=['status'])
-        return Response(ShipmentListSerializer(shipment).data)
+        return Response(ShipmentListSerializer(shipment, context={'stock_gates': _stock_gate_bulk([shipment])}).data)
 
 
 def _check_qty_conflicts(shipment):

@@ -48,12 +48,21 @@ class ShipmentSerializer(serializers.ModelSerializer):
     audit_logs = ShipmentAuditLogSerializer(many=True, read_only=True)
     created_by_email = serializers.SerializerMethodField()
     approved_by_email = serializers.SerializerMethodField()
+    # Live stock gate. Computed by the view and passed in through context —
+    # never derived here, or a list would run one query per row.
+    stock_gate = serializers.SerializerMethodField()
     is_stale_draft = serializers.SerializerMethodField()
     channel = serializers.SerializerMethodField()
 
     class Meta:
         model = Shipment
         fields = '__all__'
+
+    def get_stock_gate(self, obj):
+        gates = self.context.get('stock_gates')
+        # Absent context means the caller did not ask for it; say nothing
+        # rather than guessing a value the UI would act on.
+        return gates.get(obj.id) if gates else None
 
     def get_created_by_email(self, obj):
         return obj.created_by.email if obj.created_by else None
@@ -127,6 +136,9 @@ class ShipmentListSerializer(serializers.ModelSerializer):
     channel = serializers.SerializerMethodField()
     summary = serializers.SerializerMethodField()
     approved_by_email = serializers.SerializerMethodField()
+    # Live stock gate, computed by the view and handed in through context —
+    # never derived here, or a list would run one query per row.
+    stock_gate = serializers.SerializerMethodField()
 
     class Meta:
         model = Shipment
@@ -137,12 +149,18 @@ class ShipmentListSerializer(serializers.ModelSerializer):
             'created_by_email', 'item_count', 'created_at', 'updated_at',
             'vehicle_type', 'vehicle_number', 'driver_name', 'driver_phone',
             'dispatch_date_planned', 'notes', 'is_stale_draft', 'summary',
-            'approved_by_email',
+            'approved_by_email', 'stock_gate',
             # FC switching: state drives the tag + Verify button in the
             # Switching section; details feed its from→to table.
             'switch_state', 'switch_details', 'switch_email_to',
             'switch_email_sent_at', 'switch_verified_at',
         ]
+
+    def get_stock_gate(self, obj):
+        gates = self.context.get('stock_gates')
+        # No context means the caller did not ask for it; return nothing
+        # rather than a value the UI would act on.
+        return gates.get(obj.id) if gates else None
 
     def get_created_by_email(self, obj):
         return obj.created_by.email if obj.created_by else None
