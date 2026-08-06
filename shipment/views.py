@@ -2334,6 +2334,16 @@ class AppointmentItemsView(_SafeAPIView):
         fill_param = str(request.query_params.get('maximize_fill') or '1').lower()
         maximize_fill = fill_param in ('1', 'true', 'yes', 'on')
 
+        # DOH filler (stage 2 of maximize-fill): top up leftover capacity with
+        # same-FC PENDING POs that are NOT on this appointment, ranked by DOH
+        # urgency. Default ON, which is what it has always done — this only
+        # makes it switchable. Independent of maximize_fill: stage 1, which
+        # tops up from the appointment's OWN leftover lines, stays on either
+        # way. Turning this off means the truck carries only what the
+        # appointment asked for.
+        doh_param = str(request.query_params.get('doh_fill') or '1').lower()
+        doh_fill = doh_param in ('1', 'true', 'yes', 'on')
+
         # Respect live planner-warehouse stock (default ON): cap planned qty by
         # what's physically available. Off = plan against PO qty only.
         stock_param = str(request.query_params.get('respect_stock') or '1').lower()
@@ -2835,7 +2845,7 @@ class AppointmentItemsView(_SafeAPIView):
 
             # Stage 2 — DOH-driven fillers (non-appointment PENDING POs at same FC)
             cur_planned = sum(float(it.get('planned_liters') or 0) for it in loaded)
-            if cur_planned < float(capacity) and primary_fc:
+            if doh_fill and cur_planned < float(capacity) and primary_fc:
                 appt_po_uppers = sorted({
                     str(it.get('po_number') or '').strip().upper()
                     for it in items
@@ -2971,6 +2981,7 @@ class AppointmentItemsView(_SafeAPIView):
             'maximize_fill': maximize_fill,
             'filler_count': filler_count,
             'doh_filler_count': doh_filler_count,
+            'doh_fill': doh_fill,
             'commit_caps': commit_caps,
             'loaded_items': loaded,
             'not_loaded_items': not_loaded,
