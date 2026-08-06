@@ -23,7 +23,7 @@ from rest_framework.views import APIView
 from rest_framework.parsers import MultiPartParser, FormParser
 
 from accounts.permissions import has_permission_code
-from sap.billing import SAP_BILLING_SPLIT_SQL
+from sap.billing import SAP_BILLING_SPLIT_SQL, SAP_ITEM_ALIASES
 from .models import Shipment, ShipmentAuditLog, ShipmentItem, ShipmentDeletionLog
 from .serializers import (
     ShipmentAuditLogSerializer,
@@ -1758,7 +1758,6 @@ def _attach_invoice_detail(items):
         # the bottle shape as its own SKU, so an invoice raised against
         # FG0000384 (mustard 1L round bottle) belongs to the line the PO sheet
         # calls FG0000030. See SAP_ITEM_ALIASES for the verified pairs.
-        from uploads.amazon_uploads import SAP_ITEM_ALIASES
         canonical = sorted({c for c in code_of.values() if c})
         variants = [a for a, b in SAP_ITEM_ALIASES.items() if b in set(canonical)]
         wanted = sorted(set(canonical) | set(variants))
@@ -1773,27 +1772,46 @@ def _attach_invoice_detail(items):
                 # Fold onto the canonical code, ADDING rather than replacing: a PO
                 # can carry both bottles, and they are one product to Amazon.
                 key = (po, SAP_ITEM_ALIASES.get(code, code))
-                prev_qty, prev_inv = billing.get(key, (0.0, []))
+                prev_qty, prev_disp, prev_inv = billing.get(key, (0.0, 0.0, []))
                 docs = inv or []
                 if isinstance(docs, str):
                     try:
                         docs = json.loads(docs)
                     except (TypeError, ValueError):
                         docs = []
-                billing[key] = (prev_qty + float(qty or 0), list(prev_inv) + list(docs))
+                docs = [e for e in docs if isinstance(e, dict)]
+                # Units on an invoice that has physically left. The planner gates
+                # on this (SAP_BILLING_SPLIT_SQL), so the tag has to know it too —
+                # otherwise it labels a departed load "invoiced, still in the
+                # warehouse" while the panel underneath shows its bilty.
+                disp = sum(
+                    float(e.get('qty') or 0) for e in docs if e.get('dispatched') is True
+                )
+                billing[key] = (
+                    prev_qty + float(qty or 0),
+                    prev_disp + disp,
+                    list(prev_inv) + docs,
+                )
 
     # Greedy split: earlier ASINs on the same (po, item) consume the billed
-    # total first, so sibling lines never each claim the whole figure.
-    share_of, consumed = {}, {}
+    # total first, so sibling lines never each claim the whole figure. Dispatched
+    # units are split by the same rule and order, so the two figures stay
+    # consistent with each other line by line.
+    share_of, disp_of, consumed, disp_used = {}, {}, {}, {}
     for (po, asin) in sorted(code_of):
         code = code_of[(po, asin)]
         if not code or (po, code) not in billing:
             continue
-        billed, _ = billing[(po, code)]
+        billed, dispatched, _ = billing[(po, code)]
+        cap = accepted_of.get((po, asin), 0.0)
         used = consumed.get((po, code), 0.0)
-        share = max(0.0, min(accepted_of.get((po, asin), 0.0), billed - used))
+        share = max(0.0, min(cap, billed - used))
         consumed[(po, code)] = used + share
         share_of[(po, asin)] = share
+        d_used = disp_used.get((po, code), 0.0)
+        d_share = max(0.0, min(cap, dispatched - d_used))
+        disp_used[(po, code)] = d_used + d_share
+        disp_of[(po, asin)] = d_share
 
     for it in rows:
         po = str(it['po_number']).strip().upper()
@@ -1803,16 +1821,13 @@ def _attach_invoice_detail(items):
             it['invoiced_status'] = ''
             continue
         code = code_of.get((po, asin))
-        _billed, inv = billing.get((po, code), (0.0, []))
-        if isinstance(inv, str):
-            try:
-                inv = json.loads(inv)
-            except (TypeError, ValueError):
-                inv = []
+        _billed, _dispatched, inv = billing.get((po, code), (0.0, 0.0, []))
         docs = [e for e in (inv or []) if isinstance(e, dict)]
         accepted = accepted_of.get((po, asin), 0.0)
+        dispatched = disp_of.get((po, asin), 0.0)
 
         it['invoiced_qty'] = round(share, 2)
+        it['dispatched_qty'] = round(dispatched, 2)
         it['invoice_detail'] = docs
         it['invoice_count'] = len({str(e.get('doc_num')) for e in docs if e.get('doc_num')})
         it['invoice_nos'] = ', '.join(sorted({str(e.get('doc_num')) for e in docs if e.get('doc_num')}))

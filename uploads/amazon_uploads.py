@@ -34,7 +34,12 @@ from rest_framework.response import Response
 
 from accounts.permissions import can_access_platform, has_permission_code, require
 from config.perf_cache import cached_get
-from sap.billing import dispatched_qty_sql, ensure_billing_fresh
+from sap.billing import (
+    SAP_ITEM_ALIASES,
+    dispatched_qty_sql,
+    ensure_billing_fresh,
+    sap_item_code_sql,
+)
 
 try:
     from openpyxl import load_workbook
@@ -3631,46 +3636,12 @@ _SKU_PENDENCY_FULLY_INVOICED = """(
     ), 0) > 0
 )"""
 
-# "Dispatched": at least one of this line's invoices carries an OINV dispatch
-# stamp (bilty / vehicle / dispatch date — see sap.billing.DISPATCH_FIELDS), so
-# the load has physically left. A strict subset of has_invoice: every dispatched
-# line is also invoiced, which is why the two toggles nest the way they do below.
-# Correlated straight against sap_billing with the shared expression, rather
-# than joining SAP_BILLING_SPLIT_SQL: that subquery re-derives every row of the
-# table (dispatch notes included) once per outer row, which cost ~2s here.
-# SAP item codes that are the SAME Amazon product in a different bottle.
-#
-# Amazon sells one ASIN; SAP tracks the bottle shape as its own SKU. An invoice
-# raised against the variant code matched nothing, so the line read as never
-# invoiced - PO 6Z4WTENK showed blank invoiced columns while SAP held invoice
-# 607260210 for its full 12,000 units.
-#
-# Verified against JIVO_MART_HANADB, the company these RK-World invoices live
-# in. Worth knowing: the same code means a DIFFERENT product in the Oil company
-# (FG0000384 is Sano Extra Virgin there), so always confirm in Mart.
-# Each pair below is an identical item name plus a " ROUND BOTTLE" suffix:
-#
-#   FG0000384  MUSTARD KACHI GHANI 1 LTR 20 PCS ROUND BOTTLE  -> FG0000030
-#   FG0000386  JIVO GOLD 1 LTR 20 PCS ROUND BOTTLE            -> FG0000149
-#   FG0000395  SOYABEAN OIL 1 LTR 20 PCS ROUND BOTTLE         -> FG0000193
-#
-# Deliberately a fixed list, not a name-matching rule: the other unmatched codes
-# billed on Amazon POs are genuinely different products (olive, 1L+1L combos,
-# beverages, water), and a fuzzy rule would silently merge those. Add a pair
-# only after confirming both codes in SAP Mart.
-SAP_ITEM_ALIASES = {
-    "FG0000384": "FG0000030",
-    "FG0000386": "FG0000149",
-    "FG0000395": "FG0000193",
-}
-
-
-# The CASE expression is written literally into the predicates below (they are a
-# mix of plain and f-strings, so interpolating everywhere costs more than it
-# saves). This keeps the dict above honest about what the SQL actually does.
-_SAP_ALIAS_SQL = "(CASE sb.sap_item_code " + " ".join(
-    "WHEN '{}' THEN '{}'".format(a, b) for a, b in sorted(SAP_ITEM_ALIASES.items())
-) + " ELSE sb.sap_item_code END)"
+# SAP item codes that are the SAME Amazon product in a different bottle, folded
+# onto the code the Amazon PO carries. Defined in sap.billing, next to the join
+# that gates the planner on it, so the pendency page and the planner can never
+# disagree about which codes are the same product. SAP_ITEM_ALIASES is
+# re-exported from this module because that is where callers first imported it.
+_SAP_ALIAS_SQL = sap_item_code_sql("sb")
 
 
 # ── Invoiced detail columns ──────────────────────────────────────────────────
@@ -3769,6 +3740,13 @@ _PENDENCY_INVOICE_DETAIL = """COALESCE((
 ), '[]'::jsonb)"""
 
 
+# "Dispatched": at least one of this line's invoices carries an OINV dispatch
+# stamp (bilty / vehicle / dispatch date — see sap.billing.DISPATCH_FIELDS), so
+# the load has physically left. A strict subset of has_invoice: every dispatched
+# line is also invoiced, which is why the two toggles nest the way they do.
+# Correlated straight against sap_billing with the shared expression, rather
+# than joining SAP_BILLING_SPLIT_SQL: that subquery re-derives every row of the
+# table (dispatch notes included) once per outer row, which cost ~2s here.
 _SKU_PENDENCY_IS_DISPATCHED = f"""EXISTS (
     SELECT 1 FROM sap_billing sb
     WHERE sb.po_number = UPPER(TRIM(reporting."Amazon PO".po_number))

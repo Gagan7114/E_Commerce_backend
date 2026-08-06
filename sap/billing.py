@@ -106,27 +106,83 @@ def dispatched_qty_sql(alias: str = "b0") -> str:
         END"""
 
 
+# SAP bills a handful of Amazon SKUs under a second item code — the same product
+# in a round bottle — and the Amazon PO only ever carries the canonical one. Left
+# unfolded, the planner's join finds no billing row at all and offers units SAP
+# has already invoiced and DISPATCHED, which is how a load gets shipped twice.
+#
+# Deliberately a fixed list, not a name-matching rule: the other unmatched codes
+# billed on Amazon POs are genuinely different products (olive, 1L+1L combos,
+# beverages, water), and a fuzzy rule would silently merge those. Confirm both
+# codes in SAP *Mart* before adding a pair — item codes are per-company, and
+# FG0000384 is a completely different product (Sano Extra Virgin) in Oil.
+#
+#   FG0000384  MUSTARD KACHI GHANI 1 LTR 20 PCS ROUND BOTTLE  -> FG0000030
+#   FG0000386  JIVO GOLD 1 LTR 20 PCS ROUND BOTTLE            -> FG0000149
+#   FG0000395  SOYABEAN OIL 1 LTR 20 PCS ROUND BOTTLE         -> FG0000193
+#
+# Lives here rather than in uploads because it describes sap_billing itself, and
+# uploads already imports this module (the reverse would be a cycle).
+SAP_ITEM_ALIASES = {
+    "FG0000384": "FG0000030",
+    "FG0000386": "FG0000149",
+    "FG0000395": "FG0000193",
+}
+
+
+def sap_item_code_sql(alias: str = "b0") -> str:
+    """`alias`.sap_item_code folded onto the code the Amazon PO actually uses."""
+    if not SAP_ITEM_ALIASES:
+        return f"{alias}.sap_item_code"
+    whens = " ".join(
+        "WHEN '{}' THEN '{}'".format(variant, canonical)
+        for variant, canonical in sorted(SAP_ITEM_ALIASES.items())
+    )
+    return f"(CASE {alias}.sap_item_code {whens} ELSE {alias}.sap_item_code END)"
+
+
+# Folding is an AGGREGATION, not a rename: 29 live POs are billed under both a
+# variant and its canonical code, so two rows collapse onto one key. Emitting
+# them unaggregated would silently DOUBLE every joined PO line rather than fail
+# loudly — worse than the scalar-subquery error the same fold caused on the
+# pendency page. Hence the GROUP BY, and SUM() on both quantities.
 SAP_BILLING_SPLIT_SQL = f"""(
     SELECT
-        b0.po_number,
-        b0.sap_item_code,
-        b0.billed_qty,
-        {dispatched_qty_sql("b0")} AS dispatched_qty,
-        -- Why a line is gated, in the planner's words. NULL means "not
-        -- dispatched", so this doubles as the flag. Non-null even when SAP
-        -- stamped the dispatch without any of the details.
-        (
-            SELECT COALESCE(NULLIF(concat_ws(' · ',
-                       'Dispatched ' || NULLIF(e->'dispatch'->>'dispatch_date', ''),
-                       'vehicle '    || NULLIF(e->'dispatch'->>'vehicle', ''),
-                       'bilty '      || NULLIF(e->'dispatch'->>'bilty_no', '')
-                   ), ''), 'Dispatched')
-            FROM jsonb_array_elements(COALESCE(b0.invoices, '[]'::jsonb)) e
-            WHERE (e->>'dispatched')::boolean IS TRUE
-            ORDER BY e->'dispatch'->>'dispatch_date' DESC NULLS LAST
-            LIMIT 1
-        ) AS dispatch_note
-    FROM sap_billing b0
+        po_number,
+        sap_item_code,
+        SUM(billed_qty)     AS billed_qty,
+        SUM(dispatched_qty) AS dispatched_qty,
+        -- Most recent dispatch across the folded codes; NULL only when none of
+        -- them went out, so this still doubles as the "is gated" flag.
+        (array_agg(dispatch_note ORDER BY last_dispatch DESC NULLS LAST)
+            FILTER (WHERE dispatch_note IS NOT NULL))[1] AS dispatch_note
+    FROM (
+        SELECT
+            b0.po_number,
+            {sap_item_code_sql("b0")} AS sap_item_code,
+            b0.billed_qty,
+            {dispatched_qty_sql("b0")} AS dispatched_qty,
+            -- Why a line is gated, in the planner's words. Non-null even when
+            -- SAP stamped the dispatch without any of the details.
+            (
+                SELECT COALESCE(NULLIF(concat_ws(' · ',
+                           'Dispatched ' || NULLIF(e->'dispatch'->>'dispatch_date', ''),
+                           'vehicle '    || NULLIF(e->'dispatch'->>'vehicle', ''),
+                           'bilty '      || NULLIF(e->'dispatch'->>'bilty_no', '')
+                       ), ''), 'Dispatched')
+                FROM jsonb_array_elements(COALESCE(b0.invoices, '[]'::jsonb)) e
+                WHERE (e->>'dispatched')::boolean IS TRUE
+                ORDER BY e->'dispatch'->>'dispatch_date' DESC NULLS LAST
+                LIMIT 1
+            ) AS dispatch_note,
+            (
+                SELECT MAX(e->'dispatch'->>'dispatch_date')
+                FROM jsonb_array_elements(COALESCE(b0.invoices, '[]'::jsonb)) e
+                WHERE (e->>'dispatched')::boolean IS TRUE
+            ) AS last_dispatch
+        FROM sap_billing b0
+    ) folded
+    GROUP BY 1, 2
 )"""
 
 
