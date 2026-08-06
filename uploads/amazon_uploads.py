@@ -3613,16 +3613,22 @@ def _stated_litres(column: str) -> str:
 # a single billed_qty between them. Summing the item's accepted units keeps the
 # comparison honest; a shared item with anything left keeps all its ASIN rows
 # visible, which errs toward showing outstanding stock rather than hiding it.
-_SKU_PENDENCY_FULLY_INVOICED = """EXISTS (
-    SELECT 1 FROM sap_billing sb
-    WHERE sb.po_number = UPPER(TRIM(reporting."Amazon PO".po_number))
-      AND (CASE sb.sap_item_code WHEN 'FG0000384' THEN 'FG0000030' WHEN 'FG0000386' THEN 'FG0000149' WHEN 'FG0000395' THEN 'FG0000193' ELSE sb.sap_item_code END) = UPPER(TRIM(reporting."Amazon PO".sap_sku_code))
-      AND sb.billed_qty >= (
-          SELECT COALESCE(SUM(x.accepted_qty), 0)
-          FROM reporting."Amazon PO" x
-          WHERE UPPER(TRIM(x.po_number)) = sb.po_number
-            AND UPPER(TRIM(x.sap_sku_code)) = sb.sap_item_code
-      )
+_SKU_PENDENCY_FULLY_INVOICED = """(
+    COALESCE((
+        SELECT SUM(sb.billed_qty) FROM sap_billing sb
+        WHERE sb.po_number = UPPER(TRIM(reporting."Amazon PO".po_number))
+          AND (CASE sb.sap_item_code WHEN 'FG0000384' THEN 'FG0000030' WHEN 'FG0000386' THEN 'FG0000149' WHEN 'FG0000395' THEN 'FG0000193' ELSE sb.sap_item_code END) = UPPER(TRIM(reporting."Amazon PO".sap_sku_code))
+    ), 0) >= (
+        SELECT COALESCE(SUM(x.accepted_qty), 0)
+        FROM reporting."Amazon PO" x
+        WHERE UPPER(TRIM(x.po_number)) = UPPER(TRIM(reporting."Amazon PO".po_number))
+          AND UPPER(TRIM(x.sap_sku_code)) = UPPER(TRIM(reporting."Amazon PO".sap_sku_code))
+    )
+    AND COALESCE((
+        SELECT SUM(sb.billed_qty) FROM sap_billing sb
+        WHERE sb.po_number = UPPER(TRIM(reporting."Amazon PO".po_number))
+          AND (CASE sb.sap_item_code WHEN 'FG0000384' THEN 'FG0000030' WHEN 'FG0000386' THEN 'FG0000149' WHEN 'FG0000395' THEN 'FG0000193' ELSE sb.sap_item_code END) = UPPER(TRIM(reporting."Amazon PO".sap_sku_code))
+    ), 0) > 0
 )"""
 
 # "Dispatched": at least one of this line's invoices carries an OINV dispatch
@@ -3679,7 +3685,7 @@ _SAP_ALIAS_SQL = "(CASE sb.sap_item_code " + " ".join(
 # applies (see the billing CTE in shipment/views.py). Same rule both sides means
 # this page and the planner can never disagree about how much is invoiced.
 _PENDENCY_BILLED_PAIR = """COALESCE((
-    SELECT sb.billed_qty FROM sap_billing sb
+    SELECT SUM(sb.billed_qty) FROM sap_billing sb
     WHERE sb.po_number = UPPER(TRIM(reporting."Amazon PO".po_number))
       AND (CASE sb.sap_item_code WHEN 'FG0000384' THEN 'FG0000030' WHEN 'FG0000386' THEN 'FG0000149' WHEN 'FG0000395' THEN 'FG0000193' ELSE sb.sap_item_code END) = UPPER(TRIM(reporting."Amazon PO".sap_sku_code))
 ), 0)"""
