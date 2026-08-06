@@ -42,6 +42,33 @@ TRUCK_CAPACITIES = {'10_ton': 10000.0, '15_ton': 15000.0}
 # whole point of the split.
 _BILLING_JOIN = f"JOIN {SAP_BILLING_SPLIT_SQL} sb"
 
+# Units SAP has already DISPATCHED, as a per-(PO, ASIN) share. sap_billing bills
+# per (po, item) while a PO line is per ASIN, and two ASINs can share one item
+# code — so the figure is split greedily in ASIN order, capped by each line's own
+# accepted qty. Identical rule to the item feed, kept here as a reusable CTE body
+# so the appointment PO bar can subtract it instead of advertising gross ordered
+# quantities for loads that already left.
+_DISPATCHED_SHARE_CTE = f"""
+                    SELECT
+                        UPPER(TRIM(ap.po_number)) AS po_upper,
+                        UPPER(TRIM(ap.asin))      AS asin_upper,
+                        LEAST(
+                            ap.accepted_qty,
+                            GREATEST(
+                                sb.dispatched_qty - COALESCE(SUM(ap.accepted_qty) OVER (
+                                    PARTITION BY UPPER(TRIM(ap.po_number)), UPPER(TRIM(ap.sap_sku_code))
+                                    ORDER BY ap.asin
+                                    ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING), 0),
+                                0
+                            )
+                        ) AS dispatched_qty
+                    FROM reporting."Amazon PO" ap
+                    {_BILLING_JOIN}
+                        ON sb.po_number = UPPER(TRIM(ap.po_number))
+                       AND sb.sap_item_code = UPPER(TRIM(ap.sap_sku_code))
+                    WHERE ap.accepted_qty > 0
+"""
+
 # Accounts allowed to delete an APPROVED shipment — a destructive admin action
 # that permanently removes the shipment and frees its committed PO rows + stock.
 # Scoped to a single account by explicit request; every other user can only
@@ -1784,9 +1811,24 @@ def _attach_invoice_detail(items):
                 # on this (SAP_BILLING_SPLIT_SQL), so the tag has to know it too —
                 # otherwise it labels a departed load "invoiced, still in the
                 # warehouse" while the panel underneath shows its bilty.
-                disp = sum(
-                    float(e.get('qty') or 0) for e in docs if e.get('dispatched') is True
-                )
+                #
+                # This MUST mirror sap.billing.dispatched_qty_sql exactly, or the
+                # badge contradicts the quantity on its own row. Three rules there
+                # that a plain "dispatched is True" sum silently drops:
+                #  * a credit note frees dispatched units first — the goods came
+                #    back and can ship again — and Sales Return rows are always
+                #    negative, so they belong in the same sum. Every such row
+                #    carries dispatched=false, so the naive filter never sees one.
+                #  * GREATEST clamps returns that exceed what went out.
+                #  * a row whose invoices predate the dispatch feature has no
+                #    `dispatched` key at all; those fall back to billed_qty.
+                if any('dispatched' not in e for e in docs):
+                    disp = float(qty or 0)
+                else:
+                    disp = max(0.0, sum(
+                        float(e.get('qty') or 0) for e in docs
+                        if e.get('dispatched') is True or e.get('type') == 'Sales Return'
+                    ))
                 billing[key] = (
                     prev_qty + float(qty or 0),
                     prev_disp + disp,
@@ -2230,6 +2272,12 @@ def _row_eligibility_reason(row):
         base = f'Out of stock (availability={avail})'
     elif not row.get('has_qty'):
         base = 'Zero accepted qty'
+    elif float(row.get('dispatched_qty') or 0) > 0 and float(row.get('accepted_qty') or 0) <= 0:
+        # accepted_qty here is already NET of what SAP dispatched, so a positive
+        # dispatched figure with nothing remaining means the whole line went out.
+        # Without this branch the bar fell through to "Unknown reason", which is
+        # the one thing worse than the old wrong "ready to ship".
+        base = f"Already dispatched ({float(row['dispatched_qty']):,.0f} units left the warehouse)"
     else:
         base = 'Unknown reason'
     return f"{flip} · {base}" if flip else base
@@ -2273,6 +2321,7 @@ class AppointmentListView(_SafeAPIView):
                     ) AS pv
                     WHERE NULLIF(TRIM(pv), '') IS NOT NULL
                 ),
+                dispatched_share AS (""" + _DISPATCHED_SHARE_CTE + """),
                 po_status AS (
                     SELECT
                         app.appointment_id,
@@ -2285,7 +2334,13 @@ class AppointmentListView(_SafeAPIView):
                             p.status = 'Confirmed'
                             AND p.po_status = 'PENDING'
                             AND p.availability_status = 'AC - Accepted: In stock'
-                            AND COALESCE(p.accepted_qty, 0) > 0
+                            -- Net of what SAP already dispatched. Gross accepted_qty
+                            -- counted a fully-shipped line as eligible and the bar
+                            -- offered its whole ordered qty as "ready to ship",
+                            -- while the items endpoint for the same appointment
+                            -- correctly omitted it.
+                            AND GREATEST(COALESCE(p.accepted_qty, 0)
+                                         - COALESCE(ds.dispatched_qty, 0), 0) > 0
                             AND NOT EXISTS (
                                 SELECT 1
                                 FROM sp_items si
@@ -2301,6 +2356,9 @@ class AppointmentListView(_SafeAPIView):
                         ON UPPER(TRIM(p.po_number)) = app.po_upper
                         -- No FC filter: a PO on this appointment at another FC is a
                         -- flip (intentionally moved), so it still counts as matched.
+                    LEFT JOIN dispatched_share ds
+                        ON ds.po_upper = app.po_upper
+                       AND ds.asin_upper = UPPER(TRIM(p.asin))
                     GROUP BY app.appointment_id, app.po_upper
                 ),
                 appt_counts AS (
@@ -2378,6 +2436,7 @@ class AppointmentListView(_SafeAPIView):
                     ) AS pv
                     WHERE NULLIF(TRIM(pv), '') IS NOT NULL
                 ),
+                dispatched_share AS (""" + _DISPATCHED_SHARE_CTE + """),
                 latest_inv AS (
                     SELECT
                         UPPER(TRIM(COALESCE(asin::text, ''))) AS asin_key,
@@ -2405,7 +2464,11 @@ class AppointmentListView(_SafeAPIView):
                     p.po_number,
                     p.asin,
                     p.sku_name             AS product_name,
-                    p.accepted_qty,
+                    -- Remaining, not ordered: the bar is a "what can I load"
+                    -- panel, so it must not quote units that already shipped.
+                    GREATEST(COALESCE(p.accepted_qty, 0)
+                             - COALESCE(ds.dispatched_qty, 0), 0) AS accepted_qty,
+                    COALESCE(ds.dispatched_qty, 0) AS dispatched_qty,
                     p.case_pack,
                     p.per_liter,
                     p.availability_status,
@@ -2428,12 +2491,16 @@ class AppointmentListView(_SafeAPIView):
                         p.status = 'Confirmed'
                         AND p.po_status = 'PENDING'
                         AND p.availability_status = 'AC - Accepted: In stock'
-                        AND COALESCE(p.accepted_qty, 0) > 0
+                        AND GREATEST(COALESCE(p.accepted_qty, 0)
+                                     - COALESCE(ds.dispatched_qty, 0), 0) > 0
                         AND lk.po_upper IS NULL
                     ) AS is_eligible
                 FROM appt_po_pairs app
                 LEFT JOIN reporting."Amazon PO" p
                     ON UPPER(TRIM(p.po_number)) = app.po_upper
+                LEFT JOIN dispatched_share ds
+                    ON ds.po_upper = app.po_upper
+                   AND ds.asin_upper = UPPER(TRIM(p.asin))
                 LEFT JOIN latest_inv li
                     ON li.asin_key = UPPER(TRIM(COALESCE(p.asin::text, '')))
                 LEFT JOIN locked_lookup lk

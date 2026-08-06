@@ -7,9 +7,15 @@ PO and per SKU: accepted / billed / shipped / still-shippable, plus the SAP invo
 detail behind each billed line. Powers the standalone "Billing" view and the
 shipment-planner appointment panel.
 
-Billing rule (per product decision): SAP billing is the authority for "done" —
-``shippable = accepted − billed`` (the planner's own shipped tally is surfaced for
-context but does NOT reduce shippable here).
+Billing rule: ``billed`` is what SAP has invoiced, but ``shippable`` gates on what
+SAP has DISPATCHED — ``shippable = accepted − dispatched`` — because that is the
+rule the planner enforces (see sap.billing.SAP_BILLING_SPLIT_SQL). Invoiced stock
+that has not left is still in the warehouse and still loadable; reporting it as
+unshippable here contradicted the PO picker on the same screen. The planner's own
+shipped tally is surfaced for context but does NOT reduce shippable.
+
+Item codes are folded through SAP_ITEM_ALIASES before joining, so invoices SAP
+raised under a variant code are not missed.
 """
 from __future__ import annotations
 
@@ -20,7 +26,12 @@ from rest_framework.decorators import api_view, permission_classes
 from rest_framework.response import Response
 
 from accounts.permissions import require
-from sap.billing import ensure_billing_fresh, last_sync_at
+from sap.billing import (
+    dispatched_qty_sql,
+    ensure_billing_fresh,
+    last_sync_at,
+    sap_item_code_sql,
+)
 
 
 def _page(request):
@@ -72,8 +83,37 @@ def amazon_po_billing(request):
         params.append(po_list)
 
     sql = f"""
-      WITH billed AS (
-          SELECT po_number, sap_item_code, billed_qty, invoices FROM sap_billing
+      WITH folded AS (
+          -- Fold the variant item codes onto the canonical one, exactly as the
+          -- planner's join does. Without this, an invoice SAP raised against
+          -- FG0000384 matches nothing here and the line reads "never billed" —
+          -- PO 6Z4WTENK showed 12,000 already-DISPATCHED units as unbilled and
+          -- fully shippable on the same screen the planner offered 0.
+          SELECT b0.po_number,
+                 {sap_item_code_sql("b0")} AS sap_item_code,
+                 b0.billed_qty,
+                 {dispatched_qty_sql("b0")} AS dispatched_qty,
+                 COALESCE(b0.invoices, '[]'::jsonb) AS invoices
+          FROM sap_billing b0
+      ),
+      -- Quantities and documents are aggregated separately: unnesting the
+      -- invoice arrays multiplies rows, which would inflate the SUMs.
+      billed_q AS (
+          SELECT po_number, sap_item_code,
+                 SUM(billed_qty)     AS billed_qty,
+                 SUM(dispatched_qty) AS dispatched_qty
+          FROM folded GROUP BY 1, 2
+      ),
+      billed_docs AS (
+          SELECT f.po_number, f.sap_item_code, jsonb_agg(e) AS invoices
+          FROM folded f, LATERAL jsonb_array_elements(f.invoices) e
+          GROUP BY 1, 2
+      ),
+      billed AS (
+          SELECT q.po_number, q.sap_item_code, q.billed_qty, q.dispatched_qty,
+                 COALESCE(d.invoices, '[]'::jsonb) AS invoices
+          FROM billed_q q
+          LEFT JOIN billed_docs d USING (po_number, sap_item_code)
       ),
       committed AS (
           SELECT si.asin, UPPER(TRIM(si.po_number)) AS po_number,
@@ -84,9 +124,16 @@ def amazon_po_billing(request):
       )
       SELECT p.po_number, p.order_date, p.fulfillment_center, p.core_fresh_now,
              p.asin, p.item, p.sap_sku_code, p.accepted_qty,
-             COALESCE(b.billed_qty, 0)  AS billed_qty,
-             COALESCE(c.shipped_qty, 0) AS shipped_qty,
-             GREATEST(p.accepted_qty - COALESCE(b.billed_qty, 0), 0) AS shippable_qty,
+             COALESCE(b.billed_qty, 0)     AS billed_qty,
+             COALESCE(b.dispatched_qty, 0) AS dispatched_qty,
+             COALESCE(c.shipped_qty, 0)    AS shipped_qty,
+             -- Shippable is what the PLANNER will actually offer, so it gates on
+             -- DISPATCHED, not billed. Billed-not-dispatched stock is still in the
+             -- warehouse and still loadable; calling it unshippable here told the
+             -- operator 19,139 units were done while the PO picker on the same
+             -- screen offered them. `billed` stays a billing figure — see
+             -- fully_billed, which is unchanged.
+             GREATEST(p.accepted_qty - COALESCE(b.dispatched_qty, 0), 0) AS shippable_qty,
              (COALESCE(b.billed_qty, 0) >= p.accepted_qty) AS fully_billed,
              b.invoices
       FROM reporting."Amazon PO" p
@@ -125,7 +172,9 @@ def amazon_po_billing(request):
         g["lines"].append({
             "asin": r["asin"], "item": r["item"], "sap_item_code": r["sap_sku_code"],
             "accepted": acc, "billed": float(r["billed_qty"] or 0), "shipped": sh,
-            "shippable": 0.0, "fully_billed": False, "invoices": inv or [],
+            "dispatched": float(r["dispatched_qty"] or 0),
+            "shippable": 0.0, "fully_billed": False, "fully_dispatched": False,
+            "invoices": inv or [],
             "_sku_key": str(r["sap_sku_code"] or "").strip().upper(),
         })
         g["shipped"] += sh
@@ -141,16 +190,24 @@ def amazon_po_billing(request):
             by_sku.setdefault(ln["_sku_key"], []).append(ln)
         for sku_lines in by_sku.values():
             remaining = max((ln["billed"] for ln in sku_lines), default=0.0)  # the sku's net billed
+            # Dispatched is split by the same rule and the same ASIN order, so a
+            # line's "gone" figure can never exceed its own billed figure.
+            remaining_disp = max((ln["dispatched"] for ln in sku_lines), default=0.0)
             for ln in sorted(sku_lines, key=lambda x: str(x["asin"] or "")):
                 alloc = min(ln["accepted"], remaining) if remaining > 0 else 0.0
                 remaining -= alloc
+                disp = min(ln["accepted"], remaining_disp) if remaining_disp > 0 else 0.0
+                remaining_disp -= disp
                 ln["billed"] = alloc
-                ln["shippable"] = max(ln["accepted"] - alloc, 0.0)
+                ln["dispatched"] = disp
+                ln["shippable"] = max(ln["accepted"] - disp, 0.0)
                 ln["fully_billed"] = ln["accepted"] > 0 and alloc >= ln["accepted"]
+                ln["fully_dispatched"] = ln["accepted"] > 0 and disp >= ln["accepted"]
         for ln in g["lines"]:
             ln.pop("_sku_key", None)
         g["accepted"] = sum(ln["accepted"] for ln in g["lines"])
         g["billed"] = sum(ln["billed"] for ln in g["lines"])
+        g["dispatched"] = sum(ln["dispatched"] for ln in g["lines"])
         g["shippable"] = sum(ln["shippable"] for ln in g["lines"])
 
     grouped = []
