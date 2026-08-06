@@ -3565,7 +3565,7 @@ _SKU_PENDENCY_PENDING = (
 _SKU_PENDENCY_HAS_INVOICE = """EXISTS (
     SELECT 1 FROM sap_billing sb
     WHERE sb.po_number = UPPER(TRIM(reporting."Amazon PO".po_number))
-      AND sb.sap_item_code = UPPER(TRIM(reporting."Amazon PO".sap_sku_code))
+      AND (CASE sb.sap_item_code WHEN 'FG0000384' THEN 'FG0000030' WHEN 'FG0000386' THEN 'FG0000149' WHEN 'FG0000395' THEN 'FG0000193' ELSE sb.sap_item_code END) = UPPER(TRIM(reporting."Amazon PO".sap_sku_code))
 )"""
 
 # Does the master sheet state a litre value for this SKU, rather than leaving it
@@ -3616,7 +3616,7 @@ def _stated_litres(column: str) -> str:
 _SKU_PENDENCY_FULLY_INVOICED = """EXISTS (
     SELECT 1 FROM sap_billing sb
     WHERE sb.po_number = UPPER(TRIM(reporting."Amazon PO".po_number))
-      AND sb.sap_item_code = UPPER(TRIM(reporting."Amazon PO".sap_sku_code))
+      AND (CASE sb.sap_item_code WHEN 'FG0000384' THEN 'FG0000030' WHEN 'FG0000386' THEN 'FG0000149' WHEN 'FG0000395' THEN 'FG0000193' ELSE sb.sap_item_code END) = UPPER(TRIM(reporting."Amazon PO".sap_sku_code))
       AND sb.billed_qty >= (
           SELECT COALESCE(SUM(x.accepted_qty), 0)
           FROM reporting."Amazon PO" x
@@ -3632,6 +3632,41 @@ _SKU_PENDENCY_FULLY_INVOICED = """EXISTS (
 # Correlated straight against sap_billing with the shared expression, rather
 # than joining SAP_BILLING_SPLIT_SQL: that subquery re-derives every row of the
 # table (dispatch notes included) once per outer row, which cost ~2s here.
+# SAP item codes that are the SAME Amazon product in a different bottle.
+#
+# Amazon sells one ASIN; SAP tracks the bottle shape as its own SKU. An invoice
+# raised against the variant code matched nothing, so the line read as never
+# invoiced - PO 6Z4WTENK showed blank invoiced columns while SAP held invoice
+# 607260210 for its full 12,000 units.
+#
+# Verified against JIVO_MART_HANADB, the company these RK-World invoices live
+# in. Worth knowing: the same code means a DIFFERENT product in the Oil company
+# (FG0000384 is Sano Extra Virgin there), so always confirm in Mart.
+# Each pair below is an identical item name plus a " ROUND BOTTLE" suffix:
+#
+#   FG0000384  MUSTARD KACHI GHANI 1 LTR 20 PCS ROUND BOTTLE  -> FG0000030
+#   FG0000386  JIVO GOLD 1 LTR 20 PCS ROUND BOTTLE            -> FG0000149
+#   FG0000395  SOYABEAN OIL 1 LTR 20 PCS ROUND BOTTLE         -> FG0000193
+#
+# Deliberately a fixed list, not a name-matching rule: the other unmatched codes
+# billed on Amazon POs are genuinely different products (olive, 1L+1L combos,
+# beverages, water), and a fuzzy rule would silently merge those. Add a pair
+# only after confirming both codes in SAP Mart.
+SAP_ITEM_ALIASES = {
+    "FG0000384": "FG0000030",
+    "FG0000386": "FG0000149",
+    "FG0000395": "FG0000193",
+}
+
+
+# The CASE expression is written literally into the predicates below (they are a
+# mix of plain and f-strings, so interpolating everywhere costs more than it
+# saves). This keeps the dict above honest about what the SQL actually does.
+_SAP_ALIAS_SQL = "(CASE sb.sap_item_code " + " ".join(
+    "WHEN '{}' THEN '{}'".format(a, b) for a, b in sorted(SAP_ITEM_ALIASES.items())
+) + " ELSE sb.sap_item_code END)"
+
+
 # ── Invoiced detail columns ──────────────────────────────────────────────────
 #
 # sap_billing holds ONE row per (po, sap_item_code) with the NET billed qty and
@@ -3646,7 +3681,7 @@ _SKU_PENDENCY_FULLY_INVOICED = """EXISTS (
 _PENDENCY_BILLED_PAIR = """COALESCE((
     SELECT sb.billed_qty FROM sap_billing sb
     WHERE sb.po_number = UPPER(TRIM(reporting."Amazon PO".po_number))
-      AND sb.sap_item_code = UPPER(TRIM(reporting."Amazon PO".sap_sku_code))
+      AND (CASE sb.sap_item_code WHEN 'FG0000384' THEN 'FG0000030' WHEN 'FG0000386' THEN 'FG0000149' WHEN 'FG0000395' THEN 'FG0000193' ELSE sb.sap_item_code END) = UPPER(TRIM(reporting."Amazon PO".sap_sku_code))
 ), 0)"""
 
 # What earlier sibling ASINs on the same (po, item) already consumed.
@@ -3708,14 +3743,14 @@ _PENDENCY_INVOICE_NOS = """COALESCE((
     SELECT string_agg(DISTINCT e->>'doc_num', ', ' ORDER BY e->>'doc_num')
     FROM sap_billing sb, jsonb_array_elements(sb.invoices) e
     WHERE sb.po_number = UPPER(TRIM(reporting."Amazon PO".po_number))
-      AND sb.sap_item_code = UPPER(TRIM(reporting."Amazon PO".sap_sku_code))
+      AND (CASE sb.sap_item_code WHEN 'FG0000384' THEN 'FG0000030' WHEN 'FG0000386' THEN 'FG0000149' WHEN 'FG0000395' THEN 'FG0000193' ELSE sb.sap_item_code END) = UPPER(TRIM(reporting."Amazon PO".sap_sku_code))
 ), '')"""
 
 _PENDENCY_INVOICE_COUNT = """COALESCE((
     SELECT COUNT(DISTINCT e->>'doc_num')
     FROM sap_billing sb, jsonb_array_elements(sb.invoices) e
     WHERE sb.po_number = UPPER(TRIM(reporting."Amazon PO".po_number))
-      AND sb.sap_item_code = UPPER(TRIM(reporting."Amazon PO".sap_sku_code))
+      AND (CASE sb.sap_item_code WHEN 'FG0000384' THEN 'FG0000030' WHEN 'FG0000386' THEN 'FG0000149' WHEN 'FG0000395' THEN 'FG0000193' ELSE sb.sap_item_code END) = UPPER(TRIM(reporting."Amazon PO".sap_sku_code))
 ), 0)"""
 
 # Per-invoice breakdown for the click-through panel. Returned whole so the UI
@@ -3724,14 +3759,14 @@ _PENDENCY_INVOICE_DETAIL = """COALESCE((
     SELECT jsonb_agg(e ORDER BY e->>'doc_date', e->>'doc_num')
     FROM sap_billing sb, jsonb_array_elements(sb.invoices) e
     WHERE sb.po_number = UPPER(TRIM(reporting."Amazon PO".po_number))
-      AND sb.sap_item_code = UPPER(TRIM(reporting."Amazon PO".sap_sku_code))
+      AND (CASE sb.sap_item_code WHEN 'FG0000384' THEN 'FG0000030' WHEN 'FG0000386' THEN 'FG0000149' WHEN 'FG0000395' THEN 'FG0000193' ELSE sb.sap_item_code END) = UPPER(TRIM(reporting."Amazon PO".sap_sku_code))
 ), '[]'::jsonb)"""
 
 
 _SKU_PENDENCY_IS_DISPATCHED = f"""EXISTS (
     SELECT 1 FROM sap_billing sb
     WHERE sb.po_number = UPPER(TRIM(reporting."Amazon PO".po_number))
-      AND sb.sap_item_code = UPPER(TRIM(reporting."Amazon PO".sap_sku_code))
+      AND (CASE sb.sap_item_code WHEN 'FG0000384' THEN 'FG0000030' WHEN 'FG0000386' THEN 'FG0000149' WHEN 'FG0000395' THEN 'FG0000193' ELSE sb.sap_item_code END) = UPPER(TRIM(reporting."Amazon PO".sap_sku_code))
       AND ({dispatched_qty_sql("sb")}) > 0
 )"""
 
