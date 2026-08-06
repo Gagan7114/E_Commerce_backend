@@ -5884,6 +5884,18 @@ class ManualPlanView(_SafeAPIView):
             planned_liters = round(sum(float(it.get('planned_liters') or 0) for it in loaded), 4)
             load_pct = round((planned_liters / capacity * 100) if capacity > 0 else 0, 2)
 
+        # Surface the stock cap as a reason, the way the auto planner does. Without
+        # this a line trimmed because a sibling line of the same SKU drained the
+        # pool just showed a smaller number with nothing to explain it — and stock,
+        # truck capacity and a commitment cap all look identical at that point.
+        for it in not_loaded:
+            if (it.get('stock_unfit') and not it.get('expiry_blocked')
+                    and float(it.get('planned_qty') or 0) <= 0):
+                it['unfit_reason'] = it.get('unfit_reason') or it['stock_unfit']
+        for it in loaded:
+            if it.get('stock_limited') and it.get('stock_unfit') and not it.get('short_reason'):
+                it['short_reason'] = it['stock_unfit']
+
         _attach_invoice_detail(loaded)
         _attach_invoice_detail(not_loaded)
 
