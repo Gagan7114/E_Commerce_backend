@@ -1720,6 +1720,94 @@ def _apply_stock_caps(items, avail_total, avail_remaining, respect, detail, rese
             )
 
 
+def _attach_invoice_detail(items):
+    """Tag planner lines with what SAP has already invoiced against them.
+
+    Two queries for the whole plan, then arithmetic in Python — the planner is
+    already the slowest page here and this must not add a lookup per line.
+
+    sap_billing holds ONE row per (po, sap_item_code) while a plan line is per
+    (po, ASIN), and two ASINs on a PO can share an item code. The billed total is
+    split greedily in ASIN order, capped by each line's accepted quantity — the
+    same rule the billing CTE and the SKU Pendency page use, so all three agree
+    about how much of a PO is invoiced.
+
+    The invoice DOCUMENTS are per (po, item) and are NOT split: an invoice
+    covering two sibling ASINs genuinely appears against both.
+    """
+    rows = [it for it in items if it.get('po_number') and it.get('asin')]
+    if not rows:
+        return items
+    pos = sorted({str(it['po_number']).strip().upper() for it in rows})
+
+    code_of, accepted_of = {}, {}
+    with connection.cursor() as cur:
+        cur.execute(
+            'SELECT UPPER(TRIM(po_number)), UPPER(TRIM(asin)), '
+            "UPPER(TRIM(COALESCE(sap_sku_code, ''))), MAX(COALESCE(accepted_qty, 0)) "
+            'FROM reporting."Amazon PO" '
+            'WHERE UPPER(TRIM(po_number)) = ANY(%s::text[]) '
+            'GROUP BY 1, 2, 3',
+            [pos],
+        )
+        for po, asin, item_code, acc in cur.fetchall():
+            code_of[(po, asin)] = item_code
+            accepted_of[(po, asin)] = float(acc or 0)
+
+        wanted = sorted({c for c in code_of.values() if c})
+        billing = {}
+        if wanted:
+            cur.execute(
+                'SELECT po_number, sap_item_code, billed_qty, invoices FROM sap_billing '
+                'WHERE po_number = ANY(%s::text[]) AND sap_item_code = ANY(%s::text[])',
+                [pos, wanted],
+            )
+            for po, code, qty, inv in cur.fetchall():
+                billing[(po, code)] = (float(qty or 0), inv or [])
+
+    # Greedy split: earlier ASINs on the same (po, item) consume the billed
+    # total first, so sibling lines never each claim the whole figure.
+    share_of, consumed = {}, {}
+    for (po, asin) in sorted(code_of):
+        code = code_of[(po, asin)]
+        if not code or (po, code) not in billing:
+            continue
+        billed, _ = billing[(po, code)]
+        used = consumed.get((po, code), 0.0)
+        share = max(0.0, min(accepted_of.get((po, asin), 0.0), billed - used))
+        consumed[(po, code)] = used + share
+        share_of[(po, asin)] = share
+
+    for it in rows:
+        po = str(it['po_number']).strip().upper()
+        asin = str(it['asin']).strip().upper()
+        share = share_of.get((po, asin))
+        if share is None:
+            it['invoiced_status'] = ''
+            continue
+        code = code_of.get((po, asin))
+        _billed, inv = billing.get((po, code), (0.0, []))
+        if isinstance(inv, str):
+            try:
+                inv = json.loads(inv)
+            except (TypeError, ValueError):
+                inv = []
+        docs = [e for e in (inv or []) if isinstance(e, dict)]
+        accepted = accepted_of.get((po, asin), 0.0)
+
+        it['invoiced_qty'] = round(share, 2)
+        it['invoice_detail'] = docs
+        it['invoice_count'] = len({str(e.get('doc_num')) for e in docs if e.get('doc_num')})
+        it['invoice_nos'] = ', '.join(sorted({str(e.get('doc_num')) for e in docs if e.get('doc_num')}))
+        if share <= 0:
+            it['invoiced_status'] = ''
+        elif share >= accepted - 1e-6:
+            it['invoiced_status'] = 'Invoiced'
+        else:
+            it['invoiced_status'] = 'Partial invoiced'
+    return items
+
+
 def _fetch_doh_filler_pool(fc, exclude_po_uppers, doh_by_asin, families=None, asins=None):
     """
     Pull all PENDING in-stock POs at the given FC that ARE NOT already in the
@@ -3071,6 +3159,11 @@ class AppointmentItemsView(_SafeAPIView):
             for it in loaded:
                 if it.get('stock_limited') and it.get('stock_unfit') and not it.get('short_reason'):
                     it['short_reason'] = it['stock_unfit']
+
+        # What SAP has already invoiced against each line — drives the
+        # Invoiced / Partial invoiced tag on Plan Review.
+        _attach_invoice_detail(loaded)
+        _attach_invoice_detail(not_loaded)
 
         # If load is still thin, suggest a smaller truck size
         truck_suggestion = _suggest_smaller_truck(planned_liters, capacity, truck_size)
@@ -5773,6 +5866,9 @@ class ManualPlanView(_SafeAPIView):
             )
             planned_liters = round(sum(float(it.get('planned_liters') or 0) for it in loaded), 4)
             load_pct = round((planned_liters / capacity * 100) if capacity > 0 else 0, 2)
+
+        _attach_invoice_detail(loaded)
+        _attach_invoice_detail(not_loaded)
 
         # Only POs that actually made it onto the truck need a switching request —
         # a sister-FC PO the packer set aside isn't being moved anywhere.
