@@ -3531,6 +3531,7 @@ SKU_PENDENCY_COLUMNS = (
     "invoiced_qty",
     "invoiced_short_qty",
     "invoiced_ltrs",
+    "invoiced_short_ltrs",
     "invoice_nos",
     "invoice_count",
     "invoice_detail",
@@ -3684,6 +3685,14 @@ _PENDENCY_SHORT_QTY = f"""CASE
     ELSE GREATEST(COALESCE(reporting."Amazon PO".accepted_qty, 0)
                   - {_PENDENCY_INVOICED_QTY}, 0)
 END"""
+
+# The shortfall in litres. Same stated-value gate as every other litre here, and
+# derived from the same _PENDENCY_SHORT_QTY, so the pair can never disagree.
+_PENDENCY_SHORT_LTRS = (
+    f'CASE WHEN {_SKU_PENDENCY_HAS_STATED_LITRE} '
+    f'THEN {_PENDENCY_SHORT_QTY} * COALESCE(reporting."Amazon PO".per_liter, 0) '
+    f'ELSE 0 END'
+)
 
 # Litres follow the same stated-value rule as every other litre on this page:
 # no per_unit_value in the master sheet, no litres. See _SKU_PENDENCY_HAS_STATED_LITRE.
@@ -3862,6 +3871,7 @@ def amazon_po_sku_pendency(request):
                 "invoiced_qty",
                 "invoiced_short_qty",
                 "invoiced_ltrs",
+                "invoiced_short_ltrs",
             ),
             column_exprs={
                 "has_invoice": _SKU_PENDENCY_HAS_INVOICE,
@@ -3870,6 +3880,7 @@ def amazon_po_sku_pendency(request):
                 "invoiced_qty": _PENDENCY_INVOICED_QTY,
                 "invoiced_short_qty": _PENDENCY_SHORT_QTY,
                 "invoiced_ltrs": _PENDENCY_INVOICED_LTRS,
+                "invoiced_short_ltrs": _PENDENCY_SHORT_LTRS,
                 "invoice_nos": _PENDENCY_INVOICE_NOS,
                 "invoice_count": _PENDENCY_INVOICE_COUNT,
                 "invoice_detail": _PENDENCY_INVOICE_DETAIL,
