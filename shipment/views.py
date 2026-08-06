@@ -57,7 +57,16 @@ _DISPATCHED_SHARE_CTE = f"""
                             GREATEST(
                                 sb.dispatched_qty - COALESCE(SUM(ap.accepted_qty) OVER (
                                     PARTITION BY UPPER(TRIM(ap.po_number)), UPPER(TRIM(ap.sap_sku_code))
-                                    ORDER BY ap.asin
+                                    -- CLOSED lines absorb the dispatched pool first.
+                                    -- Plain alphabetical order attributes it to whichever
+                                    -- ASIN sorts first, which is arbitrary: on 1GLIGT3J
+                                    -- SAP dispatched exactly the 119 units Amazon had
+                                    -- already closed, yet 3 of them landed on the still-
+                                    -- PENDING sibling and the bar told the planner those
+                                    -- 3 units "left the warehouse". Amazon closing a line
+                                    -- is the strongest evidence of which units shipped.
+                                    ORDER BY (ap.po_status = 'PENDING'
+                                              AND ap.status = 'Confirmed') ASC, ap.asin
                                     ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING), 0),
                                 0
                             )
@@ -1028,8 +1037,11 @@ def _explain_ineligibility(c):
     not_in_stock = int(c.get('not_in_stock_count') or 0)
     no_qty = int(c.get('no_qty_count') or 0)
     locked = int(c.get('locked_count') or 0)
+    dispatched = int(c.get('dispatched_count') or 0)
 
     # Dominant-cause cases — read more clearly than a list of fragments
+    if dispatched == total:
+        return f'All {total} POs have already been dispatched'
     if locked == total:
         return f'All {total} POs are locked in other shipments'
     if not_in_stock == total:
@@ -1040,6 +1052,7 @@ def _explain_ineligibility(c):
         return f'All {total} POs have zero accepted qty'
 
     parts = []
+    if dispatched:   parts.append(f'{dispatched} already dispatched')
     if locked:       parts.append(f'{locked} locked in other shipments')
     if not_in_stock: parts.append(f'{not_in_stock} out of stock')
     if not_pending:  parts.append(f'{not_pending} closed/dispatched')
@@ -2330,6 +2343,17 @@ class AppointmentListView(_SafeAPIView):
                         BOOL_OR(p.status = 'Confirmed' AND p.po_status = 'PENDING') AS is_pending,
                         BOOL_OR(p.availability_status = 'AC - Accepted: In stock') AS is_in_stock,
                         BOOL_OR(COALESCE(p.accepted_qty, 0) > 0) AS has_qty,
+                        -- Ordered something, SAP shipped all of it. Tracked on its own
+                        -- because locked_po below is a RESIDUAL bucket ("pending, in
+                        -- stock, has qty, still not eligible") that used to be reachable
+                        -- only through the sp_items lock. Gating eligibility on
+                        -- dispatch added a second route into it, so a PO in no shipment
+                        -- at all was being reported as "locked in other shipments".
+                        BOOL_OR(
+                            COALESCE(ds.dispatched_qty, 0) > 0
+                            AND GREATEST(COALESCE(p.accepted_qty, 0)
+                                         - COALESCE(ds.dispatched_qty, 0), 0) <= 0
+                        ) AS is_dispatched_out,
                         BOOL_OR(
                             p.status = 'Confirmed'
                             AND p.po_status = 'PENDING'
@@ -2372,11 +2396,13 @@ class AppointmentListView(_SafeAPIView):
                         COUNT(*) FILTER (WHERE NOT COALESCE(is_pending, FALSE))   AS not_pending_po,
                         COUNT(*) FILTER (WHERE NOT COALESCE(is_in_stock, FALSE))  AS not_in_stock_po,
                         COUNT(*) FILTER (WHERE NOT COALESCE(has_qty, FALSE))      AS no_qty_po,
+                        COUNT(*) FILTER (WHERE COALESCE(is_dispatched_out, FALSE)) AS dispatched_po,
                         COUNT(*) FILTER (
                             WHERE COALESCE(is_pending, FALSE)
                               AND COALESCE(is_in_stock, FALSE)
                               AND COALESCE(has_qty, FALSE)
                               AND NOT COALESCE(is_eligible, FALSE)
+                              AND NOT COALESCE(is_dispatched_out, FALSE)
                         ) AS locked_po
                     FROM po_status
                     GROUP BY appointment_id
@@ -2397,7 +2423,8 @@ class AppointmentListView(_SafeAPIView):
                     COALESCE(ac.not_pending_po,  0) AS not_pending_count,
                     COALESCE(ac.not_in_stock_po, 0) AS not_in_stock_count,
                     COALESCE(ac.no_qty_po,       0) AS no_qty_count,
-                    COALESCE(ac.locked_po,       0) AS locked_count
+                    COALESCE(ac.locked_po,       0) AS locked_count,
+                    COALESCE(ac.dispatched_po,   0) AS dispatched_count
                 FROM appt_dedup ad
                 LEFT JOIN appt_counts ac USING (appointment_id)
                 LEFT JOIN public.appointment_commit acm USING (appointment_id)
