@@ -1754,7 +1754,14 @@ def _attach_invoice_detail(items):
             code_of[(po, asin)] = item_code
             accepted_of[(po, asin)] = float(acc or 0)
 
-        wanted = sorted({c for c in code_of.values() if c})
+        # Ask for the variant codes too. Amazon sells one ASIN while SAP tracks
+        # the bottle shape as its own SKU, so an invoice raised against
+        # FG0000384 (mustard 1L round bottle) belongs to the line the PO sheet
+        # calls FG0000030. See SAP_ITEM_ALIASES for the verified pairs.
+        from uploads.amazon_uploads import SAP_ITEM_ALIASES
+        canonical = sorted({c for c in code_of.values() if c})
+        variants = [a for a, b in SAP_ITEM_ALIASES.items() if b in set(canonical)]
+        wanted = sorted(set(canonical) | set(variants))
         billing = {}
         if wanted:
             cur.execute(
@@ -1763,7 +1770,17 @@ def _attach_invoice_detail(items):
                 [pos, wanted],
             )
             for po, code, qty, inv in cur.fetchall():
-                billing[(po, code)] = (float(qty or 0), inv or [])
+                # Fold onto the canonical code, ADDING rather than replacing: a PO
+                # can carry both bottles, and they are one product to Amazon.
+                key = (po, SAP_ITEM_ALIASES.get(code, code))
+                prev_qty, prev_inv = billing.get(key, (0.0, []))
+                docs = inv or []
+                if isinstance(docs, str):
+                    try:
+                        docs = json.loads(docs)
+                    except (TypeError, ValueError):
+                        docs = []
+                billing[key] = (prev_qty + float(qty or 0), list(prev_inv) + list(docs))
 
     # Greedy split: earlier ASINs on the same (po, item) consume the billed
     # total first, so sibling lines never each claim the whole figure.
