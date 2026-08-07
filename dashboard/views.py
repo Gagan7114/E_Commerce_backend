@@ -4034,6 +4034,13 @@ def top_skus(request):
                         sql += " GROUP BY 1, 2"
                         run("secmaster", dest, sql, params)
                     if use_amazon:
+                        # amazon_sec_range rows are CUMULATIVE month-to-date
+                        # snapshots (several pulls per month, from_date = month
+                        # start). Summing every snapshot in the window counts
+                        # the same units once per pull — July 2026 measured 7x
+                        # the real litres. Mirror the monthly branch below:
+                        # keep only each month's freshest snapshot inside the
+                        # window, then sum across the window's months.
                         run("amazon_sec_range", dest, """
                             WITH ml AS (
                                 SELECT DISTINCT ON (format_sku_code)
@@ -4043,14 +4050,24 @@ def top_skus(request):
                                 FROM master_sheet
                                 WHERE format_sku_code IS NOT NULL AND format_sku_code::text <> ''
                                 ORDER BY format_sku_code
+                            ),
+                            snap AS (
+                                SELECT r.asin,
+                                       COALESCE(r.shipped_units, 0) AS units,
+                                       r.to_date::date AS to_date,
+                                       MAX(r.to_date::date) OVER (
+                                           PARTITION BY date_trunc('month', r.from_date)
+                                       ) AS month_latest
+                                FROM amazon_sec_range r
+                                WHERE r.to_date::date >= %s
+                                  AND r.to_date::date <= %s
                             )
-                            SELECT COALESCE(ml.name, r.asin) AS name,
+                            SELECT COALESCE(ml.name, s.asin) AS name,
                                    UPPER(TRIM(ml.item_head::text)) AS head,
-                                   COALESCE(SUM(COALESCE(r.shipped_units, 0) * COALESCE(ml.per_unit_value::numeric, 0)), 0) AS ltrs
-                            FROM amazon_sec_range r
-                            JOIN ml ON UPPER(TRIM(ml.format_sku_code::text)) = UPPER(TRIM(r.asin::text))
-                            WHERE r.to_date::date >= %s
-                              AND r.to_date::date <= %s
+                                   COALESCE(SUM(s.units * COALESCE(ml.per_unit_value::numeric, 0)), 0) AS ltrs
+                            FROM snap s
+                            JOIN ml ON UPPER(TRIM(ml.format_sku_code::text)) = UPPER(TRIM(s.asin::text))
+                            WHERE s.to_date = s.month_latest
                               AND UPPER(TRIM(ml.item_head::text)) IN ('PREMIUM', 'COMMODITY')
                             GROUP BY 1, 2
                         """, [start_dt, end_dt])
