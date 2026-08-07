@@ -5301,16 +5301,14 @@ def _realise_aggregate(platform, month_num, year, group_by=None, filters=None):
                 fmt_ph = ", ".join(["%s"] * len(primary_formats))
                 # Delivered value must match the platform's Primary dashboard
                 # "Deliver Value" KPI card, which is what users compare against.
-                # That KPI uses the tax-INCLUSIVE delivered amount
-                # (total_deliver_amt_inclusive; see
+                # That KPI uses the tax-EXCLUSIVE delivered amount
+                # (total_delivered_amt_exclusive; see
                 # _primary_master_po_order_minus_deliver_kpi_total →
-                # metric_delivered_value in platforms/views.py) for EVERY platform.
-                # (Note: the Primary dashboard's per-head summary table uses a
-                # different, per-platform column, but the headline KPI — the number
-                # on the card — is always inclusive.)
+                # metric_delivered_value in platforms/views.py) for EVERY platform
+                # (user decision 2026-08-07, switched from inclusive).
                 sql = f"""
                     SELECT {grp} AS name, UPPER(TRIM(item_head::text)) AS head,
-                           COALESCE(SUM(total_deliver_amt_inclusive), 0) AS value,
+                           COALESCE(SUM(total_delivered_amt_exclusive), 0) AS value,
                            COALESCE(SUM(total_delivered_liters), 0) AS ltrs,
                            COALESCE(SUM(total_distributor_commission), 0) AS commission
                     FROM public.master_po

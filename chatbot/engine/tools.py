@@ -131,7 +131,7 @@ _MASTER_PO_SOURCE = _PoSource(
     order_ltrs="total_order_liters", delivered_ltrs="total_delivered_liters",
     filled_ltrs="filled_ltrs", missed_ltrs="missed_ltrs",
     order_qty="order_qty", delivered_qty="delivered_qty",
-    amount="total_order_amt_inclusive", delivered_amount="total_deliver_amt_inclusive",
+    amount="total_order_amt_inclusive", delivered_amount="total_delivered_amt_exclusive",
     format_col="format",
     dim_cols={"state": "state", "city": "city", "location": "location",
               "sku": "sku_code", "brand": "brand", "category": "category",
@@ -1743,7 +1743,7 @@ def realise(q: ParsedQuery) -> DataResult:
     wsql = (" WHERE " + " AND ".join(where)) if where else ""
     span = f" ({q.date_label})" if q.date_label else ""
 
-    sql = (f"SELECT COALESCE(SUM(total_deliver_amt_inclusive),0), COALESCE(SUM(total_delivered_liters),0), "
+    sql = (f"SELECT COALESCE(SUM(total_delivered_amt_exclusive),0), COALESCE(SUM(total_delivered_liters),0), "
            f"COALESCE(SUM(total_distributor_commission),0) FROM {table}{wsql}")
     _c, rows, _t = safe_sql.run_select(sql, params, max_rows=1)
     value, ltr, comm = rows[0]

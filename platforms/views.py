@@ -87,7 +87,7 @@ def _drop_primary_normalized() -> None:
 _PRIMARY_CTE_STUB = "WITH _stub AS (SELECT 1)"
 
 _PRIMARY_DASHBOARD_CACHE_TTL = 60  # seconds
-_PRIMARY_DASHBOARD_CACHE_VERSION = 26  # Amazon Pending LTRS -> gross (SUM Total Order Liters WHERE PENDING), matching the source sheet
+_PRIMARY_DASHBOARD_CACHE_VERSION = 27  # Deliver Value -> total_delivered_amt_exclusive on every platform (was total_deliver_amt_inclusive)
 
 
 # Platforms hidden from the whole app. Kept in code/DB (not deleted), but the
@@ -375,8 +375,8 @@ _PRIMARY_DASHBOARD_FORMATS = {
     "zomato": "ZOMATO",
 }
 _PRIMARY_DASHBOARD_DONE_VALUE_COLUMNS = {
-    ("bigbasket", "DEL MONTH"): "total_deliver_amt_inclusive",
-    ("bigbasket", "PO MONTH"): "total_deliver_amt_inclusive",
+    ("bigbasket", "DEL MONTH"): "total_delivered_amt_exclusive",
+    ("bigbasket", "PO MONTH"): "total_delivered_amt_exclusive",
     ("blinkit", "DEL MONTH"): "total_delivered_amt_exclusive",
     ("blinkit", "PO MONTH"): "total_delivered_amt_exclusive",
     ("citymall", "DEL MONTH"): "total_delivered_amt_exclusive",
@@ -518,7 +518,7 @@ def _primary_master_po_order_minus_deliver_kpi_total(
             0 AS projection_value,
             0 AS projection_ltrs,
             0 AS projection_qty,
-            COALESCE(SUM(COALESCE(total_deliver_amt_inclusive, 0)), 0) AS done_value,
+            COALESCE(SUM(COALESCE(total_delivered_amt_exclusive, 0)), 0) AS done_value,
             COALESCE(SUM(COALESCE(total_delivered_liters, 0)), 0) AS done_ltrs,
             COALESCE(SUM(COALESCE(delivered_qty, 0)), 0) AS done_qty,
             -- Pending = short-delivered ("missed") balance. The open_close
@@ -2725,7 +2725,7 @@ normalized AS (
         COALESCE(total_order_liters,0) AS metric_order_liters,
         COALESCE(total_delivered_liters,0) AS metric_delivered_liters,
         COALESCE(total_order_amt_inclusive,0) AS metric_order_value,
-        COALESCE(total_deliver_amt_inclusive,0) AS metric_delivered_value,
+        COALESCE(total_delivered_amt_exclusive,0) AS metric_delivered_value,
         COALESCE(order_qty,0) AS metric_order_qty,
         COALESCE(delivered_qty,0) AS metric_delivered_qty,
         0 AS metric_projection_value, 0 AS metric_projection_ltrs, 0 AS metric_projection_qty,
@@ -7391,12 +7391,13 @@ normalized AS (
         END AS per_ltr_key,
         -- Direct mapping per user spec: each KPI card reads exactly one
         -- canonical column from master_po — no qty x rate fallbacks.
-        -- Value cards use the tax/margin-INCLUSIVE amounts (these match the
-        -- source DB; the *_exclusive columns under-report Order/Deliver value).
+        -- Order value stays tax/margin-INCLUSIVE; Deliver value uses the
+        -- EXCLUSIVE amount (user decision 2026-08-07: every platform's
+        -- Deliver Value reads total_delivered_amt_exclusive).
         COALESCE(total_order_liters, 0) AS metric_order_liters,
         COALESCE(total_delivered_liters, 0) AS metric_delivered_liters,
         COALESCE(total_order_amt_inclusive, 0) AS metric_order_value,
-        COALESCE(total_deliver_amt_inclusive, 0) AS metric_delivered_value,
+        COALESCE(total_delivered_amt_exclusive, 0) AS metric_delivered_value,
         COALESCE(order_qty, 0) AS metric_order_qty,
         COALESCE(delivered_qty, 0) AS metric_delivered_qty,
         0 AS metric_projection_value,
