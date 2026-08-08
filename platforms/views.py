@@ -4612,6 +4612,32 @@ def _ads_dashboard_payload(
 # with allow_date=False (year/month are generated text columns). CPC/CPR/CPM/CTR
 # are recomputed at the aggregate level (SUM/SUM) rather than summing the per-row
 # generated columns.
+#
+# Meta exports are CUMULATIVE month-to-date snapshots ("1 Jul → 6 Jul", then
+# "1 Jul → 31 Jul"), one stored row per reporting-end date. Summing a month's
+# rows therefore counts the overlapping days once per snapshot — on 2026-08-08
+# July read ₹76,692 against a true ₹36,225 because a 1-6 Jul pull was still
+# stored next to 1-31 Jul. Every read goes through _META_LATEST_SQL, which keeps
+# only the newest snapshot per campaign per month; the uploader prunes stale
+# snapshots on write (`_meta_prune_stale_snapshots`), but the read must not
+# depend on the table already being clean.
+#
+# Picking the latest row per CAMPAIGN (rather than the single newest snapshot
+# date) keeps a campaign that dropped out of the newest pull at its last known
+# month-to-date figure instead of silently zeroing it.
+_META_CAMPAIGN_KEY = "COALESCE(NULLIF(TRIM(campaign_name), ''), '(Unnamed)')"
+
+_META_LATEST_SQL = f"""
+    SELECT DISTINCT ON (year, month, {_META_CAMPAIGN_KEY})
+           {_META_CAMPAIGN_KEY} AS campaign_name,
+           campaign_status, "date",
+           amount_spent, impressions, reach, unique_clicks
+    FROM meta_data
+    {{where_sql}}
+    ORDER BY year, month, {_META_CAMPAIGN_KEY},
+             to_date(NULLIF("date", ''), 'DD-MM-YYYY') DESC NULLS LAST
+"""
+
 _META_METRICS_SQL = """
     COALESCE(SUM(reach), 0)          AS reach,
     COALESCE(SUM(impressions), 0)    AS impressions,
@@ -4659,13 +4685,15 @@ def meta_dashboard(request):
     where_sql = ("WHERE " + " AND ".join(clauses)) if clauses else ""
     filters = {"year": year_param or None, "month": month_param or None}
 
+    latest_sql = _META_LATEST_SQL.format(where_sql=where_sql)
+
     summary_rows = _dict_rows(
         f"""
+        WITH latest AS ({latest_sql})
         SELECT {_META_METRICS_SQL},
                COUNT(DISTINCT campaign_name) AS campaigns,
-               to_char(MAX(to_date(NULLIF(date, ''), 'DD-MM-YYYY')), 'DD-MM-YYYY') AS max_date
-        FROM meta_data
-        {where_sql}
+               to_char(MAX(to_date(NULLIF("date", ''), 'DD-MM-YYYY')), 'DD-MM-YYYY') AS max_date
+        FROM latest
         """,
         params,
     )
@@ -4674,11 +4702,11 @@ def meta_dashboard(request):
 
     rows = _dict_rows(
         f"""
-        SELECT COALESCE(NULLIF(TRIM(campaign_name), ''), '(Unnamed)') AS campaign_name,
+        WITH latest AS ({latest_sql})
+        SELECT campaign_name,
                MAX(campaign_status) AS campaign_status,
                {_META_METRICS_SQL}
-        FROM meta_data
-        {where_sql}
+        FROM latest
         GROUP BY 1
         ORDER BY amount_spent DESC NULLS LAST
         """,

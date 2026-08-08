@@ -194,6 +194,57 @@ def _normalize_amazon_business_rows(table: str, data: list[dict]) -> int:
             changed += 1
     return changed
 
+# Meta campaign names carry an en-dash ("Pomace 5L – PD"). Meta exports UTF-8,
+# but a file opened and re-saved through Excel on Windows gets read as cp1252
+# and the corruption is baked in ("Pomace 5L â€“ PD"). Because meta_data's
+# unique key is (date, campaign_name), the two spellings never collide, so the
+# upsert INSERTS a second row and the dashboard counts that campaign twice
+# (seen 2026-08-08: 17 byte-identical duplicate rows inflating July by ₹13,893).
+# Repairing the text here — the one choke point every upload lane goes through —
+# keeps a single spelling in the table.
+_MOJIBAKE_MARKERS = ("â€", "â‚", "Ã", "Â")
+
+
+def _repair_mojibake(text: str) -> str:
+    """Undo UTF-8-decoded-as-cp1252 corruption ("â€“" → "–", "â‚¹" → "₹").
+
+    Re-encodes the string back to the cp1252 bytes it was mis-read from and
+    decodes those as UTF-8. Only attempted when a tell-tale marker is present,
+    and only kept when the round-trip succeeds — text that is genuinely spelled
+    with these characters fails to decode and is returned untouched.
+    """
+    for _ in range(3):  # doubly-corrupted text needs more than one pass
+        if not any(marker in text for marker in _MOJIBAKE_MARKERS):
+            break
+        try:
+            repaired = text.encode("cp1252").decode("utf-8")
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            break
+        if repaired == text:
+            break
+        text = repaired
+    return text
+
+
+def _normalize_meta_campaign_rows(table: str, data: list[dict]) -> int:
+    """Repair mojibake and trim `campaign_name` on meta_data upload rows in place.
+
+    Returns the number of rows changed. No-op for every other table.
+    """
+    if table != "meta_data":
+        return 0
+    changed = 0
+    for row in data:
+        raw = row.get("campaign_name")
+        if raw is None:
+            continue
+        cleaned = _repair_mojibake(str(raw)).strip()
+        if cleaned != raw:
+            row["campaign_name"] = cleaned
+            changed += 1
+    return changed
+
+
 PRIMARY_UPLOAD_REPLACE_KEYS = {
     # Primary PO rows are identified by platform PO + platform SKU. Status,
     # dates, vendor, rates, and quantities are mutable row data.
@@ -2951,6 +3002,83 @@ def _amazon_city_prune_stale_ranges(rows):
     return keep, deleted, skipped
 
 
+_META_MONTH_NAMES = [
+    "JANUARY", "FEBRUARY", "MARCH", "APRIL", "MAY", "JUNE",
+    "JULY", "AUGUST", "SEPTEMBER", "OCTOBER", "NOVEMBER", "DECEMBER",
+]
+
+
+def _meta_prune_stale_snapshots(rows):
+    """Meta ads exports are cumulative month-to-date snapshots — "1 Jul → 6 Jul",
+    then "1 Jul → 31 Jul" — so each newer pull fully contains the older ones.
+    meta_data stores one row per (reporting-end date, campaign), which means two
+    pulls of the same month sit side by side and every SUM over that month counts
+    the overlapping days twice (seen 2026-08-08: July read ₹76,692 against a true
+    ₹36,225 because a 1-6 Jul snapshot was still stored alongside 1-31 Jul).
+
+    Keep only the LATEST snapshot per calendar month, exactly as
+    `_amazon_city_prune_stale_ranges` does for Amazon city ranges:
+
+    - rows already stored for the same month with an OLDER reporting-end date are
+      deleted before this upload's rows go in;
+    - incoming rows OLDER than what's stored (or older than another snapshot
+      inside the same file) are dropped, not inserted.
+
+    `date` is TEXT 'DD-MM-YYYY' and `month`/`year` are generated from it.
+    Returns (rows_to_insert, deleted, skipped_stale)."""
+    def _d(value):
+        try:
+            return datetime.strptime(str(value or "").strip(), "%d-%m-%Y").date()
+        except ValueError:
+            return None
+
+    latest = {}  # (year, month) -> max incoming reporting-end date
+    parsed = []  # (row, group_key, end_date)
+    for row in rows:
+        end = _d((row or {}).get("date"))
+        if end is None:
+            parsed.append((row, None, None))  # let normal validation handle it
+            continue
+        key = (end.year, end.month)
+        parsed.append((row, key, end))
+        if key not in latest or end > latest[key]:
+            latest[key] = end
+
+    deleted = 0
+    stale_groups = set()
+    if latest:
+        with connection.cursor() as cur:
+            for (year, month), end in latest.items():
+                month_name = _META_MONTH_NAMES[month - 1]
+                # Stale upload guard: the table already holds a fresher snapshot
+                # for this month — don't let an older file regress it.
+                cur.execute(
+                    "SELECT MAX(to_date(NULLIF(\"date\", ''), 'DD-MM-YYYY')) "
+                    "FROM meta_data WHERE year = %s AND month = %s",
+                    [str(year), month_name],
+                )
+                existing_max = (cur.fetchone() or [None])[0]
+                if existing_max is not None and existing_max > end:
+                    stale_groups.add((year, month))
+                    continue
+                cur.execute(
+                    "DELETE FROM meta_data WHERE year = %s AND month = %s "
+                    "  AND to_date(NULLIF(\"date\", ''), 'DD-MM-YYYY') < %s",
+                    [str(year), month_name, end],
+                )
+                deleted += cur.rowcount
+
+    keep, skipped = [], 0
+    for row, key, end in parsed:
+        if key is None:
+            keep.append(row)
+        elif key in stale_groups or end < latest[key]:
+            skipped += 1
+        else:
+            keep.append(row)
+    return keep, deleted, skipped
+
+
 def _sync_amazon_cities_to_pincode_mapping(rows):
     """After an amazon_sec_city (city-wise Amazon Secondary) upload, grow
     pincode_mapping with any city it doesn't know yet.
@@ -3084,6 +3212,15 @@ def _batch_upload(body, *, forced_table: str | None = None):
             normalized_business, table,
         )
 
+    # Repair mojibake campaign names before the dedupe/prune logic runs, so both
+    # spellings of an en-dash collapse onto one upsert key.
+    normalized_campaigns = _normalize_meta_campaign_rows(table, data)
+    if normalized_campaigns:
+        logger.info(
+            "Repaired mojibake campaign_name on %s row(s) for %s upload",
+            normalized_campaigns, table,
+        )
+
     if table == "total_po_grn_update":
         return _update_total_po_grn_dates(data)
     if table == "total_po_zbs_grn_update":
@@ -3156,6 +3293,22 @@ def _batch_upload(body, *, forced_table: str | None = None):
                 "warnings": [
                     "Upload skipped: the table already holds a fresher "
                     "month-to-date range for this business and month."
+                ] if skipped_stale else [],
+            })
+
+    # Meta ads: cumulative month-to-date snapshots — supersede this month's older
+    # pulls and drop incoming rows staler than what's stored (see helper).
+    if table == "meta_data":
+        data, pruned_ranges, skipped_stale = _meta_prune_stale_snapshots(data)
+        if not data:
+            return Response({
+                "success": 0, "created": 0, "updated": 0,
+                "skipped": skipped_stale, "failed": 0,
+                "pruned_ranges": pruned_ranges, "skipped_stale": skipped_stale,
+                "error": None,
+                "warnings": [
+                    "Upload skipped: the table already holds a fresher "
+                    "month-to-date snapshot for this month."
                 ] if skipped_stale else [],
             })
 
