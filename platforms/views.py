@@ -5399,6 +5399,43 @@ def bigbasket_ads_daily_dashboard(request, slug: str):
     ))
 
 
+def _blinkit_campaign_labels() -> dict[str, str]:
+    """{campaign_id: display name} for the Blinkit ads Campaign view.
+
+    Blinkit REUSES campaign names: eight names are each carried by two different
+    campaign_ids (e.g. "Pomace Oil 1L" is both 45139 and 116184), and campaigns
+    also get renamed in place (116184 became "Pomace Oil 1L_R Ads"). So grouping
+    by `campaign_name` — the way the Amazon sheet does — would merge two
+    unrelated campaigns into one row AND split a renamed one across two.
+
+    The dashboard therefore groups by `campaign_id`, the stable identity, and
+    only uses the name as a label: the campaign's most recent one. Two campaigns
+    can still end up with the same latest name (a dead "Mustard Oil 1L" and the
+    live one), so the id is appended wherever a name isn't unique.
+    """
+    rows = _dict_rows(
+        """
+        SELECT DISTINCT ON (campaign_id) campaign_id, campaign_name
+          FROM blinkit_ads
+         WHERE campaign_id IS NOT NULL AND TRIM(campaign_id) <> ''
+         ORDER BY campaign_id, date DESC
+        """,
+        [],
+    )
+    ids_per_name: dict[str, int] = {}
+    for r in rows:
+        name = (r["campaign_name"] or "").strip()
+        ids_per_name[name] = ids_per_name.get(name, 0) + 1
+
+    labels: dict[str, str] = {}
+    for r in rows:
+        name = (r["campaign_name"] or "").strip() or "(Unnamed campaign)"
+        if ids_per_name.get(name, 0) > 1:
+            name = f"{name} ({r['campaign_id']})"
+        labels[str(r["campaign_id"])] = name
+    return labels
+
+
 @api_view(["GET"])
 @permission_classes([require("platform.stats.view")])
 @cached_get(timeout=60, prefix="plat.blinkit_ads")
@@ -5406,6 +5443,22 @@ def blinkit_ads_dashboard(request, slug: str):
     _ensure_scope(request.user, slug)
     if slug != "blinkit":
         raise ValidationError("Blinkit Ads Dashboard is available only for Blinkit.")
+
+    # Dimension switch — re-groups the whole sheet, same mechanism the Amazon
+    # sheet uses for Portfolio / Campaign / ASIN. `item` stays the default so
+    # the dashboard opens exactly as it did before the Campaign view existed.
+    dimension = str(request.query_params.get("dimension") or "item").strip().lower()
+    dim_map = {
+        "item": ("item", "Items", "(Unmapped)"),
+        # Grouped by id, labelled by name after the fact — see
+        # `_blinkit_campaign_labels` for why the name can't be the key.
+        "campaign": ("campaign_id", "Campaigns", "(Unassigned)"),
+        "category": ("category", "Categories", "(Unmapped)"),
+    }
+    dimension_key, dimension_label, dimension_unmapped = dim_map.get(
+        dimension, dim_map["item"]
+    )
+
     # Date-wise mode: per-day rows (date + item). Valid here because
     # blinkit_ads_master is per-day (non-cumulative) like amazon_ads_master.
     date_wise = str(
@@ -5417,16 +5470,16 @@ def blinkit_ads_dashboard(request, slug: str):
         request.query_params.get("month_wise") or ""
     ).strip().lower() in ("1", "true", "yes")
     where_sql, params, trend_where_sql, trend_params, filters = _ads_build_where(request, allow_date=True)
-    return Response(_ads_dashboard_payload(
+    payload = _ads_dashboard_payload(
         source="blinkit_ads_master",
         date_wise=date_wise,
         month_wise=month_wise,
         # Range summary (sum across the selected period), not max-date snapshot.
         summary_use_max_date=False,
         title="Blinkit ADS Dashboard",
-        dimension_key="item",
-        dimension_label="Items",
-        dimension_unmapped="(Unmapped)",
+        dimension_key=dimension_key,
+        dimension_label=dimension_label,
+        dimension_unmapped=dimension_unmapped,
         # blinkit_ads_master has both `direct_gmv` and `indirect_gmv` — keep them separate.
         metric_specs=_quick_commerce_metrics(gmv_field="direct_gmv", include_indirect_qty=True, include_indirect_gmv=True,
                                              include_ads_sale=True),
@@ -5439,7 +5492,16 @@ def blinkit_ads_dashboard(request, slug: str):
         trend_where_sql=trend_where_sql,
         trend_params=trend_params,
         filters=filters,
-    ))
+    )
+
+    # Swap the grouped campaign_ids for readable names. Done here rather than in
+    # SQL so the GROUP BY key stays the id — the label is presentation only.
+    if dimension == "campaign":
+        labels = _blinkit_campaign_labels()
+        for row in payload.get("breakdown_rows", []):
+            row["dimension"] = labels.get(row.get("dimension"), row.get("dimension"))
+
+    return Response(payload)
 
 
 def _report_ordinal_day(day: int) -> str:
