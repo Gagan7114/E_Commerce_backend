@@ -39,6 +39,11 @@ Contract
   GET  /api/platform/<slug>/blinkit-sale-target
          ?date=YYYY-MM-DD          (default: latest date with Blinkit data)
          &compare_date=YYYY-MM-DD  (default: the day before `date`)
+         &close_months=YYYY-MM,…   (default: the six months before `date`'s
+                                    month; any closed month may be picked, in
+                                    any combination, and growth is measured
+                                    from the newest one picked. The literal
+                                    `none` means no close columns at all.)
   POST /api/platform/<slug>/blinkit-sale-target/set-target
          body {item, item_head, month, year, target_ltrs, category?}
 
@@ -69,6 +74,11 @@ ITEM_HEADS = ("PREMIUM", "COMMODITY")
 
 # How many closed months to show to the left of "Growth From <prev>".
 CLOSE_MONTHS = 6
+
+# How many closed months the picker offers. Twelve consecutive months carry
+# twelve distinct month names, so the columns never need a year to tell them
+# apart — which is what keeps the headers reading like the workbook's.
+CLOSE_MONTH_CHOICES = 12
 
 # Products with no sales in this many months back from the selected month drop
 # off the target sheet (a delisted SKU shouldn't linger forever). A product with
@@ -132,6 +142,60 @@ def _month_shift(year: int, month: int, back: int) -> tuple[int, int]:
 
 def _month_start(year: int, month: int) -> date:
     return date(year, month, 1)
+
+
+def _split_month_key(key: str) -> tuple[int, int]:
+    """'2026-07' -> (2026, 7)."""
+    year, month = key.split("-")
+    return int(year), int(month)
+
+
+def _close_month_meta(key: str, with_year: bool = False) -> dict:
+    """One close column's labels — plain "Jul Close" / "Jul", as the workbook
+    writes them.
+
+    `with_year` is the safety valve, not the norm. The picker offers twelve
+    consecutive months, whose names are all distinct, so the year is redundant
+    and stays off. It only switches on if a gap in the data ever pushed two
+    same-named months into one selection, where three columns would otherwise
+    all read "Jul Close".
+    """
+    year, month = _split_month_key(key)
+    first = date(year, month, 1)
+    short = first.strftime("%b-%y") if with_year else first.strftime("%b")
+    return {
+        "key": key,
+        "label": f"{short} Close",
+        "option_label": short,
+        "short": short,
+        "month": month,
+        "year": year,
+    }
+
+
+def _parse_close_months(raw: str, month: int, year: int) -> list[str]:
+    """Parse `close_months=2026-07,2026-06` into validated 'YYYY-MM' keys.
+
+    Months at or after the selected one are dropped rather than rejected: a
+    "close" is by definition a month that has finished, and silently ignoring a
+    stale pick keeps the sheet usable when the user moves the As-on date back.
+    """
+    keys: list[str] = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            k_year, k_month = _split_month_key(part)
+            date(k_year, k_month, 1)
+        except (ValueError, TypeError):
+            raise ValidationError(
+                f"`close_months` entries must look like YYYY-MM (got '{part}')."
+            )
+        if (k_year, k_month) >= (year, month):
+            continue
+        keys.append(_month_key(k_year, k_month))
+    return keys
 
 
 def _parse_date(raw, field: str):
@@ -269,8 +333,34 @@ def _catalog(window_start: date, window_end: date) -> dict[str, dict]:
     }
 
 
-def _monthly_closes(window_start: date, window_end: date) -> dict[str, dict[str, float]]:
-    """{item_key: {'YYYY-MM': litres}} over the close-month window."""
+def _available_close_months(before: date) -> list[str]:
+    """The most recent CLOSE_MONTH_CHOICES months with Blinkit sales, strictly
+    before the selected month, newest first — the Close-months pick-list."""
+    rows = _dict_rows(
+        f"""
+        SELECT DISTINCT TO_CHAR("date", 'YYYY-MM') AS ym
+          FROM secmaster_mv
+         WHERE {_BLINKIT_FORMAT_SQL}
+           AND "date" < %s
+         ORDER BY 1 DESC
+         LIMIT %s
+        """,
+        [before, CLOSE_MONTH_CHOICES],
+    )
+    return [r["ym"] for r in rows]
+
+
+def _monthly_closes(
+    window_start: date, window_end: date, months: list[str]
+) -> dict[str, dict[str, float]]:
+    """{item_key: {'YYYY-MM': litres}} for exactly the requested months.
+
+    The date range is the span of those months, so the scan stays bounded, and
+    the `= ANY` keeps a non-contiguous pick (say Jul and Feb) from dragging in
+    everything between them.
+    """
+    if not months:
+        return {}
     rows = _dict_rows(
         f"""
         SELECT UPPER(TRIM("item")) AS item_key,
@@ -279,10 +369,11 @@ def _monthly_closes(window_start: date, window_end: date) -> dict[str, dict[str,
           FROM secmaster_mv
          WHERE {_BLINKIT_FORMAT_SQL}
            AND "date" >= %s AND "date" < %s
+           AND TO_CHAR("date", 'YYYY-MM') = ANY(%s)
            AND "item" IS NOT NULL AND TRIM("item") <> ''
          GROUP BY 1, 2
         """,
-        [window_start, window_end],
+        [window_start, window_end, months],
     )
     closes: dict[str, dict[str, float]] = {}
     for row in rows:
@@ -404,6 +495,7 @@ def blinkit_sale_target(request, slug: str):
             "daily": {"current": _daily_block(None, []), "compare": _daily_block(None, [])},
             "targets": {
                 "close_months": [],
+                "available_close_months": [],
                 "prev_month_label": None,
                 "sections": [],
                 "grand_total": None,
@@ -422,30 +514,52 @@ def blinkit_sale_target(request, slug: str):
     elapsed_days = min(as_on.day, days_in_month)
     month_start = _month_start(year, month)
 
-    # Close columns: the CLOSE_MONTHS months before the selected one, newest
-    # first ("Jul Close, Jun Close, … Feb Close").
-    close_months = []
-    for back in range(1, CLOSE_MONTHS + 1):
-        c_year, c_month = _month_shift(year, month, back)
-        close_months.append({
-            "key": _month_key(c_year, c_month),
-            "label": f"{date(c_year, c_month, 1).strftime('%b')} Close",
-            "short": date(c_year, c_month, 1).strftime("%b"),
-            "month": c_month,
-            "year": c_year,
-        })
-    close_keys = [c["key"] for c in close_months]
-    prev_key = close_keys[0] if close_keys else None
-
-    # One window spans both the close months and the selected month.
-    oldest_year, oldest_month = _month_shift(year, month, CLOSE_MONTHS)
-    closes_start = _month_start(oldest_year, oldest_month)
     next_year, next_month = _month_shift(year, month, -1)
     window_end = _month_start(next_year, next_month)
 
+    # Close columns. `close_months=YYYY-MM,YYYY-MM,…` picks them explicitly;
+    # with no param the sheet keeps its old shape — the CLOSE_MONTHS months
+    # immediately before the selected one ("Jul Close, Jun Close, … Feb Close").
+    available = _available_close_months(month_start)
+    raw = str(request.query_params.get("close_months") or "").strip()
+    if raw.lower() == "none":
+        # Explicitly "no close columns". Needed because an empty query param is
+        # dropped in transit, which would be indistinguishable from sending no
+        # param at all and would silently restore the six defaults.
+        close_keys = []
+    elif raw:
+        close_keys = _parse_close_months(raw, month, year)
+    else:
+        close_keys = [
+            _month_key(*_month_shift(year, month, back))
+            for back in range(1, CLOSE_MONTHS + 1)
+        ]
+    # Newest first, so the columns read Jul, Jun, May … whatever order they were
+    # ticked in, and the growth basis below is always the most recent pick.
+    close_keys = sorted(set(close_keys), reverse=True)
+    # Headers stay bare ("Jul Close") unless two picks share a month name, which
+    # the twelve-month pick-list makes impossible in practice — see
+    # `_close_month_meta`.
+    names = [k[5:] for k in close_keys]
+    ambiguous = len(set(names)) != len(names)
+    close_months = [_close_month_meta(key, ambiguous) for key in close_keys]
+    # Growth compares against the NEWEST selected close month, not blindly
+    # against month-1: every figure on the sheet then has its basis visible in a
+    # column. With the default selection that newest month IS month-1, so the
+    # untouched sheet reads exactly as before.
+    prev_key = close_keys[0] if close_keys else None
+
+    # One scan spanning the oldest selected close month to the selected month.
+    closes_start = (
+        _month_start(*_split_month_key(close_keys[-1])) if close_keys else month_start
+    )
+
     catalog_year, catalog_month = _month_shift(year, month, CATALOG_LOOKBACK_MONTHS)
-    catalog = _catalog(_month_start(catalog_year, catalog_month), window_end)
-    closes_by_item = _monthly_closes(closes_start, window_end)
+    # A close month older than the catalog lookback still needs its products
+    # listed, or its column would be blank for them.
+    catalog_start = min(_month_start(catalog_year, catalog_month), closes_start)
+    catalog = _catalog(catalog_start, window_end)
+    closes_by_item = _monthly_closes(closes_start, window_end, close_keys)
     mtd_by_item = _month_to_date(month_start, as_on)
     targets_by_item = _saved_targets(month, year)
 
@@ -518,6 +632,9 @@ def blinkit_sale_target(request, slug: str):
         },
         "targets": {
             "close_months": close_months,
+            # Every closed month with Blinkit data — the Close-months picker's
+            # options, newest first.
+            "available_close_months": [_close_month_meta(k) for k in available],
             "prev_month_label": close_months[0]["short"] if close_months else None,
             "sections": sections,
             "grand_total": grand_total,
