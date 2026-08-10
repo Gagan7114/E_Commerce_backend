@@ -20,6 +20,14 @@
  * refresh, INCLUDING formulas (they are re-written as formulas, not flattened
  * to their last value). See writeSheet_ for the details.
  *
+ * !! ONE-TIME STEP AFTER WIDENING COLUMNS !!
+ * The script writes all 43 columns of COLUMNS into A..AQ and treats everything
+ * from AR onwards as yours. It used to own only A..J, so if the tab already has
+ * your own columns starting at K, MOVE THEM FIRST or they will be overwritten:
+ * select columns K..AQ on the tab and Insert -> "32 columns left" (or cut your
+ * block and paste it at AR). Do that BEFORE the next refresh. A brand-new /
+ * empty tab needs nothing.
+ *
  * -- SETUP (one time) ------------------------------------------------------
  * 1. Open your Google Sheet -> Extensions -> Apps Script. Paste this whole file
  *    into Code.gs (replacing what's there) and Save.  (Opening it from the
@@ -110,27 +118,72 @@ var CONFIG = {
 };
 
 // [field in the API row, header written to the sheet, type].
-// type: 'date' -> real date cell | 'number' -> real number cell | '' -> text.
+// type: 'date'   -> real date cell (dd-MMM-yyyy)
+//       'number' -> real number cell, 2 decimals with thousands separators
+//       'int'    -> real number cell, no decimals and NO separators - for IDs
+//                   and codes, where "1,234.00" would be wrong/unsearchable
+//       ''       -> text, written through unchanged
 // '__source' is added by this script (mart / oil); everything else comes
 // straight from the SAP procedure. Add or remove lines freely - the script
 // columns are simply "the first COLUMNS.length columns of the tab".
+//
+// This is the FULL column set the procedure returns (42 fields), in the order
+// SAP returns them, plus '__source' at the end. Delete any line you don't want
+// on the sheet; nothing else needs changing. But see MANUAL COLUMNS below -
+// widening COLUMNS moves where your own columns have to start.
 var COLUMNS = [
-  ['DocDate',       'Date',       'date'],
-  ['ItemCode',      'Item Code',  ''],
-  ['ItemName',      'Item Name',  ''],
-  ['SKU',           'SKU',        ''],
-  ['U_TYPE',        'Item Head',  ''],
-  ['U_Sub_Group',   'Sub Group',  ''],
-  ['Quantity',      'Quantity',   'number'],
-  ['Liter',         'Liter',      'number'],
-  ['LineTotal',     'Line Total', 'number'],
-  ['__source',      'Source',     ''],
+  ['Level',          'Level',           'int'],
+  ['DocNum',         'Doc No',          'int'],
+  ['DocDate',        'Date',            'date'],
+  ['U_Main_Group',   'Main Group',      ''],
+  ['U_Chain',        'Chain',           ''],
+  ['State',          'State',           ''],
+  ['CardCode',       'Card Code',       ''],
+  ['CardName',       'Card Name',       ''],
+  ['SKU',            'SKU',             ''],
+  ['ItmsGrpNam',     'Item Group',      ''],
+  ['ItmsGrpCod',     'Item Group Code', 'int'],
+  ['ItemCode',       'Item Code',       ''],
+  ['ItemName',       'Item Name',       ''],
+  ['SalPackUn',      'Sal Pack Un',     'number'],
+  ['Quantity',       'Quantity',        'number'],
+  ['Liter',          'Liter',           'number'],
+  ['LineTotal',      'Line Total',      'number'],
+  ['Realise',        'Realise',         'number'],
+  ['SchemeQty',      'Scheme Qty',      'number'],
+  ['SchemeSaleAmt',  'Scheme Sale Amt', 'number'],
+  ['SchemeAmt',      'Scheme Amt',      'number'],
+  ['COGS',           'COGS',            'number'],
+  ['TransId',        'Trans Id',        'int'],
+  ['BaseEntry',      'Base Entry',      'int'],
+  ['BaseType',       'Base Type',       'int'],
+  ['COGSBase',       'COGS Base',       'number'],
+  ['BaseTransId',    'Base Trans Id',   'int'],
+  ['Variety',        'Variety',         ''],
+  ['Type',           'Type',            ''],
+  ['Brand',          'Brand',           ''],
+  ['Location',       'Location',        ''],
+  ['Year',           'Year',            'int'],
+  ['Month',          'Month',           'int'],
+  ['MonthName',      'Month Name',      ''],
+  ['Box',            'Box',             'number'],
+  ['Liter(Y/N)',     'Liter (Y/N)',     ''],
+  ['Branch',         'Branch',          ''],
+  ['U_TYPE',         'Item Head',       ''],
+  ['U_Sub_Group',    'Sub Group',       ''],
+  ['U_Variety',      'U Variety',       ''],
+  ['CCOGS',          'CCOGS',           'number'],
+  ['U_MART_DOC_NO',  'Mart Doc No',     ''],
+  ['__source',       'Source',          ''],
 ];
 
 // Which fields identify a row, so a note you typed in a manual column comes
-// back onto the SAME sale after the next refresh. Repeats of the same
-// (date, item) are told apart by their position within that group.
-var KEY_FIELDS = ['DocDate', 'ItemCode'];
+// back onto the SAME sale after the next refresh. DocNum is in here because
+// without it two different invoices on the SAME day for the SAME item are told
+// apart only by their position in the sort order - and a backdated document
+// arriving later shifts those positions, sliding your notes onto the wrong
+// sale. Any field listed here must also appear in COLUMNS above.
+var KEY_FIELDS = ['DocDate', 'DocNum', 'ItemCode'];
 
 // Where the login comes from: Script Properties first, then the CONFIG lines.
 // NOTE getScriptProperties().getProperty() takes the property NAME
@@ -362,7 +415,7 @@ function date_(v) {
 function cellValue_(row, field, type) {
   var raw = val_(row, field);
   if (type === 'date') return date_(raw);
-  if (type === 'number') return num_(raw);
+  if (type === 'number' || type === 'int') return num_(raw);
   return raw == null ? '' : raw;
 }
 
@@ -375,10 +428,16 @@ function getSpreadsheet_() {
 }
 
 // ---------------------------------------------------------------------------
-// Row identity. The script OWNS only the columns in COLUMNS (A..J by default).
-// Anything to the RIGHT of them is MANUAL: it survives every refresh and is
-// re-attached to the SAME sale, matched on KEY_FIELDS plus how many earlier
-// rows share that key.
+// MANUAL COLUMNS. The script OWNS the first COLUMNS.length columns of the tab -
+// with the full 43-entry list above that is A..AQ. Anything to the RIGHT of
+// them is MANUAL: it survives every refresh and is re-attached to the SAME
+// sale, matched on KEY_FIELDS plus how many earlier rows share that key.
+//
+// IMPORTANT when you widen or narrow COLUMNS: "manual" is decided purely by
+// POSITION, so your own columns must start at column COLUMNS.length + 1 (AQ+1
+// = AR today). If they sit anywhere inside the owned range they are treated as
+// script columns and overwritten on the next refresh. Move them first, then
+// run - see the note in the file header.
 // ---------------------------------------------------------------------------
 
 function keyPart_(v) {
@@ -476,7 +535,9 @@ function writeSheet_(rows) {
   sheet.setFrozenRows(1);
 }
 
-// Date columns as dd-MMM-yyyy, number columns with thousands separators.
+// Date columns as dd-MMM-yyyy, money/quantity columns with thousands
+// separators, and 'int' columns bare - a document number must read 1049678,
+// not 1,049,678.00.
 function formatColumns_(sheet, rowCount) {
   if (rowCount < 2) return;
   COLUMNS.forEach(function (c, i) {
@@ -484,6 +545,8 @@ function formatColumns_(sheet, rowCount) {
       sheet.getRange(2, i + 1, rowCount - 1, 1).setNumberFormat('dd-MMM-yyyy');
     } else if (c[2] === 'number') {
       sheet.getRange(2, i + 1, rowCount - 1, 1).setNumberFormat('#,##0.00');
+    } else if (c[2] === 'int') {
+      sheet.getRange(2, i + 1, rowCount - 1, 1).setNumberFormat('0');
     }
   });
 }
