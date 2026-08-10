@@ -6809,6 +6809,215 @@ class ShipmentRecordView(_SafeAPIView):
         return Response({'results': results, 'count': len(results)})
 
 
+def _switch_row_kind(row, shipment_appointment_id=''):
+    """Which of the TWO switch kinds one switch_details row is.
+
+      'fc'          — the PO lives at a sister FC and must be moved to this
+                      truck's FC.                        ("PO switching")
+      'appointment' — the PO is already at this FC but booked on a DIFFERENT
+                      appointment, so it must be re-slotted.
+
+    The stored `switch_kind` wins whenever it names one of those two. It cannot
+    simply be trusted to exist, though: the auto planner shipped without sending
+    the field, so rows saved before that fix carry no kind at all. Those are
+    DERIVED — two different FCs is an FC move; same FC but a different source
+    appointment is a re-slot. Anything still ambiguous falls back to 'fc', which
+    is what the flow meant before appointment moves existed, so a row is never
+    lost from both buckets.
+    """
+    kind = str(row.get('switch_kind') or '').strip().lower()
+    if kind in ('fc', 'appointment'):
+        return kind
+    a = str(row.get('from_fc') or '').strip().upper()
+    b = str(row.get('to_fc') or '').strip().upper()
+    if a and b and a != b:
+        return 'fc'
+    frm = str(row.get('from_appointment_id') or '').strip()
+    if frm and frm != str(shipment_appointment_id or '').strip():
+        return 'appointment'
+    return 'fc'
+
+
+def _switch_num(value):
+    """A switch row is hand-edited JSON, so a quantity can arrive as 1200, 1200.0,
+    '1200', '1,200', None or ''. Always hand back a real number — the client must
+    never have to coerce (and must never concatenate two strings by accident)."""
+    if value is None or isinstance(value, bool):
+        return 0.0
+    if isinstance(value, (int, float, Decimal)):
+        return float(value)
+    try:
+        return float(str(value).replace(',', '').strip())
+    except (TypeError, ValueError):
+        return 0.0
+
+
+class ShipmentSwitchingView(_SafeAPIView):
+    """History → Switching: every switch row on every switching shipment, split
+    into the two kinds the flow actually distinguishes.
+
+      po_switches          — switch_kind 'fc': the PO sits at a sister FC and
+                             Amazon must move it here (from_fc → to_fc).
+      appointment_switches — switch_kind 'appointment': the PO is already here
+                             but on another booking and must be re-slotted
+                             (from_appointment_id → this truck's appointment).
+
+    A FLIP is deliberately absent: a PO already riding one of this truck's
+    appointments needs nothing from Amazon, so it was never written to
+    switch_details in the first place (see _tag_manual_switches).
+
+    One query for the shipments (the rows are JSON on the shipment itself, so
+    there is nothing to join per shipment) plus the cached FC→channel map.
+    Newest shipment first; rows keep their saved order within a shipment.
+
+    `summary` counts SHIPMENTS for the four state buckets and `shipments`, and
+    LINES/POs/units/liters for the two kind buckets — a switching shipment with
+    an empty switch_details therefore still shows up in its state count, which
+    is the honest picture of what is sitting in the queue.
+    """
+    permission_classes = [IsAuthenticated]
+
+    STATES = (
+        Shipment.SwitchState.WAITING,
+        Shipment.SwitchState.EMAIL_FAILED,
+        Shipment.SwitchState.VERIFIED,
+        Shipment.SwitchState.REJECTED,
+    )
+
+    def get(self, request):
+        limit = _safe_int(request.query_params.get('limit'), 200, lo=1, hi=2000)
+        state = (request.query_params.get('state') or '').strip().lower()
+        if state in ('', 'all', 'any'):
+            state = ''
+        elif state not in self.STATES:
+            return Response(
+                {'error': 'Unknown state filter.',
+                 'detail': f'state must be one of: all, {", ".join(self.STATES)}.'},
+                status=400,
+            )
+
+        qs = Shipment.objects.exclude(switch_state='')
+        if state:
+            qs = qs.filter(switch_state=state)
+        # A REJECTED SHIPMENT is dead weight in this queue — its switch will
+        # never be actioned — so it is hidden, exactly like every other planner
+        # read. Asking explicitly for the rejected bucket is the one case where
+        # you do want to see them, so that filter opts out.
+        if state != Shipment.SwitchState.REJECTED:
+            qs = qs.exclude(status=Shipment.Status.REJECTED)
+
+        shipments = list(
+            qs.order_by('-created_at', '-id').values(
+                'id', 'status', 'switch_state', 'destination_fc',
+                'appointment_id', 'appointment_time', 'created_at',
+                'created_by__email', 'switch_details', 'switch_email_to',
+                'switch_email_sent_at', 'switch_verified_at',
+                'switch_verified_by__email', 'switch_verify_note',
+            )[:limit]
+        )
+
+        channel_map = _fc_channel_map()
+        po_switches, appointment_switches = [], []
+        po_pos, appt_pos = set(), set()
+        summary = {
+            'po_lines': 0, 'po_pos': 0, 'po_units': 0.0, 'po_liters': 0.0,
+            'appt_lines': 0, 'appt_pos': 0, 'appt_units': 0.0, 'appt_liters': 0.0,
+            'waiting': 0, 'email_failed': 0, 'verified': 0, 'rejected': 0,
+            'shipments': len(shipments),
+        }
+
+        for sh in shipments:
+            sw_state = str(sh.get('switch_state') or '')
+            if sw_state in summary:
+                summary[sw_state] += 1
+
+            details = sh.get('switch_details')
+            if isinstance(details, str):
+                # JSONField normally decodes for us; a legacy text column (or a
+                # double-encoded write) would otherwise blow up the whole page.
+                try:
+                    details = json.loads(details)
+                except (ValueError, TypeError):
+                    details = []
+            if not isinstance(details, list):
+                details = []
+
+            fc = str(sh.get('destination_fc') or '').strip()
+            appt_id = str(sh.get('appointment_id') or '').strip()
+            # Serialized once per shipment, not once per row.
+            base = _serialize_row({
+                'shipment_id': sh['id'],
+                'shipment_status': sh.get('status') or '',
+                'switch_state': sw_state,
+                'destination_fc': fc,
+                'channel': channel_map.get(fc.upper()),
+                'appointment_id': appt_id,
+                'appointment_time': sh.get('appointment_time'),
+                'created_at': sh.get('created_at'),
+                'created_by_email': sh.get('created_by__email') or '',
+                'email_to': sh.get('switch_email_to') or '',
+                'email_sent_at': sh.get('switch_email_sent_at'),
+                'verified_at': sh.get('switch_verified_at'),
+                'verified_by': sh.get('switch_verified_by__email') or '',
+                'verify_note': sh.get('switch_verify_note') or '',
+            })
+
+            for r in details:
+                if not isinstance(r, dict):
+                    continue
+                kind = _switch_row_kind(r, appt_id)
+                po = str(r.get('po_number') or '').strip()
+                units = _switch_num(r.get('units'))
+                cartons = _switch_num(r.get('cartons'))
+                liters = _switch_num(r.get('liters'))
+                row = dict(base, **_serialize_row({
+                    'po_number': po,
+                    'asin': str(r.get('asin') or ''),
+                    'product_name': str(r.get('product_name') or r.get('product') or ''),
+                    'from_fc': str(r.get('from_fc') or '').strip(),
+                    # An unset target is this truck's FC / appointment by
+                    # construction — that is where the switch is moving TO — so
+                    # fill it in rather than render a blank arrow. A stored
+                    # value always wins.
+                    'to_fc': str(r.get('to_fc') or '').strip() or fc,
+                    'from_appointment_id': str(r.get('from_appointment_id') or '').strip(),
+                    'from_appointment_time': r.get('from_appointment_time') or None,
+                    'to_appointment_id': str(r.get('to_appointment_id') or '').strip() or appt_id,
+                    'to_appointment_time': (
+                        r.get('to_appointment_time') or sh.get('appointment_time')
+                    ),
+                    'units': round(units, 2),
+                    'cartons': round(cartons, 2),
+                    'liters': round(liters, 2),
+                    'remark': str(r.get('remark') or ''),
+                }))
+                if kind == 'appointment':
+                    appointment_switches.append(row)
+                    summary['appt_lines'] += 1
+                    summary['appt_units'] += units
+                    summary['appt_liters'] += liters
+                    if po:
+                        appt_pos.add(po.upper())
+                else:
+                    po_switches.append(row)
+                    summary['po_lines'] += 1
+                    summary['po_units'] += units
+                    summary['po_liters'] += liters
+                    if po:
+                        po_pos.add(po.upper())
+
+        summary['po_pos'] = len(po_pos)
+        summary['appt_pos'] = len(appt_pos)
+        for k in ('po_units', 'po_liters', 'appt_units', 'appt_liters'):
+            summary[k] = round(summary[k], 2)
+
+        return Response({
+            'po_switches': po_switches,
+            'appointment_switches': appointment_switches,
+            'summary': summary,
+        })
+
+
 class ShipmentKpiView(_SafeAPIView):
     """Live planner KPIs (Data → KPIs), computed from sp_shipments / sp_items over
     ACTIVE shipments (not rejected): truck fill %, unit fill %, short-supply %,

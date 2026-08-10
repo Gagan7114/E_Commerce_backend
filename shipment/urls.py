@@ -25,6 +25,7 @@ urlpatterns = [
     path('po-shipment-lookup/', views.PoShipmentLookupView.as_view(), name='po-shipment-lookup'),
     path('po-short-supply/', views.PoShortSupplyView.as_view(), name='po-short-supply'),
     path('record/', views.ShipmentRecordView.as_view(), name='shipment-record'),
+    path('switching/', views.ShipmentSwitchingView.as_view(), name='shipment-switching'),
     path('kpis/', views.ShipmentKpiView.as_view(), name='shipment-kpis'),
     path('inventory/', views.SapInventoryView.as_view(), name='sap-inventory'),
     path('shipments/<int:pk>/', views.ShipmentDetailView.as_view(), name='shipment-detail'),
