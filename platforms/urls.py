@@ -1,6 +1,12 @@
 from django.urls import path
 
-from . import views, monthly_targets, primary_monthly_targets, call_center_targets
+from . import (
+    views,
+    monthly_targets,
+    primary_monthly_targets,
+    call_center_targets,
+    blinkit_sale_target,
+)
 
 urlpatterns = [
     # Cross-platform dashboard — registered before the <slug:slug> routes so
@@ -119,6 +125,17 @@ urlpatterns = [
     path("<slug:slug>/bigbasket-ads-daily-dashboard", views.bigbasket_ads_daily_dashboard, name="platform-bigbasket-ads-daily-dashboard"),
     path("<slug:slug>/blinkit-ads-dashboard", views.blinkit_ads_dashboard, name="platform-blinkit-ads-dashboard"),
     path("<slug:slug>/blinkit-summary-report", views.blinkit_summary_report, name="platform-blinkit-summary-report"),
+    # Marketing → Sale & Target (Blinkit only): daily sale pair + litre-wise targets.
+    path(
+        "<slug:slug>/blinkit-sale-target",
+        blinkit_sale_target.blinkit_sale_target,
+        name="platform-blinkit-sale-target",
+    ),
+    path(
+        "<slug:slug>/blinkit-sale-target/set-target",
+        blinkit_sale_target.blinkit_sale_target_set_target,
+        name="platform-blinkit-sale-target-set-target",
+    ),
     path("<slug:slug>/flipkart-ads-dashboard", views.flipkart_ads_dashboard, name="platform-flipkart-ads-dashboard"),
     path("<slug:slug>/flipkart-fsn-dashboard", views.flipkart_fsn_dashboard, name="platform-flipkart-fsn-dashboard"),
     path("<slug:slug>/blinkit-brandfund-dashboard", views.blinkit_brandfund_dashboard, name="platform-blinkit-brandfund-dashboard"),
