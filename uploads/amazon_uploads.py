@@ -3090,28 +3090,37 @@ def _paginated_select(
         f'{column_exprs[col]} AS "{col}"' if col in column_exprs else f'"{col}"'
         for col in columns
     )
-    with connection.cursor() as cur:
-        cur.execute(f"SELECT COUNT(*) FROM {table_sql}{where_sql}", params)
-        total = int(cur.fetchone()[0] or 0)
-        cur.execute(
-            f"SELECT {column_sql} FROM {table_sql}{where_sql} {order_sql} LIMIT %s OFFSET %s",
-            params + [page_size, offset],
-        )
-        results = _rows_to_dicts(cur)
-        column_totals = None
-        if total_columns:
-            # Sum the SAME expression the rows are built from. Summing the stored
-            # column instead would make a computed column's header total disagree
-            # with the rows under it.
-            sum_sql = ", ".join(
-                f'COALESCE(SUM(({column_exprs[col]})::numeric), 0) AS "{col}"'
-                if col in column_exprs
-                else f'COALESCE(SUM("{col}"::numeric), 0) AS "{col}"'
-                for col in total_columns
+    # JIT OFF, deliberately. These pages build a wide SELECT list of correlated
+    # sub-selects (invoiced split, dispatch flags, stated-litre gating), which
+    # inflates the planner's cost estimate past jit_above_cost (100k) and makes
+    # Postgres LLVM-compile the whole thing. Measured on the pendency page:
+    # 9.5s of "Optimization + Emission" wrapped around 180ms of actual work —
+    # the rows query went 11,874ms -> 94ms with jit off, same plan, same rows.
+    # SET LOCAL keeps it scoped to this transaction, so nothing else is affected.
+    with transaction.atomic():
+        with connection.cursor() as cur:
+            cur.execute("SET LOCAL jit = off")
+            cur.execute(f"SELECT COUNT(*) FROM {table_sql}{where_sql}", params)
+            total = int(cur.fetchone()[0] or 0)
+            cur.execute(
+                f"SELECT {column_sql} FROM {table_sql}{where_sql} {order_sql} LIMIT %s OFFSET %s",
+                params + [page_size, offset],
             )
-            cur.execute(f"SELECT {sum_sql} FROM {table_sql}{where_sql}", params)
-            row = cur.fetchone()
-            column_totals = {col: float(row[i]) for i, col in enumerate(total_columns)}
+            results = _rows_to_dicts(cur)
+            column_totals = None
+            if total_columns:
+                # Sum the SAME expression the rows are built from. Summing the
+                # stored column instead would make a computed column's header
+                # total disagree with the rows under it.
+                sum_sql = ", ".join(
+                    f'COALESCE(SUM(({column_exprs[col]})::numeric), 0) AS "{col}"'
+                    if col in column_exprs
+                    else f'COALESCE(SUM("{col}"::numeric), 0) AS "{col}"'
+                    for col in total_columns
+                )
+                cur.execute(f"SELECT {sum_sql} FROM {table_sql}{where_sql}", params)
+                row = cur.fetchone()
+                column_totals = {col: float(row[i]) for i, col in enumerate(total_columns)}
     payload: dict[str, Any] = {"results": results, "count": total, "page": page, "page_size": page_size}
     if column_totals is not None:
         payload["totals"] = column_totals
