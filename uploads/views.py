@@ -57,6 +57,11 @@ UPLOAD_ALLOWED_TABLES = {
     "total_po", "total_po_zbs", "total_po_grn_update", "total_po_zbs_grn_update",
     # Ads
     "blinkit_ads",
+    # The two detail grains behind blinkit_ads, straight from the report's
+    # PRODUCT_LISTING / PRODUCT_RECOMMENDATION sheets. blinkit_ads keeps taking
+    # the campaign-day merge; these keep the rows it merges away.
+    "blinkit_ads_keyword",
+    "blinkit_ads_asset",
     "amazon_ads",
     "swiggy_ads",
     "zepto_ads",
@@ -133,6 +138,11 @@ MASTER_SHEET_SEARCH_COLUMNS = [
 # uploader, and matches the (date, campaign_id) unique index (migration 0081).
 UPLOAD_FORCED_UNIQUE_KEYS = {
     "blinkit_ads": "date,campaign_id",
+    # Mirror the unique indexes from migration 0086 verbatim. A campaign runs the
+    # same keyword under several match types and positions, and each is its own
+    # report line, so all of them are part of the key.
+    "blinkit_ads_keyword": "date,campaign_id,keyword,match_type,most_viewed_position,cpm",
+    "blinkit_ads_asset": "date,campaign_id,subcampaign_id,asset,cpm",
     # Amazon tables: force the exact DB unique-index key so EVERY upload lane
     # (Upload Hub UI and the automation CLI) upserts onto the same rows instead
     # of relying on the client to send the right unique_key. Keys mirror the
@@ -307,6 +317,8 @@ PRIMARY_PO_GST_MULTIPLIERS = (
 UPLOAD_DATE_DELETE_TABLES = {
     "amazon_ads": "date",
     "blinkit_ads": "date",
+    "blinkit_ads_keyword": "date",
+    "blinkit_ads_asset": "date",
     "swiggy_ads": "date",
     "zepto_ads": "date",
     "bigbasket_ads": "date",

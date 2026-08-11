@@ -4,7 +4,7 @@ from django.contrib.auth.admin import UserAdmin as DjangoUserAdmin
 from django.contrib.auth.forms import UserChangeForm, UserCreationForm
 from django.contrib.auth.models import Group, Permission
 
-from .models import FeatureFlag, InventoryDohNotification, User
+from .models import InventoryDohNotification, User
 
 admin.site.unregister(Group)
 
@@ -102,20 +102,6 @@ class PermissionAdmin(admin.ModelAdmin):
 
     def has_delete_permission(self, request, obj=None):
         return False
-
-@admin.register(FeatureFlag)
-class FeatureFlagAdmin(admin.ModelAdmin):
-    """Read-out / emergency override for the two global switches.
-
-    Normal use is the Settings → Profile → Feature Controls card; this exists so
-    a switch can be recovered from the admin if the UI is unreachable. Rows are
-    created on first toggle — a missing row means enabled.
-    """
-
-    list_display = ("key", "is_enabled", "updated_by", "updated_at")
-    list_filter = ("is_enabled",)
-    readonly_fields = ("updated_at",)
-
 
 @admin.register(InventoryDohNotification)
 class InventoryDohNotificationAdmin(admin.ModelAdmin):

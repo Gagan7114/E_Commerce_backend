@@ -52,9 +52,6 @@ MIDDLEWARE = [
     "django.contrib.auth.middleware.AuthenticationMiddleware",
     "django.contrib.messages.middleware.MessageMiddleware",
     "django.middleware.clickjacking.XFrameOptionsMiddleware",
-    # Last, so its 403 travels back out through CorsMiddleware and the browser
-    # sees the JSON message instead of a CORS failure.
-    "uploads.middleware.UploaderKillSwitchMiddleware",
 ]
 
 ROOT_URLCONF = "config.urls"

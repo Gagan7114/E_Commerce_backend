@@ -15,9 +15,8 @@ from platforms.services.inventory_doh_alerts import (
     upsert_low_doh_notifications,
 )
 
-from .feature_flags import flags_state, set_flag
-from .models import FeatureFlag, InventoryDohNotification
-from .permissions import require, user_permission_codes
+from .models import InventoryDohNotification
+from .permissions import user_permission_codes
 from .serializers import MeSerializer
 
 UserModel = get_user_model()
@@ -78,38 +77,6 @@ def user_permissions(request):
         for mod, perms in sorted(grouped.items())
     ]
     return Response({"permissions": result})
-
-
-@api_view(["GET"])
-@permission_classes([IsAuthenticated])
-def feature_flags(request):
-    """The global switch state. Readable by EVERY signed-in user.
-
-    It has to be: each user's chatbot needs to know whether the game is open,
-    and the Uploaders UI needs to know whether uploads are accepted. Only
-    `profile_controls.manage` can change it (see update_feature_flags).
-    """
-    return Response({"flags": flags_state()})
-
-
-@api_view(["PATCH", "POST"])
-# Same single owner-only code that reveals the Settings → Feature Controls card.
-@permission_classes([require("profile_controls.manage")])
-def update_feature_flags(request):
-    """Flip one or both switches. Body: {"uploader": false, "game_play": true}."""
-    body = request.data or {}
-    updates = {key: body[key] for key in FeatureFlag.KEYS if key in body}
-    if not updates:
-        return Response(
-            {"detail": f"Send at least one of: {', '.join(FeatureFlag.KEYS)}."},
-            status=status.HTTP_400_BAD_REQUEST,
-        )
-    for key, value in updates.items():
-        # Accept real booleans and the "false"/"0" strings a form post can send.
-        if isinstance(value, str):
-            value = value.strip().lower() not in {"false", "0", "off", ""}
-        set_flag(key, bool(value), request.user)
-    return Response({"flags": flags_state()})
 
 
 @api_view(["POST"])
