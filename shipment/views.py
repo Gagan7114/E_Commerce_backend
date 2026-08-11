@@ -3139,7 +3139,11 @@ class AppointmentItemsView(_SafeAPIView):
         # tops up from the appointment's OWN leftover lines, stays on either
         # way. Turning this off means the truck carries only what the
         # appointment asked for.
-        doh_param = str(request.query_params.get('doh_fill') or '1').lower()
+        # Defaults OFF, matching the wizard's own default: biggest-line-first is
+        # the standing fill rule and DOH order is a deliberate choice. A request
+        # that omits the param used to get DOH ordering while the UI showed the
+        # switch as Off — the same plan described two different ways.
+        doh_param = str(request.query_params.get('doh_fill') or '0').lower()
         doh_fill = doh_param in ('1', 'true', 'yes', 'on')
 
         # Respect live planner-warehouse stock (default ON): cap planned qty by
@@ -3557,6 +3561,16 @@ class AppointmentItemsView(_SafeAPIView):
             r['is_switch'] = is_switch
             r['switch_from_fc'] = (actual_fc or src_fc) if is_switch else None
             r['switch_to_fc'] = primary_fc_value if is_switch else None
+            # WHICH kind of switch, stamped server-side. Every consumer — the
+            # switching popup, the saved switch_details, History → Switching —
+            # falls back to 'fc' when this is missing, so an appointment move
+            # (PO already at this FC, wrong booking) was being filed as an FC
+            # move and asked Amazon for the wrong thing. fc_mismatch means the
+            # stock is physically elsewhere; otherwise it is here on the wrong
+            # appointment.
+            r['switch_kind'] = (
+                None if not is_switch else ('fc' if fc_mismatch else 'appointment')
+            )
         _record_po_flips(flips_seen)
 
         # Which appointment each SWITCHED PO currently sits on at its home FC —
@@ -3659,7 +3673,17 @@ class AppointmentItemsView(_SafeAPIView):
                         _r['is_switch'] = True
                         _r['switch_kind'] = 'fc'
                         _r['home_fc'] = _r.get('home_fc') or _sfc
+                        _r['switch_from_fc'] = _sfc
                         _r['switch_to_fc'] = primary_fc_value
+                        # A truck physically ships to ONE FC. Once switched, this
+                        # line goes where the truck goes — the same re-point a
+                        # flip gets above — while `home_fc`/`switch_from_fc` keep
+                        # where it came from. Leaving the sister FC here would put
+                        # DED3-destined rows on a DED5 shipment: the saved header
+                        # says DED5 (it comes from the appointment) but the lines
+                        # would disagree, and _filler_pass would drop them as
+                        # wrong-FC on any later top-up pass.
+                        _r['destination_fc'] = primary_fc_value
                         _r['appointment_id'] = _r.get('appointment_id') or appointment_id
                     items.extend(_sis_pool)
 
@@ -6681,6 +6705,11 @@ class ManualPlanView(_SafeAPIView):
                     primary_fc=fc,
                     mark_key='_doh_filler',
                     reason='DOH filler · same-FC PENDING POs not in this selection, ranked by DOH urgency.',
+                    # This pass only runs with DOH filling ON, and its own label
+                    # says "ranked by DOH urgency" — so rank by it. It sorted
+                    # biggest-line-first, the same as every other filler, which
+                    # made the sentence on the row untrue.
+                    order_key=_doh_fill_sort_key,
                 )
                 planned_liters = round(sum(float(it.get('planned_liters') or 0) for it in loaded), 4)
                 load_pct = round((planned_liters / capacity * 100) if capacity > 0 else 0, 2)
