@@ -486,6 +486,51 @@ def _fill_sort_key(item):
     )
 
 
+def _manual_fill_order(item):
+    """MANUAL selection / fill / trim order.
+
+    The tail of the key is the legacy manual order verbatim — priority score
+    desc, nearest cancellation deadline, biggest line — because that is the order
+    a manual plan has always been packed in and changing it would reshuffle
+    every existing plan.
+
+    The head is new and is the whole point: a line the planner ADDED from the
+    set-aside suggestions sorts LAST, behind everything they originally picked.
+    That single flag is what makes an add a top-up rather than a re-plan — the
+    added line can only take capacity, stock and commitment headroom the original
+    selection did not want, so adding one can never bump a line that was already
+    on the truck. With no added lines the flag is 0 for every row and the key
+    collapses to exactly the old one.
+
+    Passed to _enforce_commit_caps as ``fill_order`` too: that helper spends the
+    Vendor Central cap in fill order and trims whatever is last, so the two must
+    be the same key or the truck would be filled by one rule and trimmed by
+    another (see its docstring).
+    """
+    return (
+        1 if item.get('_suggestion_add') else 0,
+        -(float(item.get('priority_score') or 0)),
+        (item.get('days_to_expiry') or 999),
+        -(float(item.get('accepted_qty') or 0)),
+    )
+
+
+# Verdict fields stamped by the run that SET A LINE ASIDE. A suggestion row makes
+# a full round trip through the browser before it comes back to be added, so it
+# still carries the previous plan's answer — planned_qty 0, "left off the truck",
+# the stock cap that run computed. None of it survives: the row is re-planned from
+# scratch here and every one of these is recomputed by the packer / stock pass /
+# cap pass. `ship_cap` and `short_reason` are deliberately NOT stripped — those are
+# the planner's own short-supply instruction, not a previous verdict.
+_SUGGESTION_ADD_STALE_KEYS = (
+    'planned_qty', 'planned_liters', 'unfit_reason', 'not_loaded',
+    'expiry_blocked', 'min_units_blocked',
+    'stock_cap', 'stock_limited', 'stock_unfit', 'stock_unbacked', 'stock_note',
+    'sap_stock', 'sap_on_order', 'sap_reserved', 'sap_available',
+    '_filler', '_doh_filler', 'filler_reason',
+)
+
+
 def _min_units_block_reason(item, min_units=None):
     """Why the auto planner skipped this line for being too small, or None.
 
@@ -1658,6 +1703,96 @@ def _reserved_stock_by_asin():
         for asin, qty in cur.fetchall():
             reserved[asin] = float(qty or 0)
     return reserved
+
+
+def _claimed_and_ordered_by_po_asin(po_uppers):
+    """Per PO LINE: what other shipments already claim, and what Amazon ordered.
+
+    Returns ``(committed_map, ship_map, ordered_map)``, all keyed by
+    ``(ASIN_UPPER, PO_UPPER)``:
+      * ``committed_map`` — units already committed to OTHER active shipments
+        (every status except ``rejected``, not-loaded rows excluded);
+      * ``ship_map`` — one shipment id per claimed line, so the caller can name
+        who is holding it;
+      * ``ordered_map`` — the Amazon-accepted (ordered) quantity.
+
+    Lifted verbatim out of ShipmentListCreateView.post, which still calls it: the
+    over-commit rule the draft save enforces at 409 time is the SAME rule a
+    planner needs at plan time, and two copies of it would drift. A line missing
+    from ``ordered_map`` is one the Amazon PO list does not know about — the
+    caller must refuse it rather than assume a quantity.
+    """
+    committed_map, ship_map, ordered_map = {}, {}, {}
+    po_list = sorted({str(p or '').strip().upper() for p in (po_uppers or [])} - {''})
+    if not po_list:
+        return committed_map, ship_map, ordered_map
+    with connection.cursor() as cur:
+        # Units already committed to OTHER active shipments, per (asin, po).
+        cur.execute(
+            """
+            SELECT UPPER(TRIM(si.asin)), UPPER(TRIM(si.po_number)),
+                   COALESCE(SUM(COALESCE(si.planned_qty, 0)), 0),
+                   MIN(s.id)
+            FROM sp_items si JOIN sp_shipments s ON s.id = si.shipment_id
+            WHERE UPPER(TRIM(si.po_number)) = ANY(%s)
+              AND si.not_loaded = FALSE AND s.status != 'rejected'
+            GROUP BY UPPER(TRIM(si.asin)), UPPER(TRIM(si.po_number))
+            """,
+            [po_list],
+        )
+        for a, p, q, sid in cur.fetchall():
+            committed_map[(a, p)] = float(q or 0)
+            ship_map[(a, p)] = sid
+        # Ordered (Amazon-accepted) qty per (asin, po).
+        cur.execute(
+            """
+            SELECT UPPER(TRIM(asin)), UPPER(TRIM(po_number)), MAX(accepted_qty)
+            FROM reporting."Amazon PO"
+            WHERE UPPER(TRIM(po_number)) = ANY(%s)
+            GROUP BY UPPER(TRIM(asin)), UPPER(TRIM(po_number))
+            """,
+            [po_list],
+        )
+        for a, p, q in cur.fetchall():
+            if q is not None:
+                ordered_map[(a, p)] = float(q)
+    return committed_map, ship_map, ordered_map
+
+
+def _open_qty_by_po_asin(po_uppers):
+    """``(ASIN_UPPER, PO_UPPER)`` → OPEN units, i.e. ordered minus what SAP has
+    already DISPATCHED against the line.
+
+    This is byte-for-byte the expression POListView hands the picker as
+    ``accepted_qty`` (``_BILLED_CTE`` + ``_OPEN_LINE_SQL``), so a quantity
+    re-derived here can never disagree with the one the planner clicked. Used to
+    re-ground a line that arrived from the client rather than from the picker —
+    the SAP deduction is applied ONCE, here, and nothing downstream subtracts it
+    again.
+    """
+    out = {}
+    po_list = sorted({str(p or '').strip().upper() for p in (po_uppers or [])} - {''})
+    if not po_list:
+        return out
+    with connection.cursor() as cur:
+        cur.execute(
+            f"""
+            WITH billed AS ({_BILLED_CTE})
+            SELECT UPPER(TRIM(ap.asin)), UPPER(TRIM(ap.po_number)),
+                   MAX(GREATEST(COALESCE(ap.accepted_qty, 0)
+                                - COALESCE(b.billed_qty, 0), 0))
+            FROM reporting."Amazon PO" ap
+            LEFT JOIN billed b
+                ON b.po_number = UPPER(TRIM(ap.po_number))
+               AND b.asin = ap.asin
+            WHERE UPPER(TRIM(ap.po_number)) = ANY(%s)
+            GROUP BY UPPER(TRIM(ap.asin)), UPPER(TRIM(ap.po_number))
+            """,
+            [po_list],
+        )
+        for a, p, q in cur.fetchall():
+            out[(a, p)] = float(q or 0)
+    return out
 
 
 def _committed_stock_by_asin(exclude_shipment_id=None):
@@ -4252,38 +4387,12 @@ class ShipmentListCreateView(_SafeAPIView):
                     )
                 if new_by_key:
                     po_uppers = list({p for (_a, p) in new_by_key})
-                    committed_map, ordered_map, ship_map = {}, {}, {}
-                    with connection.cursor() as _claim_cur:
-                        # Units already committed to OTHER active shipments (this new
-                        # one isn't inserted yet), per (asin, po).
-                        _claim_cur.execute(
-                            """
-                            SELECT UPPER(TRIM(si.asin)), UPPER(TRIM(si.po_number)),
-                                   COALESCE(SUM(COALESCE(si.planned_qty, 0)), 0),
-                                   MIN(s.id)
-                            FROM sp_items si JOIN sp_shipments s ON s.id = si.shipment_id
-                            WHERE UPPER(TRIM(si.po_number)) = ANY(%s)
-                              AND si.not_loaded = FALSE AND s.status != 'rejected'
-                            GROUP BY UPPER(TRIM(si.asin)), UPPER(TRIM(si.po_number))
-                            """,
-                            [po_uppers],
-                        )
-                        for a, p, q, sid in _claim_cur.fetchall():
-                            committed_map[(a, p)] = float(q or 0)
-                            ship_map[(a, p)] = sid
-                        # Ordered (Amazon-accepted) qty per (asin, po).
-                        _claim_cur.execute(
-                            """
-                            SELECT UPPER(TRIM(asin)), UPPER(TRIM(po_number)), MAX(accepted_qty)
-                            FROM reporting."Amazon PO"
-                            WHERE UPPER(TRIM(po_number)) = ANY(%s)
-                            GROUP BY UPPER(TRIM(asin)), UPPER(TRIM(po_number))
-                            """,
-                            [po_uppers],
-                        )
-                        for a, p, q in _claim_cur.fetchall():
-                            if q is not None:
-                                ordered_map[(a, p)] = float(q)
+                    # Units already committed to OTHER active shipments (this new
+                    # one isn't inserted yet) + the ordered qty, per (asin, po).
+                    # Same helper the manual planner uses to ground a hand-added
+                    # suggestion line, so plan time and save time cannot disagree
+                    # about what is still free on a PO line.
+                    committed_map, ship_map, ordered_map = _claimed_and_ordered_by_po_asin(po_uppers)
                     # fix #4: every loaded line must reference a real Amazon PO, else
                     # its ordered qty can't be verified and it could bypass the cap.
                     unknown_po = [
@@ -6052,6 +6161,77 @@ class ManualPlanView(_SafeAPIView):
                 if units > 0 or cartons > 0:
                     commit_caps[str(k)] = {'units': units, 'cartons': cartons}
 
+        # ── Adding a SET-ASIDE (suggestion) line ─────────────────────────────
+        # The auto planner refuses two kinds of line BY RULE — under
+        # MIN_AUTO_LINE_UNITS shippable units, and inside the MIN_DAYS_TO_EXPIRY
+        # cancellation cutoff — and returns them in not_loaded_items tagged
+        # suggestion/suggestion_kind. `suggestion_items` is the planner saying
+        # "put that one on the truck anyway".
+        #
+        # It is a SEPARATE list from `items`, not a flag on `items`, for one
+        # reason: these rows must be planned AFTER everything already selected.
+        # They are merged into the same selection here (so they go through the
+        # identical FC guard, switch tagging, priority, stock pass, packer and cap
+        # passes — nothing is re-implemented for them), and _manual_fill_order
+        # then pins them to the back of the queue. So an added line can only ever
+        # consume leftover capacity, leftover stock and leftover commit headroom.
+        #
+        # Neither RULE applies to them once added, exactly as neither applies to
+        # any other manual row: min_units is an auto-only selection rule, and the
+        # near-expiry gate is off in manual because a human explicitly chose the
+        # line and was warned at click time. What the rules DID say is preserved
+        # per row as expiry_warning / min_units_warning so the UI can keep saying
+        # it. Every real CONSTRAINT — litres, units, cartons, commit, stock,
+        # SAP-dispatched, claimed-elsewhere — still binds, below.
+        if not isinstance(selected_items, list):
+            selected_items = []
+        selected_items = [it for it in selected_items if isinstance(it, dict)]
+        # "This row was added from the suggestions" is a fact the SERVER decides,
+        # because everything about an added row — its back-of-the-queue fill order,
+        # its stricter stock rule, its re-derived quantity — hangs off it. A row
+        # arriving in `items` with the flag already set is stripped, so the only
+        # way to be an add is to be sent as one.
+        for _it in selected_items:
+            _it.pop('_suggestion_add', None)
+            _it.pop('added_from_suggestion', None)
+        raw_adds = request.data.get('suggestion_items') or []
+        add_rows, add_refused = [], []
+        if isinstance(raw_adds, list):
+            seen_keys = {
+                (str(it.get('po_number') or '').strip().upper(),
+                 str(it.get('asin') or '').strip().upper())
+                for it in selected_items
+            }
+            for raw in raw_adds:
+                if not isinstance(raw, dict):
+                    continue
+                po_up = str(raw.get('po_number') or '').strip().upper()
+                asin_up = str(raw.get('asin') or '').strip().upper()
+                if not po_up or not asin_up:
+                    add_refused.append({
+                        'po_number': raw.get('po_number') or '',
+                        'asin': raw.get('asin') or '',
+                        'reason': ('Line has no PO number or ASIN, so it cannot be '
+                                   'checked against the Amazon PO list — not added.'),
+                    })
+                    continue
+                if (po_up, asin_up) in seen_keys:
+                    # Planning the same PO line twice would let one open balance be
+                    # promised twice over and blow the save-time over-commit guard.
+                    add_refused.append({
+                        'po_number': po_up, 'asin': asin_up,
+                        'reason': ('Already on this plan — a PO line can only be '
+                                   'loaded once per truck.'),
+                    })
+                    continue
+                seen_keys.add((po_up, asin_up))
+                row = {k: v for k, v in raw.items() if k not in _SUGGESTION_ADD_STALE_KEYS}
+                row['_suggestion_add'] = True
+                row['added_from_suggestion'] = True
+                add_rows.append(row)
+        if add_rows:
+            selected_items = selected_items + add_rows
+
         if not selected_items:
             return Response({'error': 'No items selected'}, status=400)
 
@@ -6100,6 +6280,100 @@ class ManualPlanView(_SafeAPIView):
             it['drr_ltr'] = live.get('drr_ltr', 0) or 0
             it['doh'] = live.get('doh', 0) or 0
 
+        # ── Ground every ADDED line in server-side quantities ────────────────
+        # A row picked in the PO picker arrives with an accepted_qty POListView
+        # computed (ordered − SAP-dispatched) and a claimed-elsewhere check the
+        # picker ran client-side. A suggestion row does not: it fell out of an
+        # auto plan, sat in the browser, and came back. So its shippable quantity
+        # is re-derived here from the two authorities that already exist, and the
+        # line is planned on the TIGHTER of them:
+        #
+        #   open      = ordered − SAP-dispatched              (_open_qty_by_po_asin,
+        #                                                      the POListView rule)
+        #   headroom  = ordered − committed to other active shipments
+        #                                                (_claimed_and_ordered_by_po_asin,
+        #                                                 the draft-save 409 rule)
+        #   shippable = min(what the client asked for, open, headroom)
+        #
+        # Both are "ordered minus something", so taking the MIN applies each
+        # deduction once and never subtracts SAP dispatch twice — it just picks
+        # whichever is binding. Matching the save-time rule also means an add that
+        # is accepted here can actually be saved: no plan that survives this
+        # can 409 on over-commit later.
+        #
+        # A (PO, ASIN) the Amazon PO list has never heard of is refused outright,
+        # the same way ShipmentListCreateView refuses one: with no ordered qty
+        # there is nothing to bound the line by.
+        if add_rows:
+            _add_pos = [it.get('po_number') for it in add_rows]
+            _open_map = _open_qty_by_po_asin(_add_pos)
+            _committed_map, _claim_ship, _ordered_map = _claimed_and_ordered_by_po_asin(_add_pos)
+            _today = timezone.localdate()
+            _grounded = []
+            for it in add_rows:
+                key = (str(it.get('asin') or '').strip().upper(),
+                       str(it.get('po_number') or '').strip().upper())
+                ordered_q = _ordered_map.get(key)
+                open_q = _open_map.get(key)
+                if ordered_q is None and open_q is None:
+                    add_refused.append({
+                        'po_number': key[1], 'asin': key[0],
+                        'reason': ('Not found in the Amazon PO list, so the ordered '
+                                   'quantity cannot be verified — not added. Refresh '
+                                   'the plan and try again.'),
+                    })
+                    continue
+                try:
+                    asked = float(it.get('accepted_qty') or 0)
+                except (TypeError, ValueError):
+                    asked = 0.0
+                bounds = [max(0.0, asked)]
+                if open_q is not None:
+                    bounds.append(max(0.0, open_q))
+                if ordered_q is not None:
+                    bounds.append(max(0.0, ordered_q - _committed_map.get(key, 0.0)))
+                qty = min(bounds)
+                it['accepted_qty'] = qty
+                # Litres must be restated off the grounded qty: the packer reads
+                # total_accepted_liters directly whenever the line carries no cap,
+                # and a stale figure there would spend truck capacity the line no
+                # longer needs (or hide capacity it does).
+                try:
+                    _pl = float(it.get('per_liter') or 0)
+                except (TypeError, ValueError):
+                    _pl = 0.0
+                it['total_accepted_liters'] = round(qty * _pl, 4)
+                it['suggestion_requested_units'] = round(asked, 4)
+                if _committed_map.get(key):
+                    it['claimed_elsewhere_qty'] = round(_committed_map[key], 4)
+                    it['claimed_elsewhere_shipment_id'] = _claim_ship.get(key)
+                # Keep the auto planner's own words for WHY it was set aside, as a
+                # warning that rides along with the line. Recomputed, never taken
+                # from the client — suggestion_kind decides what the UI badges, so
+                # a caller must not be able to choose it.
+                _warn = _expiry_block_reason(it, _today)
+                _dte = _days_to_expiry_live(it, _today)
+                _small = _min_units_block_reason(it, MIN_AUTO_LINE_UNITS)
+                it['suggestion'] = True
+                if _warn and _dte is not None and _dte >= 0:
+                    it['expiry_warning'] = _warn
+                if _small:
+                    it['min_units_warning'] = _small
+                # Same precedence the auto packer uses: it tests the deadline
+                # before the minimum, so a line that is both reads as near_expiry.
+                if it.get('expiry_warning'):
+                    it['suggestion_kind'] = 'near_expiry'
+                elif _small:
+                    it['suggestion_kind'] = 'under_min_units'
+                else:
+                    it['suggestion_kind'] = ''
+                _grounded.append(it)
+            if len(_grounded) != len(add_rows):
+                _keep = {id(x) for x in _grounded}
+                add_rows = _grounded
+                selected_items = [it for it in selected_items
+                                  if not it.get('_suggestion_add') or id(it) in _keep]
+
         # No-per-litre items are NOT stripped out here. They flow through the same
         # packer as the auto planner (_pack_into_capacity), which ships zero-volume
         # OTHER-bucket items at full qty and sets the rest aside as not-loaded with a
@@ -6111,6 +6385,39 @@ class ManualPlanView(_SafeAPIView):
         # get re-pointed to the truck's FC and go through the switching
         # request/verification cycle before submit). Cross-channel payloads are
         # still rejected so a direct API call can't bypass the rule.
+        #
+        # An ADDED suggestion at the wrong FC is refused on its own rather than
+        # 400-ing the request: the planner's original selection is a whole plan's
+        # work and one bad add must not throw it away. Only the add is dropped,
+        # with a reason; the cross-channel 400 below still guards the selection
+        # itself, so a direct API call gains nothing.
+        if add_rows:
+            _primary_fcs = {str(it.get('destination_fc') or '').strip().upper()
+                            for it in selected_items
+                            if it.get('destination_fc') and not it.get('_suggestion_add')}
+            if _primary_fcs:
+                _, _pgroup = _fc_switch_group(sorted(_primary_fcs)[0])
+                _allowed = {f.upper() for f in _pgroup} | _primary_fcs
+                _kept = []
+                for it in add_rows:
+                    _afc = str(it.get('destination_fc') or '').strip().upper()
+                    if _afc and _afc not in _allowed:
+                        add_refused.append({
+                            'po_number': it.get('po_number'), 'asin': it.get('asin'),
+                            'reason': (
+                                f'Ships to {_afc}, which is not this truck\'s FC '
+                                f'({", ".join(sorted(_allowed & _primary_fcs))}) or a sister '
+                                f'FC on the same channel — not added.'
+                            ),
+                        })
+                    else:
+                        _kept.append(it)
+                if len(_kept) != len(add_rows):
+                    _keep_ids = {id(x) for x in _kept}
+                    add_rows = _kept
+                    selected_items = [it for it in selected_items
+                                      if not it.get('_suggestion_add') or id(it) in _keep_ids]
+
         fcs = {str(it.get('destination_fc') or '').strip().upper()
                for it in selected_items if it.get('destination_fc')}
         if len(fcs) > 1:
@@ -6145,9 +6452,16 @@ class ManualPlanView(_SafeAPIView):
                 target_fc = str(row[0] or '').strip()
         if not target_fc and fcs:
             from collections import Counter
+            # Added suggestion rows get no vote here. They are a top-up onto a
+            # truck whose destination is already decided; letting one flip the
+            # plurality would re-point the whole plan and turn the ORIGINAL rows
+            # into FC switches.
+            _fc_voters = [it for it in selected_items
+                          if it.get('destination_fc') and not it.get('_suggestion_add')]
+            if not _fc_voters:
+                _fc_voters = [it for it in selected_items if it.get('destination_fc')]
             target_fc = Counter(
-                str(it.get('destination_fc') or '').strip()
-                for it in selected_items if it.get('destination_fc')
+                str(it.get('destination_fc') or '').strip() for it in _fc_voters
             ).most_common(1)[0][0]
 
         # Tag every line before planning, so is_switch travels with the rows the
@@ -6164,11 +6478,9 @@ class ManualPlanView(_SafeAPIView):
             item['priority_score'] = score
             item['priority_reason'] = reason
 
-        selected_items.sort(key=lambda x: (
-            -x.get('priority_score', 0),
-            x.get('days_to_expiry') or 999,
-            -(float(x.get('accepted_qty') or 0)),
-        ))
+        # The legacy manual order, with added suggestion rows pinned to the back —
+        # see _manual_fill_order. With nothing added the key is the old one.
+        selected_items.sort(key=_manual_fill_order)
 
         # Live warehouse stock cap. Tags each item with on-hand / reserved /
         # available / incoming and caps the shippable qty to what's AVAILABLE
@@ -6179,8 +6491,23 @@ class ManualPlanView(_SafeAPIView):
         reserved = _reserved_stock_by_asin()
         avail_total = {a: max(0.0, d['onhand'] - reserved.get(a, 0.0)) for a, d in stock_detail.items()}
         avail_remaining = dict(avail_total)
-        _apply_stock_caps(selected_items, avail_total, avail_remaining, True, stock_detail, reserved,
+        # Two passes over ONE shared pool, in fill order: the original selection
+        # first, then anything added from the suggestions. Sharing avail_remaining
+        # is what makes an added line see only the stock its siblings left behind
+        # (same mechanism the DOH filler uses), so the two can never plan the same
+        # physical units twice.
+        _primary_rows = [it for it in selected_items if not it.get('_suggestion_add')]
+        _added_rows = [it for it in selected_items if it.get('_suggestion_add')]
+        _apply_stock_caps(_primary_rows, avail_total, avail_remaining, True, stock_detail, reserved,
                           allow_unbacked=True)
+        if _added_rows:
+            # allow_unbacked is deliberately OFF for added lines. It exists for a
+            # PO somebody chose IN THE PICKER knowing the warehouse is empty and
+            # expecting stock to land before dispatch — that is a decision about
+            # the whole plan. An add is a top-up onto a truck that is already
+            # planned, so it follows the filler's rule instead: a line with no free
+            # stock stays off rather than claiming units that do not exist.
+            _apply_stock_caps(_added_rows, avail_total, avail_remaining, True, stock_detail, reserved)
 
         # enforce_expiry=False: every row here was explicitly clicked by a planner,
         # who was warned at selection time that the PO cancels inside the cutoff.
@@ -6218,9 +6545,15 @@ class ManualPlanView(_SafeAPIView):
                 planned_liters = round(sum(float(it.get('planned_liters') or 0) for it in loaded), 4)
                 load_pct = round((planned_liters / capacity * 100) if capacity > 0 else 0, 2)
 
+        # fill_order: the cap is spent in fill order and whatever is last gets
+        # trimmed, so it must be the key this plan was actually built with —
+        # _manual_fill_order, which is the legacy manual order plus "added
+        # suggestions last". Without it an added line could take commit headroom
+        # away from a line the planner originally picked.
         if commit_caps:
             loaded, not_loaded = _enforce_commit_caps(
                 loaded, not_loaded, commit_caps, key_field='po_number',
+                fill_order=_manual_fill_order,
             )
             planned_liters = round(sum(float(it.get('planned_liters') or 0) for it in loaded), 4)
             load_pct = round((planned_liters / capacity * 100) if capacity > 0 else 0, 2)
@@ -6234,6 +6567,7 @@ class ManualPlanView(_SafeAPIView):
                 it['appointment_id'] = appointment_id  # tag so the cap groups them
             loaded, not_loaded = _enforce_commit_caps(
                 loaded, not_loaded, {appointment_id: appt_cap}, key_field='appointment_id',
+                fill_order=_manual_fill_order,
             )
             planned_liters = round(sum(float(it.get('planned_liters') or 0) for it in loaded), 4)
             load_pct = round((planned_liters / capacity * 100) if capacity > 0 else 0, 2)
@@ -6260,6 +6594,48 @@ class ManualPlanView(_SafeAPIView):
             for it in loaded if it.get('is_switch')
         } - {''})
 
+        # What happened to each added suggestion, in the packer's / cap pass's own
+        # words. The rows themselves stay in loaded_items / not_loaded_items where
+        # every other consumer already finds them (tagged added_from_suggestion);
+        # this is the per-add verdict so the UI can answer "did my click work?"
+        # without diffing two lists.
+        suggestion_adds = None
+        if add_rows or add_refused:
+            _verdicts = []
+            for it in loaded:
+                if not it.get('_suggestion_add'):
+                    continue
+                pq = float(it.get('planned_qty') or 0)
+                asked = float(it.get('suggestion_requested_units') or 0)
+                _verdicts.append({
+                    'po_number': it.get('po_number'),
+                    'asin': it.get('asin'),
+                    'suggestion_kind': it.get('suggestion_kind') or '',
+                    'requested_units': asked,
+                    'planned_qty': pq,
+                    'planned_liters': float(it.get('planned_liters') or 0),
+                    'status': 'partial' if it.get('short_reason') else 'loaded',
+                    'reason': it.get('short_reason') or '',
+                })
+            for it in not_loaded:
+                if not it.get('_suggestion_add'):
+                    continue
+                _verdicts.append({
+                    'po_number': it.get('po_number'),
+                    'asin': it.get('asin'),
+                    'suggestion_kind': it.get('suggestion_kind') or '',
+                    'requested_units': float(it.get('suggestion_requested_units') or 0),
+                    'planned_qty': 0,
+                    'planned_liters': 0,
+                    'status': 'not_loaded',
+                    'reason': it.get('unfit_reason') or '',
+                })
+            suggestion_adds = {
+                'requested': len(raw_adds) if isinstance(raw_adds, list) else 0,
+                'results': _verdicts,
+                'refused': add_refused,
+            }
+
         return Response({
             'loaded_items': loaded,
             'not_loaded_items': not_loaded,
@@ -6268,6 +6644,12 @@ class ManualPlanView(_SafeAPIView):
             'appointment_commit': appt_cap,
             'respect_stock': True,
             'stock_snapshot': _stock_meta_payload(stock_detail),
+            # Per-add verdict for `suggestion_items` (null when none were sent).
+            'suggestion_adds': suggestion_adds,
+            # The two AUTO rules that create suggestion rows in the first place,
+            # echoed so the UI labels them off the server's numbers, not its own.
+            'min_auto_line_units': MIN_AUTO_LINE_UNITS,
+            'near_expiry_days': MIN_DAYS_TO_EXPIRY,
             # Stated, not inferred: Plan Review used to guess the truck's FC from
             # whichever one held the most lines, which changes as lines are added.
             'target_fc': target_fc,
