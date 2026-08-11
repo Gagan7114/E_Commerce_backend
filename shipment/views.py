@@ -647,6 +647,13 @@ def _pack_into_capacity(items, capacity_lt, enforce_expiry=True, min_units=None)
         else:
             if per_liter > 0:
                 partial_qty = math.floor(remaining / per_liter)
+                # The minimum-line floor applies to what actually goes ON the
+                # truck, so it has to be re-checked here: the line cleared the
+                # gate on its FULL quantity, but only a slice of it fits, and a
+                # 4-unit slice is exactly the dribble the floor exists to stop.
+                floored_by_min = bool(min_units and 0 < partial_qty < float(min_units))
+                if floored_by_min:
+                    partial_qty = 0
                 if partial_qty > 0:
                     partial_liters = round(partial_qty * per_liter, 4)
                     item['planned_qty'] = partial_qty
@@ -663,9 +670,22 @@ def _pack_into_capacity(items, capacity_lt, enforce_expiry=True, min_units=None)
                 else:
                     item['planned_qty'] = 0
                     item['planned_liters'] = 0
-                    item['unfit_reason'] = (
-                        'Truck is full — no remaining capacity for this item.'
-                    )
+                    if floored_by_min:
+                        # Say WHY it was dropped. "Truck is full" would be a lie:
+                        # there IS room, just not enough to clear the floor.
+                        item['min_units_blocked'] = True
+                        item['suggestion'] = True
+                        item['suggestion_kind'] = 'under_min_units'
+                        item['unfit_reason'] = (
+                            f'Only space left for a part-load under the '
+                            f'{int(min_units)}-unit minimum for auto-planning, '
+                            f'so it was left off the truck. Add it by hand if '
+                            f'you want it on this load.'
+                        )
+                    else:
+                        item['unfit_reason'] = (
+                            'Truck is full — no remaining capacity for this item.'
+                        )
                     not_loaded.append(item)
             else:
                 item['planned_qty'] = 0
