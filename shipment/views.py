@@ -3591,6 +3591,36 @@ class AppointmentItemsView(_SafeAPIView):
                 _r['appointment_id'] = _r.get('appointment_id') or appointment_id
             items.extend(_fc_pool)
 
+            # Sister FCs on the same channel (DED3 ↔ DED5) join the SAME pool, so
+            # a truck that ran out of home-FC stock can still leave full instead
+            # of half-empty. They are not a free-for-all: each is stamped a switch,
+            # and _fill_sort_key's first term keeps every home-FC line ahead of
+            # every sister line, so a sister PO is only ever reached once the home
+            # FC has nothing left that fits. Each one still raises a switching
+            # request for the team to approve — filling the truck never quietly
+            # re-points stock.
+            _sisters = [
+                _fc for _fc in (switch_group or [])
+                if str(_fc or '').strip().upper() != str(primary_fc_value or '').strip().upper()
+            ]
+            if _sisters:
+                _seen_pos = sorted(_appt_po_uppers + [
+                    str(_r.get('po_number') or '').strip().upper()
+                    for _r in _fc_pool if _r.get('po_number')
+                ])
+                for _sfc in _sisters:
+                    _sis_pool = _fetch_doh_filler_pool(
+                        _sfc, _seen_pos, doh_by_asin,
+                        families=product_families, asins=family_asins,
+                    )
+                    for _r in _sis_pool:
+                        _r['is_switch'] = True
+                        _r['switch_kind'] = 'fc'
+                        _r['home_fc'] = _r.get('home_fc') or _sfc
+                        _r['switch_to_fc'] = primary_fc_value
+                        _r['appointment_id'] = _r.get('appointment_id') or appointment_id
+                    items.extend(_sis_pool)
+
         # THE auto selection order — home FC first, then biggest shippable line,
         # priority bucket breaking ties, no expiry term anywhere. This one list
         # decides everything downstream: which rows drain the stock pool, what the
@@ -3647,7 +3677,7 @@ class AppointmentItemsView(_SafeAPIView):
 
             # Stage 2 — DOH-driven fillers (non-appointment PENDING POs at same FC)
             cur_planned = sum(float(it.get('planned_liters') or 0) for it in loaded)
-            if doh_fill and cur_planned < float(capacity) and primary_fc:
+            if cur_planned < float(capacity) and primary_fc:
                 appt_po_uppers = sorted({
                     str(it.get('po_number') or '').strip().upper()
                     for it in items
