@@ -499,6 +499,45 @@ def _fill_sort_key(item):
     )
 
 
+def _doh_fill_sort_key(item):
+    """AUTO selection / fill order when DOH FILLING is ON: LOWEST COVER FIRST.
+
+    Same shape as `_fill_sort_key` — and deliberately the same FIRST term, so
+    the toggle changes which lines the truck prefers, never whether it raids a
+    sister FC early. Home-FC stock is still exhausted before anything has to be
+    switched in, because that rule is about what can physically ship today and
+    has nothing to do with which line is most urgent.
+
+    Inside each FC group the order flips from "biggest line" to "closest to
+    running out": `doh` is days of cover (SOH / DRR, less a 2-day handling
+    allowance), so ascending puts the ASIN that stocks out soonest on the truck
+    first. Bucket then units break ties, so among equally-covered lines the
+    bigger one still goes.
+
+    UNKNOWN COVER IS NOT URGENT. `doh` is stored as 0.0 whenever DRR is 0 — an
+    ASIN with no sales in the window, where cover is undefined rather than
+    exhausted. Sorting on the raw value would put every no-sales line at the
+    very front of the truck, which is the opposite of what this mode is for. So
+    a line only carries its DOH when DRR is positive; otherwise it sorts last.
+    """
+    try:
+        drr = float(item.get('drr_unit') or 0)
+    except (TypeError, ValueError):
+        drr = 0.0
+    try:
+        doh = float(item.get('doh') or 0)
+    except (TypeError, ValueError):
+        doh = 0.0
+    return (
+        1 if item.get('is_switch') else 0,
+        doh if drr > 0 else float('inf'),
+        -_BUCKET_RANK.get(str(item.get('priority_bucket') or '').upper(), 0),
+        -_shippable_units(item),
+        str(item.get('po_number') or ''),
+        str(item.get('asin') or ''),
+    )
+
+
 def _manual_fill_order(item):
     """MANUAL selection / fill / trim order.
 
@@ -1288,6 +1327,7 @@ def _explain_ineligibility(c):
 
 
 def _filler_pass(loaded, leftover_pool, capacity, primary_fc=None, mark_key='_filler', reason=None,
+                 order_key=None,
                  min_units=None):
     """
     Second-stage pack that fills any unused truck capacity from `leftover_pool`.
@@ -1327,7 +1367,9 @@ def _filler_pass(loaded, leftover_pool, capacity, primary_fc=None, mark_key='_fi
             if str(it.get('destination_fc') or '').strip().upper() == pf
         ]
 
-    pool.sort(key=_fill_sort_key)
+    # Same key the caller filled the truck with, so the top-up can never
+    # disagree with the main pack about what "next" means.
+    pool.sort(key=order_key or _fill_sort_key)
 
     filler_loaded, filler_unfit, _used = _pack_into_capacity(
         pool, remaining, True, min_units,
@@ -3626,7 +3668,13 @@ class AppointmentItemsView(_SafeAPIView):
         # decides everything downstream: which rows drain the stock pool, what the
         # packer loads and in what sequence, the multi-truck breakdown, and (via
         # _fill_sort_key again) what the commit cap trims.
-        items.sort(key=_fill_sort_key)
+        # DOH filling picks WHICH of the two orders above runs. It no longer
+        # decides whether outside POs may join — they always do, or a truck
+        # would leave part-empty with shippable stock behind it. On: closest to
+        # stocking out first. Off: biggest line first. Home FC outranks sister
+        # FC in both, so the toggle can never pull a switch forward.
+        _order_key = _doh_fill_sort_key if doh_fill else _fill_sort_key
+        items.sort(key=_order_key)
 
         # Live warehouse stock: tag every item with planner-warehouse on-hand / reserved /
         # available / incoming, and (when respect_stock) cap the orderable qty to
@@ -3672,6 +3720,7 @@ class AppointmentItemsView(_SafeAPIView):
                     primary_fc=primary_fc,
                     mark_key='_filler',
                     min_units=MIN_AUTO_LINE_UNITS,
+                    order_key=_order_key,
                 )
                 filler_count = sum(1 for it in loaded if it.get('_filler'))
 
@@ -3699,9 +3748,12 @@ class AppointmentItemsView(_SafeAPIView):
                         mark_key='_doh_filler',
                         reason=(
                             'DOH filler · pulled from same-FC PENDING POs not '
-                            'tied to this appointment, biggest line first.'
+                            'tied to this appointment, '
+                            + ('lowest days of cover first.' if doh_fill
+                               else 'biggest line first.')
                         ),
                         min_units=MIN_AUTO_LINE_UNITS,
+                        order_key=_order_key,
                     )
                     doh_filler_count = sum(1 for it in loaded if it.get('_doh_filler'))
 
@@ -3716,7 +3768,7 @@ class AppointmentItemsView(_SafeAPIView):
                 loaded, not_loaded, commit_caps, family=(' / '.join(product_families) or None),
                 # Trim in the reverse of the order the truck was filled, so the
                 # smallest lines are cut first instead of the furthest-from-expiry.
-                fill_order=_fill_sort_key,
+                fill_order=_order_key,
             )
             planned_liters = round(sum(float(it.get('planned_liters') or 0) for it in loaded), 4)
             load_pct = round((planned_liters / capacity * 100) if capacity > 0 else 0, 2)
