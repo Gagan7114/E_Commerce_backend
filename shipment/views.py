@@ -2080,17 +2080,33 @@ def _apply_stock_caps(items, avail_total, avail_remaining, respect, detail, rese
             _where = f'{_inventory_label(src_whs) or src_whs} ({src_whs})' if src_whs else 'the warehouse'
             it['stock_note'] = f'No free stock in {_where} today — planned on the ordered quantity.'
             continue
-        it['stock_cap'] = avail
+        # "Plan without stock" means stock STOPS CAPPING the quantity — the whole
+        # ordered amount is planned and the shortfall is stated instead. Before,
+        # allow_unbacked only rescued a line whose pool was EMPTY, so a line with
+        # 16 of 2,000 units still got trimmed to 16, which reads as the toggle
+        # being ignored.
+        if not allow_unbacked:
+            it['stock_cap'] = avail
         # Reserve what this row could ship so later rows of the same ASIN see less.
         avail_remaining[asin] = max(0.0, avail - min(orderable, max(0.0, avail)))
         if avail < orderable - 1e-6:
             it['stock_limited'] = True
+            have = int(round(max(0.0, avail)))
             short = int(round(orderable - max(0.0, avail)))
             _where = f'{_inventory_label(src_whs) or src_whs} ({src_whs})' if src_whs else 'the warehouse'
-            it['stock_unfit'] = (
-                f'No free stock in {_where} (0 available).' if avail <= 0
-                else f'Limited to {int(round(avail))} available in {_where} ({short} short).'
-            )
+            if allow_unbacked:
+                # Not a refusal: say what is actually there and what was planned
+                # on top of it, so the planner knows what has to arrive.
+                it['stock_unbacked'] = True
+                it['stock_note'] = (
+                    f'Only {have} in stock in {_where} — planning '
+                    f'{int(round(orderable))} anyway, {short} not covered by stock.'
+                )
+            else:
+                it['stock_unfit'] = (
+                    f'No free stock in {_where} (0 available).' if avail <= 0
+                    else f'Limited to {have} available in {_where} ({short} short).'
+                )
 
 
 def _attach_invoice_detail(items):
