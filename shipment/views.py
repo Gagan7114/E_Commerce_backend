@@ -3561,12 +3561,41 @@ class AppointmentItemsView(_SafeAPIView):
             # shipment's primary appointment_id field.
             item['appointment_id'] = item.get('source_appointment_id') or appointment_id
 
-        # THE auto selection order — biggest shippable line first, priority bucket
-        # breaking ties, no expiry term anywhere. This one list decides everything
-        # downstream: which rows drain the stock pool, what the packer loads and in
-        # what sequence, the multi-truck breakdown, and (via _fill_sort_key again)
-        # what the commit cap trims. See _fill_sort_key for how units and buckets
-        # compose, and why priority_score is deliberately not a key.
+        # THE APPOINTMENT SUPPLIES THE FC AND THE DATE, NOT THE POOL.
+        #
+        # Its own POs used to BE the candidate list, so a truck could sit 7.8%
+        # full while thousands of shippable litres waited in "Add more POs" — the
+        # appointment's lines won on identity alone, whatever their size or FC.
+        # Every eligible PO at this FC now enters the SAME pool and is ordered by
+        # the same rule. What still bounds the load is unchanged: live stock, the
+        # truck's litres, both commitment-cap passes, the 10-unit floor and the
+        # 3-day expiry gate.
+        #
+        # Merged BEFORE the sort, not appended after packing (which is what the
+        # DOH filler did), so one pool is ordered once and packed once.
+        if primary_fc_value:
+            _appt_po_uppers = sorted({
+                str(it.get('po_number') or '').strip().upper()
+                for it in items
+                if it.get('po_number')
+            })
+            _fc_pool = _fetch_doh_filler_pool(
+                primary_fc_value, _appt_po_uppers, doh_by_asin,
+                families=product_families, asins=family_asins,
+            )
+            for _r in _fc_pool:
+                # Not on this appointment, so it can never be a switch: it already
+                # sits at the truck's own FC. Marking it home keeps the home-FC-
+                # first rule honest.
+                _r['is_switch'] = False
+                _r['appointment_id'] = _r.get('appointment_id') or appointment_id
+            items.extend(_fc_pool)
+
+        # THE auto selection order — home FC first, then biggest shippable line,
+        # priority bucket breaking ties, no expiry term anywhere. This one list
+        # decides everything downstream: which rows drain the stock pool, what the
+        # packer loads and in what sequence, the multi-truck breakdown, and (via
+        # _fill_sort_key again) what the commit cap trims.
         items.sort(key=_fill_sort_key)
 
         # Live warehouse stock: tag every item with planner-warehouse on-hand / reserved /
