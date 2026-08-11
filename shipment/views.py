@@ -207,24 +207,49 @@ class IsShipmentManager(BasePermission):
 CAP_TOLERANCE = 1.07
 
 
+# Demand urgency per priority bucket. Single source of truth: _compute_priority
+# scores with it, and the AUTO fill order breaks its ties with it (see
+# _fill_sort_key), so the two can never drift apart. Buckets are derived from
+# DRR / SOH / DOH only — no expiry input — which is why the fill order can lean
+# on them without letting expiry back in through the side door.
+_BUCKET_RANK = {
+    'CRITICAL': 100,
+    'VERY HIGH': 90,
+    'HIGH': 75,
+    'MEDIUM': 50,
+    'LOW': 20,
+    'HOLD': 5,
+}
+
+
 def _compute_priority(drr_unit, soh_unit, doh, days_to_expiry, po_status):
+    """(bucket, score, reason) for one line.
+
+    NOTE ON `score`: it still mixes expiry in (FEFO 25% + part of PO urgency), and
+    that is deliberate — it is a DISPLAY figure, and the Manual planner still ranks
+    with it. It no longer decides the AUTO plan: auto selection and fill order run
+    off _fill_sort_key (ordered units DESC, ties broken by `bucket`), which has no
+    expiry term at all. Anything wanting "what will load first" must call
+    _fill_sort_key, never sort on priority_score.
+    """
     drr = float(drr_unit or 0)
     soh = float(soh_unit or 0)
     d = float(doh or 0)
     dte = int(days_to_expiry or 999)
 
     if drr > 0 and soh == 0:
-        bucket, doh_score = 'CRITICAL', 100
+        bucket = 'CRITICAL'
     elif drr > 0 and d <= 7:
-        bucket, doh_score = 'VERY HIGH', 90
+        bucket = 'VERY HIGH'
     elif drr > 0 and d <= 14:
-        bucket, doh_score = 'HIGH', 75
+        bucket = 'HIGH'
     elif drr > 0 and d <= 30:
-        bucket, doh_score = 'MEDIUM', 50
+        bucket = 'MEDIUM'
     elif drr > 0 and d > 30:
-        bucket, doh_score = 'LOW', 20
+        bucket = 'LOW'
     else:
-        bucket, doh_score = 'HOLD', 5
+        bucket = 'HOLD'
+    doh_score = _BUCKET_RANK[bucket]
 
     fefo = 100 if dte <= 7 else 80 if dte <= 30 else 50 if dte <= 90 else 20
     po_urgency = (
@@ -396,7 +421,112 @@ def _expiry_block_reason(item, today=None):
     return None
 
 
-def _pack_into_capacity(items, capacity_lt, enforce_expiry=True):
+# ── Near-expiry WARNING band ─────────────────────────────────────────────────
+# Days-to-expiry at or below which a line is TAGGED for the planner's attention.
+# This is a warning only: it never changes what is packed, what is capped or what
+# is ordered. The number that actually blocks a line is MIN_DAYS_TO_EXPIRY above;
+# the two are the same value today but they are separate decisions, so widening
+# the warning band later must not widen the gate.
+NEAR_EXPIRY_WARN_DAYS = 3
+
+
+# ── Auto-mode minimum line size ──────────────────────────────────────────────
+# A PO line with fewer shippable units than this is never AUTO-added to a truck:
+# a handful of units costs the same picking, paperwork and dock time as a full
+# pallet, and the planner would rather spend that slot on a big line. It is a
+# selection rule, not a gate — the line is not dropped from the response. It goes
+# to not_loaded flagged as a SUGGESTION, so the planner can still add it by hand,
+# and the manual planner never applies the rule at all.
+#
+# WHICH QUANTITY: `accepted_qty`, i.e. the BILLED-ADJUSTED figure (ordered minus
+# what SAP has already invoiced), NOT `original_accepted_qty`. Reasons:
+#   * the rule is about what is actually shippable today — a 500-unit line with
+#     495 already billed leaves 5 units to load, and that IS the tiny line this
+#     rule exists to skip;
+#   * every downstream number (total_accepted_liters, stock caps, commit caps)
+#     is already computed off accepted_qty, so anything else would disagree with
+#     the liters the packer works in;
+#   * the DOH filler pool only selects accepted_qty, so a rule keyed on the
+#     original qty would be undefined for filler rows.
+# The SAME figure drives the descending fill order below, so "big line" means the
+# same thing in both rules.
+MIN_AUTO_LINE_UNITS = 10
+
+
+def _shippable_units(item):
+    """Units this line can actually put on a truck today (billed-adjusted)."""
+    try:
+        return float(item.get('accepted_qty') or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _fill_sort_key(item):
+    """AUTO selection / fill order: BIGGEST LINE FIRST.
+
+    Expiry is deliberately absent from every term. It used to drive this order
+    twice over — as an explicit `days_to_expiry` tiebreaker AND, less visibly,
+    through `priority_score`, a quarter of which is a FEFO term. Sorting on the
+    score would therefore have kept expiry in charge even after the tiebreaker
+    was deleted, so the score is not a key here at all.
+
+    HOW THIS COMPOSES WITH THE PRIORITY BUCKETS: units first, bucket second. The
+    bucket (CRITICAL → HOLD, from DRR/SOH/DOH and nothing else) still ranks every
+    line and still shows in the UI; it now breaks ties between lines of the SAME
+    size instead of deciding the running order. So a CRITICAL 40-unit line loads
+    after a HOLD 900-unit line, and of two 900-unit lines the CRITICAL one goes
+    first. PO number + ASIN close the key so a re-plan of unchanged data returns
+    the identical order rather than shuffling equal lines around.
+    """
+    return (
+        -_shippable_units(item),
+        -_BUCKET_RANK.get(str(item.get('priority_bucket') or '').upper(), 0),
+        str(item.get('po_number') or ''),
+        str(item.get('asin') or ''),
+    )
+
+
+def _min_units_block_reason(item, min_units=None):
+    """Why the auto planner skipped this line for being too small, or None.
+
+    Returns None when the rule is off (`min_units` falsy — manual mode), when the
+    line is big enough, and when it has nothing left to ship at all: a zero-unit
+    line is fully billed or fully committed elsewhere, which the packer already
+    explains far better than "under 10 units" would.
+    """
+    if not min_units:
+        return None
+    units = _shippable_units(item)
+    if units <= 0 or units >= float(min_units):
+        return None
+    n = int(units)
+    return (
+        f'Only {n} unit{"" if n == 1 else "s"} left to ship — under the '
+        f'{int(min_units)}-unit minimum for auto-planning, so it was left off the '
+        f'truck. Add it by hand if you want it on this load.'
+    )
+
+
+def _tag_expiry_warnings(items, today=None):
+    """Stamp every row with the live days-to-expiry and a near-expiry warning flag.
+
+    `days_to_expiry` (the stored column) is already on each row but is baked at
+    PO-upload time and clamped at 0, so it drifts — see _days_to_expiry_live. The
+    UI needs the honest number to warn on, hence a second field rather than an
+    overwrite: overwriting would silently change what every other consumer of
+    `days_to_expiry` reads.
+
+    Pure tagging. Nothing here feeds selection, ordering, capping or packing.
+    """
+    today = today or timezone.localdate()
+    for it in items:
+        dte = _days_to_expiry_live(it, today)
+        it['days_to_expiry_live'] = dte
+        it['near_expiry'] = dte is not None and dte <= NEAR_EXPIRY_WARN_DAYS
+    return items
+
+
+def _pack_into_capacity(items, capacity_lt, enforce_expiry=True, min_units=None):
     """
     Greedy pack a list of pre-sorted items into the given liter capacity.
     Returns (loaded_subset, not_loaded_subset, used_liters).
@@ -407,6 +537,11 @@ def _pack_into_capacity(items, capacity_lt, enforce_expiry=True):
     ManualPlanView turns it OFF because there a human explicitly chose the line
     and was warned at click time — but note the DOH filler pass keeps it ON even
     in manual mode, since nobody chose those rows.
+
+    ``min_units`` is the auto-mode minimum line size (MIN_AUTO_LINE_UNITS when
+    the caller opts in, None everywhere else — manual mode never passes it). A
+    line under it is set aside as a SUGGESTION rather than packed; see
+    _min_units_block_reason.
     """
     remaining = float(capacity_lt)
     loaded, not_loaded = [], []
@@ -423,8 +558,28 @@ def _pack_into_capacity(items, capacity_lt, enforce_expiry=True):
                 item['planned_liters'] = 0
                 item['unfit_reason'] = expiry_unfit
                 item['expiry_blocked'] = True
+                # Surface it as a suggestion only when the PO is genuinely NEAR
+                # its deadline: a PO already cancelled, or one with no deadline on
+                # record, is not something to offer as "add this by hand".
+                _dte = _days_to_expiry_live(item, today)
+                if _dte is not None and _dte >= 0:
+                    item['suggestion'] = True
+                    item['suggestion_kind'] = 'near_expiry'
                 not_loaded.append(item)
                 continue
+        # Too small to be worth a slot on an auto-planned truck. Checked before
+        # capacity so a tiny line can never consume the last few liters ahead of
+        # a big one, and it keeps its own reason instead of "truck is full".
+        min_units_unfit = _min_units_block_reason(item, min_units)
+        if min_units_unfit:
+            item['planned_qty'] = 0
+            item['planned_liters'] = 0
+            item['unfit_reason'] = min_units_unfit
+            item['min_units_blocked'] = True
+            item['suggestion'] = True
+            item['suggestion_kind'] = 'under_min_units'
+            not_loaded.append(item)
+            continue
         per_liter    = float(item.get('per_liter') or 0)
         accepted_qty = float(item.get('accepted_qty') or 0)
         # Effective shippable units = ordered, capped by live stock when set.
@@ -524,7 +679,7 @@ def _pack_into_capacity(items, capacity_lt, enforce_expiry=True):
 
 
 def _auto_plan_truck(items, truck_size, capacity_override=None, priority=None, strict=False,
-                     enforce_expiry=True):
+                     enforce_expiry=True, min_units=None):
     """
     Plan a truck load.
 
@@ -545,12 +700,13 @@ def _auto_plan_truck(items, truck_size, capacity_override=None, priority=None, s
 
     When `priority` is None, falls back to a flat greedy pack across all items.
 
-    `enforce_expiry` is passed straight to the packer — see _pack_into_capacity.
+    `enforce_expiry` and `min_units` are passed straight to the packer — see
+    _pack_into_capacity. `min_units` is set only by the AUTO callers.
     """
     capacity = _resolve_capacity(truck_size, capacity_override)
 
     if not priority:
-        loaded, not_loaded, used = _pack_into_capacity(items, capacity, enforce_expiry)
+        loaded, not_loaded, used = _pack_into_capacity(items, capacity, enforce_expiry, min_units)
         planned = round(used, 4)
         load_pct = round((planned / capacity * 100) if capacity > 0 else 0, 2)
         return loaded, not_loaded, capacity, planned, load_pct, None
@@ -593,31 +749,24 @@ def _auto_plan_truck(items, truck_size, capacity_override=None, priority=None, s
             priority_actual[k] = {'requested_liters': 0, 'used_liters': 0}
             bucket_used[k] = 0.0
             continue
-        l, nl, used = _pack_into_capacity(bucket_items, cap_k, enforce_expiry)
+        l, nl, used = _pack_into_capacity(bucket_items, cap_k, enforce_expiry, min_units)
         loaded_all.extend(l)
         not_loaded_all.extend(nl)
         priority_actual[k] = {'requested_liters': cap_k, 'used_liters': round(used, 4)}
         bucket_used[k] = float(used)
 
     # Best-effort second pass — fill leftover capacity from any bucket's not-loaded
-    # items, highest-scoring first. Caller has already sorted `items` by score so
-    # `not_loaded_all` is roughly score-ordered per bucket; re-sort for safety.
+    # items, biggest line first. Caller has already sorted `items` the same way so
+    # `not_loaded_all` is roughly in order per bucket; re-sort for safety.
     if not strict:
         first_pass_used = sum(bucket_used.values())
         leftover_capacity = max(0.0, capacity - first_pass_used)
         if leftover_capacity > 0 and not_loaded_all:
-            # Sort the remaining pool by priority score (high first), then expiry,
-            # then accepted qty — same key the candidate pool uses upstream.
-            spill_pool = sorted(
-                not_loaded_all,
-                key=lambda x: (
-                    -float(x.get('priority_score') or 0),
-                    int(x.get('days_to_expiry') or 999),
-                    -float(x.get('accepted_qty') or 0),
-                ),
-            )
+            # Same key the candidate pool uses upstream: ordered units desc, then
+            # priority bucket. Expiry does not order the spill either.
+            spill_pool = sorted(not_loaded_all, key=_fill_sort_key)
             spill_loaded, spill_not_loaded, spill_used = _pack_into_capacity(
-                spill_pool, leftover_capacity, enforce_expiry
+                spill_pool, leftover_capacity, enforce_expiry, min_units
             )
             # Credit the spill to whichever bucket each spilled item belongs to,
             # so adherence reporting reflects the real bucket split that shipped.
@@ -1060,7 +1209,8 @@ def _explain_ineligibility(c):
     return f'Of {total} POs: ' + (', '.join(parts) if parts else 'all unavailable')
 
 
-def _filler_pass(loaded, leftover_pool, capacity, primary_fc=None, mark_key='_filler', reason=None):
+def _filler_pass(loaded, leftover_pool, capacity, primary_fc=None, mark_key='_filler', reason=None,
+                 min_units=None):
     """
     Second-stage pack that fills any unused truck capacity from `leftover_pool`.
 
@@ -1069,7 +1219,10 @@ def _filler_pass(loaded, leftover_pool, capacity, primary_fc=None, mark_key='_fi
     `_filler` for back-compat with the first filler pass.
 
     Items kept: same FC as the rest of the truck (single-FC trucks only).
-    Sort: priority_score desc, days_to_expiry asc, accepted_qty desc.
+    Sort: ordered units desc, then priority bucket (see _fill_sort_key) — the
+    filler fills the leftover space with the biggest lines that still fit, same
+    rule as the main pack, so the two stages can't disagree about what "next"
+    means.
 
     Returns (new_loaded, new_not_loaded). Items that didn't fit go back into
     not-loaded so the UI can still surface them.
@@ -1077,6 +1230,10 @@ def _filler_pass(loaded, leftover_pool, capacity, primary_fc=None, mark_key='_fi
     The near-expiry gate is always ON here, including on a manual plan: fillers
     are chosen by the planner, not by a human, so there is no one to have made an
     informed override. Only rows a user explicitly picked can bypass it.
+
+    ``min_units`` is NOT defaulted on for the same reason it is off in manual
+    mode generally — the AUTO callers opt in explicitly, ManualPlanView does not,
+    so a manual plan behaves exactly as it did before this rule existed.
     """
     planned_lt = sum(float(it.get('planned_liters') or 0) for it in loaded)
     remaining = float(capacity) - planned_lt
@@ -1092,13 +1249,11 @@ def _filler_pass(loaded, leftover_pool, capacity, primary_fc=None, mark_key='_fi
             if str(it.get('destination_fc') or '').strip().upper() == pf
         ]
 
-    pool.sort(key=lambda x: (
-        -float(x.get('priority_score') or 0),
-        int(x.get('days_to_expiry') or 999),
-        -float(x.get('accepted_qty') or 0),
-    ))
+    pool.sort(key=_fill_sort_key)
 
-    filler_loaded, filler_unfit, _used = _pack_into_capacity(pool, remaining)
+    filler_loaded, filler_unfit, _used = _pack_into_capacity(
+        pool, remaining, True, min_units,
+    )
     default_reason = (
         'Filler · added to fill leftover truck capacity '
         '(not part of the priority-driven plan).'
@@ -1119,7 +1274,7 @@ def _filler_pass(loaded, leftover_pool, capacity, primary_fc=None, mark_key='_fi
 
 
 def _enforce_commit_caps(loaded, not_loaded, commit_caps, key_field='appointment_id',
-                         family=None):
+                         family=None, fill_order=None):
     """Trim ``loaded`` so each capped group respects its Vendor Central commit,
     allowing up to CAP_TOLERANCE (7%) over:
     sum(planned_qty) ≤ units_cap×1.07 AND sum(planned_qty/case_pack) ≤ cartons_cap×1.07.
@@ -1132,6 +1287,13 @@ def _enforce_commit_caps(loaded, not_loaded, commit_caps, key_field='appointment
     caps mean "no cap" for that field. DOH fillers (which have no appointment of
     their own) are counted toward the single appointment's cap, so the truck
     total — fillers included — respects the Vendor Central commit ×1.07.
+
+    ``fill_order`` is the caller's sort key over an item, and MUST be the same one
+    that decided the fill order: the cap is spent in this order and whatever is
+    last gets trimmed, so a mismatch would fill the truck by one rule and trim it
+    by another (fill biggest-first, trim nearest-expiry-last). AUTO passes
+    _fill_sort_key; ManualPlanView passes nothing and keeps the legacy
+    score-then-expiry order its own plan is still built with.
     """
     if not commit_caps:
         return loaded, not_loaded
@@ -1147,12 +1309,17 @@ def _enforce_commit_caps(loaded, not_loaded, commit_caps, key_field='appointment
         raw = str(it.get(key_field) or '').strip()
         return raw.upper() if key_field == 'po_number' else raw
 
+    _rank = fill_order or (lambda it: (
+        -(it.get('priority_score') or 0),
+        (it.get('days_to_expiry') or 999),
+        -(it.get('accepted_qty') or 0),
+    ))
+    # DOH fillers always sort last so they are trimmed first — they are
+    # discretionary top-up, the appointment's own POs are not.
     indexed = list(enumerate(loaded))
     indexed.sort(key=lambda pair: (
         1 if pair[1].get('_doh_filler') else 0,
-        -(pair[1].get('priority_score') or 0),
-        (pair[1].get('days_to_expiry') or 999),
-        -(pair[1].get('accepted_qty') or 0),
+        _rank(pair[1]),
     ))
 
     # A single-family truck is built from POs that may belong to other
@@ -1667,7 +1834,7 @@ def _reserved_detail_by_asin():
 
 
 def _apply_stock_caps(items, avail_total, avail_remaining, respect, detail, reserved,
-                      enforce_expiry=False, allow_unbacked=False):
+                      enforce_expiry=False, allow_unbacked=False, min_units=None):
     """Tag each item with live stock figures (on-hand, reserved-elsewhere,
     available, incoming on-order). When ``respect``, set ``stock_cap`` = units
     still AVAILABLE (on-hand − reserved) for that ASIN so the packer plans no
@@ -1684,6 +1851,12 @@ def _apply_stock_caps(items, avail_total, avail_remaining, respect, detail, rese
     so without this an expiry-doomed line drains the ASIN's whole pool and a
     shippable fresh PO of the same ASIN reads "No free stock" — zero units ship
     although the stock was there.
+
+    ``min_units`` must MATCH what the caller passes to the packer, for exactly the
+    same reason as ``enforce_expiry``: a line the auto planner will refuse for
+    being too small must not reserve any of its ASIN's pool on the way past, or a
+    big shippable line of the same ASIN reads "No free stock" because nine units
+    took the lot.
 
     ``allow_unbacked`` (manual planner only): a line with NOTHING available is left
     uncapped and tagged ``stock_unbacked`` instead of being zeroed into not_loaded.
@@ -1710,6 +1883,11 @@ def _apply_stock_caps(items, avail_total, avail_remaining, respect, detail, rese
         # neither a stock_cap nor a pool drain — and, deliberately, no stock_unfit:
         # the reason shown must be the deadline, not a stock shortfall it didn't have.
         if enforce_expiry and _expiry_block_reason(it, today) is not None:
+            continue
+        # Same treatment for a line the auto planner will skip as too small: tags
+        # yes, cap and pool drain no, and no stock_unfit — the reason the planner
+        # is shown must stay "under the minimum", not a stock shortfall.
+        if _min_units_block_reason(it, min_units) is not None:
             continue
         if not respect:
             continue
@@ -1996,6 +2174,14 @@ def _fetch_doh_filler_pool(fc, exclude_po_uppers, doh_by_asin, families=None, as
               AND (p.accepted_qty - COALESCE(b.billed_qty, 0)) > 0
               {f'AND {family_sql}' if family_sql else ''}
               {'AND UPPER(TRIM(p.asin)) = ANY(%s::text[])' if asin_list else ''}
+            -- Biggest shippable line first, same rule as the appointment pool.
+            -- _filler_pass re-sorts with _fill_sort_key (which also weighs the
+            -- priority bucket) and is the authority; this ORDER BY just means the
+            -- pool never arrives in an arbitrary order, so a truncated or
+            -- capacity-limited pass takes the big lines rather than whatever the
+            -- planner happened to scan first.
+            ORDER BY GREATEST(p.accepted_qty - COALESCE(b.billed_qty, 0), 0) DESC,
+                     p.po_number, p.asin
         """, [fc, exclude_list] + family_params + ([asin_list] if asin_list else []))
         raw = _row_to_dict(cur, cur.fetchall())
 
@@ -3086,6 +3272,16 @@ class AppointmentItemsView(_SafeAPIView):
                   AND (p.accepted_qty - COALESCE(b.billed_qty, 0)) > 0
                   {line_family_clause}
                   {line_asin_clause}
+                -- Biggest shippable line first. This used to come back unordered
+                -- and be sorted in Python; the Python sort (_fill_sort_key) is
+                -- still the authority because it also weighs the priority bucket,
+                -- which is computed after this query from live DOH. Ordering here
+                -- too means the candidate list is never in arbitrary order at any
+                -- point, and expiry orders it at neither end.
+                -- Written out rather than `ORDER BY accepted_qty` because that
+                -- name is both an output alias and a real column on p.
+                ORDER BY GREATEST(p.accepted_qty - COALESCE(b.billed_qty, 0), 0) DESC,
+                         p.po_number, p.asin
             """, [appointment_id, candidate_pos, all_appt_ids, switch_group_up]
                  + line_family_params + line_asin_params)
             raw = _row_to_dict(cur, cur.fetchall())
@@ -3181,11 +3377,13 @@ class AppointmentItemsView(_SafeAPIView):
             # shipment's primary appointment_id field.
             item['appointment_id'] = item.get('source_appointment_id') or appointment_id
 
-        items.sort(key=lambda x: (
-            -x['priority_score'],
-            x.get('days_to_expiry') or 999,
-            -(x.get('accepted_qty') or 0),
-        ))
+        # THE auto selection order — biggest shippable line first, priority bucket
+        # breaking ties, no expiry term anywhere. This one list decides everything
+        # downstream: which rows drain the stock pool, what the packer loads and in
+        # what sequence, the multi-truck breakdown, and (via _fill_sort_key again)
+        # what the commit cap trims. See _fill_sort_key for how units and buckets
+        # compose, and why priority_score is deliberately not a key.
+        items.sort(key=_fill_sort_key)
 
         # Live warehouse stock: tag every item with planner-warehouse on-hand / reserved /
         # available / incoming, and (when respect_stock) cap the orderable qty to
@@ -3197,7 +3395,7 @@ class AppointmentItemsView(_SafeAPIView):
         avail_total = {a: max(0.0, d['onhand'] - reserved.get(a, 0.0)) for a, d in stock_detail.items()}
         avail_remaining = dict(avail_total)
         _apply_stock_caps(items, avail_total, avail_remaining, respect_stock, stock_detail, reserved, allow_unbacked=allow_unbacked,
-                          enforce_expiry=True)
+                          enforce_expiry=True, min_units=MIN_AUTO_LINE_UNITS)
 
         # Appointment POs come FIRST and in full: pack the appointment's own POs
         # (highest priority_score first) straight into the truck, limited only by
@@ -3206,8 +3404,12 @@ class AppointmentItemsView(_SafeAPIView):
         # would drop committed goods); it only steers the discretionary DOH-filler
         # waterfall below and the standalone DOH Auto-Fill view. The Vendor Central
         # units/cartons cap (with +7% tolerance) is still applied at the end.
+        # min_units: AUTO mode never puts a line under MIN_AUTO_LINE_UNITS on the
+        # truck. Those lines are not dropped — they land in not_loaded flagged as
+        # suggestions so the planner can add them by hand.
         loaded, not_loaded, capacity, planned_liters, load_pct, priority_actual = _auto_plan_truck(
             items, truck_size, capacity_override, priority=None,
+            min_units=MIN_AUTO_LINE_UNITS,
         )
 
         # Maximize-fill — three-stage waterfall:
@@ -3226,6 +3428,7 @@ class AppointmentItemsView(_SafeAPIView):
                     loaded, not_loaded, capacity,
                     primary_fc=primary_fc,
                     mark_key='_filler',
+                    min_units=MIN_AUTO_LINE_UNITS,
                 )
                 filler_count = sum(1 for it in loaded if it.get('_filler'))
 
@@ -3245,7 +3448,7 @@ class AppointmentItemsView(_SafeAPIView):
                 # No allow_unbacked here: nobody picked these, and a filler
                 # exists to use spare capacity with POs that can ship today.
                 _apply_stock_caps(doh_pool, avail_total, avail_remaining, respect_stock, stock_detail, reserved,
-                                  enforce_expiry=True)
+                                  enforce_expiry=True, min_units=MIN_AUTO_LINE_UNITS)
                 if doh_pool:
                     loaded, _doh_unfit = _filler_pass(
                         loaded, doh_pool, capacity,
@@ -3253,8 +3456,9 @@ class AppointmentItemsView(_SafeAPIView):
                         mark_key='_doh_filler',
                         reason=(
                             'DOH filler · pulled from same-FC PENDING POs not '
-                            'tied to this appointment, ranked by DOH urgency.'
+                            'tied to this appointment, biggest line first.'
                         ),
+                        min_units=MIN_AUTO_LINE_UNITS,
                     )
                     doh_filler_count = sum(1 for it in loaded if it.get('_doh_filler'))
 
@@ -3267,6 +3471,9 @@ class AppointmentItemsView(_SafeAPIView):
         if commit_caps:
             loaded, not_loaded = _enforce_commit_caps(
                 loaded, not_loaded, commit_caps, family=(' / '.join(product_families) or None),
+                # Trim in the reverse of the order the truck was filled, so the
+                # smallest lines are cut first instead of the furthest-from-expiry.
+                fill_order=_fill_sort_key,
             )
             planned_liters = round(sum(float(it.get('planned_liters') or 0) for it in loaded), 4)
             load_pct = round((planned_liters / capacity * 100) if capacity > 0 else 0, 2)
@@ -3276,10 +3483,13 @@ class AppointmentItemsView(_SafeAPIView):
         # expiry_blocked lines keep their deadline reason — the expiry gate forces
         # planned_qty to 0, so without the guard this overwrite would relabel every
         # such line as a stock problem and send the planner chasing inventory for a
-        # PO that is about to be cancelled.
+        # PO that is about to be cancelled. min_units_blocked lines are guarded for
+        # the same reason: "under 10 units, add by hand" is the actionable sentence,
+        # and those lines were skipped before stock was even considered.
         if respect_stock:
             for it in not_loaded:
                 if (it.get('stock_unfit') and not it.get('expiry_blocked')
+                        and not it.get('min_units_blocked')
                         and float(it.get('planned_qty') or 0) <= 0):
                     it['unfit_reason'] = it['stock_unfit']
             for it in loaded:
@@ -3290,6 +3500,14 @@ class AppointmentItemsView(_SafeAPIView):
         # Invoiced / Partial invoiced tag on Plan Review.
         _attach_invoice_detail(loaded)
         _attach_invoice_detail(not_loaded)
+
+        # Near-expiry WARNING tag. Runs last, over the finished plan, precisely so
+        # it cannot influence it: expiry no longer picks or orders anything, it
+        # only tells the planner what to look at. `days_to_expiry` (stored, stale)
+        # is left as it was; `days_to_expiry_live` + `near_expiry` are the new
+        # fields the UI flags on.
+        _tag_expiry_warnings(loaded)
+        _tag_expiry_warnings(not_loaded)
 
         # If load is still thin, suggest a smaller truck size
         truck_suggestion = _suggest_smaller_truck(planned_liters, capacity, truck_size)
@@ -3303,7 +3521,7 @@ class AppointmentItemsView(_SafeAPIView):
             t_units = 0.0
             t_liters = 0.0
             remaining_cap = float(capacity)
-            for it in items:  # already priority-sorted
+            for it in items:  # already in fill order (units desc, then bucket)
                 pl = float(it.get('per_liter') or 0)
                 units = float(it.get('accepted_qty') or 0)
                 sc = it.get('stock_cap')
@@ -3379,6 +3597,13 @@ class AppointmentItemsView(_SafeAPIView):
             'commit_caps': commit_caps,
             'loaded_items': loaded,
             'not_loaded_items': not_loaded,
+            # The two thresholds the UI needs to label rows, echoed rather than
+            # hardcoded on the client so they can only ever be changed in one
+            # place. `min_auto_line_units` is what the sub-10 suggestions were
+            # measured against; `near_expiry_days` is the warning band behind the
+            # `near_expiry` flag on every row.
+            'min_auto_line_units': MIN_AUTO_LINE_UNITS,
+            'near_expiry_days': NEAR_EXPIRY_WARN_DAYS,
             'priority_requested': priority,
             'priority_actual': priority_actual,
             # Echoed so the UI can say what it actually planned against — which
@@ -6250,13 +6475,19 @@ class DOHAutoFillView(_SafeAPIView):
             row['priority_reason'] = reason
             items.append(row)
 
-        # 5) Sort: NO-DEMAND items skipped; rest by DOH ASC (most urgent first), FEFO tiebreaker
+        # 5) Sort: NO-DEMAND items skipped; rest by DOH ASC (most urgent first),
+        #    ties broken by the BIGGEST line. This view is DOH-driven by design, so
+        #    unlike the appointment planner its primary key stays DOH — but the
+        #    expiry tiebreaker is gone, because no auto planner orders on expiry
+        #    any more. (The sub-10 minimum is NOT applied here: this is the
+        #    standalone DOH Auto-Fill screen, not the appointment AUTO plan.)
         actionable = [it for it in items if it['priority_bucket'] != 'NO DEMAND']
         no_demand = [it for it in items if it['priority_bucket'] == 'NO DEMAND']
         actionable.sort(key=lambda x: (
             float(x.get('doh') if x.get('doh') is not None else 9999),
-            x.get('days_to_expiry') or 999,
             -(float(x.get('accepted_qty') or 0)),
+            str(x.get('po_number') or ''),
+            str(x.get('asin') or ''),
         ))
 
         # Compute per-FC urgency summary so the frontend can show a dropdown of
