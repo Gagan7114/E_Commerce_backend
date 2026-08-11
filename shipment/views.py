@@ -470,6 +470,11 @@ def _fill_sort_key(item):
     score would therefore have kept expiry in charge even after the tiebreaker
     was deleted, so the score is not a key here at all.
 
+    HOME FC OUTRANKS SIZE: everything already at the truck's own FC loads before
+    anything that would have to be switched in from a sister FC, however large.
+    Only once the home FC is exhausted (or blocked by stock, capacity or a
+    commitment cap) does a sister-FC line get a slot.
+
     HOW THIS COMPOSES WITH THE PRIORITY BUCKETS: units first, bucket second. The
     bucket (CRITICAL → HOLD, from DRR/SOH/DOH and nothing else) still ranks every
     line and still shows in the UI; it now breaks ties between lines of the SAME
@@ -479,6 +484,14 @@ def _fill_sort_key(item):
     the identical order rather than shuffling equal lines around.
     """
     return (
+        # HOME FC FIRST. A truck booked at DED5 exhausts what is already AT DED5
+        # before it reaches for a sister FC's stock, because pulling a PO from
+        # DED3 costs a switching request to Amazon and a wait, while a DED5 line
+        # can be loaded today. `is_switch` is exactly that distinction: the
+        # server sets it only when a PO sits at a sister FC and has to be moved
+        # (a flip — already moved by Amazon — is not a switch, so it sorts as
+        # home). Within each group the rest of the key is unchanged.
+        1 if item.get('is_switch') else 0,
         -_shippable_units(item),
         -_BUCKET_RANK.get(str(item.get('priority_bucket') or '').upper(), 0),
         str(item.get('po_number') or ''),
