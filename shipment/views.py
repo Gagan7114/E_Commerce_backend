@@ -450,7 +450,7 @@ NEAR_EXPIRY_WARN_DAYS = 3
 #     original qty would be undefined for filler rows.
 # The SAME figure drives the descending fill order below, so "big line" means the
 # same thing in both rules.
-MIN_AUTO_LINE_UNITS = 10
+MIN_AUTO_LINE_UNITS = 20
 
 
 def _shippable_units(item):
@@ -713,6 +713,27 @@ def _pack_into_capacity(items, capacity_lt, enforce_expiry=True, min_units=None)
             item['unfit_reason'] = item.get('stock_unfit') or (
                 f"Out of stock at {item.get('source_warehouse')}." if item.get('source_warehouse')
                 else 'Out of stock.'
+            )
+            not_loaded.append(item)
+            continue
+
+        # THE FLOOR AGAIN, on what will actually be loaded. The gate at the top
+        # of this loop tests the line's ORDERED units, so a line ordered well
+        # over the minimum whose live stock leaves only a handful cleared it and
+        # boarded at that handful — accepted 100, 12 in stock, 12 on the truck.
+        # That is exactly the dribble line the floor exists to stop, arriving by
+        # a different route. It goes to the suggestions instead, where a planner
+        # can still add it by hand.
+        if min_units and 0 < cap_units < float(min_units):
+            item['planned_qty'] = 0
+            item['planned_liters'] = 0
+            item['min_units_blocked'] = True
+            item['suggestion'] = True
+            item['suggestion_kind'] = 'under_min_units'
+            item['unfit_reason'] = (
+                f'Only {int(cap_units)} units can ship today, under the '
+                f'{int(min_units)}-unit minimum for auto-planning, so it was '
+                f'left off the truck. Add it by hand if you want it on this load.'
             )
             not_loaded.append(item)
             continue
