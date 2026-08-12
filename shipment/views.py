@@ -2417,6 +2417,16 @@ def _fetch_doh_filler_pool(fc, exclude_po_uppers, doh_by_asin, families=None, as
                 p.sap_sku_code,
                 p.sku_name            AS product_name,
                 GREATEST(p.accepted_qty - COALESCE(b.billed_qty, 0), 0) AS accepted_qty,
+                -- The quantity BEFORE billing was taken off. The invoice popup
+                -- needs it to say "accepted 3,365, invoiced 3,000, 365 left":
+                -- without it, it falls back to `accepted_qty` — which is already
+                -- net of billing — calls that the original, and subtracts the
+                -- billed quantity a SECOND time. A line with 365 genuinely left
+                -- to ship then reads "still to ship 0" while the planner loads
+                -- 365 of it, which is how a correct plan comes to contradict its
+                -- own popup. The other two candidate queries have always
+                -- selected this; this one was the gap.
+                p.accepted_qty        AS original_accepted_qty,
                 COALESCE(b.billed_qty, 0) AS billed_qty,
                 p.case_pack,
                 p.per_liter,
