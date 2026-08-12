@@ -505,15 +505,20 @@ def _fill_sort_key(item):
     the identical order rather than shuffling equal lines around.
     """
     return (
-        # HOME FC FIRST. A truck booked at DED5 exhausts what is already AT DED5
-        # before it reaches for a sister FC's stock, because pulling a PO from
-        # DED3 costs a switching request to Amazon and a wait, while a DED5 line
-        # can be loaded today. `is_switch` is exactly that distinction: the
-        # server sets it only when a PO sits at a sister FC and has to be moved
-        # (a flip — already moved by Amazon — is not a switch, so it sorts as
-        # home). Within each group the rest of the key is unchanged.
-        1 if item.get('is_switch') else 0,
+        # SIZE FIRST, WHOLE TRUCK. Home FC used to lead this key, which packed
+        # every DED5 line before any DED3 one and made the manifest read as two
+        # descending runs — a 783-unit sister line below a 22-unit home line.
+        # Changed on request (2026-08-12) to one continuous biggest-first list.
+        #
+        # The cost is real and deliberate: a sister-FC line now loads ahead of
+        # home-FC stock whenever it is bigger, so the truck raises switching
+        # requests that exhausting the home FC first would have avoided, and it
+        # waits on Amazon to action them.
         -_shippable_units(item),
+        # Home FC only breaks a TIE now. Between two lines of identical size,
+        # take the one already at the truck's FC — there is nothing to gain from
+        # a switching request when the same units can be loaded today.
+        1 if item.get('is_switch') else 0,
         -_BUCKET_RANK.get(str(item.get('priority_bucket') or '').upper(), 0),
         str(item.get('po_number') or ''),
         str(item.get('asin') or ''),
@@ -550,10 +555,13 @@ def _doh_fill_sort_key(item):
     except (TypeError, ValueError):
         doh = 0.0
     return (
-        1 if item.get('is_switch') else 0,
+        # Cover first, whole truck — the same change as _fill_sort_key: home FC
+        # no longer heads the key, it only breaks a tie between two lines that
+        # are equally urgent and equally big.
         doh if drr > 0 else float('inf'),
         -_BUCKET_RANK.get(str(item.get('priority_bucket') or '').upper(), 0),
         -_shippable_units(item),
+        1 if item.get('is_switch') else 0,
         str(item.get('po_number') or ''),
         str(item.get('asin') or ''),
     )
