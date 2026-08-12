@@ -607,7 +607,7 @@ def _manual_fill_order(item):
 # the planner's own short-supply instruction, not a previous verdict.
 _SUGGESTION_ADD_STALE_KEYS = (
     'planned_qty', 'planned_liters', 'unfit_reason', 'not_loaded',
-    'expiry_blocked', 'min_units_blocked',
+    'expiry_blocked', 'min_units_blocked', 'min_units_cause',
     'stock_cap', 'stock_limited', 'stock_unfit', 'stock_unbacked', 'stock_note',
     'sap_stock', 'sap_on_order', 'sap_reserved', 'sap_available',
     '_filler', '_doh_filler', 'filler_reason',
@@ -704,6 +704,18 @@ def _pack_into_capacity(items, capacity_lt, enforce_expiry=True, min_units=None)
             item['planned_liters'] = 0
             item['unfit_reason'] = min_units_unfit
             item['min_units_blocked'] = True
+            # WHY it is under the floor. Three different situations reach this
+            # rule and they are not the same problem: a genuinely small order, a
+            # big order with almost nothing in the warehouse, and a big order
+            # with nowhere left on the truck. The client cannot tell them apart
+            # from the numbers it has — a row blocked before stock caps exist
+            # carries no cap at all — so it labelled all three "Too small",
+            # which reads as a bug against a 1,500-unit line.
+            item['min_units_cause'] = (
+                'stock'
+                if _shippable_units(item) < float(min_units) <= float(item.get('accepted_qty') or 0)
+                else 'ordered'
+            )
             item['suggestion'] = True
             item['suggestion_kind'] = 'under_min_units'
             not_loaded.append(item)
@@ -761,6 +773,7 @@ def _pack_into_capacity(items, capacity_lt, enforce_expiry=True, min_units=None)
             item['min_units_blocked'] = True
             item['suggestion'] = True
             item['suggestion_kind'] = 'under_min_units'
+            item['min_units_cause'] = 'stock'
             item['unfit_reason'] = (
                 f'Only {int(cap_units)} units can ship today, under the '
                 f'{int(min_units)}-unit minimum for auto-planning, so it was '
@@ -825,6 +838,9 @@ def _pack_into_capacity(items, capacity_lt, enforce_expiry=True, min_units=None)
                         item['min_units_blocked'] = True
                         item['suggestion'] = True
                         item['suggestion_kind'] = 'under_min_units'
+                        # Nothing wrong with this line at all — the truck simply
+                        # ran out of room for anything but a dribble of it.
+                        item['min_units_cause'] = 'capacity'
                         item['unfit_reason'] = (
                             f'Only space left for a part-load under the '
                             f'{int(min_units)}-unit minimum for auto-planning, '
