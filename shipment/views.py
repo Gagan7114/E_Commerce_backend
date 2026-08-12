@@ -452,6 +452,39 @@ NEAR_EXPIRY_WARN_DAYS = 3
 # same thing in both rules.
 MIN_AUTO_LINE_UNITS = 20
 
+# The floor is per PACK SIZE, because a unit is not the same amount of oil in
+# every pack: 20 units of 1L is 20 litres, while 20 units of 5L is a hundred.
+# Asking a 5L line to clear the same unit count as a 1L one holds back four
+# times the volume for the same "too small to bother" judgement.
+#
+#   5L and larger -> 15 units      (75 litres and up)
+#   everything else -> 20 units    (the default above)
+#
+# Keyed on per_liter, the litres ONE unit contains, which every candidate query
+# already selects and every packer path already reads. 2L and 4L keep the 20
+# default: only the two sizes that were specified are special-cased, rather than
+# inventing a curve nobody asked for.
+MIN_AUTO_LINE_UNITS_LARGE_PACK = 15
+LARGE_PACK_LITRES = 5.0
+
+
+def _effective_min_units(item, min_units):
+    """The minimum line size for THIS item, or falsy when the rule is off.
+
+    `min_units` carries the caller's intent — manual mode passes nothing and the
+    rule does not apply at all — so a falsy value stays falsy here rather than
+    being replaced by a default the caller deliberately withheld.
+    """
+    if not min_units:
+        return min_units
+    try:
+        per_liter = float(item.get('per_liter') or 0)
+    except (TypeError, ValueError):
+        per_liter = 0.0
+    if per_liter >= LARGE_PACK_LITRES:
+        return min(float(min_units), float(MIN_AUTO_LINE_UNITS_LARGE_PACK))
+    return min_units
+
 
 def _shippable_units(item):
     """Units this line can actually put on a truck today.
@@ -622,6 +655,7 @@ def _min_units_block_reason(item, min_units=None):
     line is fully billed or fully committed elsewhere, which the packer already
     explains far better than "under 10 units" would.
     """
+    min_units = _effective_min_units(item, min_units)
     if not min_units:
         return None
     units = _shippable_units(item)
@@ -767,7 +801,8 @@ def _pack_into_capacity(items, capacity_lt, enforce_expiry=True, min_units=None)
         # That is exactly the dribble line the floor exists to stop, arriving by
         # a different route. It goes to the suggestions instead, where a planner
         # can still add it by hand.
-        if min_units and 0 < cap_units < float(min_units):
+        _min_u = _effective_min_units(item, min_units)
+        if _min_u and 0 < cap_units < float(_min_u):
             item['planned_qty'] = 0
             item['planned_liters'] = 0
             item['min_units_blocked'] = True
@@ -776,7 +811,7 @@ def _pack_into_capacity(items, capacity_lt, enforce_expiry=True, min_units=None)
             item['min_units_cause'] = 'stock'
             item['unfit_reason'] = (
                 f'Only {int(cap_units)} units can ship today, under the '
-                f'{int(min_units)}-unit minimum for auto-planning, so it was '
+                f'{int(_min_u)}-unit minimum for auto-planning, so it was '
                 f'left off the truck. Add it by hand if you want it on this load.'
             )
             not_loaded.append(item)
@@ -813,7 +848,8 @@ def _pack_into_capacity(items, capacity_lt, enforce_expiry=True, min_units=None)
                 # truck, so it has to be re-checked here: the line cleared the
                 # gate on its FULL quantity, but only a slice of it fits, and a
                 # 4-unit slice is exactly the dribble the floor exists to stop.
-                floored_by_min = bool(min_units and 0 < partial_qty < float(min_units))
+                _min_p = _effective_min_units(item, min_units)
+                floored_by_min = bool(_min_p and 0 < partial_qty < float(_min_p))
                 if floored_by_min:
                     partial_qty = 0
                 if partial_qty > 0:
@@ -843,7 +879,7 @@ def _pack_into_capacity(items, capacity_lt, enforce_expiry=True, min_units=None)
                         item['min_units_cause'] = 'capacity'
                         item['unfit_reason'] = (
                             f'Only space left for a part-load under the '
-                            f'{int(min_units)}-unit minimum for auto-planning, '
+                            f'{int(_min_p)}-unit minimum for auto-planning, '
                             f'so it was left off the truck. Add it by hand if '
                             f'you want it on this load.'
                         )
@@ -2285,7 +2321,8 @@ def _apply_stock_caps(items, avail_total, avail_remaining, respect, detail, rese
         # vanishing, with `stock` as the cause so it reads "Low stock", not
         # "Too small". Not applied under allow_unbacked — "Plan without stock" is
         # an explicit instruction to ignore stock, and this is a stock rule.
-        if respect and not allow_unbacked and min_units and 0 < avail < float(min_units):
+        _min_i = _effective_min_units(it, min_units)
+        if respect and not allow_unbacked and _min_i and 0 < avail < float(_min_i):
             _where = f'{_inventory_label(src_whs) or src_whs} ({src_whs})' if src_whs else 'the warehouse'
             it['stock_cap'] = 0.0
             it['min_units_blocked'] = True
@@ -2300,11 +2337,11 @@ def _apply_stock_caps(items, avail_total, avail_remaining, respect, detail, rese
             it['stock_unfit'] = (
                 (f'Only {int(round(avail))} of {_where} left for this line after '
                  f'earlier lines of this SKU ({int(round(_total_free))} free in '
-                 f'total), under the {int(min_units)}-unit minimum for '
+                 f'total), under the {int(_min_i)}-unit minimum for '
                  f'auto-planning.')
                 if _total_free - avail > 0.5 else
                 (f'Only {int(round(avail))} free in {_where}, under the '
-                 f'{int(min_units)}-unit minimum for auto-planning.')
+                 f'{int(_min_i)}-unit minimum for auto-planning.')
             )
             it['unfit_reason'] = it['stock_unfit']
             continue
@@ -4148,6 +4185,11 @@ class AppointmentItemsView(_SafeAPIView):
             # measured against; `near_expiry_days` is the warning band behind the
             # `near_expiry` flag on every row.
             'min_auto_line_units': MIN_AUTO_LINE_UNITS,
+            # The floor is per pack size — 5L and larger clear at a lower unit
+            # count, since a unit of it is five times the volume. Sent so the UI
+            # can name the right number instead of assuming one applies to all.
+            'min_auto_line_units_large_pack': MIN_AUTO_LINE_UNITS_LARGE_PACK,
+            'large_pack_litres': LARGE_PACK_LITRES,
             # What each selected product was given and what it actually used.
             # None when only one product (or none) was selected — there is no
             # split to report and an empty object would read as "0% each".
