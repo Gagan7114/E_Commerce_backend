@@ -2273,6 +2273,42 @@ def _apply_stock_caps(items, avail_total, avail_remaining, respect, detail, rese
             _where = f'{_inventory_label(src_whs) or src_whs} ({src_whs})' if src_whs else 'the warehouse'
             it['stock_note'] = f'No free stock in {_where} today — planned on the ordered quantity.'
             continue
+        # LOW INVENTORY IS NOT WORTH A SLOT. Under the minimum line size there is
+        # nothing here that can legally ship — the packer will reject whatever
+        # this row is capped to — so the row is blocked HERE and, crucially, does
+        # not drain the pool on its way out. It used to reserve those units
+        # anyway, which took stock off a sibling row of the same ASIN that could
+        # have used it, to plan a line that was always going to be refused.
+        #
+        # Same threshold as the ordered-units floor, and reported the same way:
+        # tagged as a suggestion so it appears in the set-aside list rather than
+        # vanishing, with `stock` as the cause so it reads "Low stock", not
+        # "Too small". Not applied under allow_unbacked — "Plan without stock" is
+        # an explicit instruction to ignore stock, and this is a stock rule.
+        if respect and not allow_unbacked and min_units and 0 < avail < float(min_units):
+            _where = f'{_inventory_label(src_whs) or src_whs} ({src_whs})' if src_whs else 'the warehouse'
+            it['stock_cap'] = 0.0
+            it['min_units_blocked'] = True
+            it['min_units_cause'] = 'stock'
+            it['suggestion'] = True
+            it['suggestion_kind'] = 'under_min_units'
+            # Name BOTH figures when they differ. The Inventory column shows the
+            # ASIN's total free stock, while this rule reads what is left after
+            # earlier lines of the same SKU took their share — so "only 4 free"
+            # beside a column reading 192 would look like one of them is wrong.
+            _total_free = float(avail_total.get(asin) or 0)
+            it['stock_unfit'] = (
+                (f'Only {int(round(avail))} of {_where} left for this line after '
+                 f'earlier lines of this SKU ({int(round(_total_free))} free in '
+                 f'total), under the {int(min_units)}-unit minimum for '
+                 f'auto-planning.')
+                if _total_free - avail > 0.5 else
+                (f'Only {int(round(avail))} free in {_where}, under the '
+                 f'{int(min_units)}-unit minimum for auto-planning.')
+            )
+            it['unfit_reason'] = it['stock_unfit']
+            continue
+
         # "Plan without stock" means stock STOPS CAPPING the quantity — the whole
         # ordered amount is planned and the shortfall is stated instead. Before,
         # allow_unbacked only rescued a line whose pool was EMPTY, so a line with
