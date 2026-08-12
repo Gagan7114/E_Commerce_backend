@@ -6,6 +6,7 @@ from . import (
     primary_monthly_targets,
     call_center_targets,
     blinkit_sale_target,
+    blinkit_campaigns_optimization,
 )
 
 urlpatterns = [
@@ -125,6 +126,13 @@ urlpatterns = [
     path("<slug:slug>/bigbasket-ads-daily-dashboard", views.bigbasket_ads_daily_dashboard, name="platform-bigbasket-ads-daily-dashboard"),
     path("<slug:slug>/blinkit-ads-dashboard", views.blinkit_ads_dashboard, name="platform-blinkit-ads-dashboard"),
     path("<slug:slug>/blinkit-summary-report", views.blinkit_summary_report, name="platform-blinkit-summary-report"),
+    # Marketing → Campaigns Optimization (Blinkit only): the raw rows the page's
+    # calculation engine works on. Assembled from tables the daily crons fill.
+    path(
+        "<slug:slug>/blinkit-campaigns-optimization",
+        blinkit_campaigns_optimization.blinkit_campaigns_optimization,
+        name="platform-blinkit-campaigns-optimization",
+    ),
     # Marketing → Sale & Target (Blinkit only): daily sale pair + litre-wise targets.
     path(
         "<slug:slug>/blinkit-sale-target",

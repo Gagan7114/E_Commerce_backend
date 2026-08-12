@@ -940,6 +940,60 @@ def _bigbasket_primary_dashboard_response(request, slug: str):
         "projection_ltrs": kpi_total.get("projection_ltrs", 0),
         "projection_qty": kpi_total.get("projection_qty", 0),
     })
+
+    # Day-wise trend. BigBasket takes its own handler and used to be the ONLY
+    # primary platform that shipped no `trends` key at all, so the Summary
+    # dashboard's Primary line sat flat at zero for it while every other
+    # platform drew a real curve. Metrics mirror the summary query above
+    # exactly (COMPLETED for done, missed_* for pending, order_* for order) so
+    # the trend sums back to the KPI cards. period_end is EXCLUSIVE (1st of the
+    # next month), hence the -1 day; capped at today so we do not emit a tail
+    # of future zero days.
+    trend_end = min(period_end - timedelta(days=1), timezone.localdate())
+    daily_trend = _primary_trend_rows(_dict_rows(
+        f"""
+        {filtered_cte},
+        trend_days AS (
+            SELECT generate_series(%s::date, %s::date, interval '1 day')::date AS period
+        ),
+        agg AS (
+            SELECT
+                ({date_expr})::date AS period,
+                COALESCE(SUM("total_order_amt_inclusive"), 0) AS order_value,
+                COALESCE(SUM("total_order_liters"), 0) AS order_ltrs,
+                COALESCE(SUM("order_qty"), 0) AS order_qty,
+                COALESCE(SUM(CASE WHEN UPPER(TRIM("po_status"::text)) = 'COMPLETED'
+                    THEN "{done_value_col}" ELSE 0 END), 0) AS done_value,
+                COALESCE(SUM(CASE WHEN UPPER(TRIM("po_status"::text)) = 'COMPLETED'
+                    THEN "total_delivered_liters" ELSE 0 END), 0) AS done_ltrs,
+                COALESCE(SUM(CASE WHEN UPPER(TRIM("po_status"::text)) = 'COMPLETED'
+                    THEN "delivered_qty" ELSE 0 END), 0) AS done_qty,
+                COALESCE(SUM(COALESCE("missed_qty", 0) * COALESCE("basic_rate", 0)), 0) AS pending_value,
+                COALESCE(SUM(COALESCE("missed_ltrs", 0)), 0) AS pending_ltrs,
+                COALESCE(SUM(COALESCE("missed_qty", 0)), 0) AS pending_qty
+            FROM filtered
+            WHERE ({date_expr}) IS NOT NULL
+            GROUP BY 1
+        )
+        SELECT
+            d.period,
+            TO_CHAR(d.period, 'DD Mon') AS label,
+            COALESCE(a.done_value, 0) AS done_value,
+            COALESCE(a.done_ltrs, 0) AS done_ltrs,
+            COALESCE(a.done_qty, 0) AS done_qty,
+            COALESCE(a.pending_value, 0) AS pending_value,
+            COALESCE(a.pending_ltrs, 0) AS pending_ltrs,
+            COALESCE(a.pending_qty, 0) AS pending_qty,
+            COALESCE(a.order_value, 0) AS order_value,
+            COALESCE(a.order_ltrs, 0) AS order_ltrs,
+            COALESCE(a.order_qty, 0) AS order_qty
+        FROM trend_days d
+        LEFT JOIN agg a ON a.period = d.period
+        ORDER BY d.period
+        """,
+        filtered_params + [period_start, trend_end],
+    ))
+
     return Response({
         "source": "master_po",
         "format": f"{slug.upper()}_PRIMARY",
@@ -967,6 +1021,13 @@ def _bigbasket_primary_dashboard_response(request, slug: str):
         "open_vendor_pending_ltrs": open_vendor_pending_ltrs,
         "open_vendor_pending_qty": open_vendor_pending_qty,
         "open_vendor_pending_order": open_vendor_pending_order,
+        # Same shape as the shared primary handler. month/year stay empty —
+        # the frontend only reads trends.day.
+        "trends": {
+            "day": daily_trend,
+            "month": [],
+            "year": [],
+        },
         "notes": [
             "DONE metrics use COMPLETED for every item head.",
             f"Done value uses {done_value_col}.",
@@ -5182,12 +5243,30 @@ def _quick_commerce_metrics(*, gmv_field: str, include_indirect_qty: bool, inclu
     # ACOS still derive from the underlying GMV columns (kept in the views): when
     # indirect GMV is tracked separately (Blinkit only), the ROAS numerator sums
     # direct + indirect; ACOS uses `gmv_field` (direct) alone.
-    # `include_ads_sale` (Blinkit only) surfaces the ROAS numerator itself as an
-    # "Ads sale" column, placed right after Ad spent.
+    # `include_ads_sale` (Blinkit only) adds an "Ads sale" column right after Ad
+    # spent. It is valued at the BASIC RATE, not at GMV: business asked for the
+    # ads-driven sale in our own ex-tax terms rather than Blinkit's selling
+    # price. It covers DIRECT + INDIRECT qty, so it is the halo-inclusive twin of
+    # the "Sale Basic Rate" column (which stays direct-only):
+    #     ads_sale          = basic_rate × (direct_qty_sold + indirect_qty_sold)
+    #     total_sale_basic_rate = basic_rate × direct_qty_sold   (unchanged)
+    # `total_sale_basic_rate` is precomputed per row in the *_ads_master views,
+    # so only the indirect leg is multiplied out here.
+    #
+    # NOTE: this deliberately DECOUPLES "Ads sale" from ROAS. ROAS and ACOS still
+    # derive from the GMV columns — ROAS sums direct + indirect GMV where
+    # indirect is tracked separately (Blinkit only), ACOS uses `gmv_field`
+    # (direct) alone — so `ads_sale ÷ ad_spent` no longer equals the ROAS column.
     roas_numerator = (
         f"(COALESCE(SUM({gmv_field}), 0) + COALESCE(SUM(indirect_gmv), 0))"
         if include_indirect_gmv
         else f"COALESCE(SUM({gmv_field}), 0)"
+    )
+    ads_sale_expr = (
+        "COALESCE(SUM(COALESCE(total_sale_basic_rate, 0) "
+        "+ COALESCE(basic_rate, 0) * COALESCE(indirect_qty_sold, 0)), 0)"
+        if include_indirect_qty
+        else "COALESCE(SUM(total_sale_basic_rate), 0)"
     )
     specs = [
         {"key": "ad_spent",        "label": "Ad spent",        "format": "inr",     "agg": "sum",
@@ -5210,7 +5289,7 @@ def _quick_commerce_metrics(*, gmv_field: str, include_indirect_qty: bool, inclu
     if include_ads_sale:
         # Right after Ad spent (index 0) so the table reads Ad spent → Ads sale.
         specs.insert(1, {"key": "ads_sale", "label": "Ads sale", "format": "inr", "agg": "sum",
-                         "expr": roas_numerator})
+                         "expr": ads_sale_expr})
     if include_indirect_qty:
         specs.append({"key": "indirect_qty_sold", "label": "Indirect qty sold", "format": "count", "agg": "sum",
                       "expr": "COALESCE(SUM(indirect_qty_sold), 0)"})

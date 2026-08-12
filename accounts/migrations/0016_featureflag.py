@@ -8,7 +8,7 @@ from django.db import migrations, models
 class Migration(migrations.Migration):
 
     dependencies = [
-        ('accounts', '0015_drop_chatbot_game_permission'),
+        ('accounts', '0011_remove_jm_primary_abs_view_permission'),
     ]
 
     operations = [
