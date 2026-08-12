@@ -5243,13 +5243,11 @@ def _quick_commerce_metrics(*, gmv_field: str, include_indirect_qty: bool, inclu
     # ACOS still derive from the underlying GMV columns (kept in the views): when
     # indirect GMV is tracked separately (Blinkit only), the ROAS numerator sums
     # direct + indirect; ACOS uses `gmv_field` (direct) alone.
-    # `include_ads_sale` (Blinkit only) adds an "Ads sale" column right after Ad
-    # spent. It is valued at the BASIC RATE, not at GMV: business asked for the
-    # ads-driven sale in our own ex-tax terms rather than Blinkit's selling
-    # price. It covers DIRECT + INDIRECT qty, so it is the halo-inclusive twin of
-    # the "Sale Basic Rate" column (which stays direct-only):
-    #     ads_sale          = basic_rate × (direct_qty_sold + indirect_qty_sold)
-    #     total_sale_basic_rate = basic_rate × direct_qty_sold   (unchanged)
+    # `include_ads_sale` (Blinkit only) now just renames that column to
+    # "Ads sale". It used to ALSO add a separate halo-inclusive column
+    # (basic_rate × (direct + indirect) qty); that was removed on request, so
+    # Blinkit shows one column, direct-only, under the Ads sale heading:
+    #     total_sale_basic_rate = basic_rate × direct_qty_sold
     # `total_sale_basic_rate` is precomputed per row in the *_ads_master views,
     # so only the indirect leg is multiplied out here.
     #
@@ -5262,16 +5260,16 @@ def _quick_commerce_metrics(*, gmv_field: str, include_indirect_qty: bool, inclu
         if include_indirect_gmv
         else f"COALESCE(SUM({gmv_field}), 0)"
     )
-    ads_sale_expr = (
-        "COALESCE(SUM(COALESCE(total_sale_basic_rate, 0) "
-        "+ COALESCE(basic_rate, 0) * COALESCE(indirect_qty_sold, 0)), 0)"
-        if include_indirect_qty
-        else "COALESCE(SUM(total_sale_basic_rate), 0)"
-    )
     specs = [
         {"key": "ad_spent",        "label": "Ad spent",        "format": "inr",     "agg": "sum",
          "expr": "COALESCE(SUM(ad_spent), 0)"},
-        {"key": "total_sale_basic_rate", "label": "Sale Basic Rate", "format": "inr", "agg": "sum",
+        # Blinkit shows this as "Ads sale". It used to carry a second column of
+        # that name, direct+indirect quantity at basic rate; that was removed and
+        # this one — direct quantity only — took the label. Every other
+        # quick-commerce sheet still calls it Sale Basic Rate.
+        {"key": "total_sale_basic_rate",
+         "label": "Ads sale" if include_ads_sale else "Sale Basic Rate",
+         "format": "inr", "agg": "sum",
          "expr": "COALESCE(SUM(total_sale_basic_rate), 0)"},
         {"key": "roas",            "label": "ROAS",            "format": "ratio",   "agg": "avg",
          "expr": f"CASE WHEN COALESCE(SUM(ad_spent), 0) > 0 "
@@ -5286,10 +5284,6 @@ def _quick_commerce_metrics(*, gmv_field: str, include_indirect_qty: bool, inclu
         {"key": "direct_qty_sold", "label": "Direct qty sold", "format": "count",   "agg": "sum",
          "expr": "COALESCE(SUM(direct_qty_sold), 0)"},
     ]
-    if include_ads_sale:
-        # Right after Ad spent (index 0) so the table reads Ad spent → Ads sale.
-        specs.insert(1, {"key": "ads_sale", "label": "Ads sale", "format": "inr", "agg": "sum",
-                         "expr": ads_sale_expr})
     if include_indirect_qty:
         specs.append({"key": "indirect_qty_sold", "label": "Indirect qty sold", "format": "count", "agg": "sum",
                       "expr": "COALESCE(SUM(indirect_qty_sold), 0)"})
@@ -5563,7 +5557,7 @@ def blinkit_ads_dashboard(request, slug: str):
         metric_specs=_quick_commerce_metrics(gmv_field="direct_gmv", include_indirect_qty=True, include_indirect_gmv=True,
                                              include_ads_sale=True),
         default_metric_keys=_QC_DEFAULT_METRIC_KEYS,
-        default_visible_columns=[*_QC_DEFAULT_VISIBLE_COLUMNS, "ads_sale", "indirect_qty_sold"],
+        default_visible_columns=[*_QC_DEFAULT_VISIBLE_COLUMNS, "indirect_qty_sold"],
         spend_metric="ad_spent",
         revenue_metric="total_sale_basic_rate",
         where_sql=where_sql,
