@@ -505,20 +505,23 @@ def _fill_sort_key(item):
     the identical order rather than shuffling equal lines around.
     """
     return (
-        # SIZE FIRST, WHOLE TRUCK. Home FC used to lead this key, which packed
-        # every DED5 line before any DED3 one and made the manifest read as two
-        # descending runs — a 783-unit sister line below a 22-unit home line.
-        # Changed on request (2026-08-12) to one continuous biggest-first list.
+        # HOME FC FIRST. A truck booked at DED5 exhausts what is already AT DED5
+        # before it reaches for a sister FC's stock, because pulling a PO from
+        # DED3 costs a switching request to Amazon and a wait, while a DED5 line
+        # can be loaded today.
         #
-        # The cost is real and deliberate: a sister-FC line now loads ahead of
-        # home-FC stock whenever it is bigger, so the truck raises switching
-        # requests that exhausting the home FC first would have avoided, and it
-        # waits on Amazon to action them.
-        -_shippable_units(item),
-        # Home FC only breaks a TIE now. Between two lines of identical size,
-        # take the one already at the truck's FC — there is nothing to gain from
-        # a switching request when the same units can be loaded today.
+        # This term was removed for half a day on 2026-08-12, when the manifest's
+        # two descending runs (every DED5 line, then every DED3 line) read as a
+        # sorting fault. Measured on appointment 576126037970 afterwards, the
+        # difference between the two orders was 3 lines and 95 litres — the truck
+        # is mostly sister-FC because DED5 has almost nothing shippable (33 of
+        # its lines have zero free stock, 28 more are under the 20-unit floor),
+        # not because of the sort. So the term is back: it costs almost no size
+        # ordering and saves 3 switching requests per truck. What was actually
+        # missing was any sign ON THE ROW of which FC a line comes from, which
+        # the manifest now carries as a tag.
         1 if item.get('is_switch') else 0,
+        -_shippable_units(item),
         -_BUCKET_RANK.get(str(item.get('priority_bucket') or '').upper(), 0),
         str(item.get('po_number') or ''),
         str(item.get('asin') or ''),
@@ -555,13 +558,12 @@ def _doh_fill_sort_key(item):
     except (TypeError, ValueError):
         doh = 0.0
     return (
-        # Cover first, whole truck — the same change as _fill_sort_key: home FC
-        # no longer heads the key, it only breaks a tie between two lines that
-        # are equally urgent and equally big.
+        # Home FC first here too — see _fill_sort_key. The toggle changes which
+        # lines a truck prefers, never whether it raids a sister FC early.
+        1 if item.get('is_switch') else 0,
         doh if drr > 0 else float('inf'),
         -_BUCKET_RANK.get(str(item.get('priority_bucket') or '').upper(), 0),
         -_shippable_units(item),
-        1 if item.get('is_switch') else 0,
         str(item.get('po_number') or ''),
         str(item.get('asin') or ''),
     )
