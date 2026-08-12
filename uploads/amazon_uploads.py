@@ -3827,7 +3827,23 @@ def amazon_po_sku_pendency(request):
     show_dispatched = str(q.get("dispatched") or "").strip().lower() in _truthy
     only_invoiced = str(q.get("only_invoiced") or "").strip().lower() in _truthy
     only_short = str(q.get("only_short") or "").strip().lower() in _truthy
-    if only_short:
+    only_leak = str(q.get("only_leak") or "").strip().lower() in _truthy
+    only_parked = str(q.get("only_parked") or "").strip().lower() in _truthy
+    if only_parked:
+        # "Billed but never moved": fully invoiced AND still here. The mirror of
+        # only_leak, and unreachable by the toggles for the same reason — both
+        # `have_invoice` and `only_invoiced` return supersets of it.
+        where.append(f"{_SKU_PENDENCY_FULLY_INVOICED} AND NOT {_SKU_PENDENCY_IS_DISPATCHED}")
+    elif only_leak:
+        # "Gone but not billed": dispatched AND not fully invoiced. Not
+        # expressible with the toggles below — `dispatched` ADDS dispatched
+        # lines to the view rather than restricting to them, so the dashboard
+        # tile that counts these could only ever open a superset of itself.
+        #
+        # Deliberately not written as short_qty > 0: that expression is 0 for a
+        # line with no invoice at all, which is the worst case this asks about.
+        where.append(f"{_SKU_PENDENCY_IS_DISPATCHED} AND NOT {_SKU_PENDENCY_FULLY_INVOICED}")
+    elif only_short:
         # "Only short invoiced": lines that HAVE been billed but not for every
         # accepted unit. Expressed as shortfall > 0, which already carries both
         # halves of that test — see _PENDENCY_SHORT_QTY, which is zero on a line
@@ -3922,6 +3938,193 @@ def amazon_po_sku_pendency(request):
             },
         )
     )
+
+
+# ── Pendency summary ─────────────────────────────────────────────────────────
+# Every headline figure of the SKU PO Pendency page, aggregated for the planner
+# dashboard. One pass over the pending set: the row-level expressions (invoiced
+# split, dispatch flag, stated-litre gate) are built once in a CTE and the grand
+# total and both breakdowns come out of it via GROUPING SETS, so the expensive
+# part is paid once rather than three times.
+#
+# Ratios are NOT computed in SQL. They are derived in Python from these sums, so
+# a rate and its numerator can never come from different queries.
+_PENDENCY_SUMMARY_SQL = f"""
+WITH base AS (
+    SELECT
+        UPPER(TRIM(COALESCE(fulfillment_center, ''))) AS fc,
+        UPPER(TRIM(COALESCE(core_fresh_now, '')))     AS channel,
+        expiry_date                                   AS expiry_date,
+        COALESCE(per_liter, 0)                        AS per_l,
+        COALESCE(requested_qty, 0)                    AS req,
+        COALESCE(accepted_qty, 0)                     AS acc,
+        COALESCE(received_qty, 0)                     AS rec,
+        COALESCE(cancelled_qty, 0)                    AS can,
+        COALESCE(remaining_qty, 0)                    AS rem,
+        {_stated_litres("total_order_liters")}        AS order_l,
+        {_stated_litres("total_accepted_liters")}     AS acc_l,
+        {_stated_litres("total_delivered_liters")}    AS del_l,
+        {_stated_litres("remaining_ltrs")}            AS rem_l,
+        {_PENDENCY_INVOICED_QTY}                      AS inv_q,
+        {_PENDENCY_INVOICED_LTRS}                     AS inv_l,
+        {_PENDENCY_SHORT_QTY}                         AS short_q,
+        {_PENDENCY_SHORT_LTRS}                        AS short_l,
+        ({_SKU_PENDENCY_IS_DISPATCHED})               AS dispatched,
+        ({_SKU_PENDENCY_FULLY_INVOICED})              AS fully_inv,
+        ({_SKU_PENDENCY_HAS_STATED_LITRE})            AS has_litre,
+        ({_PENDENCY_INVOICE_COUNT})                   AS inv_count
+      FROM reporting."Amazon PO"
+     WHERE {_SKU_PENDENCY_PENDING}
+)
+SELECT
+    CASE WHEN GROUPING(fc) = 0 THEN 'fc'
+         WHEN GROUPING(channel) = 0 THEN 'channel'
+         ELSE 'total' END                                             AS scope,
+    COALESCE(NULLIF(CASE WHEN GROUPING(fc) = 0 THEN fc
+                         WHEN GROUPING(channel) = 0 THEN channel
+                         ELSE '' END, ''), '-')                       AS scope_key,
+    COUNT(*)                                                          AS lines,
+    COUNT(*) FILTER (WHERE NOT fully_inv)                             AS outstanding_lines,
+    COALESCE(SUM(req), 0)                                             AS requested_units,
+    COALESCE(SUM(acc), 0)                                             AS accepted_units,
+    COALESCE(SUM(rec), 0)                                             AS received_units,
+    COALESCE(SUM(can), 0)                                             AS cancelled_units,
+    COALESCE(SUM(rem), 0)                                             AS remaining_units,
+    COALESCE(SUM(order_l), 0)                                         AS order_ltrs,
+    COALESCE(SUM(acc_l), 0)                                           AS accepted_ltrs,
+    COALESCE(SUM(del_l), 0)                                           AS delivered_ltrs,
+    COALESCE(SUM(rem_l), 0)                                           AS remaining_ltrs,
+    -- The open book as the pendency page's DEFAULT view shows it: outstanding
+    -- lines only. The unfiltered sums above cover the whole pending universe,
+    -- fully-invoiced lines included, so a tile quoting those and then opening
+    -- the default list would state a number the list cannot account for.
+    COALESCE(SUM(rem_l) FILTER (WHERE NOT fully_inv), 0)               AS open_ltrs,
+    COALESCE(SUM(rem) FILTER (WHERE NOT fully_inv), 0)                 AS open_units,
+    COALESCE(SUM(inv_q), 0)                                           AS invoiced_units,
+    COALESCE(SUM(inv_l), 0)                                           AS invoiced_ltrs,
+    COALESCE(SUM(short_q), 0)                                         AS short_units,
+    COALESCE(SUM(short_l), 0)                                         AS short_ltrs,
+    -- Cash leak: dispatched, not fully invoiced. Deliberately NOT short_q,
+    -- which is 0 when a line has no invoice at all - the very worst case here.
+    COUNT(*) FILTER (WHERE dispatched AND NOT fully_inv)              AS leak_lines,
+    COALESCE(SUM(GREATEST(acc - inv_q, 0))
+             FILTER (WHERE dispatched AND NOT fully_inv), 0)          AS leak_units,
+    COALESCE(SUM(CASE WHEN has_litre
+                      THEN GREATEST(acc - inv_q, 0) * per_l ELSE 0 END)
+             FILTER (WHERE dispatched AND NOT fully_inv), 0)          AS leak_ltrs,
+    -- Billed but never moved: the mirror image, a physical-stock question.
+    COUNT(*) FILTER (WHERE fully_inv AND NOT dispatched)              AS billed_not_moved_lines,
+    COALESCE(SUM(acc_l) FILTER (WHERE fully_inv AND NOT dispatched), 0)
+                                                                      AS billed_not_moved_ltrs,
+    -- At risk: outstanding litres against the clock. Undated lines are counted
+    -- separately rather than assumed safe or urgent - they are neither.
+    COUNT(*) FILTER (WHERE NOT fully_inv AND expiry_date IS NOT NULL
+                       AND expiry_date <= CURRENT_DATE + 3)           AS expiring_3d_lines,
+    COALESCE(SUM(rem_l) FILTER (WHERE NOT fully_inv AND expiry_date IS NOT NULL
+                       AND expiry_date <= CURRENT_DATE + 3), 0)       AS expiring_3d_ltrs,
+    COUNT(*) FILTER (WHERE NOT fully_inv AND expiry_date IS NOT NULL
+                       AND expiry_date <= CURRENT_DATE + 7)           AS expiring_7d_lines,
+    COALESCE(SUM(rem_l) FILTER (WHERE NOT fully_inv AND expiry_date IS NOT NULL
+                       AND expiry_date <= CURRENT_DATE + 7), 0)       AS expiring_7d_ltrs,
+    COUNT(*) FILTER (WHERE NOT fully_inv AND expiry_date IS NOT NULL
+                       AND expiry_date <= CURRENT_DATE + 14)          AS expiring_14d_lines,
+    COALESCE(SUM(rem_l) FILTER (WHERE NOT fully_inv AND expiry_date IS NOT NULL
+                       AND expiry_date <= CURRENT_DATE + 14), 0)      AS expiring_14d_ltrs,
+    COUNT(*) FILTER (WHERE expiry_date IS NULL)                       AS undated_lines,
+    -- Waiting on US, not on Amazon: accepted 0 and remaining 0 is a line still
+    -- awaiting an accept/reject decision, not a finished one.
+    COUNT(*) FILTER (WHERE acc = 0 AND rem = 0)                       AS decision_lines,
+    COUNT(*) FILTER (WHERE NOT has_litre)                             AS blank_litre_lines,
+    COUNT(*) FILTER (WHERE inv_count > 1)                             AS multi_invoice_lines
+  FROM base
+ GROUP BY GROUPING SETS ((), (fc), (channel))
+"""
+
+
+def _pct(num, den):
+    """A rate, or None when the denominator cannot answer the question.
+
+    None rather than 0: "0% filled" and "nothing was accepted, so fill rate is
+    undefined" are different statements, and a dashboard that prints the first
+    when it means the second invents a failure that did not happen.
+    """
+    try:
+        den = float(den or 0)
+        if den <= 0:
+            return None
+        return round(float(num or 0) / den * 100, 2)
+    except (TypeError, ValueError):
+        return None
+
+
+def _pendency_summary_row(r: dict) -> dict:
+    """The derived figures, computed from the sums in the SAME row so a rate and
+    its numerator can never come from different queries."""
+    acc = r.get("accepted_units") or 0
+    invoiced_share = _pct(r.get("invoiced_units"), acc)
+    return {
+        **r,
+        # Service performance.
+        "fill_rate_pct": _pct(r.get("received_units"), acc),
+        "cancel_rate_pct": _pct(r.get("cancelled_units"), acc),
+        "acceptance_gap_units": float(r.get("requested_units") or 0) - float(acc),
+        "acceptance_rate_pct": _pct(acc, r.get("requested_units")),
+        "delivery_shortfall_ltrs": float(r.get("accepted_ltrs") or 0)
+        - float(r.get("delivered_ltrs") or 0),
+        # Billing integrity.
+        "invoiced_share_pct": invoiced_share,
+        "uninvoiced_share_pct": (
+            None if invoiced_share is None else round(100 - invoiced_share, 2)
+        ),
+        "short_invoice_rate_pct": _pct(r.get("short_units"), acc),
+    }
+
+
+@api_view(["GET"])
+@permission_classes([_CanViewSkuPendency])
+@cached_get(timeout=300, prefix="amzpo.sku_pendency_summary")
+def amazon_po_sku_pendency_summary(request):
+    """Headline pendency figures for the planner dashboard.
+
+    Same universe as the SKU PO Pendency page (`_SKU_PENDENCY_PENDING`), but the
+    WHOLE of it: that page's default view hides fully-invoiced lines, which are
+    exactly what "billed but not moved" is about. Every bucket is a FILTER here
+    instead, so no figure needs the page re-queried under a different toggle.
+    """
+    try:
+        ensure_billing_fresh()
+    except Exception:      # a billing refresh must never break the dashboard
+        logger.warning("pendency summary: billing freshness check failed", exc_info=True)
+
+    # Same JIT reasoning as _paginated_select: correlated sub-selects inflate the
+    # planner's cost estimate past jit_above_cost and Postgres LLVM-compiles the
+    # lot, which costs many times the actual work.
+    with transaction.atomic():
+        with connection.cursor() as cur:
+            cur.execute("SET LOCAL jit = off")
+            cur.execute(_PENDENCY_SUMMARY_SQL)
+            rows = _rows_to_dicts(cur)
+
+    total: dict = {}
+    by_fc: list[dict] = []
+    by_channel: list[dict] = []
+    for raw in rows:
+        scope = str(raw.pop("scope", "") or "")
+        key = str(raw.pop("scope_key", "") or "") or "-"
+        row = _pendency_summary_row(
+            {k: (float(v) if v is not None else 0.0) for k, v in raw.items()}
+        )
+        if scope == "total":
+            total = row
+        elif scope == "fc":
+            by_fc.append({"fc": key, **row})
+        elif scope == "channel":
+            by_channel.append({"channel": key, **row})
+
+    # Biggest open book first - the order a reader would sort them in anyway.
+    by_fc.sort(key=lambda x: -(x.get("open_ltrs") or 0))
+    by_channel.sort(key=lambda x: -(x.get("open_ltrs") or 0))
+    return Response({"total": total, "by_fc": by_fc, "by_channel": by_channel})
 
 
 @api_view(["GET"])

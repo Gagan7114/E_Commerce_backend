@@ -36,6 +36,11 @@ urlpatterns = [
         name="amazon-po-sku-pendency-options",
     ),
     path(
+        "api/reports/amazon-po/sku-pendency/summary",
+        amazon_uploads.amazon_po_sku_pendency_summary,
+        name="amazon-po-sku-pendency-summary",
+    ),
+    path(
         "api/reports/amazon-po/sku-pendency",
         amazon_uploads.amazon_po_sku_pendency,
         name="amazon-po-sku-pendency",
