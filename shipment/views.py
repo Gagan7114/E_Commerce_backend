@@ -863,8 +863,31 @@ def _pack_into_capacity(items, capacity_lt, enforce_expiry=True, min_units=None)
     return loaded, not_loaded, used
 
 
+def _even_share_key(item, families, asins):
+    """Which product group this line belongs to, for the even-share split.
+
+    A PACK when specific packs were picked (the ASIN is the pack), otherwise the
+    FAMILY. Mirrors `_family_sql`'s matching exactly — category equals the family,
+    or sub_category contains it — so a line can never be planned under a focus it
+    would not have been selected by.
+
+    Returns None for a line belonging to no selected group; the caller treats
+    those as ungrouped and they only ever reach the truck through the spill pass.
+    """
+    if asins:
+        a = str(item.get('asin') or '').strip().upper()
+        return a if a in asins else None
+    cat = str(item.get('category') or '').strip().upper()
+    sub = str(item.get('sub_category') or '').strip().upper()
+    for fam in (families or []):
+        f = str(fam).strip().upper()
+        if f and (cat == f or f in sub):
+            return f
+    return None
+
+
 def _auto_plan_truck(items, truck_size, capacity_override=None, priority=None, strict=False,
-                     enforce_expiry=True, min_units=None):
+                     enforce_expiry=True, min_units=None, even_split_key=None):
     """
     Plan a truck load.
 
@@ -889,6 +912,53 @@ def _auto_plan_truck(items, truck_size, capacity_override=None, priority=None, s
     _pack_into_capacity. `min_units` is set only by the AUTO callers.
     """
     capacity = _resolve_capacity(truck_size, capacity_override)
+
+    # EVEN SHARE ACROSS THE SELECTED PRODUCTS. Picking two products and getting a
+    # truck of one of them is the complaint this answers: biggest-line-first fills
+    # the whole truck from whichever product happens to have the largest open PO,
+    # and the second product never gets a slot. Each selected product now gets an
+    # equal slice — half the truck each for two, a third each for three.
+    #
+    # The slice is a FLOOR, not a ceiling: a product whose slice cannot be filled
+    # (no stock, everything under the minimum) leaves its litres to the spill pass
+    # below, which packs them in the normal order regardless of product. Without
+    # that a single dry product would strand half a truck, which is worse than the
+    # problem being fixed.
+    if even_split_key and not priority:
+        groups = {}
+        for it in items:
+            k = even_split_key(it)
+            groups.setdefault(k, []).append(it)
+        keys = [k for k in groups if k is not None]
+        if len(keys) > 1:
+            share = capacity / len(keys)
+            loaded_all, not_loaded_all, used_total = [], [], 0.0
+            split_actual = {}
+            for k in keys:
+                l, nl, used = _pack_into_capacity(groups[k], share, enforce_expiry, min_units)
+                for it in l:
+                    it['share_group'] = k
+                loaded_all.extend(l)
+                not_loaded_all.extend(nl)
+                used_total += float(used)
+                split_actual[k] = {'share_liters': round(share, 4), 'used_liters': round(used, 4)}
+            not_loaded_all.extend(groups.get(None, []))
+            leftover = max(0.0, capacity - used_total)
+            if leftover > 0 and not_loaded_all:
+                spill_pool = sorted(not_loaded_all, key=_fill_sort_key)
+                sl, snl, sused = _pack_into_capacity(spill_pool, leftover, enforce_expiry, min_units)
+                for it in sl:
+                    g = even_split_key(it)
+                    if g in split_actual:
+                        split_actual[g]['used_liters'] = round(
+                            split_actual[g]['used_liters'] + float(it.get('planned_liters') or 0), 4)
+                    it['share_group'] = g
+                loaded_all.extend(sl)
+                not_loaded_all = snl
+                used_total += float(sused)
+            planned = round(used_total, 4)
+            load_pct = round((planned / capacity * 100) if capacity > 0 else 0, 2)
+            return loaded_all, not_loaded_all, capacity, planned, load_pct, {'product_split': split_actual}
 
     if not priority:
         loaded, not_loaded, used = _pack_into_capacity(items, capacity, enforce_expiry, min_units)
@@ -3829,10 +3899,23 @@ class AppointmentItemsView(_SafeAPIView):
         # min_units: AUTO mode never puts a line under MIN_AUTO_LINE_UNITS on the
         # truck. Those lines are not dropped — they land in not_loaded flagged as
         # suggestions so the planner can add them by hand.
+        # Even share when the planner picked more than one product. Packs win over
+        # families as the unit of the split: picking MUSTARD 5L and SUNFLOWER 5L
+        # asks for half a truck of each of THOSE, not of every mustard and every
+        # sunflower pack on the sheet.
+        _split_key = None
+        if family_asins or len(product_families) > 1:
+            _asin_set = {a.strip().upper() for a in (family_asins or []) if a.strip()}
+            _split_key = lambda it: _even_share_key(it, product_families, _asin_set)  # noqa: E731
+
         loaded, not_loaded, capacity, planned_liters, load_pct, priority_actual = _auto_plan_truck(
             items, truck_size, capacity_override, priority=None,
             min_units=MIN_AUTO_LINE_UNITS,
+            even_split_key=_split_key,
         )
+        product_split = (priority_actual or {}).get('product_split') if isinstance(priority_actual, dict) else None
+        if product_split is not None:
+            priority_actual = None
 
         # Maximize-fill — three-stage waterfall:
         #   1) NO-DEMAND + leftover items from THIS appointment's own pool.
@@ -4029,6 +4112,10 @@ class AppointmentItemsView(_SafeAPIView):
             # measured against; `near_expiry_days` is the warning band behind the
             # `near_expiry` flag on every row.
             'min_auto_line_units': MIN_AUTO_LINE_UNITS,
+            # What each selected product was given and what it actually used.
+            # None when only one product (or none) was selected — there is no
+            # split to report and an empty object would read as "0% each".
+            'product_split': product_split,
             'near_expiry_days': NEAR_EXPIRY_WARN_DAYS,
             'priority_requested': priority,
             'priority_actual': priority_actual,
