@@ -454,11 +454,32 @@ MIN_AUTO_LINE_UNITS = 20
 
 
 def _shippable_units(item):
-    """Units this line can actually put on a truck today (billed-adjusted)."""
-    try:
-        return float(item.get('accepted_qty') or 0)
-    except (TypeError, ValueError):
-        return 0.0
+    """Units this line can actually put on a truck today.
+
+    The ORDERED quantity, less anything that stops those units shipping: live
+    stock (`stock_cap`) and a planner's own short-supply figure (`ship_cap`),
+    which is exactly what the packer will load. Before the caps are worked out
+    both are absent and this is simply the ordered quantity.
+
+    Ordered quantity alone is the wrong number to sort a truck by, which is what
+    this used to return. A PO ordered 10,000 with 22 units in stock would lead
+    the load ahead of a 580-unit line that could ship in full, and then put 22
+    units on the truck: the fill order said "biggest first" while the truck was
+    filled smallest first. Sorting on what can actually ship makes the sequence
+    on screen the sequence that happened.
+    """
+    def _f(key):
+        try:
+            v = item.get(key)
+            return None if v is None else float(v)
+        except (TypeError, ValueError):
+            return None
+    units = _f('accepted_qty') or 0.0
+    for cap_key in ('stock_cap', 'ship_cap'):
+        cap = _f(cap_key)
+        if cap is not None:
+            units = min(units, max(0.0, cap))
+    return units
 
 
 def _fill_sort_key(item):
@@ -3732,6 +3753,18 @@ class AppointmentItemsView(_SafeAPIView):
         avail_remaining = dict(avail_total)
         _apply_stock_caps(items, avail_total, avail_remaining, respect_stock, stock_detail, reserved, allow_unbacked=allow_unbacked,
                           enforce_expiry=True, min_units=MIN_AUTO_LINE_UNITS)
+
+        # RE-SORT, now that the caps are known. The sort above ran on ordered
+        # quantities because that is all there was: stock is allocated in list
+        # order, so the pool has to be drained before anyone knows how much of
+        # each line can really go. That makes the first ordering an allocation
+        # order — biggest order gets first claim on shared stock — and this one
+        # the fill order, on units that can actually ship.
+        #
+        # Without this the two disagree in exactly the way that is visible on
+        # screen: a 10,000-unit PO with 22 in stock heads the plan and ships 22,
+        # so the rows read 22, 22, 40, 783, 501 instead of biggest-first.
+        items.sort(key=_order_key)
 
         # Appointment POs come FIRST and in full: pack the appointment's own POs
         # (highest priority_score first) straight into the truck, limited only by
