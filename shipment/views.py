@@ -2403,7 +2403,13 @@ def _fetch_doh_filler_pool(fc, exclude_po_uppers, doh_by_asin, families=None, as
                                 ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING), 0),
                             0
                         )
-                    ) AS billed_qty
+                    ) AS billed_qty,
+                    -- Billed but not yet fully dispatched — the same expression
+                    -- the appointment query exposes. Without it these rows reach
+                    -- the UI with has_invoiced undefined and only render an
+                    -- invoiced tag by luck, because the tag falls back to the
+                    -- status text when the boolean is missing.
+                    (sb.billed_qty > sb.dispatched_qty) AS has_invoiced
                 FROM reporting."Amazon PO" ap
                 {_BILLING_JOIN}
                     ON sb.po_number = UPPER(TRIM(ap.po_number))
@@ -2428,6 +2434,17 @@ def _fetch_doh_filler_pool(fc, exclude_po_uppers, doh_by_asin, families=None, as
                 -- selected this; this one was the gap.
                 p.accepted_qty        AS original_accepted_qty,
                 COALESCE(b.billed_qty, 0) AS billed_qty,
+                COALESCE(b.has_invoiced, FALSE) AS has_invoiced,
+                -- The PO's own FC. `destination_fc` above is where the line
+                -- SHIPS (re-pointed to the truck's FC when it is switched in),
+                -- so without this the row cannot say where it actually sits.
+                p.fulfillment_center,
+                -- Structurally 0: this query drops every locked pair, so a line
+                -- already on another active shipment never reaches the pool. It
+                -- is stated rather than left absent because the client reads it
+                -- numerically, and Number(undefined) is NaN — which fails every
+                -- comparison silently rather than reading as "nothing committed".
+                0::numeric AS committed_qty,
                 p.case_pack,
                 p.per_liter,
                 p.cost_price,
