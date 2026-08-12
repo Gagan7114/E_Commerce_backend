@@ -3525,6 +3525,10 @@ SKU_PENDENCY_COLUMNS = (
     "expiry_date",
     "sku_code",
     "item",
+    # The SAP item code the invoices are keyed on. Worth a column of its own:
+    # billing joins PO lines to sap_billing on it, so when the two disagree a PO
+    # looks entirely un-invoiced and there is no way to see why without it.
+    "sap_sku_code",
     "fulfillment_center",
     "core_fresh_now",
     "item_head",
@@ -3774,6 +3778,50 @@ def _add_pendency_eq(
         params.append(text.upper())
 
 
+def _enrich_pendency_stock(payload):
+    """Add live warehouse stock and DOH to each pendency row.
+
+    Both come from the SHIPMENT PLANNER's own helpers rather than being
+    re-derived here. They are the figures the planner packs trucks with, and a
+    pendency page quoting a different number for the same ASIN is the kind of
+    contradiction that costs an afternoon to chase. Both are cached, so
+    enriching a page of rows costs nothing. Imported lazily to keep the import
+    graph one-way (shipment does not import uploads).
+    """
+    try:
+        from shipment.views import (
+            _live_doh_by_asin, _planner_stock_detail, _reserved_stock_by_asin,
+        )
+        detail = _planner_stock_detail()
+        reserved = _reserved_stock_by_asin()
+        # Returns (by_asin, meta) — the meta half carries the window and the
+        # as-of date, which this page does not use.
+        doh_by_asin, _doh_meta = _live_doh_by_asin()
+    except Exception:      # context, never a reason to 500 the page
+        logger.warning("pendency: stock/DOH enrichment unavailable", exc_info=True)
+        return payload
+
+    for row in payload.get("results", []):
+        # `asin` is not in the selected columns — the page ships `sku_code`,
+        # which holds the same value on every row of this table (verified: zero
+        # rows where the two differ). Prefer asin when a caller does select it.
+        asin = str(row.get("asin") or row.get("sku_code") or "").strip().upper()
+        d = detail.get(asin)
+        # FREE stock — on hand less what active shipments have already claimed.
+        # The same figure the planner caps a line to, not raw on-hand, or this
+        # page would promise units another truck is already holding.
+        row["gp_stock"] = (
+            None if not d
+            else round(max(0.0, float(d.get("onhand") or 0) - float(reserved.get(asin, 0) or 0)), 2)
+        )
+        live = doh_by_asin.get(asin) or {}
+        # DOH is undefined without a sales rate, and the computation returns 0.0
+        # in that case — which would read as "out of cover tomorrow". Send null
+        # and let the UI print a dash.
+        row["doh"] = live.get("doh") if float(live.get("drr_unit") or 0) > 0 else None
+    return payload
+
+
 @api_view(["GET"])
 @permission_classes([_CanViewSkuPendency])
 @cached_get(timeout=60, prefix="amzpo.sku_pendency")
@@ -3829,7 +3877,40 @@ def amazon_po_sku_pendency(request):
     only_short = str(q.get("only_short") or "").strip().lower() in _truthy
     only_leak = str(q.get("only_leak") or "").strip().lower() in _truthy
     only_parked = str(q.get("only_parked") or "").strip().lower() in _truthy
-    if only_parked:
+
+    # ── Bucket filter ────────────────────────────────────────────────────────
+    # A UNION of independently chosen buckets, unlike the precedence ladder
+    # below. Ticking two shows BOTH sets rather than one winning — "fully
+    # invoiced and short invoiced together" is a sensible question the ladder
+    # cannot express.
+    #
+    #   open       — every line not yet fully invoiced. Short-invoiced lines are
+    #                a subset (billed, but not for everything), so this single
+    #                bucket is "all open POs plus the short-invoiced ones".
+    #   full       — every accepted unit is on a SAP invoice.
+    #   short      — billed, but not for every accepted unit.
+    #   dispatched — the units have physically left the warehouse.
+    #
+    # Absent, none of this applies and the ladder runs exactly as before, so the
+    # Primary page and the dashboard's only_leak / only_parked links are
+    # untouched. It sits ABOVE them deliberately: an explicit bucket list is the
+    # most specific thing a caller can ask for.
+    _bucket_sql = {
+        'open': f"NOT {_SKU_PENDENCY_FULLY_INVOICED}",
+        'full': _SKU_PENDENCY_FULLY_INVOICED,
+        'short': f"{_PENDENCY_SHORT_QTY} > 0",
+        'dispatched': _SKU_PENDENCY_IS_DISPATCHED,
+    }
+    _seen, _buckets = set(), []
+    for _b in str(q.get("bucket") or "").split(","):
+        _b = _b.strip().lower()
+        if _b in _bucket_sql and _b not in _seen:
+            _seen.add(_b)
+            _buckets.append(_b)
+
+    if _buckets:
+        where.append("(" + " OR ".join(f"({_bucket_sql[b]})" for b in _buckets) + ")")
+    elif only_parked:
         # "Billed but never moved": fully invoiced AND still here. The mirror of
         # only_leak, and unreachable by the toggles for the same reason — both
         # `have_invoice` and `only_invoiced` return supersets of it.
@@ -3889,7 +3970,7 @@ def amazon_po_sku_pendency(request):
         where, params, "fulfillment_center", q.get("fulfillment_center") or q.get("fc")
     )
 
-    return Response(
+    return Response(_enrich_pendency_stock(
         _paginated_select(
             table_sql='reporting."Amazon PO"',
             columns=SKU_PENDENCY_COLUMNS,
@@ -3937,7 +4018,7 @@ def amazon_po_sku_pendency(request):
                 "remaining_ltrs": _stated_litres("remaining_ltrs"),
             },
         )
-    )
+    ))
 
 
 # ── Pendency summary ─────────────────────────────────────────────────────────
