@@ -47,6 +47,14 @@ urlpatterns = [
         primary_monthly_targets.primary_month_targets_set_target,
         name="primary-month-targets-set-target",
     ),
+    # Cross-platform SKU-wise pendency (every platform in one table). Must be
+    # registered here, above the <slug:slug> routes, so "overall-pendency" is
+    # never read as a platform slug.
+    path(
+        "overall-pendency",
+        views.overall_pendency,
+        name="platform-overall-pendency",
+    ),
     path(
         "primary-overview-total",
         views.primary_overview_total,

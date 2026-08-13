@@ -1983,6 +1983,365 @@ def pendency_dashboard(request, slug: str):
     return Response(_payload)
 
 
+# ── Overall (cross-platform) Pendency ──────────────────────────────────────
+# One SKU-wise pendency view over EVERY platform at once, so the same item can
+# be seen adding up across Blinkit + Zepto + Amazon + … instead of one
+# dashboard per platform.
+#
+# (slug, display name, master_po `format` value). Amazon has no master_po rows
+# — it lives in reporting."Amazon PO" — so its format is None and it is read by
+# a second branch of the UNION below.
+_OVERALL_PENDENCY_PLATFORMS: list[tuple[str, str, str | None]] = [
+    ("amazon", "Amazon", None),
+    ("swiggy", "Swiggy", "SWIGGY"),
+    ("zepto", "Zepto", "ZEPTO"),
+    ("blinkit", "Blinkit", "BLINKIT"),
+    ("bigbasket", "BigBasket", "BIG BASKET"),
+    ("flipkart_grocery", "Flipkart Grocery", "FLIPKART GROCERY"),
+    ("citymall", "City Mall", "CITY MALL"),
+    ("zomato", "Zomato", "ZOMATO"),
+]
+
+_OVERALL_PENDENCY_ITEM_HEADS = ("PREMIUM", "COMMODITY", "OTHER")
+
+# What one table row stands for. `item` is the SAP item name, which is the only
+# SKU identity shared by every platform (each has its own sku_code — Amazon's is
+# the ASIN), so it is the default. The other two roll the same pendency up to a
+# coarser level. Keys are checked against this map, never interpolated raw.
+_OVERALL_PENDENCY_GROUPS = {
+    "item": ("item", "Item"),
+    "category": ("category", "Category"),
+    "sub_category": ("sub_category", "Sub Category"),
+}
+
+# master_po stores po_date as free text in either DD-MM-YYYY or YYYY-MM-DD.
+_MASTER_PO_DATE_SQL = '''
+    CASE
+        WHEN TRIM(p."po_date"::text) ~ '^[0-9]{2}-[0-9]{2}-[0-9]{4}$'
+            THEN TO_DATE(TRIM(p."po_date"::text), 'DD-MM-YYYY')
+        WHEN TRIM(p."po_date"::text) ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'
+            THEN TRIM(p."po_date"::text)::date
+    END
+'''
+
+
+@api_view(["GET"])
+@permission_classes([require("platform.stats.view")])
+def overall_pendency(request):
+    """Open-PO pendency across every platform in one table.
+
+    One row per SKU by default; `group_by` rolls the same figures up to
+    Category or Sub Category instead.
+
+    Query params
+      platforms  comma-separated slugs, or blank / "all" for every platform
+      max_date   YYYY-MM-DD — keep only POs whose PO date is on or before this
+      item_head  PREMIUM | COMMODITY | OTHER | ALL
+      group_by   item (default) | category | sub_category
+
+    Open-PO semantics match the per-platform Pendency Dashboard and the Home
+    Pendency card exactly, so the three can never disagree:
+      master_po        open_close = 'OPEN', cancelled excluded
+      Amazon PO        po_status  = 'PENDING'   (it has no open_close flag)
+      pending          = max(order - delivered, 0)
+      pending value    inclusive amounts for master_po; Amazon has only
+                       exclusive columns, so its value is tax-exclusive.
+    """
+    # Only the platforms this account is allowed to see.
+    allowed = [
+        (slug, name, fmt)
+        for slug, name, fmt in _OVERALL_PENDENCY_PLATFORMS
+        if can_access_platform(request.user, slug)
+    ]
+    allowed_slugs = {slug for slug, _n, _f in allowed}
+
+    raw_platforms = (request.query_params.get("platforms") or "").strip()
+    if raw_platforms and raw_platforms.lower() != "all":
+        wanted = {s.strip().lower() for s in raw_platforms.split(",") if s.strip()}
+        unknown = wanted - {s for s, _n, _f in _OVERALL_PENDENCY_PLATFORMS}
+        if unknown:
+            raise ValidationError(
+                f"Unknown platform(s): {', '.join(sorted(unknown))}."
+            )
+        denied = wanted - allowed_slugs
+        if denied:
+            raise PermissionDenied(
+                f"Your account is not authorized for: {', '.join(sorted(denied))}."
+            )
+        selected = [t for t in allowed if t[0] in wanted]
+    else:
+        selected = allowed
+
+    raw_max_date = (request.query_params.get("max_date") or "").strip()
+    if raw_max_date and not re.fullmatch(r"\d{4}-\d{2}-\d{2}", raw_max_date):
+        raise ValidationError("`max_date` must be YYYY-MM-DD.")
+
+    raw_head = (request.query_params.get("item_head") or "").strip().upper()
+    if raw_head in ("", "ALL"):
+        raw_head = ""
+    elif raw_head == "OTHERS":
+        raw_head = "OTHER"
+    if raw_head and raw_head not in _OVERALL_PENDENCY_ITEM_HEADS:
+        raise ValidationError("`item_head` must be PREMIUM, COMMODITY, OTHER or ALL.")
+
+    raw_group = (request.query_params.get("group_by") or "item").strip().lower()
+    if raw_group not in _OVERALL_PENDENCY_GROUPS:
+        raise ValidationError(
+            "`group_by` must be item, category or sub_category."
+        )
+    group_col, group_label = _OVERALL_PENDENCY_GROUPS[raw_group]
+
+    available = [{"slug": s, "name": n} for s, n, _f in allowed]
+
+    def _empty_payload(reason: str | None = None):
+        return Response({
+            "platforms_selected": [s for s, _n, _f in selected],
+            "available_platforms": available,
+            "max_date": raw_max_date or None,
+            "item_head": raw_head or "ALL",
+            "group_by": raw_group,
+            "group_label": group_label,
+            "min_po_date": None,
+            "max_po_date": None,
+            "totals": {
+                "pending_units": 0.0, "pending_ltrs": 0.0,
+                "open_units": 0.0, "open_ltrs": 0.0,
+                "pending_value": 0.0, "open_pos": 0, "rows": 0,
+                "groups": 0,
+            },
+            "rows": [],
+            "by_head": [],
+            "note": reason,
+        })
+
+    if not selected:
+        return _empty_payload("No platform selected.")
+
+    # ── Build the UNION that normalizes both PO tables into one shape ────────
+    union_parts: list[str] = []
+    union_params: list = []
+
+    master_rows = [(fmt, slug) for slug, _n, fmt in selected if fmt]
+    if master_rows:
+        values_sql = ", ".join(["(%s, %s)"] * len(master_rows))
+        union_parts.append(f'''
+            SELECT
+                m.slug AS slug,
+                COALESCE(
+                    NULLIF(TRIM(p."item"::text), ''),
+                    NULLIF(TRIM(p."sap_sku_name"::text), ''),
+                    NULLIF(TRIM(p."sku_name"::text), ''),
+                    'UNMAPPED'
+                ) AS item,
+                COALESCE(NULLIF(TRIM(p."sku_name"::text), ''), '-') AS sku_name,
+                COALESCE(NULLIF(UPPER(TRIM(p."item_head"::text)), ''), 'OTHER') AS item_head,
+                COALESCE(NULLIF(TRIM(p."category"::text), ''), 'UNMAPPED') AS category,
+                COALESCE(NULLIF(TRIM(p."sub_category"::text), ''), 'UNMAPPED') AS sub_category,
+                {_MASTER_PO_DATE_SQL} AS po_dt,
+                COALESCE(NULLIF(TRIM(p."po_number"::text), ''), 'UNMAPPED') AS po_number,
+                COALESCE(p."order_qty", 0) AS order_qty,
+                COALESCE(p."delivered_qty", 0) AS delivered_qty,
+                COALESCE(p."total_order_liters", 0) AS order_ltrs,
+                COALESCE(p."total_delivered_liters", 0) AS delivered_ltrs,
+                COALESCE(p."total_order_amt_inclusive", 0) AS order_value,
+                COALESCE(p."total_deliver_amt_inclusive", 0) AS delivered_value
+            FROM public."master_po" p
+            JOIN (VALUES {values_sql}) AS m(fmt, slug)
+              ON UPPER(TRIM(p."format"::text)) = m.fmt
+            WHERE UPPER(TRIM(p."open_close"::text)) = 'OPEN'
+              AND UPPER(TRIM(COALESCE(p."po_status", p."status", '')::text))
+                  NOT IN ('CANCELLED', 'CANCELED', 'CANCEL')
+        ''')
+        for fmt, slug in master_rows:
+            union_params.extend([fmt, slug])
+
+    if any(slug == "amazon" for slug, _n, _f in selected):
+        union_parts.append('''
+            SELECT
+                'amazon' AS slug,
+                COALESCE(
+                    NULLIF(TRIM(a."item"::text), ''),
+                    NULLIF(TRIM(a."sap_sku_name"::text), ''),
+                    NULLIF(TRIM(a."sku_name"::text), ''),
+                    'UNMAPPED'
+                ) AS item,
+                COALESCE(NULLIF(TRIM(a."sku_name"::text), ''), '-') AS sku_name,
+                COALESCE(NULLIF(UPPER(TRIM(a."item_head"::text)), ''), 'OTHER') AS item_head,
+                COALESCE(NULLIF(TRIM(a."category"::text), ''), 'UNMAPPED') AS category,
+                COALESCE(NULLIF(TRIM(a."sub_category"::text), ''), 'UNMAPPED') AS sub_category,
+                a."order_date"::date AS po_dt,
+                COALESCE(NULLIF(TRIM(a."po_number"::text), ''), 'UNMAPPED') AS po_number,
+                COALESCE(a."requested_qty", 0) AS order_qty,
+                COALESCE(a."received_qty", 0) AS delivered_qty,
+                COALESCE(a."total_order_liters", 0) AS order_ltrs,
+                COALESCE(a."total_delivered_liters", 0) AS delivered_ltrs,
+                COALESCE(a."total_order_amt_exclusive", 0) AS order_value,
+                COALESCE(a."total_deliver_amt_exclusive", 0) AS delivered_value
+            FROM reporting."Amazon PO" a
+            WHERE UPPER(TRIM(COALESCE(a."po_status", '')::text)) = 'PENDING'
+        ''')
+
+    if not union_parts:
+        return _empty_payload("No platform selected.")
+
+    outer_where = ["1 = 1"]
+    outer_params: list = []
+    if raw_max_date:
+        # A row with no readable PO date cannot be proved to be on or before the
+        # cut-off, so it is dropped while the filter is on. `undated_rows` in the
+        # payload says how many that was, rather than losing them silently.
+        outer_where.append("u.po_dt IS NOT NULL AND u.po_dt <= %s")
+        outer_params.append(raw_max_date)
+    if raw_head:
+        outer_where.append("u.item_head = %s")
+        outer_params.append(raw_head)
+
+    union_sql = " UNION ALL ".join(union_parts)
+
+    # master_po is a VIEW over a multi-table join and the Amazon table is wide;
+    # materialize the filtered scope ONCE into a session-temp table so the five
+    # aggregations below are cheap scans of a small local copy instead of five
+    # re-runs of the whole union. Dropped defensively before create AND in the
+    # finally block, because with CONN_MAX_AGE pooling the session (and any
+    # leftover temp table) outlives the request.
+    with connection.cursor() as cur:
+        cur.execute("DROP TABLE IF EXISTS overall_pend_scope")
+        cur.execute(
+            f"CREATE TEMP TABLE overall_pend_scope AS "
+            f"SELECT u.* FROM ({union_sql}) u WHERE {' AND '.join(outer_where)}",
+            union_params + outer_params,
+        )
+
+    pending_units = 'COALESCE(SUM(GREATEST(order_qty - delivered_qty, 0)), 0)'
+    pending_ltrs = 'COALESCE(SUM(GREATEST(order_ltrs - delivered_ltrs, 0)), 0)'
+    pending_value = 'COALESCE(SUM(GREATEST(order_value - delivered_value, 0)), 0)'
+    # PO numbers are only unique within a platform, so the key is slug+number.
+    open_pos = "COUNT(DISTINCT (slug || '|' || po_number))"
+    metric_cols = f'''
+        {pending_units} AS pending_units,
+        {pending_ltrs} AS pending_ltrs,
+        {pending_value} AS pending_value,
+        COALESCE(SUM(order_qty), 0) AS open_units,
+        COALESCE(SUM(order_ltrs), 0) AS open_ltrs,
+        {open_pos} AS open_pos
+    '''
+    order_clause = "ORDER BY pending_ltrs DESC, pending_units DESC"
+
+    # `group_col` is never user text — it is the value half of
+    # _OVERALL_PENDENCY_GROUPS, picked by an exact key lookup above.
+    try:
+        totals_row = _dict_rows(f'''
+            SELECT
+                {metric_cols},
+                COUNT(*) AS rows,
+                COUNT(DISTINCT {group_col}) AS groups,
+                COUNT(*) FILTER (WHERE po_dt IS NULL) AS undated_rows,
+                TO_CHAR(MIN(po_dt), 'DD-MM-YYYY') AS min_po_date,
+                TO_CHAR(MAX(po_dt), 'DD-MM-YYYY') AS max_po_date
+            FROM overall_pend_scope
+        ''', [])
+        totals = totals_row[0] if totals_row else {}
+
+        # One row per Item / Category / Sub Category. item_head is a property of
+        # the item, so grouping by item gives each row one head; the coarser
+        # groupings can span heads, and MIN() then just names one of them —
+        # which is why the head column is only shown in the Item view.
+        group_rows = _dict_rows(f'''
+            SELECT
+                {group_col} AS label,
+                MIN(item_head) AS item_head,
+                COUNT(DISTINCT item_head) AS head_count,
+                COUNT(DISTINCT item) AS items,
+                COUNT(DISTINCT slug) AS platform_count,
+                STRING_AGG(DISTINCT slug, ',' ORDER BY slug) AS platform_slugs,
+                {metric_cols}
+            FROM overall_pend_scope
+            GROUP BY {group_col}
+            {order_clause}
+        ''', [])
+
+        by_head = _dict_rows(f'''
+            SELECT item_head, {metric_cols}
+            FROM overall_pend_scope
+            GROUP BY item_head
+            {order_clause}
+        ''', [])
+
+        # group x platform, so a row can be expanded to show which platforms
+        # make it up without a second request.
+        group_platform = _dict_rows(f'''
+            SELECT {group_col} AS label, slug, {metric_cols}
+            FROM overall_pend_scope
+            GROUP BY {group_col}, slug
+            {order_clause}
+        ''', [])
+    finally:
+        with connection.cursor() as cur:
+            cur.execute("DROP TABLE IF EXISTS overall_pend_scope")
+
+    name_by_slug = {s: n for s, n, _f in _OVERALL_PENDENCY_PLATFORMS}
+
+    def _metrics(row: dict) -> dict:
+        return {
+            "pending_units": _num(row.get("pending_units")),
+            "pending_ltrs": _num(row.get("pending_ltrs")),
+            "pending_value": _num(row.get("pending_value")),
+            "open_units": _num(row.get("open_units")),
+            "open_ltrs": _num(row.get("open_ltrs")),
+            "open_pos": int(row.get("open_pos") or 0),
+        }
+
+    # Fold the group x platform rows into their parent row so the UI can expand
+    # one without a second request.
+    splits: dict[str, list[dict]] = {}
+    for row in group_platform:
+        slug = row.get("slug")
+        splits.setdefault(row.get("label"), []).append({
+            "slug": slug,
+            "name": name_by_slug.get(slug, slug),
+            **_metrics(row),
+        })
+
+    rows_out = []
+    for row in group_rows:
+        label = row.get("label")
+        slugs = [s for s in (row.get("platform_slugs") or "").split(",") if s]
+        rows_out.append({
+            "label": label,
+            # Only meaningful when every line under this row shares one head.
+            "item_head": (row.get("item_head") or "OTHER")
+            if int(row.get("head_count") or 0) == 1 else "MIXED",
+            "items": int(row.get("items") or 0),
+            "platform_count": int(row.get("platform_count") or 0),
+            "platform_slugs": slugs,
+            "platform_names": ", ".join(name_by_slug.get(s, s) for s in slugs),
+            "platforms": splits.get(label, []),
+            **_metrics(row),
+        })
+
+    return Response({
+        "platforms_selected": [s for s, _n, _f in selected],
+        "available_platforms": available,
+        "max_date": raw_max_date or None,
+        "item_head": raw_head or "ALL",
+        "group_by": raw_group,
+        "group_label": group_label,
+        "min_po_date": totals.get("min_po_date"),
+        "max_po_date": totals.get("max_po_date"),
+        "undated_rows": int(totals.get("undated_rows") or 0),
+        "totals": {
+            **_metrics(totals),
+            "rows": int(totals.get("rows") or 0),
+            "groups": int(totals.get("groups") or 0),
+        },
+        "rows": rows_out,
+        "by_head": [
+            {"item_head": r.get("item_head"), **_metrics(r)}
+            for r in by_head
+        ],
+    })
+
+
 @api_view(["GET"])
 @permission_classes([require("platform.stats.view")])
 @cached_get(timeout=60, prefix="plat.primary")
