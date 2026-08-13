@@ -1,7 +1,11 @@
-from django.urls import path
+from django.urls import include, path
 from . import views
 
 urlpatterns = [
+    # New Shipment 2.0 — its own namespace, its own module, no shared routes.
+    # FIRST so a v2 path can never be shadowed by a pattern below it, and one
+    # line to delete if 2.0 is ever pulled.
+    path('v2/', include('shipment.v2_urls')),
     path('appointments/dates/', views.AppointmentDatesView.as_view(), name='appointment-dates'),
     path('appointments/', views.AppointmentListView.as_view(), name='appointment-list'),
     path('appointments/<str:appointment_id>/items/', views.AppointmentItemsView.as_view(), name='appointment-items'),
