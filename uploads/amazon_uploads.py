@@ -3529,6 +3529,11 @@ SKU_PENDENCY_COLUMNS = (
     # billing joins PO lines to sap_billing on it, so when the two disagree a PO
     # looks entirely un-invoiced and there is no way to see why without it.
     "sap_sku_code",
+    # Needed to turn stock units into stock litres. `has_stated_litre` carries
+    # the same master-sheet gate every other litre column here obeys, so Stock
+    # LTR cannot show a figure for a SKU whose Ordered/Accepted LTR read 0.
+    "per_liter",
+    "has_stated_litre",
     "fulfillment_center",
     "core_fresh_now",
     "item_head",
@@ -3814,6 +3819,18 @@ def _enrich_pendency_stock(payload):
             None if not d
             else round(max(0.0, float(d.get("onhand") or 0) - float(reserved.get(asin, 0) or 0)), 2)
         )
+        # Stock in litres, under the same master-sheet gate as every other litre
+        # column on this page: no stated per-unit value, no litres. None rather
+        # than 0 so "we cannot say" stays distinct from "there is none".
+        try:
+            _per_l = float(row.get("per_liter") or 0)
+        except (TypeError, ValueError):
+            _per_l = 0.0
+        row["gp_stock_ltr"] = (
+            round(row["gp_stock"] * _per_l, 2)
+            if row.get("gp_stock") is not None and row.get("has_stated_litre") and _per_l > 0
+            else None
+        )
         live = doh_by_asin.get(asin) or {}
         # DOH is undefined without a sales rate, and the computation returns 0.0
         # in that case — which would read as "out of cover tomorrow". Send null
@@ -3999,6 +4016,7 @@ def amazon_po_sku_pendency(request):
                 "invoiced_short_ltrs",
             ),
             column_exprs={
+                "has_stated_litre": _SKU_PENDENCY_HAS_STATED_LITRE,
                 "has_invoice": _SKU_PENDENCY_HAS_INVOICE,
                 "is_dispatched": _SKU_PENDENCY_IS_DISPATCHED,
                 "invoiced_status": _PENDENCY_INVOICED_STATUS,
