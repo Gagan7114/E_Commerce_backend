@@ -44,6 +44,7 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
 from .views import (
+    CAP_TOLERANCE,
     MIN_AUTO_LINE_UNITS,
     PRODUCT_FAMILIES,
     _apply_stock_caps,
@@ -174,6 +175,23 @@ def _pendency_sql():
         'columns': SKU_PENDENCY_COLUMNS,
         'pending': _SKU_PENDENCY_PENDING,
         'fully_invoiced': _SKU_PENDENCY_FULLY_INVOICED,
+        # The four buckets the SKU PO Pendency page filters by, verbatim. A
+        # UNION, not a precedence ladder: ticking two shows BOTH sets rather than
+        # one winning, because "fully invoiced AND part-invoiced together" is a
+        # real question and a ladder cannot ask it.
+        #
+        #   open       every line not yet fully invoiced — the working view, and
+        #              a superset of `short` (a part-billed line still has units
+        #              outstanding, so it belongs in the open book)
+        #   full       every accepted unit is already on a SAP invoice
+        #   short      billed, but not for every accepted unit
+        #   dispatched the units have physically left the warehouse
+        'buckets': {
+            'open': f'NOT {_SKU_PENDENCY_FULLY_INVOICED}',
+            'full': _SKU_PENDENCY_FULLY_INVOICED,
+            'short': f'({_PENDENCY_SHORT_QTY}) > 0',
+            'dispatched': _SKU_PENDENCY_IS_DISPATCHED,
+        },
         'exprs': {
             'has_stated_litre': _SKU_PENDENCY_HAS_STATED_LITRE,
             'has_invoice': _SKU_PENDENCY_HAS_INVOICE,
@@ -526,6 +544,60 @@ def _appointment_pos(appointment_id):
     return codes, str(row[1] or '')
 
 
+def _appointment_commit(appointment_id):
+    """Vendor Central's committed units / cartons for one appointment, or None.
+
+    The caps a hand-built selection is measured against, so the book screen can
+    say "you are 300 units over" while the planner is still ticking boxes rather
+    than after a round trip. Cartons fall back to the same PO-line estimate the
+    appointment cards use (accepted_qty / case_pack), flagged, because Amazon
+    frequently commits units without committing cartons — and a blank cap reads
+    as "no limit", which is the wrong default to plan against.
+    """
+    if not appointment_id:
+        return None
+    with connection.cursor() as cur:
+        cur.execute("""
+            SELECT acm.unit_count, acm.carton_count,
+                   (
+                       SELECT ROUND(SUM(p.accepted_qty::numeric
+                                        / GREATEST(p.case_pack, 1)))
+                       FROM reporting."Amazon PO" p
+                       WHERE UPPER(TRIM(p.po_number)) IN (
+                           SELECT UPPER(TRIM(pv))
+                           FROM reporting."appointment" a,
+                                LATERAL unnest(regexp_split_to_array(
+                                    COALESCE(a.pos, ''), '\\s*[,;]\\s*')) AS pv
+                           WHERE a.appointment_id = %s
+                             AND NULLIF(TRIM(pv), '') IS NOT NULL
+                       )
+                   ) AS calc_cartons
+            FROM public.appointment_commit acm
+            RIGHT JOIN (SELECT %s AS appointment_id) t
+                    ON acm.appointment_id = t.appointment_id
+        """, [appointment_id, appointment_id])
+        row = cur.fetchone()
+    if not row:
+        return None
+    units, cartons, calc = row
+    calc_i = None
+    if cartons is None and calc is not None:
+        try:
+            calc_i = int(round(float(calc))) or None
+        except (TypeError, ValueError):
+            calc_i = None
+    if units is None and cartons is None and calc_i is None:
+        return None
+    return {
+        'units': int(units) if units is not None else None,
+        'cartons': int(cartons) if cartons is not None else calc_i,
+        'carton_is_calc': cartons is None and calc_i is not None,
+        # Single source of truth for the allowance, shared with the frontend so
+        # the two can never disagree about what "over the cap" means.
+        'tolerance': CAP_TOLERANCE,
+    }
+
+
 class V2PoBookView(_SafeAPIView):
     """Every OPEN PO line on the channel, grouped PO-wise.
 
@@ -554,7 +626,24 @@ class V2PoBookView(_SafeAPIView):
         limit = _safe_int(request.query_params.get('limit'), 5000, lo=1, hi=20000)
 
         sql = _pendency_sql()
-        where = [sql['pending'], f"NOT {sql['fully_invoiced']}"]
+
+        # Which pendency buckets to show, unioned. Unknown names are dropped and
+        # an all-unknown list falls back to `open` rather than returning
+        # everything: a typo must never silently widen the book from "what is
+        # still to ship" to "every line that ever existed".
+        wanted, seen = [], set()
+        for raw in str(request.query_params.get('bucket') or '').split(','):
+            key = raw.strip().lower()
+            if key in sql['buckets'] and key not in seen:
+                seen.add(key)
+                wanted.append(key)
+        if not wanted:
+            wanted = ['open']
+
+        where = [
+            sql['pending'],
+            '(' + ' OR '.join(f"({sql['buckets'][b]})" for b in wanted) + ')',
+        ]
         params: list = []
         if channel:
             where.append(f"{_PO_CHANNEL_RAW} = %s")
@@ -696,8 +785,11 @@ class V2PoBookView(_SafeAPIView):
             'pos': out,
             'totals': totals,
             'channel': channel,
+            'buckets': wanted,
             'appointment_id': appointment_id,
             'appointment_fc': appt_fc,
+            # The caps a hand-picked selection is measured against.
+            'appointment_commit': _appointment_commit(appointment_id),
             'appointment_po_count': sum(1 for g in out if g['on_appointment']),
             # The ceiling is a real cap, so say when it bit rather than letting a
             # truncated book read as the whole book.
