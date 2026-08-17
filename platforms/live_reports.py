@@ -25,6 +25,9 @@ browser as ``-0.164`` instead of ``-16.4%``, and every ``"Rs"#,##0`` price loses
 its currency mark — on a pricing screen that is a wrong number, not a cosmetic
 one. Formats are read in READ-ONLY mode, which costs no extra memory (measured:
 1.3 MB either way on the largest workbook; a non-read-only load costs 67x more).
+It does cost ~31% more parse CPU (a day's set: 4.7s -> 6.1s), which the LRU below
+absorbs — a workbook is parsed once and then answers every page and search from
+memory.
 
 Robustness notes:
 * Downloads use stdlib ``urllib`` with a short timeout; every network / parse /
@@ -47,6 +50,7 @@ Robustness notes:
 from __future__ import annotations
 
 import datetime
+import decimal
 import http.client
 import io
 import json
@@ -89,6 +93,7 @@ _RAW_BASE = f"https://raw.githubusercontent.com/{GITHUB_OWNER}/{GITHUB_REPO}/{GI
 
 # Cache / limit knobs.
 _LIST_TTL = 15 * 60           # GitHub directory listing — 15 min
+_LIST_FAIL_TTL = 60           # back off this long after a failed listing (rate limits)
 _FILE_TTL = 12 * 60 * 60      # downloaded workbook bytes — 12 h
 _HTTP_TIMEOUT = 30            # seconds (per socket op) — short so a slow GitHub can't pin a worker
 _MAX_BYTES = 30 * 1024 * 1024 # reject/parse-guard: workbooks larger than 30 MB
@@ -171,7 +176,7 @@ def _list_via_trees() -> list[dict]:
         if not isinstance(node, dict) or node.get("type") != "blob":
             continue
         path = node.get("path") or ""
-        if not path or "/" in path:  # root level only
+        if not isinstance(path, str) or not path or "/" in path:  # root level only
             continue
         files.append(
             {
@@ -198,12 +203,21 @@ def _list_repo_files() -> list[dict]:
     cached = cache.get("livereports.contents")
     if cached is not None:
         return cached
+    # Unauthenticated GitHub allows 60 requests/hour per server IP. Once that is
+    # spent, every page load would otherwise retry and dig the hole deeper, so a
+    # failure is briefly negative-cached. Short enough to recover on its own.
+    if cache.get("livereports.contents.failed"):
+        raise _SourceError("The reports source is rate-limited or unreachable.")
     try:
-        files = _list_via_trees()
-    except _SourceError as e:
-        logger.warning("live_reports: trees listing failed (%s); falling back to contents",
-                       e.__cause__ or e)
-        files = _list_via_contents()  # raises _SourceError if this fails too
+        try:
+            files = _list_via_trees()
+        except _SourceError as e:
+            logger.warning("live_reports: trees listing failed (%s); falling back to contents",
+                           e.__cause__ or e)
+            files = _list_via_contents()  # raises _SourceError if this fails too
+    except _SourceError:
+        cache.set("livereports.contents.failed", True, timeout=_LIST_FAIL_TTL)
+        raise
     cache.set("livereports.contents", files, timeout=_LIST_TTL)
     return files
 
@@ -226,9 +240,14 @@ def _latest_reports() -> list[dict]:
         # "latest" is a string comparison, so `Report-2026-13-45.xlsx` would sort
         # above every real date and hijack the report.
         try:
-            datetime.date.fromisoformat(date)
+            parsed_date = datetime.date.fromisoformat(date)
         except ValueError:
             logger.warning("live_reports: ignoring %r — %r is not a real date", name, date)
+            continue
+        # A far-future date is just as effective a hijack as an impossible one:
+        # `Report-9999-12-31.xlsx` is a valid date that outsorts every real file.
+        if parsed_date > datetime.date.today() + datetime.timedelta(days=2):
+            logger.warning("live_reports: ignoring %r — %r is implausibly far ahead", name, date)
             continue
         cur = latest.get(prefix)
         if cur is None or date > cur["date"]:
@@ -271,40 +290,30 @@ def _last_commit_iso(report: dict) -> str | None:
     iso = ""
     try:
         data = json.loads(_http_get(url).decode("utf-8"))
-        if isinstance(data, list) and data:
+        # Guard the element type too: a well-formed-but-unexpected body like
+        # `[null]` would otherwise raise AttributeError and surface as a 500
+        # instead of the generic 502 this module promises.
+        if isinstance(data, list) and data and isinstance(data[0], dict):
             iso = ((data[0].get("commit") or {}).get("committer") or {}).get("date") or ""
-    except (_SourceError, ValueError, UnicodeDecodeError, KeyError, IndexError, TypeError):
+    except (_SourceError, ValueError, UnicodeDecodeError, KeyError, IndexError, TypeError,
+            AttributeError):
         iso = ""
     cache.set(ck, iso, timeout=_FILE_TTL)
     return iso or None
 
 
-def _source_updated_iso() -> str | None:
-    """Publish time of the newest commit on the source branch — ONE API call.
-
-    The list endpoint needs a timestamp for every report at once. Asking per file
-    would be one request per report on a cold cache; because the bot publishes the
-    whole set in a single daily commit, the branch head is the same answer for a
-    fraction of the cost. The per-file ``_last_commit_iso`` stays authoritative on
-    the data endpoint, where only one report is in play.
-    """
-    ck = "livereports.source_updated"
-    cached = cache.get(ck)
-    if cached is not None:
-        return cached or None
-    url = (
-        f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/commits"
-        f"?sha={quote(GITHUB_BRANCH)}&per_page=1"
-    )
-    iso = ""
-    try:
-        data = json.loads(_http_get(url).decode("utf-8"))
-        if isinstance(data, list) and data:
-            iso = ((data[0].get("commit") or {}).get("committer") or {}).get("date") or ""
-    except (_SourceError, ValueError, UnicodeDecodeError, KeyError, IndexError, TypeError):
-        iso = ""
-    cache.set(ck, iso, timeout=_LIST_TTL)
-    return iso or None
+# NOTE ON A TIMESTAMP THAT IS DELIBERATELY ABSENT FROM THE LIST ENDPOINT.
+# It would be convenient to stamp every row of /reports with one "last updated"
+# value, and the obvious cheap source is the branch head (one API call). That was
+# tried and removed: the reports are NOT published in a single daily commit.
+# Measured on 2026-08-17, 7 of 9 files differ from the branch head —
+#   AllQcomm 05:30:02Z, Amazon-Now 05:00:02Z, AmazonFresh 04:30:02Z, ...
+# so the branch head would have mislabelled most reports, and on a day when one
+# scraper fails it would stamp a stale file with today's time — the worst case,
+# because it hides exactly the staleness the field exists to reveal.
+# Per-file accuracy costs one request per report, which is not affordable against
+# an unauthenticated 60/hr quota. So /reports ships the file's `date` only, and
+# the accurate per-file `updated_at` arrives with /data via `_last_commit_iso`.
 
 
 # --- Number formats ----------------------------------------------------------
@@ -336,6 +345,37 @@ def _split_format_sections(fmt: str) -> list[str]:
         buf.append(ch)
     out.append("".join(buf))
     return out
+
+
+def _tokenize_format(section: str) -> list[tuple[str, bool]]:
+    """Split a format section into (text, is_literal) tokens.
+
+    Quoted runs and backslash escapes are literal text; everything else is
+    pattern. Knowing which is which is what lets a literal be placed on the
+    correct SIDE of the number — '"Rs"#,##0' prefixes, '#,##0" kg"' suffixes.
+    """
+    tokens: list[tuple[str, bool]] = []
+    buf, in_quote, i = "", False, 0
+    while i < len(section):
+        ch = section[i]
+        if ch == '"':
+            if buf:
+                tokens.append((buf, in_quote))
+                buf = ""
+            in_quote = not in_quote
+        elif ch == "\\" and i + 1 < len(section):
+            if buf:
+                tokens.append((buf, in_quote))
+                buf = ""
+            tokens.append((section[i + 1], True))
+            i += 2
+            continue
+        else:
+            buf += ch
+        i += 1
+    if buf:
+        tokens.append((buf, in_quote))
+    return tokens
 
 
 def _pick_format_section(fmt: str, value: float) -> str:
@@ -403,30 +443,58 @@ def _format_number(value: float, fmt: str) -> str | None:
     """
     section = _pick_format_section(fmt, value)
 
-    literals = _FMT_LITERAL_RE.findall(section)
-    # Currency can appear as a quoted literal ("Rs") or a locale block ([$₹-en-IN]).
+    # A locale block ([$₹-en-IN]) carries a currency; its own leading '$' is
+    # syntax, not a dollar sign, so it must be pulled out before any symbol scan.
     bracket_currency = ""
     for block in _FMT_BRACKET_RE.findall(section):
         if block.startswith("[$"):
             bracket_currency = block[2:-1].split("-", 1)[0]
-    prefix = "".join(literals) + bracket_currency
-    for sym in ("₹", "$", "€", "£"):
-        if sym in section and sym not in prefix:
-            prefix += sym
 
-    # Strip literals / locale blocks / escapes so only the numeric skeleton is left.
-    skeleton = _FMT_LITERAL_RE.sub("", section)
-    skeleton = _FMT_BRACKET_RE.sub("", skeleton)
-    is_percent = "%" in skeleton
-    indian = bool(_INDIAN_GROUPING_RE.search(skeleton))
-    skeleton = skeleton.replace("\\", "").replace("%", "").replace("_", "").replace("*", "")
-    for sym in ("₹", "$", "€", "£"):
-        skeleton = skeleton.replace(sym, "")
+    # Split the section at the numeric run so literals land on the side the
+    # workbook put them: '"Rs"#,##0' prefixes, '#,##0" kg"' suffixes.
+    body = _FMT_BRACKET_RE.sub("", section)
+    is_percent = "%" in _FMT_LITERAL_RE.sub("", body)
+    indian = bool(_INDIAN_GROUPING_RE.search(body))
+    if indian:
+        # In '##\,##\,##0' the escaped commas ARE the grouping separators, not
+        # trailing literal text — unescape them so they stay part of the pattern.
+        body = body.replace("\\,", ",")
+
+    head, tail, skeleton_parts, seen_digit = [], [], [], False
+    for token, is_literal in _tokenize_format(body):
+        if is_literal:
+            (tail if seen_digit else head).append(token)
+            continue
+        run = ""
+        for ch in token:
+            if ch in "0#?.,":
+                seen_digit = True
+                run += ch
+            elif ch in "%_*":
+                continue
+            elif not seen_digit:
+                head.append(ch)
+            else:
+                tail.append(ch)
+        skeleton_parts.append(run)
+    skeleton = "".join(skeleton_parts)
 
     if not any(ch in skeleton for ch in "0#?"):
         return None  # e.g. "General", or a pure text/date format
 
-    grouped = "," in skeleton
+    head_str = "".join(head)
+    suffix = "".join(tail)
+    # The sign is re-applied below from the value itself, so a sign spelled in the
+    # pattern must not also be pasted in literally.
+    prefix = bracket_currency + head_str.replace("+", "").replace("-", "")
+    # Accounting sections spell their own parentheses, and those DO flow through
+    # as prefix/suffix — so the negative branch must not wrap them a second time.
+    spells_parens = "(" in head_str and ")" in suffix
+    # Excel spells an explicit positive sign in the pattern; dropping it erases
+    # the above/below-reference signal on a delta column (and the UI colours on it).
+    plus_sign = "+" if "+" in head_str and value > 0 else ""
+
+    grouped = "," in skeleton or indian
     decimals = _decimals_in(skeleton)
 
     n = value * 100 if is_percent else value
@@ -435,7 +503,14 @@ def _format_number(value: float, fmt: str) -> str | None:
 
     negative = n < 0
     n = abs(n)
-    body = f"{n:.{decimals}f}"
+    # Excel rounds half AWAY FROM ZERO; Python's format() rounds half to even.
+    # Without this, 380.5 under '"Rs"#,##0' renders Rs380 where the workbook
+    # shows Rs381 — 313 real cells in today's set land on exactly that boundary.
+    body = str(
+        decimal.Decimal(repr(n)).quantize(
+            decimal.Decimal(1).scaleb(-decimals), rounding=decimal.ROUND_HALF_UP
+        )
+    )
     int_part, _, frac_part = body.partition(".")
     if grouped:
         int_part = _group_indian(int_part) if indian else f"{int(int_part):,}"
@@ -444,11 +519,13 @@ def _format_number(value: float, fmt: str) -> str | None:
     out = f"{prefix}{text}"
     if is_percent:
         out += "%"
-    if negative:
-        # Excel's accounting style wraps negatives in parentheses; everything else
-        # takes a leading minus. (A section written as "-#,##0" is spelling that
-        # same minus, so it must not suppress it.)
-        out = f"({out})" if "(" in section and ")" in section else "-" + out
+    out += suffix
+    if negative and not spells_parens:
+        # Everything that does not spell parentheses takes a leading minus —
+        # including a section written "-#,##0", which is spelling this same minus.
+        out = "-" + out
+    elif plus_sign:
+        out = plus_sign + out
     return out
 
 
@@ -465,6 +542,10 @@ def _plain_number(v: float | int) -> str:
     text = f"{v:.4f}".rstrip("0").rstrip(".")
     if text in ("", "0", "-0") and v != 0:
         text = f"{v:.12f}".rstrip("0").rstrip(".")
+    if text in ("", "0", "-0") and v != 0:
+        # Below 1e-12 even the widened decimal reads as zero. Showing a non-zero
+        # value as "0" is worse than showing it in scientific notation.
+        text = repr(v)
     return text
 
 
@@ -519,8 +600,23 @@ def _trim(grid: list[list[str]]) -> list[list[str]]:
     return [(r + [""] * width)[:width] for r in grid]
 
 
+_SEARCH_STRIP_RE = re.compile(r"[,\s₹$€£]|rs\.?", re.IGNORECASE)
+
+
+def _search_norm(text: str) -> str:
+    """Strip grouping separators and currency marks for search comparison.
+
+    "Rs1,499" and "1499" must both match a query of either form; without this,
+    formatting the cells would have quietly broken numeric search.
+    """
+    return _SEARCH_STRIP_RE.sub("", (text or "").lower())
+
+
 # A formatted cell that reads as a number: "489", "₹1,234.50", "Rs 489", "-16.4%",
-# "12,34,567", "▲ 4.2%". Mirrors the client-side test so alignment agrees.
+# "12,34,567", "▲ 4.2%". Deliberately WIDER than the client's own isNumericish
+# (it also accepts an "Rs" prefix, which these workbooks use heavily) — the client
+# takes `numeric_cols` from the response rather than re-deriving it, so this is
+# the single source of truth for alignment.
 _NUMERICISH_RE = re.compile(
     r"^[+\-▲▼]?\s*(?:₹|Rs\.?|\$|€|£)?\s*-?\d[\d,]*(?:\.\d+)?\s*(?:%|L|ml|g|kg|x|X)?$",
     re.IGNORECASE,
@@ -601,9 +697,14 @@ def _parse_bytes(content: bytes, report: dict) -> dict:
                     hit_cap = True
                     break
                 grid.append([_cell(c.value, getattr(c, "number_format", None)) for c in row])
-            if hit_cap:
+            trimmed = _trim(grid)
+            # Only a sheet that still HAS _MAX_ROWS of real content was truncated.
+            # openpyxl over-reports max_row whenever a far-down cell carries only
+            # styling, so testing the raw iteration count would raise a "large
+            # sheet" banner over an 11-row sheet.
+            if hit_cap and len(trimmed) >= _MAX_ROWS:
                 truncated_sheets.append(name)
-            grids[name] = _trim(grid)
+            grids[name] = trimmed
     finally:
         wb.close()
     cells = sum(len(r) for g in grids.values() for r in g)
@@ -614,6 +715,10 @@ def _parse_bytes(content: bytes, report: dict) -> dict:
         "filename": report["filename"],
         "truncated_sheets": truncated_sheets,
         "cells": cells,
+        # Computed once per sheet at parse time and carried in the LRU. Doing it
+        # per request cost 86 ms on the largest sheet, on every page click and
+        # every keystroke of search.
+        "numeric_cols": {n: _numeric_columns(g) for n, g in grids.items()},
     }
 
 
@@ -676,7 +781,6 @@ def live_reports(request):
     except _SourceError as e:
         logger.warning("live_reports source error: %s", e.__cause__ or e)
         return Response({"detail": "The reports source is currently unavailable."}, status=502)
-    updated_at = _source_updated_iso()
     return Response(
         {
             "reports": [
@@ -687,12 +791,10 @@ def live_reports(request):
                     "filename": r["filename"],
                     "download_url": r["download_url"],
                     "size": r["size"],
-                    "updated_at": updated_at,
                 }
                 for r in reports
             ],
             "count": len(reports),
-            "updated_at": updated_at,
         }
     )
 
@@ -730,6 +832,11 @@ def live_data(request):
                 "download_url": report["download_url"], "sheets": [], "sheet": None,
                 "header": [], "rows": [], "count": 0, "page": 0, "page_size": _DEFAULT_PAGE_SIZE,
                 "rows_total": 0, "truncated": False,
+                # `grid` must be present even here: the Sheet view keys its loading
+                # state off Array.isArray(data.grid), so omitting it spins forever
+                # on a workbook that legitimately has no sheets.
+                "grid": [], "numeric_cols": [], "query": "",
+                "full_grid_cap": _FULL_GRID_CAP, "row_cap_hit": False,
             }
         )
 
@@ -767,7 +874,16 @@ def live_data(request):
 
     q = (request.query_params.get("q") or "").strip().lower()
     if q:
-        body = [r for r in body if any(q in (c or "").lower() for c in r)]
+        # Cells are now rendered the way the workbook renders them, so a price
+        # cell reads "Rs1,499". Matching only that text would mean typing 1499
+        # finds nothing — so match the literal text OR a separator/currency
+        # stripped form of both sides, and searching either way works.
+        qn = _search_norm(q)
+        body = [
+            r
+            for r in body
+            if any(q in (c or "").lower() or (qn and qn in _search_norm(c)) for c in r)
+        ]
 
     total = len(body)
     page, page_size = _page_params(request)
@@ -791,7 +907,7 @@ def live_data(request):
             # Numeric alignment must be a property of the COLUMN, not of whichever
             # page happens to be on screen, so it is decided here over the whole
             # sheet and sent once.
-            "numeric_cols": _numeric_columns(grid),
+            "numeric_cols": parsed.get("numeric_cols", {}).get(sheet, []),
             # `_MAX_ROWS` truncation was previously invisible on this path, so a
             # capped sheet under-reported `count` with no way for the UI to say so.
             "rows_total": rows_total,
