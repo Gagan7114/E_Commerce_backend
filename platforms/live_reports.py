@@ -18,20 +18,31 @@ day's file (or a same-day re-commit that changes the sha) refreshes automaticall
 with no cron. Everything is fully generic: any ``*-YYYY-MM-DD.xlsx`` in the repo
 shows up as a report on its own, no per-report code.
 
+Cell values are rendered the way the workbook renders them: openpyxl is asked for
+cell objects (not bare values) so each cell's ``number_format`` survives, and
+``_cell`` applies it. Without this a ``0.0%`` cell holding ``-0.164`` reaches the
+browser as ``-0.164`` instead of ``-16.4%``, and every ``"Rs"#,##0`` price loses
+its currency mark — on a pricing screen that is a wrong number, not a cosmetic
+one. Formats are read in READ-ONLY mode, which costs no extra memory (measured:
+1.3 MB either way on the largest workbook; a non-read-only load costs 67x more).
+
 Robustness notes:
 * Downloads use stdlib ``urllib`` with a short timeout; every network / parse /
   decode failure is funnelled through ``_SourceError`` and returned as a 502 with
   a generic message (details are logged server-side, never echoed to the client).
 * A size cap (before parsing) and a per-sheet row cap bound worker memory against
   an oversized or pathological upstream file.
-* Parsed workbooks are held in a small per-process LRU so repeated page/search
-  requests for one report avoid both a re-download and a re-parse, and memory
-  stays bounded regardless of how many reports are browsed.
-* KNOWN LIMITATION: the listing uses the GitHub Contents API, which returns at
-  most 1000 entries for a directory. These files accumulate by date, so if the
-  source repo is never pruned the root will exceed 1000 in a few months and the
-  newest files could be truncated from the listing. If that becomes real, switch
-  ``_list_repo_files`` to the Git Trees API (``/git/trees/{branch}?recursive=1``).
+* Parsed workbooks are held in a per-process LRU so repeated page/search requests
+  for one report avoid both a re-download and a re-parse. The LRU is bounded by
+  RETAINED CELL COUNT (not workbook count), because workbooks differ by two
+  orders of magnitude: the nine reports published on 2026-08-17 total 634,972
+  cells / 33.8 MB, but a single one of them ranges from 1,774 to 222,843 cells.
+* The listing uses the Git Trees API (``/git/trees/{branch}?recursive=1``), which
+  has no 1000-entry ceiling, and falls back to the Contents API if the tree call
+  fails. NOTE: tree blobs carry no ``download_url``, so the raw URL is built here
+  — it is used both to fetch the workbook and as the UI's "Download .xlsx" link.
+  (The source repo is rolled daily rather than accumulating, so the old Contents
+  API ceiling was never actually reached; the Trees API simply removes the cliff.)
 """
 from __future__ import annotations
 
@@ -68,7 +79,13 @@ logger = logging.getLogger(__name__)
 # --- Source config -----------------------------------------------------------
 GITHUB_OWNER = "daman8271"
 GITHUB_REPO = "sending-excel"
+GITHUB_BRANCH = "main"
 _CONTENTS_API = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/contents/"
+_TREES_API = (
+    f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}"
+    f"/git/trees/{GITHUB_BRANCH}?recursive=1"
+)
+_RAW_BASE = f"https://raw.githubusercontent.com/{GITHUB_OWNER}/{GITHUB_REPO}/{GITHUB_BRANCH}/"
 
 # Cache / limit knobs.
 _LIST_TTL = 15 * 60           # GitHub directory listing — 15 min
@@ -81,10 +98,15 @@ _MAX_PAGE_SIZE = 500
 _FULL_GRID_CAP = 2000        # rows returned to the Dashboard view (full=1), un-paginated
 
 # Per-process LRU of parsed workbooks, keyed by blob sha (content-addressed).
-# Bounds memory to at most _PARSE_LRU_MAX workbooks per worker and avoids the
-# pickle round-trip / re-parse a shared cache would incur on every page request.
-_PARSE_LRU_MAX = 3
+# Avoids the pickle round-trip / re-parse a shared cache would incur on every page
+# request. Bounded by retained CELLS rather than workbook count: measured at ~53
+# bytes per cell, so 750k cells ~= 40 MB per worker, which holds an entire day's
+# report set (634,972 cells on 2026-08-17) without evicting on every rail click.
+# A workbook ceiling still applies as a belt-and-braces bound.
+_PARSE_LRU_MAX = 12
+_PARSE_LRU_MAX_CELLS = 750_000
 _PARSE_LRU: "OrderedDict[str, dict]" = OrderedDict()
+_PARSE_LRU_CELLS = 0
 _LRU_LOCK = threading.Lock()
 
 # ``<report prefix>-YYYY-MM-DD.xlsx``
@@ -123,19 +145,65 @@ def _http_get(url: str) -> bytes:
 
 
 # --- Repo listing ------------------------------------------------------------
+def _decode_json(raw: bytes):
+    try:
+        return json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError) as e:
+        raise _SourceError("The reports source returned an unreadable listing.") from e
+
+
+def _list_via_trees() -> list[dict]:
+    """Repo-root files via the Git Trees API — no 1000-entry ceiling.
+
+    Tree blobs carry no ``download_url``, so we build the raw URL ourselves; it is
+    used both to fetch the workbook server-side and as the UI's download link.
+    Only root-level blobs are returned, matching what the Contents API listed.
+    """
+    data = _decode_json(_http_get(_TREES_API))
+    if not isinstance(data, dict) or not isinstance(data.get("tree"), list):
+        raise _SourceError("Unexpected response from the reports source.")
+    if data.get("truncated"):
+        # Genuinely enormous repo. Log it — this is the one case the Trees API
+        # cannot serve in a single call, and it must not fail silently.
+        logger.warning("live_reports: git tree response was truncated by GitHub")
+    files = []
+    for node in data["tree"]:
+        if not isinstance(node, dict) or node.get("type") != "blob":
+            continue
+        path = node.get("path") or ""
+        if not path or "/" in path:  # root level only
+            continue
+        files.append(
+            {
+                "name": path,
+                "type": "file",
+                "sha": node.get("sha"),
+                "size": node.get("size"),
+                "download_url": _RAW_BASE + quote(path),
+            }
+        )
+    return files
+
+
+def _list_via_contents() -> list[dict]:
+    """Fallback listing. Capped at 1000 entries by GitHub — fine as a backstop."""
+    data = _decode_json(_http_get(_CONTENTS_API))
+    if not isinstance(data, list):
+        raise _SourceError("Unexpected response from the reports source.")
+    return [f for f in data if isinstance(f, dict) and f.get("type") == "file"]
+
+
 def _list_repo_files() -> list[dict]:
-    """Raw GitHub contents listing for the repo root (cached ~15 min)."""
+    """Repo-root file listing (cached ~15 min). Trees API first, Contents as fallback."""
     cached = cache.get("livereports.contents")
     if cached is not None:
         return cached
-    raw = _http_get(_CONTENTS_API)  # raises _SourceError on network failure
     try:
-        data = json.loads(raw.decode("utf-8"))
-    except (ValueError, UnicodeDecodeError) as e:
-        raise _SourceError("The reports source returned an unreadable listing.") from e
-    if not isinstance(data, list):
-        raise _SourceError("Unexpected response from the reports source.")
-    files = [f for f in data if isinstance(f, dict) and f.get("type") == "file"]
+        files = _list_via_trees()
+    except _SourceError as e:
+        logger.warning("live_reports: trees listing failed (%s); falling back to contents",
+                       e.__cause__ or e)
+        files = _list_via_contents()  # raises _SourceError if this fails too
     cache.set("livereports.contents", files, timeout=_LIST_TTL)
     return files
 
@@ -154,6 +222,14 @@ def _latest_reports() -> list[dict]:
         if not m:
             continue
         prefix, date = m.group("prefix"), m.group("date")
+        # The regex only proves the SHAPE is YYYY-MM-DD. Reject impossible dates:
+        # "latest" is a string comparison, so `Report-2026-13-45.xlsx` would sort
+        # above every real date and hijack the report.
+        try:
+            datetime.date.fromisoformat(date)
+        except ValueError:
+            logger.warning("live_reports: ignoring %r — %r is not a real date", name, date)
+            continue
         cur = latest.get(prefix)
         if cur is None or date > cur["date"]:
             latest[prefix] = {
@@ -203,25 +279,215 @@ def _last_commit_iso(report: dict) -> str | None:
     return iso or None
 
 
+def _source_updated_iso() -> str | None:
+    """Publish time of the newest commit on the source branch — ONE API call.
+
+    The list endpoint needs a timestamp for every report at once. Asking per file
+    would be one request per report on a cold cache; because the bot publishes the
+    whole set in a single daily commit, the branch head is the same answer for a
+    fraction of the cost. The per-file ``_last_commit_iso`` stays authoritative on
+    the data endpoint, where only one report is in play.
+    """
+    ck = "livereports.source_updated"
+    cached = cache.get(ck)
+    if cached is not None:
+        return cached or None
+    url = (
+        f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/commits"
+        f"?sha={quote(GITHUB_BRANCH)}&per_page=1"
+    )
+    iso = ""
+    try:
+        data = json.loads(_http_get(url).decode("utf-8"))
+        if isinstance(data, list) and data:
+            iso = ((data[0].get("commit") or {}).get("committer") or {}).get("date") or ""
+    except (_SourceError, ValueError, UnicodeDecodeError, KeyError, IndexError, TypeError):
+        iso = ""
+    cache.set(ck, iso, timeout=_LIST_TTL)
+    return iso or None
+
+
+# --- Number formats ----------------------------------------------------------
+# Enough of Excel's format grammar to render what these workbooks actually use:
+# "General", '"Rs"#,##0', '0.0%', '#,##0', '0.00', and the Indian lakh/crore form
+# '[>=10000000]"₹"##\,##\,##\,##0;[>=100000]"₹"##\,##\,##0;"₹"#,##0'.
+# Anything unrecognised falls through to the plain rendering — never raises.
+
+_FMT_CONDITION_RE = re.compile(r"\[(>=|<=|<>|>|<|=)\s*(-?[\d.]+)\]")
+_FMT_BRACKET_RE = re.compile(r"\[[^\]]*\]")
+_FMT_LITERAL_RE = re.compile(r'"([^"]*)"')
+_INDIAN_GROUPING_RE = re.compile(r"#,##,#|##\\,##")
+
+
+def _split_format_sections(fmt: str) -> list[str]:
+    """Split on ';' while ignoring separators inside quotes or [] blocks."""
+    out, buf, in_quote, depth = [], [], False, 0
+    for ch in fmt:
+        if ch == '"':
+            in_quote = not in_quote
+        elif ch == "[" and not in_quote:
+            depth += 1
+        elif ch == "]" and not in_quote:
+            depth = max(0, depth - 1)
+        elif ch == ";" and not in_quote and depth == 0:
+            out.append("".join(buf))
+            buf = []
+            continue
+        buf.append(ch)
+    out.append("".join(buf))
+    return out
+
+
+def _pick_format_section(fmt: str, value: float) -> str:
+    """Choose the section of a multi-part format that applies to `value`.
+
+    Conditional formats (``[>=100000]...;...``) win by their own test. Otherwise
+    Excel's positional rule applies: positive; negative; zero.
+    """
+    sections = _split_format_sections(fmt)
+    conditional = [s for s in sections if _FMT_CONDITION_RE.search(s)]
+    if conditional:
+        for sec in sections:
+            m = _FMT_CONDITION_RE.search(sec)
+            if m is None:
+                return sec  # the unconditional "everything else" section
+            op, raw = m.group(1), m.group(2)
+            try:
+                threshold = float(raw)
+            except ValueError:
+                continue
+            if (
+                (op == ">=" and value >= threshold)
+                or (op == ">" and value > threshold)
+                or (op == "<=" and value <= threshold)
+                or (op == "<" and value < threshold)
+                or (op == "=" and value == threshold)
+                or (op == "<>" and value != threshold)
+            ):
+                return sec
+        return sections[-1]
+    if len(sections) >= 2 and value < 0:
+        return sections[1]
+    if len(sections) >= 3 and value == 0:
+        return sections[2]
+    return sections[0]
+
+
+def _group_indian(digits: str) -> str:
+    """1234567 -> 12,34,567 (last three, then pairs)."""
+    if len(digits) <= 3:
+        return digits
+    head, tail = digits[:-3], digits[-3:]
+    parts = []
+    while len(head) > 2:
+        parts.insert(0, head[-2:])
+        head = head[:-2]
+    if head:
+        parts.insert(0, head)
+    return ",".join(parts + [tail])
+
+
+def _decimals_in(pattern: str) -> int:
+    """Count the decimal placeholders after the last '.' in a numeric pattern."""
+    if "." not in pattern:
+        return 0
+    tail = pattern.rsplit(".", 1)[1]
+    return sum(1 for ch in tail if ch in "0#")
+
+
+def _format_number(value: float, fmt: str) -> str | None:
+    """Render `value` using the Excel number format `fmt`.
+
+    Returns None when the format carries no numeric instruction we understand,
+    so the caller can fall back to its plain rendering.
+    """
+    section = _pick_format_section(fmt, value)
+
+    literals = _FMT_LITERAL_RE.findall(section)
+    # Currency can appear as a quoted literal ("Rs") or a locale block ([$₹-en-IN]).
+    bracket_currency = ""
+    for block in _FMT_BRACKET_RE.findall(section):
+        if block.startswith("[$"):
+            bracket_currency = block[2:-1].split("-", 1)[0]
+    prefix = "".join(literals) + bracket_currency
+    for sym in ("₹", "$", "€", "£"):
+        if sym in section and sym not in prefix:
+            prefix += sym
+
+    # Strip literals / locale blocks / escapes so only the numeric skeleton is left.
+    skeleton = _FMT_LITERAL_RE.sub("", section)
+    skeleton = _FMT_BRACKET_RE.sub("", skeleton)
+    is_percent = "%" in skeleton
+    indian = bool(_INDIAN_GROUPING_RE.search(skeleton))
+    skeleton = skeleton.replace("\\", "").replace("%", "").replace("_", "").replace("*", "")
+    for sym in ("₹", "$", "€", "£"):
+        skeleton = skeleton.replace(sym, "")
+
+    if not any(ch in skeleton for ch in "0#?"):
+        return None  # e.g. "General", or a pure text/date format
+
+    grouped = "," in skeleton
+    decimals = _decimals_in(skeleton)
+
+    n = value * 100 if is_percent else value
+    if n != n or n in (float("inf"), float("-inf")):
+        return None
+
+    negative = n < 0
+    n = abs(n)
+    body = f"{n:.{decimals}f}"
+    int_part, _, frac_part = body.partition(".")
+    if grouped:
+        int_part = _group_indian(int_part) if indian else f"{int(int_part):,}"
+    text = int_part + ("." + frac_part if frac_part else "")
+
+    out = f"{prefix}{text}"
+    if is_percent:
+        out += "%"
+    if negative:
+        # Excel's accounting style wraps negatives in parentheses; everything else
+        # takes a leading minus. (A section written as "-#,##0" is spelling that
+        # same minus, so it must not suppress it.)
+        out = f"({out})" if "(" in section and ")" in section else "-" + out
+    return out
+
+
 # --- Parsing -----------------------------------------------------------------
-def _cell(v: Any) -> str:
-    """Stringify a cell value for display (plain-grid viewer)."""
+def _plain_number(v: float | int) -> str:
+    if isinstance(v, int):
+        return str(v)
+    if v != v:  # NaN
+        return ""
+    if v.is_integer():
+        return str(int(v))
+    # Keep small magnitudes from collapsing to "0" WITHOUT falling back to
+    # scientific notation, which has no place in a price grid.
+    text = f"{v:.4f}".rstrip("0").rstrip(".")
+    if text in ("", "0", "-0") and v != 0:
+        text = f"{v:.12f}".rstrip("0").rstrip(".")
+    return text
+
+
+def _cell(v: Any, number_format: str | None = None) -> str:
+    """Stringify a cell for display, honouring the workbook's number format.
+
+    ``number_format`` is what makes a 0.0%-formatted -0.164 read as "-16.4%"
+    instead of "-0.164". Formatting never raises: any unknown format falls back
+    to the plain rendering.
+    """
     if v is None:
         return ""
     if isinstance(v, bool):
         return "TRUE" if v else "FALSE"
-    if isinstance(v, int):
-        return str(v)
-    if isinstance(v, float):
-        if v != v:  # NaN
-            return ""
-        if v.is_integer():
-            return str(int(v))
-        # Keep small magnitudes from collapsing to "0": widen precision for them.
-        text = f"{v:.4f}".rstrip("0").rstrip(".")
-        if text in ("", "0", "-0") and v != 0:
-            text = repr(v)
-        return text
+    if isinstance(v, (int, float)) and number_format and number_format != "General":
+        try:
+            formatted = _format_number(float(v), number_format)
+        except Exception:  # a hostile format string must never break a report
+            formatted = None
+        if formatted is not None:
+            return formatted
+    if isinstance(v, (int, float)):
+        return _plain_number(v)
     if isinstance(v, datetime.datetime):
         if (v.hour, v.minute, v.second) == (0, 0, 0):
             return v.strftime("%Y-%m-%d")
@@ -253,6 +519,39 @@ def _trim(grid: list[list[str]]) -> list[list[str]]:
     return [(r + [""] * width)[:width] for r in grid]
 
 
+# A formatted cell that reads as a number: "489", "₹1,234.50", "Rs 489", "-16.4%",
+# "12,34,567", "▲ 4.2%". Mirrors the client-side test so alignment agrees.
+_NUMERICISH_RE = re.compile(
+    r"^[+\-▲▼]?\s*(?:₹|Rs\.?|\$|€|£)?\s*-?\d[\d,]*(?:\.\d+)?\s*(?:%|L|ml|g|kg|x|X)?$",
+    re.IGNORECASE,
+)
+
+
+def _numeric_columns(grid: list[list[str]], threshold: float = 0.7) -> list[bool]:
+    """Decide, ONCE PER COLUMN over the whole sheet, whether it reads as numeric.
+
+    The client used to infer this from whichever page was on screen, so a column
+    could flip between left- and right-aligned as the user paged. Alignment is a
+    property of the column, so it is settled here and sent with the response.
+    """
+    body = grid[1:] if len(grid) > 1 else []
+    if not body:
+        return []
+    width = max((len(r) for r in grid), default=0)
+    flags = []
+    for c in range(width):
+        filled = numeric = 0
+        for row in body:
+            cell = (row[c] if c < len(row) else "").strip()
+            if not cell:
+                continue
+            filled += 1
+            if _NUMERICISH_RE.match(cell):
+                numeric += 1
+        flags.append(filled > 0 and numeric / filled >= threshold)
+    return flags
+
+
 def _lru_get(sha: str) -> dict | None:
     with _LRU_LOCK:
         parsed = _PARSE_LRU.get(sha)
@@ -262,11 +561,22 @@ def _lru_get(sha: str) -> dict | None:
 
 
 def _lru_put(sha: str, parsed: dict) -> None:
+    """Insert and evict oldest-first until both bounds hold (cells and count)."""
+    global _PARSE_LRU_CELLS
     with _LRU_LOCK:
+        prev = _PARSE_LRU.pop(sha, None)
+        if prev is not None:
+            _PARSE_LRU_CELLS -= prev.get("cells", 0)
         _PARSE_LRU[sha] = parsed
+        _PARSE_LRU_CELLS += parsed.get("cells", 0)
         _PARSE_LRU.move_to_end(sha)
-        while len(_PARSE_LRU) > _PARSE_LRU_MAX:
-            _PARSE_LRU.popitem(last=False)
+        while _PARSE_LRU and (
+            len(_PARSE_LRU) > _PARSE_LRU_MAX or _PARSE_LRU_CELLS > _PARSE_LRU_MAX_CELLS
+        ):
+            if len(_PARSE_LRU) == 1:
+                break  # never evict the entry just requested, however large
+            _, dropped = _PARSE_LRU.popitem(last=False)
+            _PARSE_LRU_CELLS -= dropped.get("cells", 0)
 
 
 def _parse_bytes(content: bytes, report: dict) -> dict:
@@ -279,17 +589,32 @@ def _parse_bytes(content: bytes, report: dict) -> dict:
     try:
         sheets = list(wb.sheetnames)
         grids: dict[str, list[list[str]]] = {}
+        truncated_sheets: list[str] = []
         for name in sheets:
             ws = wb[name]
             grid: list[list[str]] = []
-            for i, row in enumerate(ws.iter_rows(values_only=True)):
+            hit_cap = False
+            # Cell objects rather than values_only=True: this is what keeps each
+            # cell's number_format, and in read-only mode it costs no extra memory.
+            for i, row in enumerate(ws.iter_rows()):
                 if i >= _MAX_ROWS:  # bound memory against a pathological sheet
+                    hit_cap = True
                     break
-                grid.append([_cell(v) for v in row])
+                grid.append([_cell(c.value, getattr(c, "number_format", None)) for c in row])
+            if hit_cap:
+                truncated_sheets.append(name)
             grids[name] = _trim(grid)
     finally:
         wb.close()
-    return {"sheets": sheets, "grids": grids, "date": report["date"], "filename": report["filename"]}
+    cells = sum(len(r) for g in grids.values() for r in g)
+    return {
+        "sheets": sheets,
+        "grids": grids,
+        "date": report["date"],
+        "filename": report["filename"],
+        "truncated_sheets": truncated_sheets,
+        "cells": cells,
+    }
 
 
 def _parse_workbook(report: dict) -> dict:
@@ -351,6 +676,7 @@ def live_reports(request):
     except _SourceError as e:
         logger.warning("live_reports source error: %s", e.__cause__ or e)
         return Response({"detail": "The reports source is currently unavailable."}, status=502)
+    updated_at = _source_updated_iso()
     return Response(
         {
             "reports": [
@@ -361,10 +687,12 @@ def live_reports(request):
                     "filename": r["filename"],
                     "download_url": r["download_url"],
                     "size": r["size"],
+                    "updated_at": updated_at,
                 }
                 for r in reports
             ],
             "count": len(reports),
+            "updated_at": updated_at,
         }
     )
 
@@ -398,8 +726,10 @@ def live_data(request):
         return Response(
             {
                 "report": report["key"], "label": report["label"], "date": report["date"],
+                "updated_at": _last_commit_iso(report),
                 "download_url": report["download_url"], "sheets": [], "sheet": None,
                 "header": [], "rows": [], "count": 0, "page": 0, "page_size": _DEFAULT_PAGE_SIZE,
+                "rows_total": 0, "truncated": False,
             }
         )
 
@@ -423,11 +753,17 @@ def live_data(request):
                 "grid": grid[:_FULL_GRID_CAP],
                 "rows_total": len(grid),
                 "truncated": len(grid) > _FULL_GRID_CAP,
+                # Sent so the UI can explain the cap precisely and route oversized
+                # sheets to the paginated Table view instead of implying it has
+                # shown everything.
+                "full_grid_cap": _FULL_GRID_CAP,
+                "row_cap_hit": sheet in parsed.get("truncated_sheets", []),
             }
         )
 
     header = grid[0] if grid else []
     body = grid[1:] if len(grid) > 1 else []
+    rows_total = len(body)  # before search, so the UI can say "12 of 4,555"
 
     q = (request.query_params.get("q") or "").strip().lower()
     if q:
@@ -452,5 +788,14 @@ def live_data(request):
             "count": total,
             "page": page,
             "page_size": page_size,
+            # Numeric alignment must be a property of the COLUMN, not of whichever
+            # page happens to be on screen, so it is decided here over the whole
+            # sheet and sent once.
+            "numeric_cols": _numeric_columns(grid),
+            # `_MAX_ROWS` truncation was previously invisible on this path, so a
+            # capped sheet under-reported `count` with no way for the UI to say so.
+            "rows_total": rows_total,
+            "truncated": sheet in parsed.get("truncated_sheets", []),
+            "query": q,
         }
     )
