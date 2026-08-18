@@ -5592,51 +5592,52 @@ def amazon_ads_total_sales(request, slug: str):
 # and indirect GMV separate. All share ad_spent, direct_qty_sold, ads_ltr_sold,
 # impressions.
 
-def _quick_commerce_metrics(*, gmv_field: str, include_indirect_qty: bool, include_indirect_gmv: bool,
-                            include_ads_sale: bool = False):
+def _quick_commerce_metrics(*, include_indirect_qty: bool, include_ads_sale: bool = False):
     """Build metric_specs for Swiggy/Zepto/BigBasket/Blinkit. Single source of
     truth so the schema stays in lockstep across the four platforms."""
-    # The Direct/Indirect GMV columns are no longer surfaced in the ads
-    # dashboard — they're replaced by "Sale Basic Rate" (total_sale_basic_rate =
-    # basic_rate × direct_qty_sold, computed in the *_ads_master views). ROAS and
-    # ACOS still derive from the underlying GMV columns (kept in the views): when
-    # indirect GMV is tracked separately (Blinkit only), the ROAS numerator sums
-    # direct + indirect; ACOS uses `gmv_field` (direct) alone.
-    # `include_ads_sale` (Blinkit only) now just renames that column to
-    # "Ads sale". It used to ALSO add a separate halo-inclusive column
-    # (basic_rate × (direct + indirect) qty); that was removed on request, so
-    # Blinkit shows one column, direct-only, under the Ads sale heading:
-    #     total_sale_basic_rate = basic_rate × direct_qty_sold
-    # `total_sale_basic_rate` is precomputed per row in the *_ads_master views,
-    # so only the indirect leg is multiplied out here.
+    # The Direct/Indirect GMV columns are not surfaced in the ads dashboard —
+    # they're replaced by "Sale Basic Rate" (total_sale_basic_rate =
+    # basic_rate × direct_qty_sold, computed in the *_ads_master views).
+    # `include_ads_sale` (Blinkit only) renames that column to "Ads sale".
     #
-    # NOTE: this deliberately DECOUPLES "Ads sale" from ROAS. ROAS and ACOS still
-    # derive from the GMV columns — ROAS sums direct + indirect GMV where
-    # indirect is tracked separately (Blinkit only), ACOS uses `gmv_field`
-    # (direct) alone — so `ads_sale ÷ ad_spent` no longer equals the ROAS column.
-    roas_numerator = (
-        f"(COALESCE(SUM({gmv_field}), 0) + COALESCE(SUM(indirect_gmv), 0))"
-        if include_indirect_gmv
-        else f"COALESCE(SUM({gmv_field}), 0)"
-    )
+    # ROAS / ACOS are derived from THAT column, not from the platform's own GMV:
+    #     ROAS = Ads sale ÷ Ad spent
+    #     ACOS = Ad spent ÷ Ads sale × 100
+    # so the two ratio cards invert into each other AND divide cleanly into the
+    # Ad spent / Ads sale cards beside them. This is how the Amazon and Flipkart
+    # ads dashboards already compute theirs, so all six platforms now agree.
+    #
+    # Changed on request 2026-08-18. The previous definition read the platform's
+    # own GMV columns instead — ROAS = (direct + indirect GMV) ÷ spend, ACOS =
+    # spend ÷ direct GMV — which is why `ads_sale ÷ ad_spent` used to disagree
+    # with the ROAS column. Those GMV columns still exist in the *_ads_master
+    # views; they are simply no longer read by any dashboard metric.
+    #
+    # UNITS (Blinkit): Blinkit's feed reports "Direct Quantities Sold" in LITRES,
+    # not packs, while basic_rate is a PER-PACK landing rate. blinkit_ads_master
+    # divides the raw figure by per_ltr (uploads migration 0088) so direct_qty_sold
+    # means PACKS here — the same as every other platform — and ads_ltr_sold carries
+    # the litres. Before 0088 the multiplication used litres against a per-pack rate,
+    # which over-counted Ads sale by each SKU's pack size (5L SKUs 5×, 2L 2×, 1L
+    # correct). Because ROAS/ACOS now derive from Ads sale, that fix moves them too
+    # (it did not, back when they were GMV-based).
+    sale = "COALESCE(SUM(total_sale_basic_rate), 0)"
     specs = [
         {"key": "ad_spent",        "label": "Ad spent",        "format": "inr",     "agg": "sum",
          "expr": "COALESCE(SUM(ad_spent), 0)"},
-        # Blinkit shows this as "Ads sale". It used to carry a second column of
-        # that name, direct+indirect quantity at basic rate; that was removed and
-        # this one — direct quantity only — took the label. Every other
-        # quick-commerce sheet still calls it Sale Basic Rate.
+        # Blinkit shows this as "Ads sale"; every other quick-commerce sheet
+        # still calls it Sale Basic Rate. Same column either way.
         {"key": "total_sale_basic_rate",
          "label": "Ads sale" if include_ads_sale else "Sale Basic Rate",
          "format": "inr", "agg": "sum",
-         "expr": "COALESCE(SUM(total_sale_basic_rate), 0)"},
+         "expr": sale},
         {"key": "roas",            "label": "ROAS",            "format": "ratio",   "agg": "avg",
          "expr": f"CASE WHEN COALESCE(SUM(ad_spent), 0) > 0 "
-                 f"THEN {roas_numerator}::numeric / SUM(ad_spent) "
+                 f"THEN {sale}::numeric / SUM(ad_spent) "
                  f"ELSE 0 END"},
         {"key": "acos",            "label": "ACOS",            "format": "percent", "agg": "avg",
-         "expr": f"CASE WHEN COALESCE(SUM({gmv_field}), 0) > 0 "
-                 f"THEN COALESCE(SUM(ad_spent), 0)::numeric / SUM({gmv_field}) * 100 "
+         "expr": f"CASE WHEN {sale} > 0 "
+                 f"THEN COALESCE(SUM(ad_spent), 0)::numeric / {sale} * 100 "
                  f"ELSE 0 END"},
         {"key": "impressions",     "label": "Impressions",     "format": "count",   "agg": "sum",
          "expr": "COALESCE(SUM(impressions), 0)"},
@@ -5672,8 +5673,7 @@ def swiggy_ads_dashboard(request, slug: str):
         dimension_key="item",
         dimension_label="Items",
         dimension_unmapped="(Unmapped)",
-        # swiggy_ads_master uses `direct_gmv` (not `gmv`) — alias it via the gmv_field arg.
-        metric_specs=_quick_commerce_metrics(gmv_field="direct_gmv", include_indirect_qty=False, include_indirect_gmv=False),
+        metric_specs=_quick_commerce_metrics(include_indirect_qty=False),
         default_metric_keys=_QC_DEFAULT_METRIC_KEYS,
         default_visible_columns=_QC_DEFAULT_VISIBLE_COLUMNS,
         spend_metric="ad_spent",
@@ -5700,7 +5700,7 @@ def zepto_ads_dashboard(request, slug: str):
         dimension_key="item",
         dimension_label="Items",
         dimension_unmapped="(Unmapped)",
-        metric_specs=_quick_commerce_metrics(gmv_field="gmv", include_indirect_qty=True, include_indirect_gmv=False),
+        metric_specs=_quick_commerce_metrics(include_indirect_qty=True),
         default_metric_keys=_QC_DEFAULT_METRIC_KEYS,
         default_visible_columns=_QC_DEFAULT_VISIBLE_COLUMNS,
         spend_metric="ad_spent",
@@ -5732,7 +5732,7 @@ def bigbasket_ads_dashboard(request, slug: str):
         dimension_key="item",
         dimension_label="Items",
         dimension_unmapped="(Unmapped)",
-        metric_specs=_quick_commerce_metrics(gmv_field="gmv", include_indirect_qty=True, include_indirect_gmv=False),
+        metric_specs=_quick_commerce_metrics(include_indirect_qty=True),
         default_metric_keys=_QC_DEFAULT_METRIC_KEYS,
         default_visible_columns=_QC_DEFAULT_VISIBLE_COLUMNS,
         spend_metric="ad_spent",
@@ -5764,7 +5764,7 @@ def swiggy_ads_daily_dashboard(request, slug: str):
         dimension_key="item",
         dimension_label="Items",
         dimension_unmapped="(Unmapped)",
-        metric_specs=_quick_commerce_metrics(gmv_field="direct_gmv", include_indirect_qty=False, include_indirect_gmv=False),
+        metric_specs=_quick_commerce_metrics(include_indirect_qty=False),
         default_metric_keys=_QC_DEFAULT_METRIC_KEYS,
         default_visible_columns=_QC_DEFAULT_VISIBLE_COLUMNS,
         spend_metric="ad_spent",
@@ -5791,7 +5791,7 @@ def zepto_ads_daily_dashboard(request, slug: str):
         dimension_key="item",
         dimension_label="Items",
         dimension_unmapped="(Unmapped)",
-        metric_specs=_quick_commerce_metrics(gmv_field="gmv", include_indirect_qty=True, include_indirect_gmv=False),
+        metric_specs=_quick_commerce_metrics(include_indirect_qty=True),
         default_metric_keys=_QC_DEFAULT_METRIC_KEYS,
         default_visible_columns=_QC_DEFAULT_VISIBLE_COLUMNS,
         spend_metric="ad_spent",
@@ -5818,7 +5818,7 @@ def bigbasket_ads_daily_dashboard(request, slug: str):
         dimension_key="item",
         dimension_label="Items",
         dimension_unmapped="(Unmapped)",
-        metric_specs=_quick_commerce_metrics(gmv_field="gmv", include_indirect_qty=True, include_indirect_gmv=False),
+        metric_specs=_quick_commerce_metrics(include_indirect_qty=True),
         default_metric_keys=_QC_DEFAULT_METRIC_KEYS,
         default_visible_columns=_QC_DEFAULT_VISIBLE_COLUMNS,
         spend_metric="ad_spent",
@@ -5912,8 +5912,8 @@ def blinkit_ads_dashboard(request, slug: str):
         dimension_key=dimension_key,
         dimension_label=dimension_label,
         dimension_unmapped=dimension_unmapped,
-        # blinkit_ads_master has both `direct_gmv` and `indirect_gmv` — keep them separate.
-        metric_specs=_quick_commerce_metrics(gmv_field="direct_gmv", include_indirect_qty=True, include_indirect_gmv=True,
+        # Blinkit is the only quick-commerce sheet with an indirect (halo) qty column.
+        metric_specs=_quick_commerce_metrics(include_indirect_qty=True,
                                              include_ads_sale=True),
         default_metric_keys=_QC_DEFAULT_METRIC_KEYS,
         default_visible_columns=[*_QC_DEFAULT_VISIBLE_COLUMNS, "indirect_qty_sold"],
