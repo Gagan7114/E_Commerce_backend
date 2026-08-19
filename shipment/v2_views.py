@@ -1570,6 +1570,11 @@ class V2FillView(_SafeAPIView):
         # stock, which is what every other planner surface does by default.
         if not with_stock and not without_stock:
             with_stock = True
+            # And SAY so. The response echoes `strategies` and the book prints it
+            # as "filled by …", so a defaulted rule that stayed out of the echo
+            # left the UI unable to report what the plan was actually built with —
+            # the load was stock-capped and the screen said nothing at all.
+            strategies = sorted(set(strategies) | {'with_stock'})
 
         _pos, appt_fc = _appointment_pos(appointment_id)
         items, doh_meta = _fill_candidates(
