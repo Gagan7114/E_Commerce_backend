@@ -1801,9 +1801,19 @@ class V2FillOptionsView(_SafeAPIView):
             with transaction.atomic():
                 with connection.cursor() as cur:
                     _no_jit(cur)
+                    # GROUPING SETS, so one pass returns BOTH the family
+                    # totals and the per-pack-size breakdown under each.
+                    #
+                    # Not two queries and not a Python rollup of the pack rows:
+                    # po_count and sku_count are COUNT(DISTINCT ...), and one PO
+                    # carries several pack sizes, so adding the per-pack counts
+                    # would count that PO once per size it happens to contain.
+                    # The family-level row (pack IS NULL) is the only place those
+                    # two figures are correct.
                     cur.execute(f"""
                         {_POOL_CTES}
                         SELECT CASE {case_arms} ELSE NULL END        AS family,
+                               p.per_liter                              AS pack,
                                COUNT(DISTINCT UPPER(TRIM(p.po_number))) AS po_count,
                                COUNT(DISTINCT UPPER(TRIM(p.asin)))      AS sku_count,
                                COALESCE(SUM({_POOL_UNITS}), 0)          AS units,
@@ -1811,13 +1821,39 @@ class V2FillOptionsView(_SafeAPIView):
                         FROM reporting."Amazon PO" p
                         {_POOL_JOINS}
                         WHERE {' AND '.join(where)}
-                        GROUP BY 1
+                        GROUP BY GROUPING SETS ((1), (1, 2))
                     """, params)
-                    fam_rows = {
-                        r['family']: r
-                        for r in _row_to_dict(cur, cur.fetchall())
-                        if r['family']
-                    }
+                    fam_rows, pack_rows = {}, {}
+                    for r in _row_to_dict(cur, cur.fetchall()):
+                        if not r['family']:
+                            continue
+                        if r['pack'] is None:
+                            fam_rows[r['family']] = r
+                        else:
+                            pack_rows.setdefault(r['family'], []).append(r)
+
+        def _packs(name):
+            """The bottle sizes inside one family, biggest first.
+
+            Biggest first because that is the order the packer fills in and the
+            order a planner thinks in — a 15 L line moves the load meter, a 1 L
+            line tops it off. A size with nothing open is dropped rather than
+            shown as a zero: the list answers "what can this family give me",
+            and an empty size is not an answer.
+            """
+            out = []
+            for r in pack_rows.get(name, []):
+                units = _num(r['units'])
+                if units <= 0:
+                    continue
+                out.append(_serialize_row({
+                    'per_liter': _num(r['pack']),
+                    'sku_count': int(r['sku_count'] or 0),
+                    'units': units,
+                    'liters': _num(r['liters']),
+                }))
+            out.sort(key=lambda x: -_num(x['per_liter']))
+            return out
 
         families = [
             _serialize_row({
@@ -1826,6 +1862,7 @@ class V2FillOptionsView(_SafeAPIView):
                 'sku_count': int(fam_rows[name]['sku_count'] or 0),
                 'units': _num(fam_rows[name]['units']),
                 'liters': _num(fam_rows[name]['liters']),
+                'packs': _packs(name),
             })
             for name in PRODUCT_FAMILIES
             if name in fam_rows and int(fam_rows[name]['po_count'] or 0) > 0
