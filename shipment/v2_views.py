@@ -168,6 +168,8 @@ def _pendency_sql():
         _PENDENCY_INVOICED_LTRS,
         _PENDENCY_INVOICED_QTY,
         _PENDENCY_INVOICED_STATUS,
+        _PENDENCY_OPEN_LTRS,
+        _PENDENCY_OPEN_QTY,
         _PENDENCY_SHORT_LTRS,
         _PENDENCY_SHORT_QTY,
         _SKU_PENDENCY_FULLY_INVOICED,
@@ -208,6 +210,12 @@ def _pendency_sql():
             'invoiced_short_qty': _PENDENCY_SHORT_QTY,
             'invoiced_ltrs': _PENDENCY_INVOICED_LTRS,
             'invoiced_short_ltrs': _PENDENCY_SHORT_LTRS,
+            # Ordered less INVOICED, in units and litres. Imported rather than
+            # rewritten: the planner and the SKU PO Pendency page have to answer
+            # "how much is still to be billed for" with the same number, and two
+            # copies of that subtraction would eventually disagree.
+            'open_qty': _PENDENCY_OPEN_QTY,
+            'open_ltrs': _PENDENCY_OPEN_LTRS,
             'invoice_nos': _PENDENCY_INVOICE_NOS,
             'invoice_count': _PENDENCY_INVOICE_COUNT,
             'invoice_detail': _PENDENCY_INVOICE_DETAIL,
@@ -229,6 +237,48 @@ def _num(value, default=0.0):
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+_PENDENCY_REAL_COLUMNS = None
+
+
+def _pendency_select(sql):
+    """The book's SELECT list, with the coupling to SKU_PENDENCY_COLUMNS checked.
+
+    `columns` is imported from the SKU PO Pendency uploader so the two screens
+    cannot drift. The cost of that is real: a column added there is silently
+    added to this query too, and if it is DERIVED rather than stored the query
+    starts selecting a column that does not exist. That is how open_qty took the
+    PO book down — Postgres says `column "open_qty" does not exist`, which names
+    the symptom and not the fix, and nothing failed until a planner opened step 4.
+
+    So the raw columns are checked against the table once per process, and a
+    missing one says exactly what to do about it. Cheap: one catalogue query, and
+    only the names that are NOT expressions are ever in question.
+    """
+    global _PENDENCY_REAL_COLUMNS
+    raw = [c for c in sql['columns'] if c not in sql['exprs']]
+    if _PENDENCY_REAL_COLUMNS is None:
+        with connection.cursor() as cur:
+            cur.execute(
+                "SELECT column_name FROM information_schema.columns"
+                " WHERE table_schema = 'reporting' AND table_name = 'Amazon PO'"
+            )
+            _PENDENCY_REAL_COLUMNS = {r[0] for r in cur.fetchall()}
+    missing = [c for c in raw if c not in _PENDENCY_REAL_COLUMNS]
+    if missing:
+        raise RuntimeError(
+            'SKU_PENDENCY_COLUMNS lists %s, which reporting."Amazon PO" does not '
+            'have. They are derived columns, so add an expression for each to the '
+            "'exprs' map in _pendency_sql() — importing the constant from "
+            'uploads.amazon_uploads rather than rewriting it, so the planner and '
+            'the SKU PO Pendency page keep answering with the same number.'
+            % ', '.join(missing)
+        )
+    return ', '.join(
+        f'{sql["exprs"][c]} AS "{c}"' if c in sql['exprs'] else f'"{c}"'
+        for c in sql['columns']
+    )
 
 
 def _no_jit(cur):
@@ -1070,10 +1120,7 @@ class V2PoBookView(_SafeAPIView):
             )
             params.extend([f'%{search[:200]}%'] * 7)
 
-        cols = ', '.join(
-            f'{sql["exprs"][c]} AS "{c}"' if c in sql['exprs'] else f'"{c}"'
-            for c in sql['columns']
-        )
+        cols = _pendency_select(sql)
 
         with transaction.atomic():
             with connection.cursor() as cur:
