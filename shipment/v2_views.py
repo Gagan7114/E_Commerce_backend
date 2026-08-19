@@ -1813,7 +1813,9 @@ class V2FillOptionsView(_SafeAPIView):
                     cur.execute(f"""
                         {_POOL_CTES}
                         SELECT CASE {case_arms} ELSE NULL END        AS family,
-                               p.per_liter                              AS pack,
+                               UPPER(TRIM(p.asin))                      AS asin,
+                               MAX(p.sku_name)                          AS item,
+                               MAX(p.per_liter)                         AS per_liter,
                                COUNT(DISTINCT UPPER(TRIM(p.po_number))) AS po_count,
                                COUNT(DISTINCT UPPER(TRIM(p.asin)))      AS sku_count,
                                COALESCE(SUM({_POOL_UNITS}), 0)          AS units,
@@ -1827,19 +1829,25 @@ class V2FillOptionsView(_SafeAPIView):
                     for r in _row_to_dict(cur, cur.fetchall()):
                         if not r['family']:
                             continue
-                        if r['pack'] is None:
+                        if r['asin'] is None:
                             fam_rows[r['family']] = r
                         else:
                             pack_rows.setdefault(r['family'], []).append(r)
 
         def _packs(name):
-            """The bottle sizes inside one family, biggest first.
+            """The individual PACKS inside one family, biggest bottle first.
 
-            Biggest first because that is the order the packer fills in and the
-            order a planner thinks in — a 15 L line moves the load meter, a 1 L
-            line tops it off. A size with nothing open is dropped rather than
-            shown as a zero: the list answers "what can this family give me",
-            and an empty size is not an answer.
+            One entry per ASIN, carrying its name as well as its size, because the
+            picker shows "SANO MUSTARD 5L" and sends the ASIN. The fill endpoint
+            already narrows on `asins`; this is what lets a planner choose them.
+
+            Biggest first: that is both the order the packer fills in and the order
+            a planner thinks in — a 5 L line moves the load meter, a 1 L line tops
+            it off. Ties break on units so the deepest pack of a size leads.
+
+            A pack with nothing open is dropped rather than shown as a zero. The
+            list answers "what can this family give me", and an empty pack is not
+            an answer.
             """
             out = []
             for r in pack_rows.get(name, []):
@@ -1847,12 +1855,13 @@ class V2FillOptionsView(_SafeAPIView):
                 if units <= 0:
                     continue
                 out.append(_serialize_row({
-                    'per_liter': _num(r['pack']),
-                    'sku_count': int(r['sku_count'] or 0),
+                    'asin': r['asin'],
+                    'item': (r['item'] or '').strip(),
+                    'per_liter': _num(r['per_liter']),
                     'units': units,
                     'liters': _num(r['liters']),
                 }))
-            out.sort(key=lambda x: -_num(x['per_liter']))
+            out.sort(key=lambda x: (-_num(x['per_liter']), -_num(x['units'])))
             return out
 
         families = [
