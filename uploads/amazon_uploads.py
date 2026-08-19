@@ -3980,6 +3980,7 @@ def amazon_po_sku_pendency(request):
     else:
         where.append(f"NOT {_SKU_PENDENCY_FULLY_INVOICED}")
 
+    _add_pendency_eq(where, params, "item_head", q.get("item_head"))
     _add_pendency_eq(where, params, "category", q.get("category"))
     _add_pendency_eq(where, params, "sub_category", q.get("sub_category"))
     _add_pendency_eq(where, params, "core_fresh_now", q.get("channel") or q.get("core_fresh_now"))
@@ -4254,6 +4255,9 @@ def amazon_po_sku_pendency_options(request):
             "sub_categories": _distinct("sub_category"),
             "channels": _distinct("core_fresh_now", upper=True),
             "fulfillment_centers": _distinct("fulfillment_center"),
+            # Sourced from PENDING rows like every other list here, so the
+            # dropdown can never offer a value that returns nothing.
+            "item_heads": _distinct("item_head"),
         }
     )
 
