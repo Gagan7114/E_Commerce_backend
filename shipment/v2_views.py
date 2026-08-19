@@ -53,8 +53,10 @@ from .views import (
     _compute_priority,
     _DISPATCHED_SHARE_CTE,
     _doh_fill_sort_key,
+    _claimed_and_ordered_by_po_asin,
     _even_share_key,
     _explain_ineligibility,
+    _fc_switch_group,
     _family_sql,
     _fill_sort_key,
     _live_doh_by_asin,
@@ -855,6 +857,37 @@ def _actual_fcs_by_appointment(appointment_ids):
         return {aid: list(fcs or []) for aid, fcs in cur.fetchall()}
 
 
+def _claim_state_by_line(po_uppers):
+    """Per (ASIN, PO): how many units OTHER live shipments already hold.
+
+    The manual picker's real ceiling. Amazon's accepted quantity is NOT what a
+    planner may take -- somebody else's draft may already be holding half of it,
+    and planning those units again means two trucks promising the same stock and a
+    409 at save time. Catching it at CLICK time is the whole point of carrying it.
+
+    Reuses ``_claimed_and_ordered_by_po_asin``, the same function the draft save
+    calls to raise that 409. One rule checked in two places, rather than a
+    picker-side guess that drifts from the thing it is trying to predict.
+
+    ``ordered_qty`` rides along because it is how a caller tells "the Amazon PO
+    list has never heard of this line" (refuse it outright) from "nobody has
+    claimed it" (take all of it).
+    """
+    if not po_uppers:
+        return {}
+    committed, ship, ordered = _claimed_and_ordered_by_po_asin(po_uppers)
+    out = {}
+    for key, qty in committed.items():
+        out[key] = {
+            'claimed_qty': float(qty or 0),
+            'claimed_shipment_id': ship.get(key),
+        }
+    for key, qty in ordered.items():
+        e = out.setdefault(key, {'claimed_qty': 0.0, 'claimed_shipment_id': None})
+        e['ordered_qty'] = float(qty or 0)
+    return out
+
+
 def _summarise_eligibility(row, codes, elig_by_po, other_fcs):
     """Fold the per-PO flags onto one appointment row, in place.
 
@@ -1013,6 +1046,14 @@ class V2PoBookView(_SafeAPIView):
                            category,
                            sub_category,
                            days_to_expiry,
+                           -- The status columns every "can this line ship" gate
+                           -- reads. Carried per LINE rather than derived on the
+                           -- client, because the pendency bucket filter can put
+                           -- closed and dispatched lines in the book on purpose
+                           -- and a picker with no status column would tick them.
+                           po_status,
+                           status AS po_record_status,
+                           availability_status,
                            {_PO_CHANNEL_RAW} AS channel
                     FROM reporting."Amazon PO"
                     WHERE {' AND '.join(where)}
@@ -1025,6 +1066,32 @@ class V2PoBookView(_SafeAPIView):
         lines = payload.get('results', [])
 
         appt_pos, appt_fc = _appointment_pos(appointment_id)
+
+        # What other shipments already hold on these lines. One query for the
+        # whole book, then attached per line as a CEILING the picker can enforce
+        # before anybody clicks, instead of a 409 after they have built a plan.
+        claim = _claim_state_by_line({
+            str(ln.get('po_number') or '').strip().upper() for ln in lines
+        })
+        for ln in lines:
+            key = (
+                str(ln.get('asin') or '').strip().upper(),
+                str(ln.get('po_number') or '').strip().upper(),
+            )
+            st = claim.get(key) or {}
+            ln['claimed_qty'] = st.get('claimed_qty', 0.0)
+            ln['claimed_shipment_id'] = st.get('claimed_shipment_id')
+            # `known_to_amazon` false means the Amazon PO list has no ordered
+            # quantity for this line. The save path refuses those outright, so the
+            # picker must too -- there is nothing to check a claim against.
+            ln['known_to_amazon'] = 'ordered_qty' in st
+            accepted = _num(ln.get('accepted_qty'))
+            received = _num(ln.get('received_qty'))
+            claimed = _num(st.get('claimed_qty'))
+            # THE CEILING: what Amazon accepted, less what it has already received,
+            # less what other live shipments are holding. Never negative -- an
+            # over-claimed line is at zero, not at a negative allowance.
+            ln['claimable_qty'] = max(0.0, accepted - received - claimed)
 
         groups: dict[str, dict] = {}
         for line in lines:
@@ -1124,6 +1191,12 @@ class V2PoBookView(_SafeAPIView):
             'buckets': wanted,
             'appointment_id': appointment_id,
             'appointment_fc': appt_fc,
+            # Which FCs this truck may legally MIX with. Same channel only -- a
+            # sister-FC line is an FC switch (allowed, needs approval); anything
+            # outside the group can never ship on this truck at all. Fails closed:
+            # an unmapped FC gets only itself.
+            'sister_fcs': sorted({f.upper() for f in (_fc_switch_group(appt_fc)[1] or [])}
+                                 | ({appt_fc.upper()} if appt_fc else set())),
             # The caps a hand-picked selection is measured against.
             'appointment_commit': _appointment_commit(appointment_id),
             'appointment_po_count': sum(1 for g in out if g['on_appointment']),
