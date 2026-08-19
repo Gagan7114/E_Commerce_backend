@@ -11,6 +11,10 @@ from . import v2_views
 urlpatterns = [
     path('channels/', v2_views.V2ChannelsView.as_view(), name='v2-channels'),
     path('appointments/', v2_views.V2AppointmentsView.as_view(), name='v2-appointments'),
+    # Line-by-line eligibility for ONE appointment, fetched when the card's
+    # detail link is opened rather than for every card in the list.
+    path('appointments/<str:appointment_id>/lines/',
+         v2_views.V2AppointmentDetailView.as_view(), name='v2-appointment-lines'),
     path('pos/', v2_views.V2PoBookView.as_view(), name='v2-po-book'),
     # More specific route first: 'fill/options/' must not be swallowed by
     # 'fill/'. They are different methods (GET vs POST) so a collision would not

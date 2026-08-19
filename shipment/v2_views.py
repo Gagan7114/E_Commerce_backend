@@ -51,8 +51,10 @@ from .views import (
     _auto_plan_truck,
     _BILLING_JOIN,
     _compute_priority,
+    _DISPATCHED_SHARE_CTE,
     _doh_fill_sort_key,
     _even_share_key,
+    _explain_ineligibility,
     _family_sql,
     _fill_sort_key,
     _live_doh_by_asin,
@@ -60,6 +62,7 @@ from .views import (
     _pack_into_capacity,
     _planner_stock_detail,
     _reserved_stock_by_asin,
+    _row_eligibility_reason,
     _row_to_dict,
     _SafeAPIView,
     _safe_int,
@@ -473,6 +476,14 @@ class V2AppointmentsView(_SafeAPIView):
                     """, [sorted(po_uppers)])
                     open_by_po = {r['po']: r for r in _row_to_dict(cur, cur.fetchall())}
 
+        # CAN these slots be planned, and has somebody already planned them? Both
+        # are page-wide lookups rather than per-card queries: three round trips
+        # for 300 cards instead of 900.
+        elig_by_po = _eligibility_by_po(po_uppers)
+        appt_ids = [r['appointment_id'] for r in rows]
+        existing_by_appt = _existing_shipments_for(appt_ids)
+        other_fcs_by_appt = _actual_fcs_by_appointment(appt_ids)
+
         results = []
         for r in rows:
             cc = r.get('amazon_carton_count')
@@ -495,6 +506,15 @@ class V2AppointmentsView(_SafeAPIView):
             r['open_line_count'] = sum(int(o['line_count'] or 0) for o in open_rows)
             r['open_units'] = sum(_num(o['units']) for o in open_rows)
             r['open_liters'] = sum(_num(o['liters']) for o in open_rows)
+
+            _summarise_eligibility(
+                r, codes, elig_by_po,
+                other_fcs_by_appt.get(r['appointment_id']),
+            )
+            aid = str(r.get('appointment_id') or '').strip()
+            r['existing_shipments'] = existing_by_appt.get(aid, [])
+            r['has_existing_plan'] = bool(r['existing_shipments'])
+
             results.append(_serialize_row(r))
 
         return Response({
@@ -503,6 +523,142 @@ class V2AppointmentsView(_SafeAPIView):
             'channel': channel,
             'scope': scope,
             'as_of': today.isoformat(),
+        })
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 2b. One appointment, line by line — why each PO/SKU can or cannot ship
+# ──────────────────────────────────────────────────────────────────────────────
+
+class V2AppointmentDetailView(_SafeAPIView):
+    """Every (PO, ASIN) on one appointment, with a reason per line.
+
+    ON DEMAND, ONE APPOINTMENT. The card shows "3/5 POs" from the cheap per-PO
+    rollup; this answers the follow-up question — WHICH two, and why not. Running
+    it for every card in the list would cost seconds to answer a question nobody
+    has asked yet.
+
+    The reason strings come from ``_row_eligibility_reason``, the original
+    wizard's own function, so a line reads identically in both screens. Same for
+    the flip handling: a PO booked here but sitting at another FC is VALID and
+    tagged ``is_flipped``, not treated as a blocker.
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, appointment_id):
+        appointment_id = str(appointment_id or '').strip()
+        if not appointment_id:
+            return Response({'appointment_id': '', 'lines': [], 'summary': {}})
+
+        with connection.cursor() as cur:
+            cur.execute(f"""
+                WITH appt AS (
+                    SELECT a.appointment_id,
+                           MAX(a.destination_fc) AS destination_fc,
+                           MAX(a.status)         AS status,
+                           MAX(a.appointment_time) AS appointment_time,
+                           STRING_AGG(DISTINCT NULLIF(TRIM(COALESCE(a.pos, '')), ''), ',') AS pos
+                    FROM reporting."appointment" a
+                    WHERE a.appointment_id = %s
+                    GROUP BY a.appointment_id
+                ),
+                pairs AS (
+                    SELECT ap.appointment_id, ap.destination_fc, UPPER(TRIM(pv)) AS po_upper
+                    FROM appt ap,
+                         LATERAL unnest(regexp_split_to_array(
+                             COALESCE(ap.pos, ''), '\s*[,;]\s*')) AS pv
+                    WHERE NULLIF(TRIM(pv), '') IS NOT NULL
+                ),
+                dispatched_share AS ({_DISPATCHED_SHARE_CTE}),
+                locked_lookup AS ({_LOCKED_LOOKUP_CTE}),
+                latest_inv AS (
+                    SELECT UPPER(TRIM(COALESCE(asin::text, ''))) AS asin_key,
+                           COALESCE(SUM(sellable_on_hand_units), 0)::numeric AS soh_unit
+                    FROM amazon_master_inventory
+                    WHERE inventory_date = (SELECT MAX(inventory_date)
+                                            FROM amazon_master_inventory)
+                      AND NULLIF(TRIM(COALESCE(asin::text, '')), '') IS NOT NULL
+                    GROUP BY UPPER(TRIM(COALESCE(asin::text, '')))
+                )
+                SELECT pr.destination_fc            AS expected_fc,
+                       p.po_number,
+                       p.asin,
+                       p.sku_name                   AS product_name,
+                       p.item_head,
+                       p.case_pack,
+                       p.per_liter,
+                       -- NET of what SAP already dispatched: the drawer is a
+                       -- "what can still go" view, so it must not quote units
+                       -- that have left the building.
+                       GREATEST(COALESCE(p.accepted_qty, 0)
+                                - COALESCE(ds.dispatched_qty, 0), 0) AS accepted_qty,
+                       COALESCE(p.accepted_qty, 0)  AS ordered_qty,
+                       COALESCE(ds.dispatched_qty, 0) AS dispatched_qty,
+                       COALESCE(li.soh_unit, 0)     AS soh_unit,
+                       p.availability_status,
+                       p.po_status,
+                       p.status                     AS po_record_status,
+                       p.fulfillment_center         AS actual_fc,
+                       lk.locked_shipment_id,
+                       (p.fulfillment_center IS NOT NULL
+                        AND p.fulfillment_center <> pr.destination_fc) AS is_fc_mismatch,
+                       (p.status = 'Confirmed' AND p.po_status = 'PENDING') AS is_pending,
+                       (p.availability_status = 'AC - Accepted: In stock') AS is_in_stock,
+                       (COALESCE(p.accepted_qty, 0) > 0)               AS has_qty,
+                       (lk.po_upper IS NOT NULL)                      AS is_locked,
+                       (
+                           p.status = 'Confirmed'
+                           AND p.po_status = 'PENDING'
+                           AND p.availability_status = 'AC - Accepted: In stock'
+                           AND GREATEST(COALESCE(p.accepted_qty, 0)
+                                        - COALESCE(ds.dispatched_qty, 0), 0) > 0
+                           AND lk.po_upper IS NULL
+                       )                                              AS is_eligible
+                FROM pairs pr
+                LEFT JOIN reporting."Amazon PO" p
+                       ON UPPER(TRIM(p.po_number)) = pr.po_upper
+                LEFT JOIN dispatched_share ds
+                       ON ds.po_upper = pr.po_upper
+                      AND ds.asin_upper = UPPER(TRIM(COALESCE(p.asin::text, '')))
+                LEFT JOIN latest_inv li
+                       ON li.asin_key = UPPER(TRIM(COALESCE(p.asin::text, '')))
+                LEFT JOIN locked_lookup lk
+                       ON lk.po_upper = pr.po_upper
+                      AND lk.asin_upper = UPPER(TRIM(COALESCE(p.asin::text, '')))
+                WHERE p.po_number IS NOT NULL
+                ORDER BY p.po_number, p.asin
+            """, [appointment_id])
+            rows = _row_to_dict(cur, cur.fetchall())
+
+        lines = []
+        for raw in rows:
+            d = _serialize_row(raw)
+            d['reason'] = _row_eligibility_reason(d)
+            d['is_flipped'] = bool(d.get('is_fc_mismatch'))
+            d['flipped_from'] = (d.get('actual_fc') or '').strip() if d['is_flipped'] else None
+            d['flipped_to'] = (d.get('expected_fc') or '').strip() if d['is_flipped'] else None
+            accepted = _num(d.get('accepted_qty'))
+            soh = _num(d.get('soh_unit'))
+            # How far short the warehouse is on THIS line. Positive only — a
+            # surplus is not a shortfall, and a negative figure in that column
+            # would read as one.
+            d['shortfall_unit'] = max(0.0, accepted - soh)
+            d['soh_covers_pct'] = round((soh / accepted) * 100, 1) if accepted > 0 else None
+            lines.append(d)
+
+        eligible = [d for d in lines if d.get('is_eligible')]
+        return Response({
+            'appointment_id': appointment_id,
+            'lines': lines,
+            'summary': {
+                'line_count': len(lines),
+                'eligible_count': len(eligible),
+                'blocked_count': len(lines) - len(eligible),
+                'po_count': len({str(d.get('po_number') or '').upper() for d in lines}),
+                'eligible_units': round(sum(_num(d.get('accepted_qty')) for d in eligible)),
+                'flipped_count': sum(1 for d in lines if d.get('is_flipped')),
+            },
         })
 
 
@@ -542,6 +698,186 @@ def _appointment_pos(appointment_id):
         if c.strip()
     }
     return codes, str(row[1] or '')
+
+
+# ── Eligibility ─────────────────────────────────────────────────
+# CAN a PO actually go on a truck? A different question from "is it open", which
+# is what the pendency gate answers. A PO can be wide open and still unplannable:
+# locked into another shipment, marked out of stock by Amazon, closed, or already
+# dispatched.
+#
+# THE RULE IS THE ORIGINAL WIZARD'S, NOT A NEW ONE. Every condition below is
+# lifted from the eligibility query in shipment/views.py, including the decision
+# that an FC MISMATCH DOES NOT BLOCK — a PO booked on an appointment at another FC
+# is a deliberate "flip", so it stays eligible and is merely tagged. Two planning
+# screens disagreeing about whether a PO can ship is exactly the contradiction
+# this module's docstring exists to prevent.
+
+_ELIGIBILITY_FLAGS = """
+    BOOL_OR(p.po_number IS NOT NULL)                            AS has_fc_match,
+    BOOL_OR(p.status = 'Confirmed' AND p.po_status = 'PENDING')  AS is_pending,
+    BOOL_OR(p.availability_status = 'AC - Accepted: In stock')   AS is_in_stock,
+    BOOL_OR(COALESCE(p.accepted_qty, 0) > 0)                     AS has_qty,
+    BOOL_OR(
+        COALESCE(ds.dispatched_qty, 0) > 0
+        AND GREATEST(COALESCE(p.accepted_qty, 0)
+                     - COALESCE(ds.dispatched_qty, 0), 0) <= 0
+    )                                                            AS is_dispatched_out,
+    BOOL_OR(lk.po_upper IS NOT NULL)                             AS is_locked,
+    BOOL_OR(
+        p.status = 'Confirmed'
+        AND p.po_status = 'PENDING'
+        AND p.availability_status = 'AC - Accepted: In stock'
+        AND GREATEST(COALESCE(p.accepted_qty, 0)
+                     - COALESCE(ds.dispatched_qty, 0), 0) > 0
+        AND lk.po_upper IS NULL
+    )                                                            AS is_eligible
+"""
+
+# Which (PO, ASIN) pairs are already committed to a live shipment. `not_loaded`
+# rows do not lock: a line somebody looked at and left off is still free.
+_LOCKED_LOOKUP_CTE = """
+    SELECT UPPER(TRIM(si.po_number)) AS po_upper,
+           UPPER(TRIM(si.asin))      AS asin_upper,
+           MIN(si.shipment_id)       AS locked_shipment_id
+    FROM sp_items si
+    JOIN sp_shipments s ON s.id = si.shipment_id
+    WHERE si.not_loaded = FALSE
+      AND s.status != 'rejected'
+    GROUP BY UPPER(TRIM(si.po_number)), UPPER(TRIM(si.asin))
+"""
+
+
+def _eligibility_by_po(po_uppers):
+    """{PO -> flags} for a set of PO codes. One query for the whole page.
+
+    Per PO, not per line: the card needs "3 of 5 POs can ship", and a PO counts
+    as shippable when ANY line on it can, hence BOOL_OR. The per-line breakdown
+    behind the card's detail link is a separate query run for the ONE appointment
+    being opened — computing it for all 300 cards up front would buy a
+    multi-second page load nobody asked for.
+
+    Starts FROM the wanted list rather than from the PO table so a code with no
+    PO row at all comes back with every flag false instead of vanishing. That
+    distinction is the whole basis of the "PO data not found at this FC" message.
+    """
+    if not po_uppers:
+        return {}
+    with connection.cursor() as cur:
+        cur.execute(f"""
+            WITH dispatched_share AS ({_DISPATCHED_SHARE_CTE}),
+                 locked_lookup AS ({_LOCKED_LOOKUP_CTE}),
+                 wanted AS (SELECT UNNEST(%s::text[]) AS po_upper)
+            SELECT w.po_upper,
+                   {_ELIGIBILITY_FLAGS}
+            FROM wanted w
+            LEFT JOIN reporting."Amazon PO" p
+                   ON UPPER(TRIM(p.po_number)) = w.po_upper
+            LEFT JOIN dispatched_share ds
+                   ON ds.po_upper = w.po_upper
+                  AND ds.asin_upper = UPPER(TRIM(COALESCE(p.asin::text, '')))
+            LEFT JOIN locked_lookup lk
+                   ON lk.po_upper = w.po_upper
+                  AND lk.asin_upper = UPPER(TRIM(COALESCE(p.asin::text, '')))
+            GROUP BY w.po_upper
+        """, [sorted(po_uppers)])
+        return {r['po_upper']: r for r in _row_to_dict(cur, cur.fetchall())}
+
+
+def _existing_shipments_for(appointment_ids):
+    """{appointment_id -> [{shipment_id, status}]} — already-planned slots.
+
+    Checks BOTH the primary appointment_id and the combined
+    additional_appointment_ids: a slot pulled onto someone else's truck as an
+    extra is just as planned as one that anchored its own.
+    """
+    ids = {str(a).strip() for a in appointment_ids if a}
+    if not ids:
+        return {}
+    out = {}
+    with connection.cursor() as cur:
+        cur.execute("""
+            SELECT id, status, appointment_id, additional_appointment_ids
+            FROM sp_shipments
+            WHERE status != 'rejected'
+        """)
+        for sid, sstatus, primary, additional in cur.fetchall():
+            hit = set()
+            if primary:
+                hit.add(str(primary).strip())
+            for a in str(additional or '').split(','):
+                if a.strip():
+                    hit.add(a.strip())
+            for a in hit & ids:
+                out.setdefault(a, []).append({'shipment_id': sid, 'status': sstatus})
+    return out
+
+
+def _actual_fcs_by_appointment(appointment_ids):
+    """{appointment_id -> [FCs its POs really sit at]}, excluding the booked FC.
+
+    Feeds the "appointment says DED5, the POs are at DED3" message. Without it a
+    missing PO row and an out-of-stock PO row are indistinguishable — both look
+    like is_in_stock = FALSE — and the card blames the wrong thing.
+    """
+    ids = [str(a).strip() for a in appointment_ids if a]
+    if not ids:
+        return {}
+    with connection.cursor() as cur:
+        cur.execute("""
+            WITH appt_dedup AS (
+                SELECT a.appointment_id,
+                       MAX(a.destination_fc) AS destination_fc,
+                       STRING_AGG(DISTINCT NULLIF(TRIM(COALESCE(a.pos, '')), ''), ',') AS pos
+                FROM reporting."appointment" a
+                WHERE a.appointment_id = ANY(%s::text[])
+                GROUP BY a.appointment_id
+            ),
+            pairs AS (
+                SELECT ad.appointment_id, ad.destination_fc, UPPER(TRIM(pv)) AS po_upper
+                FROM appt_dedup ad,
+                     LATERAL unnest(regexp_split_to_array(
+                         COALESCE(ad.pos, ''), '\s*[,;]\s*')) AS pv
+                WHERE NULLIF(TRIM(pv), '') IS NOT NULL
+            )
+            SELECT pr.appointment_id,
+                   ARRAY_AGG(DISTINCT p.fulfillment_center)
+                       FILTER (WHERE p.fulfillment_center IS NOT NULL
+                                 AND TRIM(p.fulfillment_center) <> ''
+                                 AND TRIM(p.fulfillment_center)
+                                     <> TRIM(COALESCE(pr.destination_fc, ''))
+                       ) AS other_fcs
+            FROM pairs pr
+            LEFT JOIN reporting."Amazon PO" p
+                   ON UPPER(TRIM(p.po_number)) = pr.po_upper
+            GROUP BY pr.appointment_id
+        """, [ids])
+        return {aid: list(fcs or []) for aid, fcs in cur.fetchall()}
+
+
+def _summarise_eligibility(row, codes, elig_by_po, other_fcs):
+    """Fold the per-PO flags onto one appointment row, in place.
+
+    The count fields are named exactly as ``_explain_ineligibility`` reads them,
+    so the sentence a planner sees here is word-for-word the one the original
+    wizard shows for the same appointment.
+    """
+    flags = [elig_by_po[c] for c in codes if c in elig_by_po]
+    total = len(codes)
+    eligible = sum(1 for f in flags if f.get('is_eligible'))
+
+    row['eligible_po_count'] = eligible
+    row['has_eligible'] = eligible > 0
+    row['no_fc_match_count'] = total - sum(1 for f in flags if f.get('has_fc_match'))
+    row['not_pending_count'] = sum(1 for f in flags if not f.get('is_pending'))
+    row['not_in_stock_count'] = sum(1 for f in flags if not f.get('is_in_stock'))
+    row['no_qty_count'] = sum(1 for f in flags if not f.get('has_qty'))
+    row['locked_count'] = sum(1 for f in flags if f.get('is_locked'))
+    row['dispatched_count'] = sum(1 for f in flags if f.get('is_dispatched_out'))
+    row['pos_actual_fcs'] = other_fcs or []
+    # Only when there is NOTHING to plan. A partial blocker is already legible
+    # from "3/5 POs", and a paragraph of explanation on a usable card is noise.
+    row['ineligible_reason'] = '' if eligible > 0 else _explain_ineligibility(row)
 
 
 def _appointment_commit(appointment_id):
