@@ -55,6 +55,7 @@ from .views import (
     _DISPATCHED_SHARE_CTE,
     _doh_fill_sort_key,
     _claimed_and_ordered_by_po_asin,
+    _enforce_commit_caps,
     _even_share_key,
     _explain_ineligibility,
     _fc_switch_group,
@@ -1652,6 +1653,48 @@ class V2FillView(_SafeAPIView):
                 load_pct = round((planned_liters / capacity * 100) if capacity else 0, 2)
 
         loaded.sort(key=order_key)
+
+        # PASS 3 — AMAZON'S COMMITMENT.
+        #
+        # This was missing, and it is the whole reason Express could hand back a
+        # truck 1,790 units over the commitment: the packer enforces LITRES and
+        # nothing else, so a 15,000 L truck filled to 100% could still be 125% of
+        # the units Amazon agreed to receive. The FC cuts that back or rejects it.
+        #
+        # `_enforce_commit_caps` is the auto planner's own trimmer, so 2.0 gets the
+        # identical rule — units AND cartons, each allowed CAP_TOLERANCE (7%) over,
+        # trimmed line by line with a stated reason rather than silently.
+        #
+        # `fill_order=order_key` is not optional. The cap is spent in the order it
+        # is given and whatever is last gets trimmed, so passing a different key
+        # would fill the truck by one rule and cut it back by another — the DOH
+        # fill would load nearest-to-stockout first and then trim by size.
+        commit = _appointment_commit(appointment_id)
+        if commit and (commit.get('units') or commit.get('cartons')):
+            for it in loaded:
+                # The caps are keyed by appointment and 2.0 plans against exactly
+                # one, so every line belongs to the same group. Stamped here rather
+                # than assumed, because the trimmer groups by this field.
+                it['appointment_id'] = appointment_id
+            loaded, not_loaded = _enforce_commit_caps(
+                loaded, not_loaded,
+                {appointment_id: {
+                    'units': int(commit.get('units') or 0),
+                    'cartons': int(commit.get('cartons') or 0),
+                }},
+                key_field='appointment_id',
+                fill_order=order_key,
+            )
+            # Trimming frees litres, so the meter has to be recomputed or the bar
+            # reports the pre-trim load against the post-trim truck.
+            planned_liters = round(sum(
+                _num(it.get('planned_liters'))
+                or _num(it.get('planned_qty')) * _num(it.get('per_liter'))
+                for it in loaded
+            ), 4)
+            load_pct = round((planned_liters / capacity * 100) if capacity else 0, 2)
+            loaded.sort(key=order_key)
+
         _tag_expiry_warnings(loaded)
         _tag_expiry_warnings(not_loaded)
         for it in not_loaded:
@@ -1671,6 +1714,7 @@ class V2FillView(_SafeAPIView):
             'appointment_id': appointment_id,
             'appointment_fc': appt_fc,
             'capacity_liters': capacity,
+            'appointment_commit': _appointment_commit(appointment_id),
             'min_auto_line_units': MIN_AUTO_LINE_UNITS,
             'stock_meta': _stock_meta_payload(stock_detail),
             'doh_meta': doh_meta,
