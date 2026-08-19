@@ -1814,7 +1814,14 @@ class V2FillOptionsView(_SafeAPIView):
                         {_POOL_CTES}
                         SELECT CASE {case_arms} ELSE NULL END        AS family,
                                UPPER(TRIM(p.asin))                      AS asin,
-                               MAX(p.sku_name)                          AS item,
+                               -- p.item, NOT p.sku_name. `item` is the short
+                               -- internal name ("SANO MUSTARD 5L"); sku_name is
+                               -- the Amazon marketing title, which runs past 200
+                               -- characters and truncates to something you cannot
+                               -- tell apart from its neighbour. The original
+                               -- planner's family endpoint reads `item` for the
+                               -- same reason.
+                               MAX(p.item)                              AS item,
                                MAX(p.per_liter)                         AS per_liter,
                                COUNT(DISTINCT UPPER(TRIM(p.po_number))) AS po_count,
                                COUNT(DISTINCT UPPER(TRIM(p.asin)))      AS sku_count,
