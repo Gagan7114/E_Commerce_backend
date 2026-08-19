@@ -3542,6 +3542,14 @@ SKU_PENDENCY_COLUMNS = (
     "received_qty",
     "cancelled_qty",
     "remaining_qty",
+    # OPEN = ordered less what SAP has invoiced. A different question from
+    # `remaining_qty`, which is ordered less what AMAZON has received: one asks
+    # what we still have to bill for, the other what they still have to book in.
+    # Both are kept — the planner reads Open, the Primary page reads Remaining —
+    # because renaming one into the other would silently change a figure two
+    # pages already quote.
+    "open_qty",
+    "open_ltrs",
     "total_order_liters",
     "total_accepted_liters",
     "total_delivered_liters",
@@ -3730,6 +3738,28 @@ _PENDENCY_INVOICED_LTRS = (
     f'CASE WHEN {_SKU_PENDENCY_HAS_STATED_LITRE} '
     f'THEN {_PENDENCY_INVOICED_QTY} * COALESCE(reporting."Amazon PO".per_liter, 0) '
     f'ELSE 0 END'
+)
+
+# OPEN = ordered, less what SAP has already invoiced for this line.
+#
+# Floored at zero: a line billed for more than it ordered is over-invoiced, which
+# is a real problem, but it is not NEGATIVE work still to do. The over-billing is
+# already visible in Invoiced QTY exceeding Ordered QTY on the same row.
+_PENDENCY_OPEN_QTY = (
+    f'GREATEST(COALESCE(reporting."Amazon PO".requested_qty, 0) - {_PENDENCY_INVOICED_QTY}, 0)'
+)
+
+# Open LTR is ORDERED LTR less INVOICED LTR — the two columns as they appear on
+# screen, subtracted. Deliberately NOT open_qty x per_liter, which would be the
+# same number only where the sheet's stored Ordered LTR happens to equal
+# requested_qty x per_liter; where it does not, the row would fail the
+# subtraction a reader does with their own eyes.
+#
+# Both sides already carry the master-sheet litre gate, so a SKU with no stated
+# per-unit value contributes 0 to each and 0 here, exactly as its Ordered LTR
+# reads. Floored at zero for the same reason as the quantity.
+_PENDENCY_OPEN_LTRS = (
+    f'GREATEST({_stated_litres("total_order_liters")} - ({_PENDENCY_INVOICED_LTRS}), 0)'
 )
 
 # The invoice documents themselves are per (po, item) and are NOT split — an
@@ -4007,6 +4037,8 @@ def amazon_po_sku_pendency(request):
                 "received_qty",
                 "cancelled_qty",
                 "remaining_qty",
+                "open_qty",
+                "open_ltrs",
                 "total_order_liters",
                 "total_accepted_liters",
                 "total_delivered_liters",
@@ -4025,6 +4057,8 @@ def amazon_po_sku_pendency(request):
                 "invoiced_short_qty": _PENDENCY_SHORT_QTY,
                 "invoiced_ltrs": _PENDENCY_INVOICED_LTRS,
                 "invoiced_short_ltrs": _PENDENCY_SHORT_LTRS,
+                "open_qty": _PENDENCY_OPEN_QTY,
+                "open_ltrs": _PENDENCY_OPEN_LTRS,
                 "invoice_nos": _PENDENCY_INVOICE_NOS,
                 "invoice_count": _PENDENCY_INVOICE_COUNT,
                 "invoice_detail": _PENDENCY_INVOICE_DETAIL,
