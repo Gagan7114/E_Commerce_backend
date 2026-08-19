@@ -37,6 +37,7 @@ unaliased twin for exactly that case.
 from __future__ import annotations
 
 import logging
+import re
 
 from django.db import connection, transaction
 from django.utils import timezone
@@ -855,6 +856,28 @@ def _actual_fcs_by_appointment(appointment_ids):
             GROUP BY pr.appointment_id
         """, [ids])
         return {aid: list(fcs or []) for aid, fcs in cur.fetchall()}
+
+
+# The size tokens an item name ends in, in every form the data actually uses:
+# "5L", "500ML", "500G", "1+1L" (a combo pack) and "1L + 1L" (the same thing
+# spelled out). Stripping them leaves the VARIANT, which is what packs group by.
+_PACK_SIZE_RE = re.compile(r'\d+(?:[.+]\d+)*\s*(?:ML|LTR|KG|L|G)\b', re.I)
+
+
+def _pack_variant(item):
+    """"MUSTARD 5L" -> "MUSTARD".  "SANO MUSTARD 1L" -> "SANO MUSTARD".
+
+    The variant is the item name with its size stripped out, so every size of one
+    product sorts together. Derived rather than stored because there is no variant
+    column — the size is embedded in the name, and this is the only place that
+    needs it pulled back out.
+
+    Leftover "+" and doubled spaces are cleaned up: "RICE BRAN 1L + 1L" loses both
+    sizes and would otherwise come back as "RICE BRAN +".
+    """
+    text = _PACK_SIZE_RE.sub(' ', str(item or '').upper())
+    text = text.replace('+', ' ')
+    return ' '.join(text.split())
 
 
 def _claim_state_by_line(po_uppers):
@@ -1868,7 +1891,39 @@ class V2FillOptionsView(_SafeAPIView):
                     'units': units,
                     'liters': _num(r['liters']),
                 }))
-            out.sort(key=lambda x: (-_num(x['per_liter']), -_num(x['units'])))
+            # VARIANT, then biggest bottle inside it.
+            #
+            # Not pure size order, and not the original planner's order either —
+            # that one is sorted by ASIN, which is the order Amazon created the
+            # listings in. It LOOKS brand-grouped because ASINs were issued in
+            # batches per brand, and the illusion breaks: MUSTARD 4L lands at the
+            # bottom next to the Yellows instead of beside the other plain
+            # Mustards.
+            #
+            # Grouping by variant keeps both readings intact — scan for the brand
+            # you want, then pick the size — and every group is contiguous.
+            #
+            # The HOUSE line leads, then the rest alphabetically. Without that
+            # first key the order flips between families for no reason a planner
+            # can see: MUSTARD leads with plain "MUSTARD" because M < S, while
+            # SUNFLOWER leads with "SANO SUNFLOWER" because S < U. Same rule, two
+            # different-looking answers. Pinning the un-branded variant to the top
+            # makes every family read the same way.
+            def _tier(variant):
+                # 0 the house line itself, 1 its other forms (POUCH, 1+1), 2
+                # everything branded. Without tier 1, "SOYABEAN 1L POUCH" sorts
+                # after "SANO SOYABEAN" (S-O > S-A) and strands itself below the
+                # brands instead of sitting with the product it belongs to.
+                if variant == name:
+                    return 0
+                return 1 if variant.startswith(name) else 2
+
+            out.sort(key=lambda x: (
+                _tier(_pack_variant(x['item'])),
+                _pack_variant(x['item']),
+                -_num(x['per_liter']),
+                -_num(x['units']),
+            ))
             return out
 
         families = [
