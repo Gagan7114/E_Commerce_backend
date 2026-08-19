@@ -136,6 +136,26 @@ MASTER_SHEET_SEARCH_COLUMNS = [
 # duplicate row and double-counted spend. Forcing (date, campaign_id) here makes
 # a rename UPDATE the existing campaign-day even for the current deployed
 # uploader, and matches the (date, campaign_id) unique index (migration 0081).
+# Tables whose upload is the COMPLETE record for the dates it carries, so a
+# stored row for one of those dates that the upload did not refresh is a stale
+# leftover. Two ways they appear on the Blinkit ads detail tables, both seen on
+# 2026-08-18 inflating Campaigns Optimization ad spend by Rs 3,143 against the
+# Ads Dashboard's Rs 12,71,703:
+#
+#   * Blinkit RESTATES a recent day. 16 Aug "Extra Light 2L / olive oil / EXACT"
+#     came back with Most Viewed Position 5 on the 17 Aug pull and 1 on the 18th.
+#     Position is part of the unique key, so the restated line inserted NEXT TO
+#     the old one and both counted (Rs 3,049.50 twice, impressions 2432 vs 2436).
+#   * The export FORMAT changes. The Search Reports workbook names an asset
+#     "Repeat Order Suggestions - New User Targeting" and carries a subcampaign
+#     id; the API export calls the same thing "Repeat Order Suggestion" with no
+#     subcampaign. No key matches, so a whole parallel set lands.
+#
+# `clear_dates` on an upload means: THIS REQUEST CARRIES EVERY ROW FOR THESE
+# DATES. Send it on one unchunked request per table -- a chunked caller would
+# sweep away its own earlier chunks.
+DATE_WINDOW_OWNED_TABLES = {"blinkit_ads_keyword", "blinkit_ads_asset"}
+
 UPLOAD_FORCED_UNIQUE_KEYS = {
     "blinkit_ads": "date,campaign_id",
     # Mirror the unique indexes from migration 0086 verbatim. A campaign runs the
@@ -3183,6 +3203,8 @@ def _batch_upload(body, *, forced_table: str | None = None):
     # table before reloading. Never honoured for primary PO tables (guarded
     # below) so it can't be misused to clear order history.
     replace_all = bool(body.get("replace_all", False))
+    # See DATE_WINDOW_OWNED_TABLES.
+    clear_dates_raw = body.get("clear_dates") or []
 
     if table not in UPLOAD_ALLOWED_TABLES:
         return Response(
@@ -3323,6 +3345,39 @@ def _batch_upload(body, *, forced_table: str | None = None):
                     "month-to-date snapshot for this month."
                 ] if skipped_stale else [],
             })
+
+    clear_dates: list[date] = []
+    if clear_dates_raw:
+        if table not in DATE_WINDOW_OWNED_TABLES:
+            return Response(
+                {"detail": f"clear_dates is not supported for table '{table}'."},
+                status=400,
+            )
+        if not isinstance(clear_dates_raw, list) or len(clear_dates_raw) > 400:
+            return Response(
+                {"detail": "clear_dates must be a list of at most 400 ISO dates."},
+                status=400,
+            )
+        try:
+            clear_dates = sorted({date.fromisoformat(str(d)) for d in clear_dates_raw})
+        except ValueError:
+            return Response(
+                {"detail": "clear_dates entries must be ISO YYYY-MM-DD dates."},
+                status=400,
+            )
+
+    # One run stamp for every row in this request, read from the DATABASE clock so
+    # it cannot drift from the NOW() default on rows already stored. Rows this
+    # upload touches carry it (uploaded_at joins `columns`, so the upsert refreshes
+    # it too); anything older inside the window is a leftover the sweep removes.
+    swept = 0
+    run_ts = None
+    if clear_dates:
+        with connection.cursor() as ts_cur:
+            ts_cur.execute("SELECT now()")
+            run_ts = ts_cur.fetchone()[0]
+        for row in data:
+            row["uploaded_at"] = run_ts
 
     column_types = _upload_table_column_types(table)
     table_columns = set(column_types)
@@ -3493,6 +3548,18 @@ def _batch_upload(body, *, forced_table: str | None = None):
                     failed += 1
                     last_error = str(e)
 
+        # Sweep AFTER the rows have landed, never before. A delete-then-insert
+        # would leave the window empty if a later batch failed; this way the worst
+        # case is the leftovers surviving one more upload. Only on a completely
+        # clean run, so a partial failure never drops what it could not refresh.
+        if clear_dates and run_ts is not None and failed == 0 and last_error is None:
+            cur.execute(
+                f'DELETE FROM {_quote_ident(table)} '
+                'WHERE "date" = ANY(%s) AND uploaded_at < %s',
+                [clear_dates, run_ts],
+            )
+            swept = cur.rowcount
+
     notification_result = None
     if success and table in INVENTORY_DOH_UPLOAD_PLATFORMS:
         try:
@@ -3540,6 +3607,7 @@ def _batch_upload(body, *, forced_table: str | None = None):
         "error": last_error,
         "pincode_sync": pincode_sync,
         "pruned_ranges": pruned_ranges,
+        "swept_stale": swept,
         "skipped_stale": skipped_stale,
         "inventory_doh_notifications": notification_result,
     })
