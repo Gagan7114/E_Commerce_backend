@@ -1054,6 +1054,15 @@ class V2PoBookView(_SafeAPIView):
                            po_status,
                            status AS po_record_status,
                            availability_status,
+                           -- Cost, for the review screen's costed table. cost_price
+                           -- is often blank on the sheet, so the per-unit rate is
+                           -- derived from the TOTAL over the ORIGINALLY-accepted
+                           -- qty rather than the leftover -- that is the rate
+                           -- Amazon actually pays per unit on the PO, and dividing
+                           -- by what is left would inflate it as a PO gets
+                           -- delivered.
+                           cost_price,
+                           total_accepted_cost,
                            {_PO_CHANNEL_RAW} AS channel
                     FROM reporting."Amazon PO"
                     WHERE {' AND '.join(where)}
