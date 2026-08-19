@@ -1020,23 +1020,41 @@ class V2PoBookView(_SafeAPIView):
 
         sql = _pendency_sql()
 
-        # Which pendency buckets to show, unioned. Unknown names are dropped and
-        # an all-unknown list falls back to `open` rather than returning
-        # everything: a typo must never silently widen the book from "what is
-        # still to ship" to "every line that ever existed".
+        # Which pendency buckets to show, unioned.
+        #
+        # THREE CASES, and they are genuinely different:
+        #
+        #   absent            -> `open`, the working book. A bare URL has to land
+        #                        somewhere useful.
+        #   'none'            -> NOTHING. The client says so explicitly when every
+        #                        chip is off, and an empty filter honestly means an
+        #                        empty book. Snapping back to `open` there reads as
+        #                        the filter being broken, which is exactly how it
+        #                        was reported.
+        #   unknown name(s)   -> `open`. A typo must never silently widen the book
+        #                        from "what is still to ship" to "everything".
+        raw_param = request.query_params.get('bucket')
         wanted, seen = [], set()
-        for raw in str(request.query_params.get('bucket') or '').split(','):
+        for raw in str(raw_param or '').split(','):
             key = raw.strip().lower()
             if key in sql['buckets'] and key not in seen:
                 seen.add(key)
                 wanted.append(key)
-        if not wanted:
+        explicit_none = str(raw_param or '').strip().lower() == 'none'
+        if not wanted and not explicit_none:
             wanted = ['open']
 
-        where = [
-            sql['pending'],
-            '(' + ' OR '.join(f"({sql['buckets'][b]})" for b in wanted) + ')',
-        ]
+        where = [sql['pending']]
+        if wanted:
+            where.append(
+                '(' + ' OR '.join(f"({sql['buckets'][b]})" for b in wanted) + ')'
+            )
+        else:
+            # A predicate that cannot be true, rather than skipping the query: the
+            # rest of the response (totals, appointment commit, sister FCs) still
+            # has to be built, and building it from a short-circuit would be a
+            # second code path to keep in step with this one.
+            where.append('FALSE')
         params: list = []
         if channel:
             where.append(f"{_PO_CHANNEL_RAW} = %s")
