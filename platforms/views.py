@@ -7069,6 +7069,9 @@ _BLINKIT_SEC_DETAIL_ROWS = (
     ("COMMODITY", "MUSTARD", "MUSTARD KACCHI GHANI", "1 LTR", 15382),
     ("COMMODITY", "MUSTARD", "MUSTARD KACCHI GHANI", "5 LTR", 13310),
     ("COMMODITY", "SUNFLOWER", "SUNFLOWER", "1 LTR", 2914),
+    # New Blinkit listing (first sales Aug 2026). The 5th field is the dead
+    # static "last month" snapshot — computed live now, so 0 is fine.
+    ("PREMIUM", "GROUNDNUT", "GROUNDNUT", "1 LTR", 0),
 )
 
 _SWIGGY_SEC_ITEM_HEADS = ("PREMIUM", "COMMODITY", "OTHER")
@@ -7089,6 +7092,11 @@ _SWIGGY_SEC_DETAIL_ROWS = (
     ("PREMIUM", "OLIVE", "EXTRA VIRGIN", "1 LTR"),
     ("PREMIUM", "BLENDED", "SO OLIVE", "5 LTR"),
     ("PREMIUM", "GHEE", "DESI GHEE", "1 LTR"),
+    # Packs/products Swiggy sells that the source Excel never listed.
+    ("PREMIUM", "SESAME OIL", "SESAME OIL", "1 LTR"),
+    ("PREMIUM", "MUSTARD", "YELLOW MUSTARD", "1 LTR"),
+    ("PREMIUM", "GROUNDNUT", "GROUNDNUT", "2 LTR"),
+    ("PREMIUM", "CANOLA", "CANOLA", "500 MLS"),
     ("OTHER", "DRINKS", "BLUEBERRY", "200 MLS"),
     ("OTHER", "DRINKS", "JEERA", "160 MLS"),
     ("OTHER", "DRINKS", "MINERAL WATER", "1 LTR"),
@@ -7103,6 +7111,7 @@ _SWIGGY_SEC_DETAIL_ROWS = (
     ("COMMODITY", "MUSTARD", "MUSTARD KACCHI GHANI", "5 LTR"),
     ("COMMODITY", "RICE BRAN", "RICE BRAN", "1 LTR"),
     ("COMMODITY", "RICE BRAN", "RICE BRAN", "5 LTR"),
+    ("COMMODITY", "MUSTARD", "MUSTARD KACCHI GHANI", "200 MLS"),
 )
 
 _ZEPTO_SEC_ITEM_HEADS = ("PREMIUM", "COMMODITY", "OTHER")
@@ -7126,6 +7135,9 @@ _ZEPTO_SEC_DETAIL_ROWS = (
     ("PREMIUM", "GHEE", "A2 GHEE", "500 MLS"),
     ("PREMIUM", "GROUNDNUT", "GROUNDNUT", "5 LTR"),
     ("PREMIUM", "OLIVE", "EXTRA LIGHT", "5 LTR"),
+    # 200 ML packs Zepto started selling after the source Excel was frozen.
+    ("PREMIUM", "GROUNDNUT", "GROUNDNUT", "200 MLS"),
+    ("PREMIUM", "OLIVE", "EXTRA VIRGIN", "200 MLS"),
     ("COMMODITY", "MUSTARD", "MUSTARD KACCHI GHANI", "1 LTR"),
     ("COMMODITY", "SUNFLOWER", "SUNFLOWER", "1 LTR"),
     ("COMMODITY", "MUSTARD", "MUSTARD KACCHI GHANI", "5 LTR"),
@@ -7234,7 +7246,10 @@ _FLIPKART_SEC_DETAIL_ROWS = (
     ("PREMIUM", "OLIVE", "EXTRA VIRGIN"),
     ("PREMIUM", "OLIVE", "SANO POMACE"),
     ("COMMODITY", "RICE BRAN", "RICE BRAN"),
-    ("COMMODITY", "SUNFLOWER OIL", "SUNFLOWER OIL"),
+    # Renamed to match what the feed actually sends ("SUNFLOWER", not
+    # "SUNFLOWER OIL") — the old spelling matched nothing, so all sunflower
+    # sales were dropped from this table.
+    ("COMMODITY", "SUNFLOWER", "SUNFLOWER"),
     ("PREMIUM", "COCONUT", "COCONUT"),
     ("COMMODITY", "BLENDED", "GOLD"),
     ("PREMIUM", "BLENDED", "SO OLIVE"),
@@ -7242,7 +7257,7 @@ _FLIPKART_SEC_DETAIL_ROWS = (
     ("COMMODITY", "SOYABEAN", "SOYABEAN"),
     ("PREMIUM", "GHEE", "A2 GHEE"),
     ("OTHER", "SPICES", "SAFFRON"),
-    ("PREMIUM", "SESAME", "SESAME"),
+    ("PREMIUM", "SESAME OIL", "SESAME OIL"),  # feed sends "SESAME OIL"
     ("OTHER", "SEEDS", "FLAX SEEDS"),
     ("OTHER", "SEEDS", "ALL SEEDS"),
     ("OTHER", "SEEDS", "BAASIL SEEDS"),
@@ -7272,12 +7287,17 @@ _FLIPKART_SEC_DETAIL_ROWS = (
     ("OTHER", "SPICES", "CINNAMON"),
     ("OTHER", "SPICES", "CUMIN"),
     ("OTHER", "SPICES", "GREEN CARDAMOM"),
-    ("OTHER", "WHEATGRASS", "PUNJABI JEERA"),
-    ("OTHER", "WHEATGRASS", "WHEATGRASS APPLE"),
-    ("OTHER", "WHEATGRASS", "WHEATGRASS BLUEBERRY"),
-    ("OTHER", "WHEATGRASS", "WHEATGRASS GIGNGER ALE"),
-    ("OTHER", "WHEATGRASS", "WHEATGRASS MANGO"),
-    ("OTHER", "WHEATGRASS", "WHEATGRASS MOJITO"),
+    # The drinks come through as plain names under category DRINKS. The old
+    # "WHEATGRASS <flavour>" spellings never matched a single row.
+    # "GIGNGER ALE" is misspelt in the source feed — keep it to match.
+    ("OTHER", "DRINKS", "PUNJABI JEERA"),
+    ("OTHER", "DRINKS", "APPLE"),
+    ("OTHER", "DRINKS", "BLUEBERRY"),
+    ("OTHER", "DRINKS", "GIGNGER ALE"),
+    ("OTHER", "DRINKS", "GINGER"),
+    ("OTHER", "DRINKS", "MANGO"),
+    ("OTHER", "DRINKS", "MOJITO"),
+    ("OTHER", "TEA", "TEA"),
 )
 
 _FLIPKART_SEC_MONTHLY_CATEGORY_ROWS = (
@@ -7293,13 +7313,13 @@ _FLIPKART_SEC_MONTHLY_CATEGORY_ROWS = (
     ("", "OLIVE", "JIVO POMACE"),
     ("", "OLIVE", "POMACE"),
     ("", "OLIVE", "SANO POMACE"),
-    ("", "SESAME", "SESAME"),
+    ("", "SESAME OIL", "SESAME OIL"),
     ("", "YELLOW MUSTARD", "YELLOW MUSTARD"),
     ("COMMODITY", "BLENDED", "GOLD"),
     ("", "MUSTARD", "MUSTARD KACCHI GHANI"),
     ("", "RICE BRAN", "RICE BRAN"),
     ("", "SOYABEAN", "SOYABEAN"),
-    ("", "SUNFLOWER OIL", "SUNFLOWER OIL"),
+    ("", "SUNFLOWER", "SUNFLOWER"),
 )
 
 _FLIPKART_SEC_MONTHLY_ITEM_HEADS = ("PREMIUM", "COMMODITY")
