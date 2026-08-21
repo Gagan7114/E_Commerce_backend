@@ -1214,11 +1214,28 @@ class V2PoBookView(_SafeAPIView):
             ln['known_to_amazon'] = 'ordered_qty' in st
             accepted = _num(ln.get('accepted_qty'))
             received = _num(ln.get('received_qty'))
+            invoiced = _num(ln.get('invoiced_qty'))
             claimed = _num(st.get('claimed_qty'))
-            # THE CEILING: what Amazon accepted, less what it has already received,
-            # less what other live shipments are holding. Never negative -- an
+            # THE CEILING: what Amazon accepted, less what has already GONE, less
+            # what other live shipments are holding. Never negative -- an
             # over-claimed line is at zero, not at a negative allowance.
-            ln['claimable_qty'] = max(0.0, accepted - received - claimed)
+            #
+            # "Gone" is max(received, invoiced), and the invoiced half was missing.
+            # Express has always planned net of billing (_POOL_UNITS is accepted
+            # less billed); the hand picker did not, so the two disagreed about the
+            # same line. Measured on the CORE book: 46 of 247 lines offered more
+            # than was left, 36,285 units in total. The worst was 3QR7SEEJ /
+            # B0CKFFW9B6 - accepted 8,113, invoiced 8,112, received 0 - where the
+            # picker offered all 8,113 and one unit was actually left. Those units
+            # are billed and shipped; loading them again ships them twice.
+            #
+            # MAX, not a sum. Invoicing and receiving describe the same units at
+            # two stages, so adding them subtracts the same stock twice: 4H6S3PSB
+            # is accepted 12,000, received 3,897, invoiced 9,900, where the answer
+            # is 2,100 and a sum gives 0. Both orders occur in the data - 46 lines
+            # invoiced ahead of received, 6 received ahead of invoiced - so it has
+            # to be whichever is further along, not either one alone.
+            ln['claimable_qty'] = max(0.0, accepted - max(received, invoiced) - claimed)
 
         groups: dict[str, dict] = {}
         for line in lines:
