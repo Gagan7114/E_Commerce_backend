@@ -294,6 +294,11 @@ PRIMARY_UPLOAD_AUTHORITATIVE_COLUMNS = [
     "basic_rate",
     "landing_rate",
     "location",
+    # Swiggy-only: FacilityName. NULL for every other platform, so re-uploading
+    # any other platform's file cannot write it. Listed here so a Swiggy
+    # re-upload REFRESHES the facility (e.g. a PO moved to another warehouse)
+    # instead of keeping the first value forever.
+    "facility_name",
     "format",
     "remark",
 ]
