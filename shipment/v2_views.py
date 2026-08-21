@@ -232,6 +232,22 @@ def _enrich_stock(payload):
     return _enrich_pendency_stock(payload)
 
 
+def _book_stock_meta():
+    """Freshness of the live-stock snapshot the book's gp_stock column came from.
+
+    Same shape and same source as the fill endpoint's, so the two screens cannot
+    disagree about whether stock is readable. Never raises: this is context for a
+    banner, and a book that would not load because it could not describe its own
+    stock would be a worse failure than the one it is reporting.
+    """
+    try:
+        from shipment.views import _planner_stock_detail, _stock_meta_payload
+        return _stock_meta_payload(_planner_stock_detail())
+    except Exception:
+        logger.warning('v2 book: stock freshness unavailable', exc_info=True)
+        return {'as_of': None, 'age_seconds': None, 'stale': True, 'unavailable': True}
+
+
 def _num(value, default=0.0):
     try:
         return float(value)
@@ -1295,6 +1311,12 @@ class V2PoBookView(_SafeAPIView):
             # an unmapped FC gets only itself.
             'sister_fcs': sorted({f.upper() for f in (_fc_switch_group(appt_fc)[1] or [])}
                                  | ({appt_fc.upper()} if appt_fc else set())),
+            # Whether the stock column can be believed. The book was silent about
+            # this: with SAP unreachable every gp_stock came back null, the strip
+            # read "0 Units Stock-Backed", and nothing distinguished that from a
+            # book with genuinely no stock behind it. The fill endpoint has always
+            # said so in its own payload; the screen a planner starts on did not.
+            'stock_meta': _book_stock_meta(),
             # The caps a hand-picked selection is measured against.
             'appointment_commit': _appointment_commit(appointment_id),
             'appointment_po_count': sum(1 for g in out if g['on_appointment']),

@@ -2251,6 +2251,13 @@ def _apply_stock_caps(items, avail_total, avail_remaining, respect, detail, rese
     onto two trucks, and it stays on whichever way this flag is set.
     """
     today = timezone.localdate() if enforce_expiry else None
+    # An EMPTY snapshot and an unmapped ASIN are different facts, and saying the
+    # first as though it were the second sends people looking for a mapping that
+    # is already there. When SAP is unreachable `detail` comes back empty for
+    # every ASIN at once; that is a system being down, not 138 SKUs missing from
+    # the master sheet.
+    snapshot_missing = not detail
+
     for it in items:
         asin = str(it.get('asin') or '').strip().upper()
         d = detail.get(asin)
@@ -2283,6 +2290,9 @@ def _apply_stock_caps(items, avail_total, avail_remaining, respect, detail, rese
                 # units were never counted against live stock.
                 it['stock_unbacked'] = True
                 it['stock_note'] = (
+                    'Live stock could not be read from SAP — planned on the ordered '
+                    'quantity, availability was never verified.'
+                    if snapshot_missing else
                     f'Not mapped to {_inventory_label(PLANNER_WAREHOUSE) or PLANNER_WAREHOUSE} '
                     f'({PLANNER_WAREHOUSE}) stock — planned on the ordered quantity, '
                     'availability could not be verified.'
@@ -2295,6 +2305,9 @@ def _apply_stock_caps(items, avail_total, avail_remaining, respect, detail, rese
             it['stock_cap'] = 0.0
             it['stock_limited'] = True
             it['stock_unfit'] = (
+                'Live stock could not be read from SAP, so nothing could be '
+                'verified and this was left out. Nothing is wrong with this line.'
+                if snapshot_missing else
                 f'Not mapped to {_inventory_label(PLANNER_WAREHOUSE) or PLANNER_WAREHOUSE} '
                 f'({PLANNER_WAREHOUSE}) stock — availability cannot be verified, so it '
                 'was left out of the plan.'
