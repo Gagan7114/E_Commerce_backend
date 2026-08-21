@@ -1111,6 +1111,19 @@ class V2PoBookView(_SafeAPIView):
             wanted = ['open']
 
         where = [sql['pending']]
+        # A LINE AMAZON NEVER ACCEPTED CANNOT BE SHIPPED, so it is not in the book.
+        #
+        # 77 of the 326 lines on the CORE book were requested and never accepted -
+        # accepted 0, received 0, invoiced 0 - across 34 POs, four of which
+        # consisted of nothing else. They are already unselectable ("Nothing
+        # ordered"), so they were pure noise: a quarter of the list to scroll past,
+        # and 77 counted in "SKU Lines" above a book that can ship none of them.
+        #
+        # This is the planner's book, and you can only load accepted units. The
+        # requested-but-unaccepted gap is a real thing to look at, and the SKU PO
+        # Pendency page is where it belongs - it has the ordered column to compare
+        # against. Scoped to 2.0's book alone; the shared pendency SQL is untouched.
+        where.append('COALESCE(reporting."Amazon PO".accepted_qty, 0) > 0')
         if wanted:
             where.append(
                 '(' + ' OR '.join(f"({sql['buckets'][b]})" for b in wanted) + ')'
