@@ -2105,6 +2105,27 @@ class V2FillOptionsView(_SafeAPIView):
                         {_POOL_CTES}
                         SELECT {_product_key_sql('p')}              AS family,
                                UPPER(TRIM(p.asin))                      AS asin,
+                               -- WHICH SLICE THIS PRODUCT CAN FILL.
+                               --
+                               -- MAX() and not a GROUP BY: a product belongs to
+                               -- exactly one item head. Checked across the whole
+                               -- sheet - all 51 sub-categories map to a single
+                               -- head each - so there is no aggregation happening
+                               -- here, only a value being carried up.
+                               --
+                               -- The panel needs it to answer the question it
+                               -- could not answer before: a Premium slice asked
+                               -- for while every chosen product is Commodity is
+                               -- four fifths of a truck reserved for nothing, and
+                               -- the planner deserves to be told BEFORE the fill
+                               -- rather than left to infer it from an empty load.
+                               --
+                               -- Nothing in this comment spells out a per-cent
+                               -- SIGN on purpose: psycopg scans the whole
+                               -- statement for placeholders, comments included,
+                               -- so one bare occurrence of it here fails the
+                               -- query outright with "incomplete placeholder".
+                               MAX({_item_head_case('p.item_head')})    AS item_head,
                                -- p.item, NOT p.sku_name. `item` is the short
                                -- internal name ("SANO MUSTARD 5L"); sku_name is
                                -- the Amazon marketing title, which runs past 200
@@ -2208,6 +2229,7 @@ class V2FillOptionsView(_SafeAPIView):
         families = [
             _serialize_row({
                 'family': name,
+                'item_head': row['item_head'] or 'OTHER',
                 'po_count': int(row['po_count'] or 0),
                 'sku_count': int(row['sku_count'] or 0),
                 'units': _num(row['units']),
