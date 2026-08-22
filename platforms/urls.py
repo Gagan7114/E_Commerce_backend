@@ -55,6 +55,14 @@ urlpatterns = [
         views.overall_pendency,
         name="platform-overall-pendency",
     ),
+    # Drill-down sibling of the above: same open-PO scope, re-grouped one
+    # level at a time (platform -> city -> warehouse -> distributor -> item ->
+    # SKU -> PO -> line). Also above the <slug:slug> routes.
+    path(
+        "pendency-explorer",
+        views.pendency_explorer,
+        name="platform-pendency-explorer",
+    ),
     path(
         "primary-overview-total",
         views.primary_overview_total,

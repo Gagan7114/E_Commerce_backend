@@ -2014,24 +2014,141 @@ _OVERALL_PENDENCY_GROUPS = {
     "sub_category": ("sub_category", "Sub Category"),
 }
 
-# master_po stores po_date as free text in either DD-MM-YYYY or YYYY-MM-DD.
-_MASTER_PO_DATE_SQL = '''
+# master_po stores po_date / po_expiry_date as free text in either DD-MM-YYYY or
+# YYYY-MM-DD (the column type has changed over time), so every read of one goes
+# through this CASE. `alias` is the table alias the column hangs off.
+def _master_po_date_sql(column: str, alias: str = "p") -> str:
+    return f'''
     CASE
-        WHEN TRIM(p."po_date"::text) ~ '^[0-9]{2}-[0-9]{2}-[0-9]{4}$'
-            THEN TO_DATE(TRIM(p."po_date"::text), 'DD-MM-YYYY')
-        WHEN TRIM(p."po_date"::text) ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'
-            THEN TRIM(p."po_date"::text)::date
+        WHEN TRIM({alias}."{column}"::text) ~ '^[0-9]{{2}}-[0-9]{{2}}-[0-9]{{4}}$'
+            THEN TO_DATE(TRIM({alias}."{column}"::text), 'DD-MM-YYYY')
+        WHEN TRIM({alias}."{column}"::text) ~ '^[0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}$'
+            THEN TRIM({alias}."{column}"::text)::date
     END
-'''
+    '''
+
+
+# One row per open PO LINE, with both PO tables normalized to the same columns.
+#
+# This is the single definition of "an open PO line" for BOTH cross-platform
+# pendency endpoints (the flat table and the drill-down Explorer), so the two can
+# never disagree with each other or with the per-platform Pendency Dashboard:
+#   master_po   open_close = 'OPEN', cancelled excluded
+#   Amazon PO   po_status  = 'PENDING'   (it has no open_close flag)
+#
+# `selected` is the caller's already-permission-filtered list of
+# (slug, display name, master_po format) tuples. Returns (parts, params) for a
+# UNION ALL — the caller joins the parts and wraps them in its own WHERE.
+def _overall_pendency_union(selected) -> tuple[list[str], list]:
+    parts: list[str] = []
+    params: list = []
+
+    master_rows = [(fmt, slug) for slug, _n, fmt in selected if fmt]
+    if master_rows:
+        values_sql = ", ".join(["(%s, %s)"] * len(master_rows))
+        parts.append(f'''
+            SELECT
+                m.slug AS slug,
+                COALESCE(
+                    NULLIF(TRIM(p."item"::text), ''),
+                    NULLIF(TRIM(p."sap_sku_name"::text), ''),
+                    NULLIF(TRIM(p."sku_name"::text), ''),
+                    'UNMAPPED'
+                ) AS item,
+                COALESCE(NULLIF(TRIM(p."sku_name"::text), ''), '-') AS sku_name,
+                COALESCE(NULLIF(UPPER(TRIM(p."item_head"::text)), ''), 'OTHER') AS item_head,
+                COALESCE(NULLIF(TRIM(p."category"::text), ''), 'UNMAPPED') AS category,
+                COALESCE(NULLIF(TRIM(p."sub_category"::text), ''), 'UNMAPPED') AS sub_category,
+                COALESCE(NULLIF(TRIM(p."sku_code"::text), ''), 'UNMAPPED') AS sku_code,
+                COALESCE(NULLIF(UPPER(TRIM(p."city"::text)), ''), 'UNMAPPED') AS city,
+                COALESCE(NULLIF(UPPER(TRIM(p."state"::text)), ''), 'UNMAPPED') AS state,
+                -- `location` already resolves to the Swiggy facility name where
+                -- one exists (migration 0073), so it is the warehouse everywhere.
+                COALESCE(NULLIF(UPPER(TRIM(p."location"::text)), ''), 'UNMAPPED') AS warehouse,
+                COALESCE(
+                    NULLIF(UPPER(TRIM(p."vendor_new"::text)), ''),
+                    NULLIF(UPPER(TRIM(p."vendor_name"::text)), ''),
+                    'UNMAPPED'
+                ) AS distributor,
+                {_master_po_date_sql("po_date")} AS po_dt,
+                {_master_po_date_sql("po_expiry_date")} AS expiry_dt,
+                COALESCE(
+                    NULLIF(UPPER(TRIM(p."po_status"::text)), ''),
+                    NULLIF(UPPER(TRIM(p."status"::text)), ''),
+                    'OPEN'
+                ) AS po_status,
+                COALESCE(NULLIF(TRIM(p."po_number"::text), ''), 'UNMAPPED') AS po_number,
+                COALESCE(p."order_qty", 0) AS order_qty,
+                COALESCE(p."delivered_qty", 0) AS delivered_qty,
+                COALESCE(p."total_order_liters", 0) AS order_ltrs,
+                COALESCE(p."total_delivered_liters", 0) AS delivered_ltrs,
+                COALESCE(p."total_order_amt_inclusive", 0) AS order_value,
+                COALESCE(p."total_deliver_amt_inclusive", 0) AS delivered_value
+            FROM public."master_po" p
+            JOIN (VALUES {values_sql}) AS m(fmt, slug)
+              ON UPPER(TRIM(p."format"::text)) = m.fmt
+            WHERE UPPER(TRIM(p."open_close"::text)) = 'OPEN'
+              AND UPPER(TRIM(COALESCE(p."po_status", p."status", '')::text))
+                  NOT IN ('CANCELLED', 'CANCELED', 'CANCEL')
+        ''')
+        for fmt, slug in master_rows:
+            params.extend([fmt, slug])
+
+    if any(slug == "amazon" for slug, _n, _f in selected):
+        # Amazon's warehouse is the fulfillment centre and its distributor
+        # column is `vendor`; its value columns are tax-EXCLUSIVE (it has no
+        # inclusive pair), which the endpoints note in their payloads.
+        parts.append('''
+            SELECT
+                'amazon' AS slug,
+                COALESCE(
+                    NULLIF(TRIM(a."item"::text), ''),
+                    NULLIF(TRIM(a."sap_sku_name"::text), ''),
+                    NULLIF(TRIM(a."sku_name"::text), ''),
+                    'UNMAPPED'
+                ) AS item,
+                COALESCE(NULLIF(TRIM(a."sku_name"::text), ''), '-') AS sku_name,
+                COALESCE(NULLIF(UPPER(TRIM(a."item_head"::text)), ''), 'OTHER') AS item_head,
+                COALESCE(NULLIF(TRIM(a."category"::text), ''), 'UNMAPPED') AS category,
+                COALESCE(NULLIF(TRIM(a."sub_category"::text), ''), 'UNMAPPED') AS sub_category,
+                COALESCE(
+                    NULLIF(TRIM(a."sku_code"::text), ''),
+                    NULLIF(TRIM(a."asin"::text), ''),
+                    'UNMAPPED'
+                ) AS sku_code,
+                COALESCE(NULLIF(UPPER(TRIM(a."city"::text)), ''), 'UNMAPPED') AS city,
+                COALESCE(NULLIF(UPPER(TRIM(a."state"::text)), ''), 'UNMAPPED') AS state,
+                COALESCE(NULLIF(UPPER(TRIM(a."fulfillment_center"::text)), ''), 'UNMAPPED') AS warehouse,
+                COALESCE(NULLIF(UPPER(TRIM(a."vendor"::text)), ''), 'UNMAPPED') AS distributor,
+                a."order_date"::date AS po_dt,
+                a."expiry_date"::date AS expiry_dt,
+                COALESCE(NULLIF(UPPER(TRIM(a."po_status"::text)), ''), 'PENDING') AS po_status,
+                COALESCE(NULLIF(TRIM(a."po_number"::text), ''), 'UNMAPPED') AS po_number,
+                COALESCE(a."requested_qty", 0) AS order_qty,
+                COALESCE(a."received_qty", 0) AS delivered_qty,
+                COALESCE(a."total_order_liters", 0) AS order_ltrs,
+                COALESCE(a."total_delivered_liters", 0) AS delivered_ltrs,
+                COALESCE(a."total_order_amt_exclusive", 0) AS order_value,
+                COALESCE(a."total_deliver_amt_exclusive", 0) AS delivered_value
+            FROM reporting."Amazon PO" a
+            WHERE UPPER(TRIM(COALESCE(a."po_status", '')::text)) = 'PENDING'
+        ''')
+
+    return parts, params
 
 
 @api_view(["GET"])
 @permission_classes([require("platform.stats.view")])
 def overall_pendency(request):
-    """Open-PO pendency across every platform in one table.
+    """Open-PO pendency across every platform in one FLAT table.
 
     One row per SKU by default; `group_by` rolls the same figures up to
     Category or Sub Category instead.
+
+    The /pendency screen moved to `pendency_explorer` below, which walks the
+    same scope one level at a time. This endpoint is kept as the flat,
+    one-request view of the whole thing and shares `_overall_pendency_union`
+    with the Explorer, so the two can never report different totals.
 
     Query params
       platforms  comma-separated slugs, or blank / "all" for every platform
@@ -2117,69 +2234,10 @@ def overall_pendency(request):
     if not selected:
         return _empty_payload("No platform selected.")
 
-    # ── Build the UNION that normalizes both PO tables into one shape ────────
-    union_parts: list[str] = []
-    union_params: list = []
-
-    master_rows = [(fmt, slug) for slug, _n, fmt in selected if fmt]
-    if master_rows:
-        values_sql = ", ".join(["(%s, %s)"] * len(master_rows))
-        union_parts.append(f'''
-            SELECT
-                m.slug AS slug,
-                COALESCE(
-                    NULLIF(TRIM(p."item"::text), ''),
-                    NULLIF(TRIM(p."sap_sku_name"::text), ''),
-                    NULLIF(TRIM(p."sku_name"::text), ''),
-                    'UNMAPPED'
-                ) AS item,
-                COALESCE(NULLIF(TRIM(p."sku_name"::text), ''), '-') AS sku_name,
-                COALESCE(NULLIF(UPPER(TRIM(p."item_head"::text)), ''), 'OTHER') AS item_head,
-                COALESCE(NULLIF(TRIM(p."category"::text), ''), 'UNMAPPED') AS category,
-                COALESCE(NULLIF(TRIM(p."sub_category"::text), ''), 'UNMAPPED') AS sub_category,
-                {_MASTER_PO_DATE_SQL} AS po_dt,
-                COALESCE(NULLIF(TRIM(p."po_number"::text), ''), 'UNMAPPED') AS po_number,
-                COALESCE(p."order_qty", 0) AS order_qty,
-                COALESCE(p."delivered_qty", 0) AS delivered_qty,
-                COALESCE(p."total_order_liters", 0) AS order_ltrs,
-                COALESCE(p."total_delivered_liters", 0) AS delivered_ltrs,
-                COALESCE(p."total_order_amt_inclusive", 0) AS order_value,
-                COALESCE(p."total_deliver_amt_inclusive", 0) AS delivered_value
-            FROM public."master_po" p
-            JOIN (VALUES {values_sql}) AS m(fmt, slug)
-              ON UPPER(TRIM(p."format"::text)) = m.fmt
-            WHERE UPPER(TRIM(p."open_close"::text)) = 'OPEN'
-              AND UPPER(TRIM(COALESCE(p."po_status", p."status", '')::text))
-                  NOT IN ('CANCELLED', 'CANCELED', 'CANCEL')
-        ''')
-        for fmt, slug in master_rows:
-            union_params.extend([fmt, slug])
-
-    if any(slug == "amazon" for slug, _n, _f in selected):
-        union_parts.append('''
-            SELECT
-                'amazon' AS slug,
-                COALESCE(
-                    NULLIF(TRIM(a."item"::text), ''),
-                    NULLIF(TRIM(a."sap_sku_name"::text), ''),
-                    NULLIF(TRIM(a."sku_name"::text), ''),
-                    'UNMAPPED'
-                ) AS item,
-                COALESCE(NULLIF(TRIM(a."sku_name"::text), ''), '-') AS sku_name,
-                COALESCE(NULLIF(UPPER(TRIM(a."item_head"::text)), ''), 'OTHER') AS item_head,
-                COALESCE(NULLIF(TRIM(a."category"::text), ''), 'UNMAPPED') AS category,
-                COALESCE(NULLIF(TRIM(a."sub_category"::text), ''), 'UNMAPPED') AS sub_category,
-                a."order_date"::date AS po_dt,
-                COALESCE(NULLIF(TRIM(a."po_number"::text), ''), 'UNMAPPED') AS po_number,
-                COALESCE(a."requested_qty", 0) AS order_qty,
-                COALESCE(a."received_qty", 0) AS delivered_qty,
-                COALESCE(a."total_order_liters", 0) AS order_ltrs,
-                COALESCE(a."total_delivered_liters", 0) AS delivered_ltrs,
-                COALESCE(a."total_order_amt_exclusive", 0) AS order_value,
-                COALESCE(a."total_deliver_amt_exclusive", 0) AS delivered_value
-            FROM reporting."Amazon PO" a
-            WHERE UPPER(TRIM(COALESCE(a."po_status", '')::text)) = 'PENDING'
-        ''')
+    # ── Normalize both PO tables into one shape ──────────────────────────────
+    # Shared with the Pendency Explorer, so the flat table and the drill-down
+    # can never disagree about what counts as an open PO line.
+    union_parts, union_params = _overall_pendency_union(selected)
 
     if not union_parts:
         return _empty_payload("No platform selected.")
@@ -2339,6 +2397,601 @@ def overall_pendency(request):
             {"item_head": r.get("item_head"), **_metrics(r)}
             for r in by_head
         ],
+    })
+
+
+# ── Pendency Explorer (one screen, drill any level deep) ────────────────────
+# The flat table above answers "how much of item X is outstanding everywhere".
+# The Explorer answers the follow-up questions — which city, which warehouse,
+# which distributor, which PO, which line — by re-grouping the SAME open-PO
+# scope one level at a time. Every click adds one filter and asks for the next
+# grouping, so one endpoint serves the whole drill path.
+#
+# Because it shares `_overall_pendency_union` with the flat table, no drill path
+# can ever add up to a different number than the headline figure.
+
+# dim key -> (scope column, display label). The column half is NEVER user text:
+# it is only ever reached through an exact key lookup in this map.
+_PENDENCY_EXPLORER_DIMS = {
+    "platform": ("slug", "Platform"),
+    "state": ("state", "State"),
+    "city": ("city", "City"),
+    "warehouse": ("warehouse", "Warehouse"),
+    "distributor": ("distributor", "Distributor"),
+    "category": ("category", "Category"),
+    "sub_category": ("sub_category", "Sub Category"),
+    "item": ("item", "Item"),
+    "sku": ("sku_code", "SKU"),
+    "po": ("po_number", "PO"),
+}
+
+# Dims whose value is only unique WITHIN one platform: a PO number and a SKU
+# code both repeat across platforms (Amazon's SKU is the ASIN). Rows for these
+# group by (slug, value) and their drill-down pins the platform too, so two
+# platforms' identically-named rows never merge into one.
+_PENDENCY_EXPLORER_PLATFORM_SCOPED = ("sku", "po")
+
+# The order the UI walks by default when the caller does not name a dim.
+_PENDENCY_EXPLORER_LADDER = (
+    "platform", "city", "warehouse", "distributor", "item", "sku", "po",
+)
+
+# Free-text search columns. One box searches every name on the row, so it works
+# the same at every level of the drill.
+_PENDENCY_EXPLORER_SEARCH_COLS = (
+    "item", "sku_name", "sku_code", "po_number",
+    "city", "state", "warehouse", "distributor", "category", "sub_category",
+)
+
+# Age = how long the PO has been open (today - PO date). Buckets are returned
+# in this order with these labels, so the chart never has to guess an ordering.
+_PENDENCY_AGE_BUCKETS = (
+    ("d0_7", "0-7 days"),
+    ("d8_15", "8-15 days"),
+    ("d16_30", "16-30 days"),
+    ("d31_60", "31-60 days"),
+    ("d60p", "60+ days"),
+    ("unknown", "No PO date"),
+)
+
+# Expiry risk = how long until the PO expires. `expired` means the expiry date
+# has already passed while the PO is still open — the most urgent bucket.
+_PENDENCY_EXPIRY_BUCKETS = (
+    ("expired", "Already expired"),
+    ("e0_3", "Expires in 0-3 days"),
+    ("e4_7", "Expires in 4-7 days"),
+    ("e8_15", "Expires in 8-15 days"),
+    ("e15p", "Expires in 15+ days"),
+    ("none", "No expiry date"),
+)
+
+# Aggregates over the materialized scope. `open_pos` keys on slug + PO number
+# because a PO number is only unique inside one platform.
+_PENDENCY_METRIC_COLS = '''
+    COALESCE(SUM(GREATEST(order_qty - delivered_qty, 0)), 0) AS pending_units,
+    COALESCE(SUM(GREATEST(order_ltrs - delivered_ltrs, 0)), 0) AS pending_ltrs,
+    COALESCE(SUM(GREATEST(order_value - delivered_value, 0)), 0) AS pending_value,
+    COALESCE(SUM(order_qty), 0) AS open_units,
+    COALESCE(SUM(delivered_qty), 0) AS delivered_units,
+    COALESCE(SUM(order_ltrs), 0) AS open_ltrs,
+    COALESCE(SUM(delivered_ltrs), 0) AS delivered_ltrs,
+    COALESCE(SUM(order_value), 0) AS open_value,
+    COUNT(DISTINCT (slug || '|' || po_number)) AS open_pos,
+    COUNT(*) AS lines
+'''
+
+_PENDENCY_ORDER_CLAUSE = "ORDER BY pending_ltrs DESC, pending_units DESC, open_pos DESC"
+
+
+def _pendency_metrics(row: dict) -> dict:
+    """The metric half of any Explorer row, in one shape everywhere."""
+    return {
+        "pending_units": _num(row.get("pending_units")),
+        "pending_ltrs": _num(row.get("pending_ltrs")),
+        "pending_value": _num(row.get("pending_value")),
+        "open_units": _num(row.get("open_units")),
+        "delivered_units": _num(row.get("delivered_units")),
+        "open_ltrs": _num(row.get("open_ltrs")),
+        "delivered_ltrs": _num(row.get("delivered_ltrs")),
+        "open_value": _num(row.get("open_value")),
+        "open_pos": int(row.get("open_pos") or 0),
+        "lines": int(row.get("lines") or 0),
+    }
+
+
+def _pendency_bucket_rows(raw_rows, buckets) -> list[dict]:
+    """Fill in the buckets that returned no rows, and keep the fixed order.
+
+    A missing bucket is a real zero, not missing data — dropping it would make
+    the chart's category axis jump around between refreshes.
+    """
+    by_key = {r.get("bucket"): r for r in raw_rows}
+    out = []
+    for key, label in buckets:
+        row = by_key.get(key) or {}
+        out.append({"bucket": key, "label": label, **_pendency_metrics(row)})
+    return out
+
+
+@api_view(["GET"])
+@permission_classes([require("platform.stats.view")])
+@cached_get(timeout=120, prefix="plat.pendexp")
+def pendency_explorer(request):
+    """One level of the cross-platform open-PO drill-down.
+
+    Query params
+      platforms   comma-separated slugs, or blank / "all" for every platform
+      item_head   PREMIUM | COMMODITY | OTHER | ALL
+      max_date    YYYY-MM-DD — keep only POs whose PO date is on or before this
+      dim         which level to list: platform | state | city | warehouse |
+                  distributor | category | sub_category | item | sku | po, or
+                  "line" for the raw PO lines (the deepest level)
+      d_<dim>     one drill filter per dim already picked, e.g.
+                  d_platform=blinkit&d_city=DELHI&d_po=PO-123
+      q           free-text search over every name on a line
+      limit       row cap for this level (default 300, max 5000)
+
+    Everything in the payload — KPIs, the four charts, the row list — is
+    computed over the SAME filtered scope, so the page can never show a chart
+    that disagrees with its own table. Open-PO math is inherited from
+    `_overall_pendency_union`, which the flat Overall Pendency table also uses.
+    """
+    allowed = [
+        (slug, name, fmt)
+        for slug, name, fmt in _OVERALL_PENDENCY_PLATFORMS
+        if can_access_platform(request.user, slug)
+    ]
+    allowed_slugs = {slug for slug, _n, _f in allowed}
+
+    raw_platforms = (request.query_params.get("platforms") or "").strip()
+    if raw_platforms and raw_platforms.lower() != "all":
+        wanted = {s.strip().lower() for s in raw_platforms.split(",") if s.strip()}
+        unknown = wanted - {s for s, _n, _f in _OVERALL_PENDENCY_PLATFORMS}
+        if unknown:
+            raise ValidationError(f"Unknown platform(s): {', '.join(sorted(unknown))}.")
+        denied = wanted - allowed_slugs
+        if denied:
+            raise PermissionDenied(
+                f"Your account is not authorized for: {', '.join(sorted(denied))}."
+            )
+        selected = [t for t in allowed if t[0] in wanted]
+    else:
+        selected = allowed
+
+    raw_max_date = (request.query_params.get("max_date") or "").strip()
+    if raw_max_date and not re.fullmatch(r"\d{4}-\d{2}-\d{2}", raw_max_date):
+        raise ValidationError("`max_date` must be YYYY-MM-DD.")
+
+    raw_head = (request.query_params.get("item_head") or "").strip().upper()
+    if raw_head in ("", "ALL"):
+        raw_head = ""
+    elif raw_head == "OTHERS":
+        raw_head = "OTHER"
+    if raw_head and raw_head not in _OVERALL_PENDENCY_ITEM_HEADS:
+        raise ValidationError("`item_head` must be PREMIUM, COMMODITY, OTHER or ALL.")
+
+    raw_query = (request.query_params.get("q") or "").strip()
+    if len(raw_query) > 120:
+        raise ValidationError("`q` is too long.")
+
+    try:
+        limit = int(request.query_params.get("limit") or 300)
+    except (TypeError, ValueError):
+        raise ValidationError("`limit` must be a whole number.")
+    limit = max(1, min(limit, 5000))
+
+    # ── the drill path: one filter per level already picked ──────────────────
+    drill: dict[str, str] = {}
+    drill_where: list[str] = []
+    drill_params: list = []
+    for key, (col, _label) in _PENDENCY_EXPLORER_DIMS.items():
+        raw = (request.query_params.get(f"d_{key}") or "").strip()
+        if not raw:
+            continue
+        if len(raw) > 200:
+            raise ValidationError(f"`d_{key}` is too long.")
+        if key == "platform":
+            raw = raw.lower()
+            if raw not in {s for s, _n, _f in _OVERALL_PENDENCY_PLATFORMS}:
+                raise ValidationError(f"Unknown platform: {raw}.")
+            if raw not in allowed_slugs:
+                raise PermissionDenied(f"Your account is not authorized for: {raw}.")
+        drill[key] = raw
+        drill_where.append(f"{col} = %s")
+        drill_params.append(raw)
+
+    # A level already pinned by the drill path would list exactly one row, so
+    # the effective dim skips forward to the first level still unresolved.
+    remaining = [k for k in _PENDENCY_EXPLORER_DIMS if k not in drill]
+    raw_dim = (request.query_params.get("dim") or "").strip().lower()
+    if raw_dim and raw_dim != "line" and raw_dim not in _PENDENCY_EXPLORER_DIMS:
+        raise ValidationError(
+            "`dim` must be line or one of: "
+            + ", ".join(_PENDENCY_EXPLORER_DIMS)
+            + "."
+        )
+    if raw_dim == "line":
+        dim = "line"
+        dim_label = "PO line"
+    else:
+        dim = raw_dim if raw_dim and raw_dim in remaining else ""
+        if not dim:
+            dim = next(
+                (k for k in _PENDENCY_EXPLORER_LADDER if k in remaining),
+                remaining[0] if remaining else "line",
+            )
+        dim_label = (
+            _PENDENCY_EXPLORER_DIMS[dim][1] if dim != "line" else "PO line"
+        )
+
+    available = [{"slug": s, "name": n} for s, n, _f in allowed]
+    name_by_slug = {s: n for s, n, _f in _OVERALL_PENDENCY_PLATFORMS}
+    today = timezone.localdate()
+
+    # Every dim the caller may drill into next, with the current row count so
+    # the UI can label the button ("City · 24") and grey out the empty ones.
+    def _dim_options(counts: dict) -> list[dict]:
+        return [
+            {
+                "key": key,
+                "label": label,
+                "count": int(counts.get(f"n_{key}") or 0),
+                "locked": key in drill,
+                "locked_value": drill.get(key),
+            }
+            for key, (_col, label) in _PENDENCY_EXPLORER_DIMS.items()
+        ]
+
+    def _empty_payload(reason: str | None = None):
+        return Response({
+            "platforms_selected": [s for s, _n, _f in selected],
+            "available_platforms": available,
+            "item_head": raw_head or "ALL",
+            "max_date": raw_max_date or None,
+            "q": raw_query or None,
+            "dim": dim,
+            "dim_label": dim_label,
+            "drill": drill,
+            "dims": _dim_options({}),
+            "totals": _pendency_metrics({}),
+            "counts": {k: 0 for k in _PENDENCY_EXPLORER_DIMS},
+            "rows": [],
+            "rows_total": 0,
+            "truncated": False,
+            "limit": limit,
+            "by_platform": [],
+            "by_head": [],
+            "by_age": _pendency_bucket_rows([], _PENDENCY_AGE_BUCKETS),
+            "by_expiry": _pendency_bucket_rows([], _PENDENCY_EXPIRY_BUCKETS),
+            "min_po_date": None,
+            "max_po_date": None,
+            "as_of": today.isoformat(),
+            "note": reason,
+        })
+
+    if not selected:
+        return _empty_payload("No platform selected.")
+
+    union_parts, union_params = _overall_pendency_union(selected)
+    if not union_parts:
+        return _empty_payload("No platform selected.")
+
+    scope_where = ["1 = 1"]
+    scope_params: list = []
+    if raw_max_date:
+        # A line with no readable PO date cannot be proved to be on or before
+        # the cut-off, so it drops out while the cut-off is set.
+        scope_where.append("u.po_dt IS NOT NULL AND u.po_dt <= %s")
+        scope_params.append(raw_max_date)
+    if raw_head:
+        scope_where.append("u.item_head = %s")
+        scope_params.append(raw_head)
+    for clause in drill_where:
+        scope_where.append(f"u.{clause}")
+    scope_params.extend(drill_params)
+    if raw_query:
+        like = f"%{raw_query}%"
+        scope_where.append(
+            "("
+            + " OR ".join(f"u.{col} ILIKE %s" for col in _PENDENCY_EXPLORER_SEARCH_COLS)
+            + ")"
+        )
+        scope_params.extend([like] * len(_PENDENCY_EXPLORER_SEARCH_COLS))
+
+    union_sql = " UNION ALL ".join(union_parts)
+
+    # master_po is a VIEW over a multi-table join and the Amazon table is wide,
+    # so the filtered scope is materialized ONCE into a session-temp table and
+    # every aggregation below is a cheap scan of that small local copy. Dropped
+    # before create AND in the finally block, because with CONN_MAX_AGE pooling
+    # the session (and any leftover temp table) outlives the request.
+    with connection.cursor() as cur:
+        cur.execute("DROP TABLE IF EXISTS pend_explore_scope")
+        cur.execute(
+            f"CREATE TEMP TABLE pend_explore_scope AS "
+            f"SELECT u.* FROM ({union_sql}) u WHERE {' AND '.join(scope_where)}",
+            union_params + scope_params,
+        )
+
+    age_case = '''
+        CASE
+            WHEN po_dt IS NULL THEN 'unknown'
+            WHEN (%s::date - po_dt) <= 7 THEN 'd0_7'
+            WHEN (%s::date - po_dt) <= 15 THEN 'd8_15'
+            WHEN (%s::date - po_dt) <= 30 THEN 'd16_30'
+            WHEN (%s::date - po_dt) <= 60 THEN 'd31_60'
+            ELSE 'd60p'
+        END
+    '''
+    expiry_case = '''
+        CASE
+            WHEN expiry_dt IS NULL THEN 'none'
+            WHEN expiry_dt < %s::date THEN 'expired'
+            WHEN (expiry_dt - %s::date) <= 3 THEN 'e0_3'
+            WHEN (expiry_dt - %s::date) <= 7 THEN 'e4_7'
+            WHEN (expiry_dt - %s::date) <= 15 THEN 'e8_15'
+            ELSE 'e15p'
+        END
+    '''
+
+    try:
+        totals_row = _dict_rows(f'''
+            SELECT
+                {_PENDENCY_METRIC_COLS},
+                COUNT(*) FILTER (WHERE po_dt IS NULL) AS undated_lines,
+                COUNT(DISTINCT (slug || '|' || po_number))
+                    FILTER (WHERE expiry_dt IS NOT NULL AND expiry_dt < %s::date)
+                    AS expired_pos,
+                MAX(%s::date - po_dt) AS max_age_days,
+                COUNT(DISTINCT slug) AS n_platform,
+                COUNT(DISTINCT state) AS n_state,
+                COUNT(DISTINCT city) AS n_city,
+                COUNT(DISTINCT warehouse) AS n_warehouse,
+                COUNT(DISTINCT distributor) AS n_distributor,
+                COUNT(DISTINCT category) AS n_category,
+                COUNT(DISTINCT sub_category) AS n_sub_category,
+                COUNT(DISTINCT item) AS n_item,
+                COUNT(DISTINCT (slug || '|' || sku_code)) AS n_sku,
+                COUNT(DISTINCT (slug || '|' || po_number)) AS n_po,
+                TO_CHAR(MIN(po_dt), 'DD-MM-YYYY') AS min_po_date,
+                TO_CHAR(MAX(po_dt), 'DD-MM-YYYY') AS max_po_date
+            FROM pend_explore_scope
+        ''', [today, today])
+        totals = totals_row[0] if totals_row else {}
+
+        by_platform = _dict_rows(f'''
+            SELECT slug, {_PENDENCY_METRIC_COLS}
+            FROM pend_explore_scope
+            GROUP BY slug
+            {_PENDENCY_ORDER_CLAUSE}
+        ''', [])
+
+        by_head = _dict_rows(f'''
+            SELECT item_head, {_PENDENCY_METRIC_COLS}
+            FROM pend_explore_scope
+            GROUP BY item_head
+            {_PENDENCY_ORDER_CLAUSE}
+        ''', [])
+
+        by_age = _dict_rows(f'''
+            SELECT {age_case} AS bucket, {_PENDENCY_METRIC_COLS}
+            FROM pend_explore_scope
+            GROUP BY 1
+        ''', [today] * 4)
+
+        by_expiry = _dict_rows(f'''
+            SELECT {expiry_case} AS bucket, {_PENDENCY_METRIC_COLS}
+            FROM pend_explore_scope
+            GROUP BY 1
+        ''', [today] * 4)
+
+        if dim == "line":
+            # The deepest level: one row per PO line, no grouping left to do.
+            raw_rows = _dict_rows(f'''
+                SELECT
+                    slug, po_number, po_status, item, item_head, category,
+                    sub_category, sku_code, sku_name, city, state, warehouse,
+                    distributor,
+                    TO_CHAR(po_dt, 'DD-MM-YYYY') AS po_date,
+                    TO_CHAR(expiry_dt, 'DD-MM-YYYY') AS expiry_date,
+                    (expiry_dt - %s::date) AS days_to_expiry,
+                    (%s::date - po_dt) AS age_days,
+                    order_qty, delivered_qty,
+                    GREATEST(order_qty - delivered_qty, 0) AS pending_units,
+                    order_ltrs, delivered_ltrs,
+                    GREATEST(order_ltrs - delivered_ltrs, 0) AS pending_ltrs,
+                    order_value AS open_value,
+                    GREATEST(order_value - delivered_value, 0) AS pending_value
+                FROM pend_explore_scope
+                ORDER BY pending_ltrs DESC, pending_units DESC
+                LIMIT %s
+            ''', [today, today, limit])
+        else:
+            group_col = _PENDENCY_EXPLORER_DIMS[dim][0]
+            # SKU codes and PO numbers repeat across platforms, so those two
+            # levels group by (platform, value) and carry the platform with them.
+            group_sql = (
+                f"slug, {group_col}"
+                if dim in _PENDENCY_EXPLORER_PLATFORM_SCOPED
+                else group_col
+            )
+            raw_rows = _dict_rows(f'''
+                SELECT
+                    {group_col} AS label,
+                    MIN(slug) AS slug,
+                    COUNT(DISTINCT slug) AS platform_count,
+                    STRING_AGG(DISTINCT slug, ',' ORDER BY slug) AS platform_slugs,
+                    MIN(item_head) AS item_head,
+                    COUNT(DISTINCT item_head) AS head_count,
+                    COUNT(DISTINCT item) AS items,
+                    COUNT(DISTINCT (slug || '|' || sku_code)) AS skus,
+                    COUNT(DISTINCT city) AS cities,
+                    COUNT(DISTINCT warehouse) AS warehouses,
+                    COUNT(DISTINCT distributor) AS distributors,
+                    MIN(city) AS first_city,
+                    MIN(warehouse) AS first_warehouse,
+                    MIN(distributor) AS first_distributor,
+                    MIN(sku_name) AS first_sku_name,
+                    MIN(po_status) AS first_po_status,
+                    MAX(%s::date - po_dt) AS age_days,
+                    MIN(expiry_dt - %s::date) AS days_to_expiry,
+                    TO_CHAR(MIN(po_dt), 'DD-MM-YYYY') AS po_date,
+                    TO_CHAR(MIN(expiry_dt), 'DD-MM-YYYY') AS expiry_date,
+                    {_PENDENCY_METRIC_COLS}
+                FROM pend_explore_scope
+                GROUP BY {group_sql}
+                {_PENDENCY_ORDER_CLAUSE}
+                LIMIT %s
+            ''', [today, today, limit])
+    finally:
+        with connection.cursor() as cur:
+            cur.execute("DROP TABLE IF EXISTS pend_explore_scope")
+
+    counts = {
+        key: int(totals.get(f"n_{key}") or 0) for key in _PENDENCY_EXPLORER_DIMS
+    }
+    rows_total = counts.get(dim, int(totals.get("lines") or 0))
+    if dim == "line":
+        rows_total = int(totals.get("lines") or 0)
+
+    rows_out: list[dict] = []
+    if dim == "line":
+        for row in raw_rows:
+            slug = row.get("slug")
+            rows_out.append({
+                "key": f"{slug}|{row.get('po_number')}|{row.get('sku_code')}",
+                "label": row.get("sku_name") or row.get("item") or "-",
+                "slug": slug,
+                "platform_name": name_by_slug.get(slug, slug),
+                "po_number": row.get("po_number"),
+                "po_status": row.get("po_status"),
+                "po_date": row.get("po_date"),
+                "expiry_date": row.get("expiry_date"),
+                "days_to_expiry": (
+                    None if row.get("days_to_expiry") is None
+                    else int(row["days_to_expiry"])
+                ),
+                "age_days": (
+                    None if row.get("age_days") is None else int(row["age_days"])
+                ),
+                "item": row.get("item"),
+                "item_head": row.get("item_head"),
+                "category": row.get("category"),
+                "sub_category": row.get("sub_category"),
+                "sku_code": row.get("sku_code"),
+                "sku_name": row.get("sku_name"),
+                "city": row.get("city"),
+                "state": row.get("state"),
+                "warehouse": row.get("warehouse"),
+                "distributor": row.get("distributor"),
+                "open_units": _num(row.get("order_qty")),
+                "delivered_units": _num(row.get("delivered_qty")),
+                "pending_units": _num(row.get("pending_units")),
+                "open_ltrs": _num(row.get("order_ltrs")),
+                "delivered_ltrs": _num(row.get("delivered_ltrs")),
+                "pending_ltrs": _num(row.get("pending_ltrs")),
+                "open_value": _num(row.get("open_value")),
+                "pending_value": _num(row.get("pending_value")),
+                "open_pos": 1,
+                "lines": 1,
+                # A line is the bottom of the drill — nothing left to open.
+                "drill": None,
+            })
+    else:
+        for row in raw_rows:
+            label = row.get("label")
+            slug = row.get("slug")
+            slugs = [s for s in (row.get("platform_slugs") or "").split(",") if s]
+            # What the caller must add to its filter path to open this row.
+            step = {dim: label}
+            if dim in _PENDENCY_EXPLORER_PLATFORM_SCOPED:
+                step["platform"] = slug
+            rows_out.append({
+                "key": (
+                    f"{slug}|{label}"
+                    if dim in _PENDENCY_EXPLORER_PLATFORM_SCOPED
+                    else str(label)
+                ),
+                "label": label,
+                "slug": slug if dim == "platform" or len(slugs) == 1 else None,
+                "platform_name": (
+                    name_by_slug.get(label, label) if dim == "platform"
+                    else ", ".join(name_by_slug.get(s, s) for s in slugs)
+                ),
+                "platform_count": int(row.get("platform_count") or 0),
+                "platform_slugs": slugs,
+                # Only meaningful when every line under the row shares one head.
+                "item_head": (
+                    (row.get("item_head") or "OTHER")
+                    if int(row.get("head_count") or 0) == 1 else "MIXED"
+                ),
+                "items": int(row.get("items") or 0),
+                "skus": int(row.get("skus") or 0),
+                "cities": int(row.get("cities") or 0),
+                "warehouses": int(row.get("warehouses") or 0),
+                "distributors": int(row.get("distributors") or 0),
+                "city": row.get("first_city"),
+                "warehouse": row.get("first_warehouse"),
+                "distributor": row.get("first_distributor"),
+                "sku_name": row.get("first_sku_name"),
+                "po_status": row.get("first_po_status"),
+                "po_date": row.get("po_date"),
+                "expiry_date": row.get("expiry_date"),
+                "days_to_expiry": (
+                    None if row.get("days_to_expiry") is None
+                    else int(row["days_to_expiry"])
+                ),
+                "age_days": (
+                    None if row.get("age_days") is None else int(row["age_days"])
+                ),
+                "drill": step,
+                **_pendency_metrics(row),
+            })
+
+    return Response({
+        "platforms_selected": [s for s, _n, _f in selected],
+        "available_platforms": available,
+        "item_head": raw_head or "ALL",
+        "max_date": raw_max_date or None,
+        "q": raw_query or None,
+        "dim": dim,
+        "dim_label": dim_label,
+        "drill": drill,
+        "dims": _dim_options(totals),
+        "totals": {
+            **_pendency_metrics(totals),
+            "undated_lines": int(totals.get("undated_lines") or 0),
+            "expired_pos": int(totals.get("expired_pos") or 0),
+            "max_age_days": (
+                None if totals.get("max_age_days") is None
+                else int(totals["max_age_days"])
+            ),
+        },
+        "counts": counts,
+        "rows": rows_out,
+        "rows_total": rows_total,
+        "truncated": len(rows_out) >= limit and rows_total > len(rows_out),
+        "limit": limit,
+        "by_platform": [
+            {
+                "slug": r.get("slug"),
+                "name": name_by_slug.get(r.get("slug"), r.get("slug")),
+                **_pendency_metrics(r),
+            }
+            for r in by_platform
+        ],
+        "by_head": [
+            {"item_head": r.get("item_head"), **_pendency_metrics(r)}
+            for r in by_head
+        ],
+        "by_age": _pendency_bucket_rows(by_age, _PENDENCY_AGE_BUCKETS),
+        "by_expiry": _pendency_bucket_rows(by_expiry, _PENDENCY_EXPIRY_BUCKETS),
+        "min_po_date": totals.get("min_po_date"),
+        "max_po_date": totals.get("max_po_date"),
+        "as_of": today.isoformat(),
+        # Amazon has no tax-inclusive amount columns, so its share of every
+        # value figure here is tax-exclusive. Same caveat as the flat table.
+        "value_basis": "master_po inclusive; Amazon exclusive",
     })
 
 
