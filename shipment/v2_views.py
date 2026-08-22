@@ -67,6 +67,7 @@ from .views import (
     _reserved_stock_by_asin,
     _row_eligibility_reason,
     _row_to_dict,
+    _shippable_units,
     _SafeAPIView,
     _safe_int,
     _serialize_row,
@@ -1493,7 +1494,7 @@ class V2PoBookView(_SafeAPIView):
 #                   the truck evenly between them.
 #   priority        SLICE. Carve capacity by item head (Premium / Commodity /
 #                   Other) and pack each slice from its own bucket.
-V2_STRATEGIES = ('doh', 'with_stock', 'without_stock', 'focus', 'priority')
+V2_STRATEGIES = ('doh', 'tonnage', 'with_stock', 'without_stock', 'focus', 'priority')
 
 # Truck sizes the picker offers, in litres (1 tonne = 1000 L — the convention the
 # TONNES column and every planner label already use). The endpoint accepts any
@@ -1709,6 +1710,196 @@ def _even_share_product_key(item, products, asins):
         return a if a in asins else None
     key = _product_of(item)
     return key if key in products else None
+
+
+# ── Tonnage filling ─────────────────────────────────────────────────────────
+
+def _tonnage_blend(items, capacity, allowed_units, allowed_cartons):
+    """Cap each line so the truck lands on its LITRE ceiling and its UNIT ceiling
+    together, by blending pack sizes. Returns the figures it worked with, or None
+    when no blend is possible or needed.
+
+    THE PROBLEM. A truck has three ceilings and filling one starves the others.
+    An 18,000 L truck against a 10,000-unit commitment needs an average of 1.68 L
+    per unit to reach both; a 1 L SKU delivers 1.00. Because the fill order is
+    biggest-line-first and the biggest open POs are 1 L, the truck spent the whole
+    unit commitment on 1 L and stopped at 10,700 L -- 59 per cent of its tonnage --
+    with 230,575 L of 5 L product untouched in the pool.
+
+    WHY ORDERING ALONE CANNOT FIX IT. Sorting densest-first fills the tonnage, but
+    lands 3,600 units against a 10,700 allowance: nothing tells the packer to stop
+    reaching for 5 L once it has enough, so two thirds of the commitment goes
+    unused and the appointment needs a second truck it should not have needed.
+
+    WHAT THIS DOES. Splits the pool at the target density, works out how many
+    units to draw from each side so both ceilings are met at once, and writes the
+    answer to `blend_cap` per line. Measured on CORE against a 10,000 u /
+    1,000 ctn appointment and an 18 T truck: 10,700 L and 59 per cent becomes
+    18,000 L and 100 per cent, at 82 per cent of the unit commitment.
+
+    Lines outside the budget are left UNCAPPED and sorted last by the companion
+    key below, so they top up anything the blend leaves behind rather than being
+    refused with a reason nobody asked for.
+    """
+    cap_l = _num(capacity)
+    au = _num(allowed_units)
+    ac = _num(allowed_cartons)
+    if cap_l <= 0 or au <= 0:
+        # No unit commitment to balance against -- densest-first is already
+        # optimal, and there is nothing to trade off.
+        return None
+
+    live = [it for it in items if _num(it.get('per_liter')) > 0 and _shippable_units(it) > 0]
+    if not live:
+        return None
+
+    target = cap_l / au
+    heavy = [it for it in live if _num(it.get('per_liter')) >= target]
+    light = [it for it in live if _num(it.get('per_liter')) < target]
+
+    def _avg(group):
+        u = sum(_shippable_units(i) for i in group)
+        return (sum(_shippable_units(i) * _num(i.get('per_liter')) for i in group) / u) if u else 0.0
+
+    d, g = _avg(heavy), _avg(light)
+    if not heavy or not light or abs(d - g) < 1e-9:
+        # One-sided pool. Nothing to blend: either everything is dense enough
+        # (the truck will fill on its own) or nothing is (it arithmetically
+        # cannot, and the panel says so before the button is pressed).
+        return {
+            'target_l_per_unit': round(target, 4),
+            'heavy_units': None, 'light_units': None,
+            'heavy_avg_l_per_unit': round(d, 4) if heavy else None,
+            'light_avg_l_per_unit': round(g, 4) if light else None,
+            'blended': False,
+        }
+
+    # ── Solve for the mix ────────────────────────────────────────────────────
+    #
+    # Three ceilings, two groups: maximise litres subject to
+    #
+    #     x + y            <= au          (units the appointment allows)
+    #     ch*x + cl*y      <= ac          (cartons it allows)
+    #     d*x  + g*y       <= cap_l       (the truck)
+    #     0 <= x <= heavy available, 0 <= y <= light available
+    #
+    # A two-variable linear program, so its optimum sits on a vertex and the
+    # vertices can simply be enumerated. That matters more than it sounds: the
+    # naive version of this solved units-and-litres and then "corrected" for
+    # cartons by assuming heavy packs are the carton-efficient ones. They are not.
+    # On live stock the available heavy packs carry 8.5 L per carton and the light
+    # ones 17.5, so cartons pull the mix toward LIGHT while litres pull it toward
+    # HEAVY, and the two-equation fallback returned 17,329 light units against a
+    # 10,700 unit cap -- an infeasible answer that looked like an answer.
+    def _cartons_per(group):
+        tot = sum(_shippable_units(i) for i in group)
+        if tot <= 0:
+            return 0.0
+        return sum(
+            _shippable_units(i) / max(1.0, _num(i.get('case_pack'), 1.0)) for i in group
+        ) / tot
+
+    ch, cl = _cartons_per(heavy), _cartons_per(light)
+    hu = sum(_shippable_units(i) for i in heavy)
+    lu = sum(_shippable_units(i) for i in light)
+
+    def _feasible(x, y):
+        if x < -1e-6 or y < -1e-6:
+            return False
+        if x > hu + 1e-6 or y > lu + 1e-6:
+            return False
+        if x + y > au + 1e-6:
+            return False
+        if ac > 0 and ch * x + cl * y > ac + 1e-6:
+            return False
+        return d * x + g * y <= cap_l + 1e-6
+
+    def _solve(a1, b1, c1, a2, b2, c2):
+        det = a1 * b2 - a2 * b1
+        if abs(det) < 1e-12:
+            return None
+        return ((c1 * b2 - c2 * b1) / det, (a1 * c2 - a2 * c1) / det)
+
+    rows = [(1.0, 1.0, au)]                       # units
+    if ac > 0:
+        rows.append((ch, cl, ac))                 # cartons
+    rows.append((d, g, cap_l))                    # the truck
+
+    cands = [(0.0, 0.0)]
+    for i in range(len(rows)):
+        a1, b1, c1 = rows[i]
+        # Each constraint alone, against each axis and each group ceiling.
+        if a1 > 0:
+            cands.append((c1 / a1, 0.0))
+        if b1 > 0:
+            cands.append((0.0, c1 / b1))
+        for bound in (hu, lu):
+            if b1 > 0:
+                cands.append((bound, (c1 - a1 * bound) / b1))
+            if a1 > 0:
+                cands.append(((c1 - b1 * bound) / a1, bound))
+        for j in range(i + 1, len(rows)):
+            hit = _solve(a1, b1, c1, *rows[j])
+            if hit:
+                cands.append(hit)
+
+    best = (0.0, 0.0)
+    best_l = -1.0
+    for x0, y0 in cands:
+        if not _feasible(x0, y0):
+            continue
+        lit = d * x0 + g * y0
+        # Prefer more litres; break ties toward more UNITS, because two mixes that
+        # fill the truck equally are not equal -- the one that also spends more of
+        # the appointment leaves less for a second truck.
+        if lit > best_l + 1e-6 or (abs(lit - best_l) <= 1e-6 and (x0 + y0) > (best[0] + best[1])):
+            best, best_l = (x0, y0), lit
+    x, y = best
+
+    def _allocate(group, budget, key):
+        """Hand `budget` units out across a group, in the given order."""
+        left = budget
+        for it in sorted(group, key=key):
+            if left <= 0:
+                break
+            take = min(_shippable_units(it), left)
+            it['blend_cap'] = take
+            left -= take
+
+    _allocate(heavy, x, lambda i: (-_num(i.get('per_liter')), -_shippable_units(i)))
+    _allocate(light, y, lambda i: (-_shippable_units(i),))
+
+    # DELIBERATELY NOT REPORTING A PREDICTED TONNAGE. The solve works on each
+    # group's AVERAGE density, while the packer then picks the densest actual
+    # lines inside each group -- so the real load beats the estimate (17,261 L
+    # against a solve that said 13,767). Publishing the estimate would have the
+    # panel contradict the truck. What actually bound the finished load is
+    # measured after packing and reported in `limits`.
+    return {
+        'target_l_per_unit': round(target, 4),
+        'heavy_units': int(round(x)),
+        'light_units': int(round(y)),
+        'heavy_avg_l_per_unit': round(d, 4),
+        'light_avg_l_per_unit': round(g, 4),
+        'heavy_l_per_carton': round(d / ch, 2) if ch else None,
+        'light_l_per_carton': round(g / cl, 2) if cl else None,
+        'blended': True,
+    }
+
+
+def _tonnage_sort_key(item):
+    """Budgeted lines first, densest of those leading; everything else last.
+
+    The budget is what produces the blend, but the ORDER is what stops a line the
+    blend allowed nothing for from taking litres before a line it did. Unbudgeted
+    lines keep their place at the back as top-up.
+    """
+    cap = item.get('blend_cap')
+    return (
+        0 if cap is not None else 1,
+        -_num(item.get('per_liter')),
+        -_shippable_units(item),
+    )
 
 
 def _fill_candidates(channel, fc_preference, selected_pos, families, asins):
@@ -1945,6 +2136,29 @@ class V2FillView(_SafeAPIView):
         # claiming to be biggest-first.
         items.sort(key=order_key)
 
+        # TONNAGE FILLING. Runs here and not earlier because the blend divides up
+        # units that can ACTUALLY ship: before the stock pass every line still
+        # looks like its ordered quantity, and a mix solved on those would hand
+        # the heavy budget to lines with nothing behind them.
+        # Fetched once, here: the blend needs the ceilings to solve against and
+        # the trimmer below needs the same figures to enforce them. Two lookups
+        # could disagree if the row changed between them.
+        commit = _appointment_commit(appointment_id)
+        allowed_u = _num((commit or {}).get('units')) * CAP_TOLERANCE
+        allowed_c = _num((commit or {}).get('cartons')) * CAP_TOLERANCE
+
+        blend_meta = None
+        if 'tonnage' in strategies:
+            blend_meta = _tonnage_blend(items, capacity, allowed_u, allowed_c)
+            # The blend decides the mix; this decides who gets the litres first.
+            items.sort(key=_tonnage_sort_key)
+            # AND THE TRIMMER HAS TO KNOW. `_enforce_commit_caps` spends the
+            # commitment in the order it is given and trims whatever is last, so
+            # handing it the old key would fill the truck by the blend and then
+            # cut it back by line size -- the exact mismatch that function's own
+            # docstring warns about.
+            order_key = _tonnage_sort_key
+
         # Even share across the chosen products. Packs beat families as the unit
         # of the split: picking MUSTARD 5L and SUNFLOWER 5L asks for half a truck
         # of each of THOSE, not of every mustard and every sunflower on the sheet.
@@ -2026,7 +2240,6 @@ class V2FillView(_SafeAPIView):
         # is given and whatever is last gets trimmed, so passing a different key
         # would fill the truck by one rule and cut it back by another — the DOH
         # fill would load nearest-to-stockout first and then trim by size.
-        commit = _appointment_commit(appointment_id)
         if commit and (commit.get('units') or commit.get('cartons')):
             for it in loaded:
                 # The caps are keyed by appointment and 2.0 plans against exactly
@@ -2097,6 +2310,10 @@ class V2FillView(_SafeAPIView):
             # of its litres because the unit commitment is full is a finished
             # truck, not a failed fill, and the screen could not tell.
             'limits': _fill_limits(summary, capacity, commit),
+            # What the pack-size blend worked with, so the panel can say "this
+            # truck needs 1.68 L per unit" rather than leaving a 59 per cent load
+            # to be puzzled over. Null unless tonnage filling was asked for.
+            'blend': blend_meta,
             'priority_actual': priority_actual,
             'product_split': product_split,
             'strategies': strategies,
