@@ -285,6 +285,48 @@ def _fill_limits(summary, capacity, commit):
     }
 
 
+def _dispatched_by_po_asin(po_uppers):
+    """Units SAP has already DISPATCHED, per (ASIN_UPPER, PO_UPPER).
+
+    A lookup rather than another expression, because `_DISPATCHED_SHARE_CTE` is
+    the canonical split and this reuses it verbatim. Writing a correlated copy of
+    it for the book query would mean two versions of a rule with a subtle
+    tie-break in it (closed lines absorb the dispatched pool before still-open
+    siblings), and the two would drift.
+
+    DISPATCHED, NOT INVOICED, and that distinction is the whole point. An invoice
+    raised against units still sitting in the warehouse has not moved them —
+    sap/billing.py says so deliberately — so netting off the invoiced figure
+    declares stock gone that a truck can still legally carry. On 6UBY3GCZ /
+    B0821DNF2W that was the difference between offering 5,000 units and offering
+    8 of them.
+    """
+    keys = sorted({str(p or '').strip().upper() for p in (po_uppers or []) if str(p or '').strip()})
+    if not keys:
+        return {}
+    try:
+        with transaction.atomic():
+            with connection.cursor() as cur:
+                _no_jit(cur)
+                cur.execute(f"""
+                    WITH dispatched_share AS ({_DISPATCHED_SHARE_CTE})
+                    SELECT po_upper, asin_upper, dispatched_qty
+                    FROM dispatched_share
+                    WHERE po_upper = ANY(%s::text[])
+                """, [keys])
+                return {
+                    (str(r['asin_upper'] or ''), str(r['po_upper'] or '')): _num(r['dispatched_qty'])
+                    for r in _row_to_dict(cur, cur.fetchall())
+                }
+    except Exception:
+        # Fail CLOSED is not an option here: an empty map would net nothing off
+        # and the book would offer units that have already left. Re-raised so the
+        # endpoint's own error handling reports it rather than quietly
+        # over-offering stock.
+        logger.exception('v2 book: dispatched share unavailable')
+        raise
+
+
 def _book_stock_meta():
     """Freshness of the live-stock snapshot the book's gp_stock column came from.
 
@@ -1253,6 +1295,11 @@ class V2PoBookView(_SafeAPIView):
         claim = _claim_state_by_line({
             str(ln.get('po_number') or '').strip().upper() for ln in lines
         })
+        # What SAP has already sent out, per line. Fetched alongside the claims
+        # because the ceiling below needs both.
+        dispatched_map = _dispatched_by_po_asin({
+            str(ln.get('po_number') or '').strip().upper() for ln in lines
+        })
         for ln in lines:
             key = (
                 str(ln.get('asin') or '').strip().upper(),
@@ -1267,28 +1314,36 @@ class V2PoBookView(_SafeAPIView):
             ln['known_to_amazon'] = 'ordered_qty' in st
             accepted = _num(ln.get('accepted_qty'))
             received = _num(ln.get('received_qty'))
-            invoiced = _num(ln.get('invoiced_qty'))
+            dispatched = _num(dispatched_map.get(key))
             claimed = _num(st.get('claimed_qty'))
+            # Carried on the line so the screen can show WHY a ceiling is lower
+            # than the ordered quantity without guessing.
+            ln['dispatched_qty'] = dispatched
             # THE CEILING: what Amazon accepted, less what has already GONE, less
             # what other live shipments are holding. Never negative -- an
             # over-claimed line is at zero, not at a negative allowance.
             #
-            # "Gone" is max(received, invoiced), and the invoiced half was missing.
-            # Express has always planned net of billing (_POOL_UNITS is accepted
-            # less billed); the hand picker did not, so the two disagreed about the
-            # same line. Measured on the CORE book: 46 of 247 lines offered more
-            # than was left, 36,285 units in total. The worst was 3QR7SEEJ /
-            # B0CKFFW9B6 - accepted 8,113, invoiced 8,112, received 0 - where the
-            # picker offered all 8,113 and one unit was actually left. Those units
-            # are billed and shipped; loading them again ships them twice.
+            # "GONE" IS max(received, DISPATCHED) -- not invoiced.
             #
-            # MAX, not a sum. Invoicing and receiving describe the same units at
-            # two stages, so adding them subtracts the same stock twice: 4H6S3PSB
-            # is accepted 12,000, received 3,897, invoiced 9,900, where the answer
-            # is 2,100 and a sum gives 0. Both orders occur in the data - 46 lines
-            # invoiced ahead of received, 6 received ahead of invoiced - so it has
-            # to be whichever is further along, not either one alone.
-            ln['claimable_qty'] = max(0.0, accepted - max(received, invoiced) - claimed)
+            # This netted off `invoiced_qty` and that was wrong in the expensive
+            # direction. An invoice raised against units still standing in the
+            # warehouse has not moved them: sap/billing.py computes
+            # `dispatched_qty` precisely to separate the two, and says so -- a
+            # credit note frees dispatched units first because the goods came
+            # back. Netting off the invoiced figure declared that stock gone and
+            # cut real lines to nothing: 6UBY3GCZ / B0821DNF2W is accepted 5,000,
+            # invoiced 4,992, DISPATCHED 0, and the picker offered 8 units of it.
+            # Express planned all 5,000, the picker clamped it to 8, and a 50/50
+            # truck came back 100 per cent Commodity.
+            #
+            # Two other surfaces already read it this way -- the fill pool and the
+            # appointment drawer both net accepted less dispatched -- so the book
+            # was the one out of step, not them.
+            #
+            # MAX, not a sum: receiving and dispatching describe the same units
+            # from the two ends of the same journey, so adding them subtracts the
+            # same stock twice. Whichever is further along is the truth.
+            ln['claimable_qty'] = max(0.0, accepted - max(received, dispatched) - claimed)
 
         groups: dict[str, dict] = {}
         for line in lines:
@@ -1541,11 +1596,28 @@ _POOL_WHERE = (
     "p.per_liter IS NOT NULL",
     "p.per_liter > 0",
     "lp.asin IS NULL",
-    "(p.accepted_qty - COALESCE(b.billed_qty, 0)) > 0",
+    # Must be the same arithmetic as _POOL_UNITS below, or the pool offers rows
+    # whose own figure is zero.
+    ("(p.accepted_qty - GREATEST(COALESCE(p.received_qty, 0),"
+     " COALESCE(b.billed_qty, 0))) > 0"),
 )
 
-# Units still shippable on a pool row: ordered, less what SAP already dispatched.
-_POOL_UNITS = 'GREATEST(p.accepted_qty - COALESCE(b.billed_qty, 0), 0)'
+# UNITS STILL SHIPPABLE ON A POOL ROW: ordered, less whatever is further along of
+# what Amazon has RECEIVED and what SAP has DISPATCHED.
+#
+# `b.billed_qty` is a misleading name for what that CTE builds -- it is the
+# dispatched share, capped and split across sibling ASINs (see _POOL_CTES) -- and
+# netting it off was already right. What was missing is `received_qty`: Amazon's
+# own count of what it has taken in. On 6Y294ATO / B0992GRH3Z that is accepted
+# 10,000, received 7,730, dispatched 0, and the pool offered all 10,000 -- 7,730
+# units Amazon already had.
+#
+# MAX, not a sum: receiving and dispatching are the two ends of one journey, so
+# adding them subtracts the same units twice. This is now character-for-character
+# the rule the book's claimable_qty applies, which is the point -- Express must
+# never plan a quantity the picker will refuse.
+_POOL_UNITS = ('GREATEST(p.accepted_qty - GREATEST(COALESCE(p.received_qty, 0),'
+               ' COALESCE(b.billed_qty, 0)), 0)')
 
 
 # ── Which products, by sub-category ──────────────────────────────────────────
