@@ -131,6 +131,30 @@ FG_WAREHOUSE_CODES: tuple[str, ...] = (
 # OITB item-group name that marks a finished good (matched case-insensitively).
 FG_GROUP_NAME = "FINISHED"
 
+# FG_WAREHOUSE_CODES above is the MART book's curated list. The oil book — shown
+# in the UI as "Wellness" — keeps its finished goods in an entirely different set
+# of godowns: BH-BT, BH-PF, BH-SC and GP-FG alone hold ~95% of its finished
+# stock and NONE of them appear in the mart list. Reusing that list against oil
+# showed 4 warehouses out of 16 and hid ~98% of the stock, so oil is discovered
+# from the data instead.
+#
+# `None` means "no whitelist" — take every warehouse the book actually stocks
+# finished goods in. Discovery is deliberately chosen over a second hand-written
+# list: a curated list that silently drops a real godown is exactly the failure
+# this comment exists to prevent. If a warehouse should be excluded from the
+# Wellness dashboard (e.g. BH-WST "wastage"), replace the None with an explicit
+# tuple rather than filtering it out somewhere downstream.
+FG_WAREHOUSE_CODES_BY_SOURCE: dict[str, tuple[str, ...] | None] = {
+    "mart": FG_WAREHOUSE_CODES,
+    "oil": None,
+}
+
+
+def fg_warehouse_codes(source: str) -> tuple[str, ...] | None:
+    """Candidate FG warehouse codes for a company book, or None to discover
+    them from the data. Unknown sources fall back to the mart list."""
+    return FG_WAREHOUSE_CODES_BY_SOURCE.get(source, FG_WAREHOUSE_CODES)
+
 # Match an FG warehouse code named in free text: 'dl fg' / 'dl-fg' / 'DLFG' ->
 # 'DL-FG'. Longest codes first (in the alternation) so 'BH-FGM' wins over
 # 'BH-FG', and the word-boundary lookarounds stop a shorter code from matching

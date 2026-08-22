@@ -19,11 +19,11 @@ from config.perf_cache import cached_get
 from .litres import is_litre_flag, row_litres
 from .service import (
     FG_GROUP_NAME,
-    FG_WAREHOUSE_CODES,
     HANA_SCHEMAS,
     SALES_ANALYSIS_DEFAULT_SOURCE,
     SALES_ANALYSIS_PROC_TTL,
     SALES_ANALYSIS_PROCEDURES,
+    fg_warehouse_codes,
     report_sales_analysis_live,
     resolve_schema,
     select,
@@ -1112,11 +1112,15 @@ def inventory_warehouse_comparison(request):
 
 
 # ─── /inventory-finished-goods ───
-# Pivot view for the JM Inventory Dashboard: rows are FINISHED-group items
-# (sub_group / variety / item code / name) and columns are the fixed warehouse
-# code list (FG_WAREHOUSE_CODES, from sap.service). Cell = OnHand for that
-# item × warehouse. Includes a per-row Grand Total. Reads mart or oil schema
-# via ?source=.
+# Pivot view for the Mart / Wellness Inventory Dashboard: rows are FINISHED-group
+# items (sub_group / variety / item code / name) and columns are warehouse codes.
+# Cell = OnHand for that item × warehouse, plus a per-row Grand Total. Reads the
+# mart or oil schema via ?source=.
+#
+# Which warehouses become columns depends on the book (fg_warehouse_codes, from
+# sap.service): mart uses its curated list, oil ("Wellness") has none and is
+# discovered from the data — the two books share almost no godowns, so mart's
+# list against oil would have hidden ~98% of its stock.
 #
 # Cells stay in UNITS. The per-item conversion factors travel alongside instead
 # (`IsLitre` + `SalPackUn` for litres, `Price` for value), so the dashboard's
@@ -1127,8 +1131,15 @@ def inventory_warehouse_comparison(request):
 @cached_get(timeout=120, prefix="sap.inventory_finished_goods")
 def inventory_finished_goods(request):
     source, schema = resolve_schema(request.query_params.get("source"))
-    placeholders = ",".join(["?"] * len(FG_WAREHOUSE_CODES))
-    params: list = [FG_GROUP_NAME, *FG_WAREHOUSE_CODES]
+    # mart ships a curated warehouse list; oil ("Wellness") has none, so its
+    # columns are whatever the book actually stocks (see sap.service).
+    whitelist = fg_warehouse_codes(source)
+    params: list = [FG_GROUP_NAME]
+    whs_filter = ""
+    if whitelist:
+        placeholders = ",".join(["?"] * len(whitelist))
+        whs_filter = f'AND T1."WhsCode" IN ({placeholders})'
+        params.extend(whitelist)
 
     rows = _run(
         f"""
@@ -1146,7 +1157,7 @@ def inventory_finished_goods(request):
         INNER JOIN OITW T1 ON T1."ItemCode" = T0."ItemCode"
         LEFT  JOIN OITB T3 ON T3."ItmsGrpCod" = T0."ItmsGrpCod"
         WHERE UPPER(T3."ItmsGrpNam") = ?
-          AND T1."WhsCode" IN ({placeholders})
+          {whs_filter}
         GROUP BY T0."ItemCode", T0."ItemName", T0."U_Sub_Group",
                  T0."U_Variety", T0."U_IsLitre", T0."SalPackUn",
                  T0."LastPurPrc", T1."WhsCode"
@@ -1154,6 +1165,18 @@ def inventory_finished_goods(request):
         params,
         schema=schema,
     )
+
+    # Column candidates. With a whitelist the curated order is kept as-is; with
+    # none, the book's own warehouses are ordered biggest-holding first so the
+    # godowns that matter sit leftmost in a table that scrolls sideways.
+    if whitelist:
+        candidates: tuple[str, ...] = tuple(whitelist)
+    else:
+        seen_totals: dict[str, float] = {}
+        for r in rows:
+            code = r["WhsCode"]
+            seen_totals[code] = seen_totals.get(code, 0.0) + float(r.get("OnHand") or 0)
+        candidates = tuple(sorted(seen_totals, key=lambda w: (-seen_totals[w], w)))
 
     # Pivot to one row per item with a warehouses dict + grand_total.
     pivot: dict[str, dict] = {}
@@ -1172,7 +1195,7 @@ def inventory_finished_goods(request):
                 "IsLitre": is_litre_flag(r.get("IsLitre")),
                 "SalPackUn": _num(r.get("SalPackUn")),
                 "Price": _num(r.get("Price")),
-                "warehouses": {w: 0 for w in FG_WAREHOUSE_CODES},
+                "warehouses": {w: 0 for w in candidates},
                 "grand_total": 0,
             }
             pivot[code] = entry
@@ -1189,7 +1212,7 @@ def inventory_finished_goods(request):
         ),
     )
 
-    column_totals = {w: 0.0 for w in FG_WAREHOUSE_CODES}
+    column_totals = {w: 0.0 for w in candidates}
     grand_total = 0.0
     for it in items:
         for w, v in it["warehouses"].items():
@@ -1205,7 +1228,7 @@ def inventory_finished_goods(request):
     # in against one item and out against another can total exactly zero while
     # the warehouse is still holding real rows, and that column must stay.
     stocked = {w for it in items for w, v in it["warehouses"].items() if v}
-    active = [w for w in FG_WAREHOUSE_CODES if w in stocked]
+    active = [w for w in candidates if w in stocked]
     for it in items:
         it["warehouses"] = {w: it["warehouses"][w] for w in active}
     column_totals = {w: column_totals[w] for w in active}
