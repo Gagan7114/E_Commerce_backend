@@ -1196,10 +1196,24 @@ def inventory_finished_goods(request):
             column_totals[w] += v
         grand_total += it["grand_total"]
 
+    # A warehouse this book never stocks would add a column of blanks to a table
+    # that already scrolls sideways, so it is dropped from the response outright.
+    # The dashboard's columns and its warehouse picker read this same list, so
+    # they cannot disagree about which warehouses exist.
+    #
+    # The test is "any non-zero CELL", not "non-zero column total": stock booked
+    # in against one item and out against another can total exactly zero while
+    # the warehouse is still holding real rows, and that column must stay.
+    stocked = {w for it in items for w, v in it["warehouses"].items() if v}
+    active = [w for w in FG_WAREHOUSE_CODES if w in stocked]
+    for it in items:
+        it["warehouses"] = {w: it["warehouses"][w] for w in active}
+    column_totals = {w: column_totals[w] for w in active}
+
     return Response({
         "source": source,
         "sources": sorted(HANA_SCHEMAS),
-        "warehouses": list(FG_WAREHOUSE_CODES),
+        "warehouses": active,
         "group": FG_GROUP_NAME,
         "items": items,
         "column_totals": column_totals,

@@ -109,11 +109,22 @@ HANA_SCHEMAS: dict[str, str] = {
 }
 DEFAULT_SOURCE = "mart"
 
-# Finished-goods warehouse codes shown as the columns of the JM Inventory
-# dashboard's FG pivot. Single source of truth: the dashboard view
+# Finished-goods warehouse codes the JM Inventory dashboard's FG pivot may show
+# as columns. Single source of truth: the dashboard view
 # (sap.views.inventory_finished_goods) and the chatbot's jm_inventory tool +
 # NLU both import these so they never drift apart.
+#
+# This is the CANDIDATE list, not the rendered one — the view drops any code
+# holding no stock in the book being read, so an always-empty warehouse never
+# costs a column (see inventory_finished_goods).
+#
+# GP-FGM ("GUPTA FINISHED GOODS MART") leads because it is the largest finished-
+# goods holder by a wide margin and the single warehouse the Amazon shipment
+# planner ships from (shipment.views.PLANNER_WAREHOUSE). It was added to the
+# planner in fe93d7b but missed here, so the dashboard reported ~16% of mart
+# finished goods for three weeks. Verified against SAP OWHS: active, mart book.
 FG_WAREHOUSE_CODES: tuple[str, ...] = (
+    "GP-FGM",
     "BH-FGM", "DL-MP", "DL-EC", "DL-GR", "DL-FG", "BH-JM",
     "FBF-HR", "KT-FG", "DL-INT", "KT-FBF", "PB-FG", "BH-GR", "BH-FG",
 )
