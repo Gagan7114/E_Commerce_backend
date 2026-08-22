@@ -113,6 +113,11 @@ urlpatterns = [
         name="platform-monthly-sales-explorer",
     ),
     path(
+        "<slug:slug>/primary/monthly-explorer",
+        views.platform_primary_monthly_explorer,
+        name="platform-primary-monthly-explorer",
+    ),
+    path(
         "bigbasket/range-dashboard",
         views.bigbasket_range_dashboard,
         {"slug": "bigbasket"},

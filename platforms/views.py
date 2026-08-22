@@ -14526,6 +14526,377 @@ def _monthly_sales_explorer_response(request, slug: str):
     })
 
 
+# ── Primary Monthly Explorer ───────────────────────────────────
+# The Monthly Sales Explorer's Primary twin. Same shape as the Secondary one —
+# a set of whole months, one chart point per month, a sortable item table and
+# per-month averages — but the numbers come from master_po rather than
+# secmaster_mv, and that changes two things:
+#
+# 1. A Primary row carries TWO figures, not one: what the platform ORDERED and
+#    what was actually DELIVERED (plus the pending gap between them). Neither is
+#    "the" sales number, so the payload ships both bases for every month and
+#    every item, and the page toggles between them client-side. No refetch, and
+#    the growth column can be re-derived for either basis or for a rolled-up
+#    Category / Sub Category group.
+# 2. A month can be bucketed by PO date or by delivery date — the same
+#    DEL MONTH / PO MONTH switch the Primary Dashboard has, meaning the same
+#    thing here.
+#
+# Amazon is absent on purpose: its Primary is not driven off master_po the way
+# every other platform is (see _amazon_primary_dashboard_response). The
+# supported list is exactly the Primary Dashboard's — keep
+# PRIMARY_MONTHLY_EXPLORER_SLUGS in the frontend in step with it.
+_PRIMARY_MONTHLY_EXPLORER_FORMATS = dict(_PRIMARY_DASHBOARD_FORMATS)
+
+# Display names for the page title. Hardcoded for the same reason
+# _MONTHLY_EXPLORER_FORMATS hardcodes its own: the slug is not always a
+# presentable name ("flipkart_grocery").
+_PRIMARY_MONTHLY_EXPLORER_LABELS = {
+    "zepto": "Zepto",
+    "bigbasket": "BigBasket",
+    "blinkit": "Blinkit",
+    "citymall": "CityMall",
+    "flipkart": "Flipkart",
+    "flipkart_grocery": "Flipkart Grocery",
+    "swiggy": "Swiggy",
+    "zomato": "Zomato",
+}
+
+# The three units the Show By control offers, mapped to the CTE's metric
+# columns as (order, deliver, pending).
+_PRIMARY_EXPLORER_METRICS = {
+    "value": ("metric_order_value", "metric_delivered_value", "metric_pending_value"),
+    "ltr": ("metric_order_liters", "metric_delivered_liters", "metric_pending_liters"),
+    "qty": ("metric_order_qty", "metric_delivered_qty", "metric_pending_qty"),
+}
+
+_PRIMARY_EXPLORER_UNITS = ("value", "ltr", "qty")
+
+
+def _primary_explorer_mode(params) -> str:
+    """DEL MONTH (default) or PO MONTH — which date decides a row's month.
+    Same vocabulary as the Primary Dashboard's mode switch."""
+    mode = _norm_sec_key(params.get("mode") or params.get("month_type") or "DEL MONTH")
+    if mode not in {"DEL MONTH", "PO MONTH"}:
+        raise ValidationError("`mode` must be DEL MONTH or PO MONTH.")
+    return mode
+
+
+def _primary_explorer_value_keys() -> tuple[str, ...]:
+    """Every numeric key an item row and the totals row carry."""
+    keys = [
+        f"{basis}_{unit}"
+        for basis in ("order", "deliver", "pending")
+        for unit in _PRIMARY_EXPLORER_UNITS
+    ]
+    keys += [
+        f"{edge}_{basis}_{unit}"
+        for edge in ("first", "last")
+        for basis in ("order", "deliver")
+        for unit in _PRIMARY_EXPLORER_UNITS
+    ]
+    return tuple(keys)
+
+
+def _primary_explorer_empty_totals() -> dict:
+    totals = {key: 0.0 for key in _primary_explorer_value_keys()}
+    for basis in ("order", "deliver"):
+        for unit in _PRIMARY_EXPLORER_UNITS:
+            totals[f"avg_{basis}_{unit}"] = 0.0
+    totals["sku_count"] = 0
+    totals["items"] = 0
+    return totals
+
+
+@api_view(["GET"])
+@permission_classes([require("platform.stats.view")])
+@cached_get(timeout=60, prefix="plat.primary_monthly_explorer")
+def platform_primary_monthly_explorer(request, slug: str):
+    slug = str(slug or "").strip().lower()
+    if slug not in _PRIMARY_MONTHLY_EXPLORER_FORMATS:
+        raise ValidationError(
+            "Primary Monthly Explorer is available for "
+            f"{', '.join(sorted(_PRIMARY_MONTHLY_EXPLORER_FORMATS))} only."
+        )
+    _ensure_scope(request.user, slug)
+    try:
+        return _primary_monthly_explorer_response(request, slug)
+    finally:
+        _drop_primary_normalized()
+
+
+def _primary_monthly_explorer_response(request, slug: str):
+    platform_format = _PRIMARY_MONTHLY_EXPLORER_FORMATS[slug]
+    platform_label = _PRIMARY_MONTHLY_EXPLORER_LABELS.get(slug, slug.title())
+    mode = _primary_explorer_mode(request.query_params)
+    date_col = "delivery_dt" if mode == "DEL MONTH" else "po_dt"
+    month_expr = f"date_trunc('month', {date_col})::date"
+    dashboard_title = f"{platform_label} Primary Monthly Explorer"
+
+    item_heads = _parse_sales_explorer_item_heads(request.query_params)
+    requested_months = _parse_explorer_months(request.query_params)
+
+    # One temp table for the whole request — the regex pack parsing and text
+    # date coercion inside the CTE are far too expensive to repeat per query.
+    _materialize_primary_normalized(_primary_master_po_cte(platform_format))
+    src = _PRIMARY_NORMALIZED_TEMP
+
+    # A month cannot be in the future. Primary feeds carry forward-dated
+    # delivery dates as a matter of course (a PO raised today for next month),
+    # so without this the picker would offer months holding only open orders.
+    live_months = f"AND {month_expr} <= date_trunc('month', CURRENT_DATE)::date"
+
+    month_rows = _dict_rows(
+        f"""
+        SELECT DISTINCT {month_expr} AS month_start
+        FROM {src}
+        WHERE {date_col} IS NOT NULL
+          {live_months}
+        ORDER BY 1
+        """,
+        [],
+    )
+    available = [row["month_start"].strftime("%Y-%m") for row in month_rows]
+    available_options = [
+        {"value": token, "label": _month_token_label(token)} for token in available
+    ]
+
+    bounds = _dict_rows(
+        f"""
+        SELECT MAX({date_col}) AS max_date
+        FROM {src}
+        WHERE {date_col} IS NOT NULL
+          {live_months}
+        """,
+        [],
+    )
+    data_max = (bounds[0] if bounds else {}).get("max_date")
+
+    if not available:
+        return Response({
+            "platform": slug,
+            "dashboard_title": dashboard_title,
+            "source": "Master PO",
+            "mode": mode,
+            "months": [],
+            "month_labels": [],
+            "months_options": [],
+            "defaulted_months": requested_months == [],
+            "sales_of": item_heads,
+            "sales_of_options": list(_SALES_EXPLORER_ITEM_HEADS),
+            "month_count": 0,
+            "days": 0,
+            "max_date": None,
+            "sales_max_date": None,
+            "growth_available": False,
+            "growth_from": None,
+            "growth_to": None,
+            "growth_partial": False,
+            "monthly": [],
+            "rows": [],
+            "items": [],
+            "totals": _primary_explorer_empty_totals(),
+            "total": _primary_explorer_empty_totals(),
+        })
+
+    months = [token for token in requested_months if token in available]
+    defaulted_months = not months
+    if defaulted_months:
+        months = available[-_MONTHLY_EXPLORER_DEFAULT_MONTHS:]
+
+    month_starts = [_month_token_to_date(token) for token in months]
+    month_placeholders = ", ".join(["%s"] * len(month_starts))
+    month_filter = f"AND {month_expr} IN ({month_placeholders})"
+
+    head_filter = ""
+    head_params: list = []
+    if item_heads:
+        placeholders = ", ".join(["%s"] * len(item_heads))
+        head_filter = f"AND item_head_key IN ({placeholders})"
+        head_params = list(item_heads)
+
+    ord_value, del_value, pend_value = _PRIMARY_EXPLORER_METRICS["value"]
+    ord_ltr, del_ltr, pend_ltr = _PRIMARY_EXPLORER_METRICS["ltr"]
+    ord_qty, del_qty, pend_qty = _PRIMARY_EXPLORER_METRICS["qty"]
+
+    sum_select = f"""
+            COALESCE(SUM({ord_value}), 0)  AS order_value,
+            COALESCE(SUM({ord_ltr}), 0)    AS order_ltr,
+            COALESCE(SUM({ord_qty}), 0)    AS order_qty,
+            COALESCE(SUM({del_value}), 0)  AS deliver_value,
+            COALESCE(SUM({del_ltr}), 0)    AS deliver_ltr,
+            COALESCE(SUM({del_qty}), 0)    AS deliver_qty,
+            COALESCE(SUM({pend_value}), 0) AS pending_value,
+            COALESCE(SUM({pend_ltr}), 0)   AS pending_ltr,
+            COALESCE(SUM({pend_qty}), 0)   AS pending_qty"""
+
+    monthly_raw = _dict_rows(
+        f"""
+        SELECT
+            {month_expr} AS month_start,
+{sum_select},
+            COUNT(DISTINCT {date_col}) AS selling_days,
+            MAX({date_col})            AS last_date
+        FROM {src}
+        WHERE {date_col} IS NOT NULL
+          {month_filter}
+          {head_filter}
+        GROUP BY 1
+        ORDER BY 1
+        """,
+        [*month_starts, *head_params],
+    )
+    monthly_by_token = {
+        row["month_start"].strftime("%Y-%m"): row for row in monthly_raw
+    }
+
+    monthly = []
+    for token in months:
+        row = monthly_by_token.get(token, {})
+        start = _month_token_to_date(token)
+        month_end = date(start.year, start.month, monthrange(start.year, start.month)[1])
+        entry = {
+            "month": token,
+            "month_start": start.isoformat(),
+            "display_month": _month_token_label(token),
+            "short_month": start.strftime("%b"),
+            "year": start.year,
+            "selling_days": int(row.get("selling_days") or 0),
+            "is_partial": bool(data_max and month_end > data_max),
+        }
+        for basis in ("order", "deliver", "pending"):
+            for unit in _PRIMARY_EXPLORER_UNITS:
+                key = f"{basis}_{unit}"
+                entry[key] = _num(row.get(key))
+        monthly.append(entry)
+
+    # Growth per item, split first-month vs last-month for BOTH bases, so the
+    # page can re-derive it when the Order/Deliver toggle flips or when rows are
+    # rolled up into Category / Sub Category.
+    first_start, last_start = month_starts[0], month_starts[-1]
+    col_for = {
+        ("order", "value"): ord_value, ("deliver", "value"): del_value,
+        ("order", "ltr"): ord_ltr, ("deliver", "ltr"): del_ltr,
+        ("order", "qty"): ord_qty, ("deliver", "qty"): del_qty,
+    }
+    growth_cols = [
+        (f"{edge}_{basis}_{unit}", col_for[(basis, unit)], start)
+        for edge, start in (("first", first_start), ("last", last_start))
+        for basis in ("order", "deliver")
+        for unit in _PRIMARY_EXPLORER_UNITS
+    ]
+    growth_select = "".join(
+        f"            COALESCE(SUM({col}) FILTER (WHERE {month_expr} = %s), 0)"
+        f" AS {alias},\n"
+        for alias, col, _ in growth_cols
+    )
+    growth_params = [start for _, _, start in growth_cols]
+
+    item_rows = _dict_rows(
+        f"""
+        SELECT
+            item_head_key AS item_head,
+            COALESCE(MIN(NULLIF(TRIM(item::text), '')), item_key) AS item,
+            MIN(NULLIF(category_key, 'OTHER')) AS category,
+            MIN(NULLIF(sub_category_key, 'OTHER')) AS sub_category,
+{sum_select},
+{growth_select}            COUNT(DISTINCT NULLIF(TRIM(sku_code::text), '')) AS sku_count
+        FROM {src}
+        WHERE {date_col} IS NOT NULL
+          {month_filter}
+          {head_filter}
+        GROUP BY item_head_key, item_key
+        ORDER BY
+            CASE item_head_key
+                WHEN 'PREMIUM' THEN 1
+                WHEN 'COMMODITY' THEN 2
+                WHEN 'OTHER' THEN 3
+                ELSE 4
+            END,
+            COALESCE(SUM({del_ltr}), 0) DESC
+        """,
+        # The FILTER placeholders sit in the SELECT list and bind positionally,
+        # so their params come BEFORE the WHERE clause's.
+        [*growth_params, *month_starts, *head_params],
+    )
+
+    month_count = len(months)
+    total_days = 0
+    for start in month_starts:
+        month_end = date(start.year, start.month, monthrange(start.year, start.month)[1])
+        if data_max and month_end > data_max:
+            month_end = data_max
+        if month_end >= start:
+            total_days += (month_end - start).days + 1
+
+    growth_available = month_count >= 2
+    value_keys = _primary_explorer_value_keys()
+
+    items = []
+    for row in item_rows:
+        entry = {
+            "item_head": row.get("item_head") or "OTHER",
+            "item": row.get("item") or "UNMAPPED",
+            "product": row.get("item") or "UNMAPPED",
+            "category": row.get("category") or "",
+            "sub_category": row.get("sub_category") or "",
+            "sku_count": int(row.get("sku_count") or 0),
+        }
+        for key in value_keys:
+            entry[key] = _num(row.get(key))
+        # Per-MONTH averages, matching the Secondary explorer. Per-DAY would be
+        # wrong here for a sharper reason than it is there: a month's POs land
+        # on a handful of dates, not evenly across 30.
+        for basis in ("order", "deliver"):
+            for unit in _PRIMARY_EXPLORER_UNITS:
+                entry[f"avg_{basis}_{unit}"] = _safe_div(
+                    entry[f"{basis}_{unit}"], month_count
+                )
+        items.append(entry)
+
+    def _sum(key: str) -> float:
+        return sum(row[key] for row in items)
+
+    totals = {key: _sum(key) for key in value_keys}
+    for basis in ("order", "deliver"):
+        for unit in _PRIMARY_EXPLORER_UNITS:
+            totals[f"avg_{basis}_{unit}"] = _safe_div(
+                totals[f"{basis}_{unit}"], month_count
+            )
+    totals["sku_count"] = sum(row["sku_count"] for row in items)
+    totals["items"] = len(items)
+
+    last_dates = [row["last_date"] for row in monthly_raw if row.get("last_date")]
+    sales_max_date = max(last_dates) if last_dates else None
+
+    return Response({
+        "platform": slug,
+        "dashboard_title": dashboard_title,
+        "source": "Master PO",
+        "mode": mode,
+        "months": months,
+        "month_labels": [_month_token_label(token) for token in months],
+        "months_options": available_options,
+        "defaulted_months": defaulted_months,
+        "sales_of": item_heads,
+        "sales_of_options": list(_SALES_EXPLORER_ITEM_HEADS),
+        "month_count": month_count,
+        "days": total_days,
+        "max_date": data_max.isoformat() if data_max else None,
+        "sales_max_date": sales_max_date.isoformat() if sales_max_date else None,
+        "growth_available": growth_available,
+        "growth_from": _month_token_label(months[0]) if growth_available else None,
+        "growth_to": _month_token_label(months[-1]) if growth_available else None,
+        "growth_partial": growth_available
+        and bool(monthly[0]["is_partial"] or monthly[-1]["is_partial"]),
+        "monthly": monthly,
+        "rows": items,
+        "items": items,
+        "totals": totals,
+        "total": totals,
+    })
+
+
 def _amazon_drr_dashboard_response(request):
     month, year, defaulted_to_latest = _parse_sec_month_year(
         request.query_params,
