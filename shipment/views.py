@@ -764,13 +764,30 @@ def _pack_into_capacity(items, capacity_lt, enforce_expiry=True, min_units=None)
         # Ordered/Short stay correct and the user's short_reason (carried on the
         # item) is preserved through to the saved record.
         uc = item.get('ship_cap')
+        # blend_cap: how many units the PACK-SIZE BLEND allows from this line.
+        #
+        # A truck has three ceilings — litres, the appointment's units and its
+        # cartons — and filling one can starve the others. On an 18,000 L truck
+        # against a 10,000-unit commitment you need 1.68 L per unit to land on
+        # both; a 1 L SKU gives 1.00, so a truck packed from the biggest lines
+        # first spends the whole unit commitment and stops at 59 per cent of its
+        # tonnage. The blend works out how many units to draw from the heavy packs
+        # and how many from the light ones, and writes the answer here.
+        #
+        # Caps like the others rather than reordering: order alone cannot express
+        # it. Densest-first fills the tonnage but leaves two thirds of the unit
+        # commitment unspent, because nothing tells the packer to stop reaching
+        # for 5 L once it has enough of them.
+        bc = item.get('blend_cap')
         caps = [accepted_qty]
         if sc is not None:
             caps.append(max(0.0, float(sc)))
         if uc is not None:
             caps.append(max(0.0, float(uc)))
+        if bc is not None:
+            caps.append(max(0.0, float(bc)))
         cap_units = min(caps)
-        capped = (sc is not None) or (uc is not None)
+        capped = (sc is not None) or (uc is not None) or (bc is not None)
         total_liters = (round(cap_units * per_liter, 4) if capped
                         else float(item.get('total_accepted_liters') or 0))
 
