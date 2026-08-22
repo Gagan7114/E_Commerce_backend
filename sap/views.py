@@ -868,6 +868,11 @@ def inventory_overview(request):
         SELECT
             T0."ItemCode",
             T0."ItemName",
+            -- SAP user-defined classification. Both books fill these 100% and
+            -- the FG dashboard already groups by them; the grid was the only
+            -- inventory view that dropped them.
+            T0."U_Sub_Group" AS "SubGroup",
+            T0."U_Variety"   AS "Variety",
             T0."ItmsGrpCod" AS "GroupCode",
             T3."ItmsGrpNam" AS "GroupName",
             T0."SalUnitMsr" AS "UOM",
