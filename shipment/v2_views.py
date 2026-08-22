@@ -1857,12 +1857,25 @@ def _tonnage_blend(items, capacity, allowed_units, allowed_cartons):
     x, y = best
 
     def _allocate(group, budget, key):
-        """Hand `budget` units out across a group, in the given order."""
+        """Hand `budget` units out across a group, in the given order.
+
+        WHOLE UNITS ONLY. The solve works in real numbers and a budget of
+        1,640.13 is meaningful arithmetic, but `blend_cap` becomes `planned_qty`
+        and a truck cannot carry 1,640.13 bottles -- it went out as exactly that
+        on two lines before this floor existed, and would have been saved to the
+        draft as a decimal.
+
+        A line whose share floors to nothing is left UNBUDGETED rather than
+        capped at zero, so it keeps its place at the back of the order as top-up
+        instead of being refused.
+        """
         left = budget
         for it in sorted(group, key=key):
-            if left <= 0:
+            if left < 1:
                 break
-            take = min(_shippable_units(it), left)
+            take = float(int(min(_shippable_units(it), left)))
+            if take < 1:
+                continue
             it['blend_cap'] = take
             left -= take
 
