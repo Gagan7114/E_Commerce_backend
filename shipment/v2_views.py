@@ -56,13 +56,11 @@ from .views import (
     _doh_fill_sort_key,
     _claimed_and_ordered_by_po_asin,
     _enforce_commit_caps,
-    _even_share_key,
     _explain_ineligibility,
     _fc_switch_group,
     _family_sql,
     _fill_sort_key,
     _live_doh_by_asin,
-    _normalise_families,
     _pack_into_capacity,
     _planner_stock_detail,
     _reserved_stock_by_asin,
@@ -1251,6 +1249,7 @@ class V2PoBookView(_SafeAPIView):
                     'channel': line.get('channel'),
                     'item_heads': set(),
                     'categories': set(),
+                    'sub_categories': set(),
                     'sku_count': 0,
                     'on_appointment': key in appt_pos,
                     'lines': [],
@@ -1264,6 +1263,15 @@ class V2PoBookView(_SafeAPIView):
                 g['item_heads'].add(str(line['item_head']).strip())
             if line.get('category'):
                 g['categories'].add(str(line['category']).strip())
+            # BOTH lists, not one instead of the other. The product filter picks
+            # by sub-category, but the free-text search still has to find a PO by
+            # typing "olive" — and "olive" is a category, matching none of EXTRA
+            # VIRGIN, EXTRA LIGHT, JIVO POMACE or SANO POMACE. Dropping the
+            # coarse names would quietly make search worse to make the filter
+            # finer.
+            sub = str(line.get('sub_category') or '').strip() or str(line.get('category') or '').strip()
+            if sub:
+                g['sub_categories'].add(sub)
             for name, src in _PO_ROLLUP:
                 g[name] += _num(line.get(src))
             # The PO's own deadline is the SOONEST of its lines'. The PO cancels
@@ -1277,6 +1285,7 @@ class V2PoBookView(_SafeAPIView):
         for g in groups.values():
             g['item_heads'] = sorted(g.pop('item_heads'))
             g['categories'] = sorted(g.pop('categories'))
+            g['sub_categories'] = sorted(g.pop('sub_categories'))
             g['item_head'] = g['item_heads'][0] if len(g['item_heads']) == 1 else ''
             # HOW MUCH OF THIS PO THE WAREHOUSE CAN COVER — not how much stock
             # exists. Two corrections, both needed for the header to mean
@@ -1484,6 +1493,97 @@ _POOL_WHERE = (
 _POOL_UNITS = 'GREATEST(p.accepted_qty - COALESCE(b.billed_qty, 0), 0)'
 
 
+# ── Which products, by sub-category ──────────────────────────────────────────
+# 2.0 picks products by SUB-CATEGORY, where the original planner focuses by one
+# of twelve product families.
+#
+# A family is the shelf ("OLIVE"); a sub-category is the thing standing on it
+# ("EXTRA VIRGIN", "EXTRA LIGHT", "JIVO POMACE", "SANO POMACE", "CLASSIC"). Ask
+# for olive and you get five products nobody planning a truck treats as
+# interchangeable; ask for half a truck of "mustard" and you get Kacchi Ghani
+# plus whatever Yellow happened to sort first. Sub-categories are the names the
+# people using this screen actually use.
+#
+# These do NOT replace `_family_sql` / `_normalise_families` / `_even_share_key`.
+# Those three belong to the original planner, which still uses them and still
+# means families by them. This is the 2.0 reading, sitting alongside.
+
+
+def _product_key_sql(alias='p'):
+    """SQL for the product a line belongs to: its sub-category, or its category
+    when the sub-category is blank.
+
+    The fallback is what keeps a line reachable. Nothing in the table has a blank
+    sub-category today, but a line grouped under '' would be dropped from the
+    picker (the bucket loop skips falsy keys) and no focus could ever select it —
+    invisible to the one control that could plan it. Falling back to the category
+    gives it its coarsest true name instead of no name.
+    """
+    return (f"NULLIF(COALESCE(NULLIF(UPPER(TRIM({alias}.sub_category)), ''),"
+            f" UPPER(TRIM({alias}.category)), ''), '')")
+
+
+def _normalise_products(raw):
+    """The requested products, uppercased, deduplicated and sorted.
+
+    NO WHITELIST, unlike `_normalise_families`. There is no closed set to check
+    against: sub-categories are data — fifty-odd today — and a new product line
+    arrives in the sheet without a deploy. Intersecting with a module constant
+    would silently drop the new name and plan an UNFOCUSED truck under it, which
+    is the worst of the three outcomes.
+
+    An unknown name is kept and simply matches nothing, so a typo plans an empty
+    truck and the screen says so. Wrong in a way you can see beats wrong in a way
+    that looks like a full load of something else.
+    """
+    return sorted({
+        str(x).strip().upper()
+        for x in str(raw or '').split(',')
+        if str(x).strip()
+    })
+
+
+def _product_sql(products, alias='p'):
+    """(sql, params) matching ANY of these products, or ('', []) for none.
+
+    Exact equality, not `_family_sql`'s two-sided category-or-sub-category LIKE:
+    a sub-category IS the leaf, so there is nothing underneath it to reach for
+    and a substring test would only let "OLIVE" swallow "SLICED OLIVE".
+    """
+    # A bare string iterates as CHARACTERS — the same trap `_family_sql`
+    # documents, so the same guard.
+    if isinstance(products, str):
+        products = [products]
+    names = [str(x).strip().upper() for x in (products or []) if str(x).strip()]
+    if not names:
+        return '', []
+    return f"{_product_key_sql(alias)} = ANY(%s::text[])", [names]
+
+
+def _product_of(item):
+    """The product a fill candidate belongs to — the Python half of
+    `_product_key_sql`, and it must stay the same rule."""
+    return (str(item.get('sub_category') or '').strip().upper()
+            or str(item.get('category') or '').strip().upper())
+
+
+def _even_share_product_key(item, products, asins):
+    """Which group a line belongs to for the even-share split.
+
+    A PACK when specific packs were picked (the ASIN is the pack), otherwise the
+    product. Mirrors `_product_sql` exactly, so a line can never be planned under
+    a focus it would not have been selected by. None for a line in no chosen
+    group; those reach the truck only through the spill pass.
+
+    `products` is a set — this runs once per candidate line.
+    """
+    if asins:
+        a = str(item.get('asin') or '').strip().upper()
+        return a if a in asins else None
+    key = _product_of(item)
+    return key if key in products else None
+
+
 def _fill_candidates(channel, fc_preference, selected_pos, families, asins):
     """The channel's shippable lines, ready to pack.
 
@@ -1501,7 +1601,7 @@ def _fill_candidates(channel, fc_preference, selected_pos, families, asins):
     FC, the flag is off across the board, and the orders fall back to pure size
     or pure urgency.
     """
-    family_sql, family_params = _family_sql(families)
+    family_sql, family_params = _product_sql(families)
     asin_list = [str(a).strip().upper() for a in (asins or []) if str(a).strip()]
     po_list = [str(p).strip().upper() for p in (selected_pos or []) if str(p).strip()]
 
@@ -1642,7 +1742,10 @@ class V2FillView(_SafeAPIView):
         appointment_id = str(data.get('appointment_id') or '').strip()
         strategies = _normalise_strategies(data.get('strategies'))
         selected_pos = data.get('selected_pos') or []
-        families = _normalise_families(','.join(
+        # `families` on the wire, sub-categories in it. The key is the one the
+        # panel has always sent and the one the original planner sends; renaming
+        # it would break nothing but buy nothing either.
+        families = _normalise_products(','.join(
             str(f) for f in (data.get('families') or [])
         ))
         asins = [str(a).strip().upper() for a in (data.get('asins') or []) if str(a).strip()]
@@ -1659,8 +1762,12 @@ class V2FillView(_SafeAPIView):
         focused = 'focus' in strategies
         if focused and not families and not asins:
             return Response({
-                'error': 'Product-focused filling needs at least one product family.',
-                'families_available': list(PRODUCT_FAMILIES),
+                'error': 'Product-focused filling needs at least one product.',
+                # Not a list of every product in the sheet: the picker is fed by
+                # fill/options/, which only offers what this channel can fill, so
+                # a static constant here would name products the caller was never
+                # shown and could not have picked.
+                'families_hint': 'See fill/options/ for the products this channel can fill.',
             }, status=400)
 
         with_stock = 'with_stock' in strategies
@@ -1717,7 +1824,8 @@ class V2FillView(_SafeAPIView):
         split_key = None
         if focused and (asins or len(families) > 1):
             asin_set = set(asins)
-            split_key = lambda it: _even_share_key(it, families, asin_set)  # noqa: E731
+            product_set = set(families)
+            split_key = lambda it: _even_share_product_key(it, product_set, asin_set)  # noqa: E731
 
         # `truck_size` is None throughout: 2.0's picker is a capacity in litres,
         # not one of the two legacy size keys, and the override wins anyway.
@@ -1975,18 +2083,12 @@ class V2FillOptionsView(_SafeAPIView):
             if channel:
                 where.append(f"{_PO_CHANNEL} = %s")
                 params.append(channel)
-            # A line's family is its category when that IS a family, else the
-            # family its sub-category names — the same two-sided test _family_sql
-            # filters with, so nothing can pass the filter and then fail to land
-            # in a bucket. Interpolated, not parameterised: the values come from
-            # PRODUCT_FAMILIES, a module constant of bare uppercase words, never
-            # from the request.
-            case_arms = ' '.join(
-                f"WHEN UPPER(TRIM(COALESCE(p.category, ''))) = '{f}'"
-                f" OR STRPOS(UPPER(TRIM(COALESCE(p.sub_category, ''))), '{f}') > 0"
-                f" THEN '{f}'"
-                for f in PRODUCT_FAMILIES
-            )
+            # THE POOL IS STILL THE TWELVE FAMILIES; the BUCKETS inside it are
+            # now sub-categories. `fam_sql` above is what keeps the universe the
+            # same — no coffee, tea, seeds or spices appear here just because the
+            # grouping got finer — and `_product_key_sql` is the same rule the
+            # fill endpoint selects with, so nothing can pass the filter and then
+            # fail to land in a bucket.
             with transaction.atomic():
                 with connection.cursor() as cur:
                     _no_jit(cur)
@@ -2001,7 +2103,7 @@ class V2FillOptionsView(_SafeAPIView):
                     # two figures are correct.
                     cur.execute(f"""
                         {_POOL_CTES}
-                        SELECT CASE {case_arms} ELSE NULL END        AS family,
+                        SELECT {_product_key_sql('p')}              AS family,
                                UPPER(TRIM(p.asin))                      AS asin,
                                -- p.item, NOT p.sku_name. `item` is the short
                                -- internal name ("SANO MUSTARD 5L"); sku_name is
@@ -2092,17 +2194,31 @@ class V2FillOptionsView(_SafeAPIView):
             ))
             return out
 
+        # BIGGEST FIRST, by open litres.
+        #
+        # This used to walk PRODUCT_FAMILIES, whose order was hand-set. There is
+        # no hand-set order for data, and alphabetical would open the row with
+        # whatever happens to start with A. Litres is the figure the chip already
+        # shows and the one that decides whether a product can fill the truck at
+        # all, so leading with it puts the useful picks under the cursor. Name
+        # breaks ties, so the row never reshuffles between two equal products.
+        #
+        # `family` stays the wire name for a bucket. It carries a sub-category
+        # now; the panel reads the key, not the word.
         families = [
             _serialize_row({
                 'family': name,
-                'po_count': int(fam_rows[name]['po_count'] or 0),
-                'sku_count': int(fam_rows[name]['sku_count'] or 0),
-                'units': _num(fam_rows[name]['units']),
-                'liters': _num(fam_rows[name]['liters']),
+                'po_count': int(row['po_count'] or 0),
+                'sku_count': int(row['sku_count'] or 0),
+                'units': _num(row['units']),
+                'liters': _num(row['liters']),
                 'packs': _packs(name),
             })
-            for name in PRODUCT_FAMILIES
-            if name in fam_rows and int(fam_rows[name]['po_count'] or 0) > 0
+            for name, row in sorted(
+                fam_rows.items(),
+                key=lambda kv: (-_num(kv[1]['liters']), kv[0]),
+            )
+            if int(row['po_count'] or 0) > 0
         ]
 
         # Item heads the priority split could actually fill. Same pool as the
