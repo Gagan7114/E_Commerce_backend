@@ -1568,7 +1568,7 @@ def _filler_pass(loaded, leftover_pool, capacity, primary_fc=None, mark_key='_fi
 
 
 def _enforce_commit_caps(loaded, not_loaded, commit_caps, key_field='appointment_id',
-                         family=None, fill_order=None):
+                         family=None, fill_order=None, min_units=None):
     """Trim ``loaded`` so each capped group respects its Vendor Central commit,
     allowing up to CAP_TOLERANCE (7%) over:
     sum(planned_qty) ≤ units_cap×1.07 AND sum(planned_qty/case_pack) ≤ cartons_cap×1.07.
@@ -1588,6 +1588,18 @@ def _enforce_commit_caps(loaded, not_loaded, commit_caps, key_field='appointment
     by another (fill biggest-first, trim nearest-expiry-last). AUTO passes
     _fill_sort_key; ManualPlanView passes nothing and keeps the legacy
     score-then-expiry order its own plan is still built with.
+
+    ``min_units`` is the auto-mode minimum line size, and it has to be given here
+    as well as to the packer. THE TRIM BELOW CAN CREATE A LINE THE PACKER WOULD
+    NEVER HAVE BUILT: _pack_into_capacity checks the floor three separate times —
+    on the ordered quantity, on the stock-capped quantity and on a
+    capacity-trimmed partial — and then this function cuts a line down to
+    whatever commitment headroom is left without consulting it. Seventeen units of
+    headroom became a truck carrying 8 of one SKU and 9 of another, both far under
+    the 20-unit floor, which is exactly the dribble all three of those checks
+    exist to prevent.
+
+    Left falsy by manual callers, where the floor does not apply at all.
     """
     if not commit_caps:
         return loaded, not_loaded
@@ -1667,6 +1679,17 @@ def _enforce_commit_caps(loaded, not_loaded, commit_caps, key_field='appointment
             ru = max(0.0, cap_u - t['u'])                  # units headroom
             rc_units = max(0.0, cap_c - t['c']) * cp        # carton headroom, in units
             allow = math.floor(min(pq, ru, rc_units))       # whole units only
+            # THE FLOOR, ON WHAT THE TRIM ACTUALLY LEAVES. A line cut to 8 units
+            # is not a smaller version of a good line, it is a dribble: it still
+            # costs a carton, an invoice line and a scan at the dock. Better to
+            # leave the last few units of the commitment unspent and hand the line
+            # to the suggestions, where a planner can add it deliberately.
+            _min_a = _effective_min_units(it, min_units)
+            if _min_a and 0 < allow < float(_min_a):
+                allow = 0
+                trimmed_under_floor = True
+            else:
+                trimmed_under_floor = False
             if allow > 0:
                 per_liter = float(it.get('per_liter') or 0)
                 short = int(round(pq - allow))
@@ -1687,12 +1710,31 @@ def _enforce_commit_caps(loaded, not_loaded, commit_caps, key_field='appointment
                 removed['planned_qty'] = 0
                 removed['planned_liters'] = 0
                 removed['not_loaded'] = True
-                removed['unfit_reason'] = (
-                    f'Exceeds Vendor Central commit cap for this {label} '
-                    f'(cap: {int(cap.get("units") or 0)} units / '
-                    f'{int(cap.get("cartons") or 0)} cartons, +7% allowed).'
-                    f'{family_note}'
-                )
+                if trimmed_under_floor:
+                    # NOT "exceeds the cap" — there IS room, just not enough of it
+                    # to be worth a line. Marked as a suggestion so the planner can
+                    # still put it on by hand, which is the whole point of leaving
+                    # the floor overridable there.
+                    removed['min_units_blocked'] = True
+                    removed['suggestion'] = True
+                    removed['suggestion_kind'] = 'under_min_units'
+                    removed['min_units_cause'] = 'commit'
+                    removed['unfit_reason'] = (
+                        f'Only a few units were left of the commitment for this '
+                        f'{label} '
+                        f'(cap: {int(cap.get("units") or 0)} units / '
+                        f'{int(cap.get("cartons") or 0)} cartons, +7% allowed), under '
+                        f'the {int(_effective_min_units(it, min_units) or 0)}-unit '
+                        f'minimum for auto-planning. Add it by hand if you want it on '
+                        f'this load.{family_note}'
+                    )
+                else:
+                    removed['unfit_reason'] = (
+                        f'Exceeds Vendor Central commit cap for this {label} '
+                        f'(cap: {int(cap.get("units") or 0)} units / '
+                        f'{int(cap.get("cartons") or 0)} cartons, +7% allowed).'
+                        f'{family_note}'
+                    )
                 extras.append(removed)
 
     new_loaded = [it for i, it in enumerate(loaded) if keep_flags[i]]

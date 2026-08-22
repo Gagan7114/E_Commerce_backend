@@ -1914,6 +1914,12 @@ class V2FillView(_SafeAPIView):
                 }},
                 key_field='appointment_id',
                 fill_order=order_key,
+                # The SAME floor the packer was given. Without it the trim
+                # undoes the packer's work: a commitment with 17 units of
+                # headroom left produced a truck carrying 8 of one SKU and 9 of
+                # another, both far under this, because the trim cut lines down
+                # to the headroom and never re-checked how small that made them.
+                min_units=MIN_AUTO_LINE_UNITS,
             )
             # Trimming frees litres, so the meter has to be recomputed or the bar
             # reports the pre-trim load against the post-trim truck.
