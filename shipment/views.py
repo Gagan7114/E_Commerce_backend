@@ -48,6 +48,50 @@ _BILLING_JOIN = f"JOIN {SAP_BILLING_SPLIT_SQL} sb"
 # accepted qty. Identical rule to the item feed, kept here as a reusable CTE body
 # so the appointment PO bar can subtract it instead of advertising gross ordered
 # quantities for loads that already left.
+# BILLED AND DISPATCHED, SPLIT THE SAME WAY, so the difference between them is
+# meaningful. That difference is the units that are INVOICED BUT STILL HERE, and
+# it has to be a fixed lot rather than a ceiling.
+#
+# Invoices are sometimes raised in advance and then shipped against a later
+# appointment. Until such an invoice is dispatched the goods are still in the
+# warehouse and still plannable — but they are plannable AS THAT INVOICE. The
+# document says 2,000 units; a truck cannot carry 1,640 of them and leave 360
+# behind, because there is no invoice for either half. So the quantity is exact:
+# take the lot or leave it.
+#
+# Both shares are computed in ONE pass with ONE ordering deliberately. The billed
+# split and the dispatched split existed separately and ordered their siblings
+# differently (plain ASIN versus closed-lines-first), which is harmless while each
+# is used alone and produces NEGATIVE undispatched figures the moment they are
+# subtracted from each other.
+_BILLED_DISPATCHED_SHARE_CTE = f"""
+                    SELECT
+                        UPPER(TRIM(ap.po_number)) AS po_upper,
+                        UPPER(TRIM(ap.asin))      AS asin_upper,
+                        ap.accepted_qty           AS accepted_qty,
+                        LEAST(ap.accepted_qty, GREATEST(
+                            sb.billed_qty - COALESCE(SUM(ap.accepted_qty) OVER w, 0), 0
+                        )) AS billed_share,
+                        LEAST(ap.accepted_qty, GREATEST(
+                            sb.dispatched_qty - COALESCE(SUM(ap.accepted_qty) OVER w, 0), 0
+                        )) AS dispatched_share
+                    FROM reporting."Amazon PO" ap
+                    {_BILLING_JOIN}
+                        ON sb.po_number = UPPER(TRIM(ap.po_number))
+                       AND sb.sap_item_code = UPPER(TRIM(ap.sap_sku_code))
+                    WHERE ap.accepted_qty > 0
+                    WINDOW w AS (
+                        PARTITION BY UPPER(TRIM(ap.po_number)), UPPER(TRIM(ap.sap_sku_code))
+                        -- Same tie-break as _DISPATCHED_SHARE_CTE, and for the same
+                        -- reason: Amazon closing a line is the strongest evidence
+                        -- that its units are the ones that shipped.
+                        ORDER BY (ap.po_status = 'PENDING'
+                                  AND ap.status = 'Confirmed') ASC, ap.asin
+                        ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+                    )
+"""
+
+
 _DISPATCHED_SHARE_CTE = f"""
                     SELECT
                         UPPER(TRIM(ap.po_number)) AS po_upper,
@@ -788,6 +832,27 @@ def _pack_into_capacity(items, capacity_lt, enforce_expiry=True, min_units=None)
             caps.append(max(0.0, float(bc)))
         cap_units = min(caps)
         capped = (sc is not None) or (uc is not None) or (bc is not None)
+
+        # AN INVOICE THE WAREHOUSE CANNOT COVER CANNOT SHIP AT ALL.
+        #
+        # `no_partial` stopped the packer settling for less than the invoice when
+        # the TRUCK was the constraint. Stock is the other way in: 2,400 units
+        # invoiced with 67 free in the warehouse arrives here as cap_units 67,
+        # which then "fits" perfectly and boards as 67 units of a 2,400-unit
+        # document. Same breach, different cause, so the same refusal.
+        _lock = float(item.get('invoice_locked_qty') or 0)
+        if item.get('no_partial') and _lock > 0 and cap_units < _lock - 0.5:
+            item['planned_qty'] = 0
+            item['planned_liters'] = 0
+            item['suggestion'] = True
+            item['suggestion_kind'] = 'invoice_whole'
+            item['unfit_reason'] = (
+                f'Invoiced for {int(_lock)} units and not dispatched, so it ships '
+                f'whole — but only {int(cap_units)} can ship today. The rest is '
+                f'short in the warehouse or held by another shipment.'
+            )
+            not_loaded.append(item)
+            continue
         total_liters = (round(cap_units * per_liter, 4) if capped
                         else float(item.get('total_accepted_liters') or 0))
 
@@ -859,6 +924,25 @@ def _pack_into_capacity(items, capacity_lt, enforce_expiry=True, min_units=None)
             remaining -= total_liters
             loaded.append(item)
         else:
+            if item.get('no_partial'):
+                # AN INVOICE CANNOT BE PART-SHIPPED. The document names a
+                # quantity; half of it has no document at all. So a line the truck
+                # cannot take whole is not taken, and says why rather than
+                # arriving short with a "truck out of capacity" note that invites
+                # somebody to accept it.
+                item['planned_qty'] = 0
+                item['planned_liters'] = 0
+                item['suggestion'] = True
+                item['suggestion_kind'] = 'invoice_whole'
+                item['unfit_reason'] = (
+                    f'Invoiced for {int(cap_units)} units and not dispatched, so it '
+                    f'ships whole or not at all — and only '
+                    f'{int(remaining / per_liter) if per_liter > 0 else 0} units of '
+                    f'room are left on this truck. Take it off another line, or '
+                    f'plan it on the next load.'
+                )
+                not_loaded.append(item)
+                continue
             if per_liter > 0:
                 partial_qty = math.floor(remaining / per_liter)
                 # The minimum-line floor applies to what actually goes ON the
@@ -1731,6 +1815,7 @@ def _enforce_commit_caps(loaded, not_loaded, commit_caps, key_field='appointment
         pq = float(it.get('planned_qty') or 0)
         cp = max(float(it.get('case_pack') or 1), 1.0)
         c_units = pq / cp
+        item_no_partial = bool(it.get('no_partial'))
 
         t = totals[gk]
         label = 'PO' if key_field == 'po_number' else 'appointment'
@@ -1753,6 +1838,10 @@ def _enforce_commit_caps(loaded, not_loaded, commit_caps, key_field='appointment
             ru = max(0.0, room_u)                          # units headroom
             rc_units = max(0.0, room_c) * cp                # carton headroom, in units
             allow = math.floor(min(pq, ru, rc_units))       # whole units only
+            # Same rule one stage later: trimming an undispatched invoice by three
+            # units breaks the document just as thoroughly as the packer would.
+            if item_no_partial and allow < pq:
+                allow = 0
             # THE FLOOR, ON WHAT THE TRIM ACTUALLY LEAVES. A line cut to 8 units
             # is not a smaller version of a good line, it is a dribble: it still
             # costs a carton, an invoice line and a scan at the dock. Better to

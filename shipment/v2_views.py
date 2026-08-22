@@ -52,6 +52,7 @@ from .views import (
     _auto_plan_truck,
     _BILLING_JOIN,
     _compute_priority,
+    _BILLED_DISPATCHED_SHARE_CTE,
     _DISPATCHED_SHARE_CTE,
     _doh_fill_sort_key,
     _claimed_and_ordered_by_po_asin,
@@ -180,6 +181,24 @@ def _pendency_sql():
         _stated_litres,
         SKU_PENDENCY_COLUMNS,
     )
+    # The dispatched-units expression and the SAP code fold, from the module that
+    # owns both, so this predicate cannot drift from the one the split uses.
+    from sap.billing import dispatched_qty_sql, sap_item_code_sql
+    # Every accepted unit on this (po, item) pair has been DISPATCHED, not merely
+    # invoiced. Correlated straight against sap_billing rather than through
+    # SAP_BILLING_SPLIT_SQL, which re-derives the whole table per outer row.
+    _BOOK_FULLY_DISPATCHED = f"""(
+        COALESCE((
+            SELECT SUM({dispatched_qty_sql("sb")}) FROM sap_billing sb
+            WHERE sb.po_number = UPPER(TRIM(reporting."Amazon PO".po_number))
+              AND ({sap_item_code_sql("sb")}) = UPPER(TRIM(reporting."Amazon PO".sap_sku_code))
+        ), 0) >= (
+            SELECT COALESCE(SUM(x.accepted_qty), 0)
+            FROM reporting."Amazon PO" x
+            WHERE UPPER(TRIM(x.po_number)) = UPPER(TRIM(reporting."Amazon PO".po_number))
+              AND UPPER(TRIM(x.sap_sku_code)) = UPPER(TRIM(reporting."Amazon PO".sap_sku_code))
+        )
+    )"""
     return {
         'columns': SKU_PENDENCY_COLUMNS,
         'pending': _SKU_PENDENCY_PENDING,
@@ -196,7 +215,21 @@ def _pendency_sql():
         #   short      billed, but not for every accepted unit
         #   dispatched the units have physically left the warehouse
         'buckets': {
-            'open': f'NOT {_SKU_PENDENCY_FULLY_INVOICED}',
+            # `open` IS NOT "not fully invoiced" ANY MORE.
+            #
+            # An invoice raised in advance and not yet dispatched leaves the goods
+            # in the warehouse, and the planner ships them AS that invoice against
+            # a later appointment. Those lines were hidden from the working view by
+            # this predicate while Express went on planning them, so the fill
+            # placed 2,000 units of 6UBY3GCZ / B07X53ZL6J and the picker had no row
+            # to put them on.
+            #
+            # So a line leaves the open book only once its invoice has actually
+            # GONE. `_SKU_PENDENCY_FULLY_INVOICED` keeps its own meaning for the
+            # SKU PO Pendency page, where "fully invoiced" is a reporting category
+            # and dispatch is a separate column.
+            'open': (f'NOT ({_SKU_PENDENCY_FULLY_INVOICED}'
+                     f' AND {_BOOK_FULLY_DISPATCHED})'),
             'full': _SKU_PENDENCY_FULLY_INVOICED,
             'short': f'({_PENDENCY_SHORT_QTY}) > 0',
             'dispatched': _SKU_PENDENCY_IS_DISPATCHED,
@@ -286,21 +319,19 @@ def _fill_limits(summary, capacity, commit):
     }
 
 
-def _dispatched_by_po_asin(po_uppers):
-    """Units SAP has already DISPATCHED, per (ASIN_UPPER, PO_UPPER).
+def _billing_by_po_asin(po_uppers):
+    """Per (ASIN_UPPER, PO_UPPER): what SAP has DISPATCHED, and what is INVOICED
+    BUT STILL HERE.
 
-    A lookup rather than another expression, because `_DISPATCHED_SHARE_CTE` is
-    the canonical split and this reuses it verbatim. Writing a correlated copy of
-    it for the book query would mean two versions of a rule with a subtle
-    tie-break in it (closed lines absorb the dispatched pool before still-open
-    siblings), and the two would drift.
+    One query and one ordering, reusing `_BILLED_DISPATCHED_SHARE_CTE`, because
+    the second figure is the difference between two splits and computing them
+    apart lets the difference go negative.
 
-    DISPATCHED, NOT INVOICED, and that distinction is the whole point. An invoice
-    raised against units still sitting in the warehouse has not moved them —
-    sap/billing.py says so deliberately — so netting off the invoiced figure
-    declares stock gone that a truck can still legally carry. On 6UBY3GCZ /
-    B0821DNF2W that was the difference between offering 5,000 units and offering
-    8 of them.
+    ``dispatched`` is units that have physically left. ``invoice_locked`` is units
+    an invoice has been raised for and NOT dispatched — raised in advance, to ship
+    against a later appointment. Those units are still in the warehouse and still
+    plannable, but only as that invoice: the document says 2,000, so a truck takes
+    2,000 or none. It is a fixed lot, not a ceiling.
     """
     keys = sorted({str(p or '').strip().upper() for p in (po_uppers or []) if str(p or '').strip()})
     if not keys:
@@ -310,21 +341,25 @@ def _dispatched_by_po_asin(po_uppers):
             with connection.cursor() as cur:
                 _no_jit(cur)
                 cur.execute(f"""
-                    WITH dispatched_share AS ({_DISPATCHED_SHARE_CTE})
-                    SELECT po_upper, asin_upper, dispatched_qty
-                    FROM dispatched_share
+                    WITH sh AS ({_BILLED_DISPATCHED_SHARE_CTE})
+                    SELECT po_upper, asin_upper, accepted_qty,
+                           dispatched_share,
+                           GREATEST(billed_share - dispatched_share, 0) AS invoice_locked
+                    FROM sh
                     WHERE po_upper = ANY(%s::text[])
                 """, [keys])
                 return {
-                    (str(r['asin_upper'] or ''), str(r['po_upper'] or '')): _num(r['dispatched_qty'])
+                    (str(r['asin_upper'] or ''), str(r['po_upper'] or '')): {
+                        'dispatched': _num(r['dispatched_share']),
+                        'invoice_locked': _num(r['invoice_locked']),
+                    }
                     for r in _row_to_dict(cur, cur.fetchall())
                 }
     except Exception:
-        # Fail CLOSED is not an option here: an empty map would net nothing off
-        # and the book would offer units that have already left. Re-raised so the
-        # endpoint's own error handling reports it rather than quietly
-        # over-offering stock.
-        logger.exception('v2 book: dispatched share unavailable')
+        # Fail LOUD. An empty map would net nothing off and unlock every invoice,
+        # so the book would offer units that have shipped and let a planner retype
+        # a quantity an invoice has already fixed.
+        logger.exception('v2 book: billing shares unavailable')
         raise
 
 
@@ -1298,7 +1333,7 @@ class V2PoBookView(_SafeAPIView):
         })
         # What SAP has already sent out, per line. Fetched alongside the claims
         # because the ceiling below needs both.
-        dispatched_map = _dispatched_by_po_asin({
+        billing_map = _billing_by_po_asin({
             str(ln.get('po_number') or '').strip().upper() for ln in lines
         })
         for ln in lines:
@@ -1315,7 +1350,9 @@ class V2PoBookView(_SafeAPIView):
             ln['known_to_amazon'] = 'ordered_qty' in st
             accepted = _num(ln.get('accepted_qty'))
             received = _num(ln.get('received_qty'))
-            dispatched = _num(dispatched_map.get(key))
+            bill = billing_map.get(key) or {}
+            dispatched = _num(bill.get('dispatched'))
+            locked = _num(bill.get('invoice_locked'))
             claimed = _num(st.get('claimed_qty'))
             # Carried on the line so the screen can show WHY a ceiling is lower
             # than the ordered quantity without guessing.
@@ -1344,7 +1381,21 @@ class V2PoBookView(_SafeAPIView):
             # MAX, not a sum: receiving and dispatching describe the same units
             # from the two ends of the same journey, so adding them subtracts the
             # same stock twice. Whichever is further along is the truth.
-            ln['claimable_qty'] = max(0.0, accepted - max(received, dispatched) - claimed)
+            free = max(0.0, accepted - max(received, dispatched) - claimed)
+            # AN UNDISPATCHED INVOICE IS A FIXED LOT, not a ceiling.
+            #
+            # Those units are invoiced and still in the warehouse — raised early,
+            # to go against a later appointment — so they are plannable, but only
+            # as the document that already exists. The invoice says 2,000; a truck
+            # cannot take 1,640 and leave 360, because neither half has an
+            # invoice. Express did exactly that on 6UBY3GCZ / B07X53ZL6J.
+            #
+            # So the quantity stops being a range and becomes a number. Clamped by
+            # `free` as well, because a claim from another live shipment or units
+            # already received still take precedence: an invoice does not conjure
+            # stock that is spoken for.
+            ln['invoice_locked_qty'] = min(locked, free) if locked > 0 else 0.0
+            ln['claimable_qty'] = ln['invoice_locked_qty'] if locked > 0 else free
 
         groups: dict[str, dict] = {}
         for line in lines:
@@ -1714,6 +1765,12 @@ def _even_share_product_key(item, products, asins):
 
 # ── Tonnage filling ─────────────────────────────────────────────────────────
 
+def target_of(capacity, allowed_units):
+    """Litres per unit needed to reach both ceilings, or 0 with no unit cap."""
+    cap, au = _num(capacity), _num(allowed_units)
+    return (cap / au) if (cap > 0 and au > 0) else 0.0
+
+
 def _tonnage_blend(items, capacity, allowed_units, allowed_cartons):
     """Cap each line so the truck lands on its LITRE ceiling and its UNIT ceiling
     together, by blending pack sizes. Returns the figures it worked with, or None
@@ -1752,6 +1809,36 @@ def _tonnage_blend(items, capacity, allowed_units, allowed_cartons):
     live = [it for it in items if _num(it.get('per_liter')) > 0 and _shippable_units(it) > 0]
     if not live:
         return None
+
+    # LINES CARRYING AN UNDISPATCHED INVOICE ARE NOT NEGOTIABLE. They ship at the
+    # invoiced quantity or not at all, so the blend cannot hand them a budget —
+    # giving 6UBY3GCZ / B07X53ZL6J a share of 1,639 against a 2,000-unit invoice
+    # is precisely the trim the lock exists to prevent, and the packer accepted it
+    # because 1,639 fitted the cap the blend had just written.
+    #
+    # They are OBLIGATIONS, so their units, litres and cartons come off the
+    # ceilings first and the blend solves for what is left over.
+    fixed = [it for it in live if it.get('no_partial')]
+    live = [it for it in live if not it.get('no_partial')]
+    for it in fixed:
+        u = _shippable_units(it)
+        cap_l -= u * _num(it.get('per_liter'))
+        au -= u
+        ac -= u / max(1.0, _num(it.get('case_pack'), 1.0))
+    cap_l = max(0.0, cap_l)
+    au = max(0.0, au)
+    ac = max(0.0, ac)
+    if not live or cap_l <= 0 or au <= 0:
+        # The obligations alone account for the truck. Nothing left to blend, and
+        # nothing that needs blending.
+        return {
+            'target_l_per_unit': round(target_of(capacity, allowed_units), 4),
+            'heavy_units': None, 'light_units': None,
+            'heavy_avg_l_per_unit': None, 'light_avg_l_per_unit': None,
+            'heavy_l_per_carton': None, 'light_l_per_carton': None,
+            'fixed_invoice_lines': len(fixed),
+            'blended': False,
+        }
 
     target = cap_l / au
     heavy = [it for it in live if _num(it.get('per_liter')) >= target]
@@ -1896,6 +1983,7 @@ def _tonnage_blend(items, capacity, allowed_units, allowed_cartons):
         'light_avg_l_per_unit': round(g, 4),
         'heavy_l_per_carton': round(d / ch, 2) if ch else None,
         'light_l_per_carton': round(g / cl, 2) if cl else None,
+        'fixed_invoice_lines': len(fixed),
         'blended': True,
     }
 
@@ -1909,6 +1997,9 @@ def _tonnage_sort_key(item):
     """
     cap = item.get('blend_cap')
     return (
+        # Invoiced-and-undispatched first: they are the one thing on the truck
+        # that cannot be made smaller to fit, so they get their litres first.
+        0 if item.get('no_partial') else 1,
         0 if cap is not None else 1,
         -_num(item.get('per_liter')),
         -_shippable_units(item),
@@ -2003,6 +2094,13 @@ def _fill_candidates(channel, fc_preference, selected_pos, families, asins):
             """, params)
             raw = _row_to_dict(cur, cur.fetchall())
 
+    # THE INVOICE LOCK, for the pool. Without it Express plans these lines as a
+    # range and takes whatever fits — 1,640 of a 2,000-unit invoice — which is the
+    # one thing an undispatched invoice does not allow.
+    lock_map = _billing_by_po_asin({
+        str(r.get('po_number') or '').strip().upper() for r in raw
+    })
+
     doh_by_asin, doh_meta = _live_doh_by_asin()
     fc_pref = str(fc_preference or '').strip().upper()
 
@@ -2027,6 +2125,17 @@ def _fill_candidates(channel, fc_preference, selected_pos, families, asins):
             fc_pref
             and str(row.get('fulfillment_center') or '').strip().upper() != fc_pref
         )
+        # AN UNDISPATCHED INVOICE MAKES THIS LINE A FIXED LOT. `ship_cap` pins the
+        # quantity from above and `no_partial` stops the packer settling for less,
+        # which together are the only way to express "exactly this many" to a
+        # packer whose whole job is to fit what it can.
+        lk = (lock_map.get((str(row.get('asin') or '').strip().upper(),
+                            str(row.get('po_number') or '').strip().upper())) or {})
+        locked = _num(lk.get('invoice_locked'))
+        if locked > 0:
+            row['invoice_locked_qty'] = locked
+            row['ship_cap'] = locked
+            row['no_partial'] = True
         pool.append(row)
     return pool, doh_meta
 
