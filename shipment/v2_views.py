@@ -60,6 +60,7 @@ from .views import (
     _fc_switch_group,
     _family_sql,
     _fill_sort_key,
+    _item_head_bucket,
     _live_doh_by_asin,
     _pack_into_capacity,
     _planner_stock_detail,
@@ -228,6 +229,60 @@ def _pendency_sql():
 def _enrich_stock(payload):
     from uploads.amazon_uploads import _enrich_pendency_stock
     return _enrich_pendency_stock(payload)
+
+
+def _fill_limits(summary, capacity, commit):
+    """Which ceiling actually stopped this load, with the arithmetic.
+
+    A truck at 59 per cent reads as a failed fill, and on this appointment it is
+    not one: the commitment is 10,000 units and these are one-litre products, so
+    10,700 units IS the truck full as far as Amazon is concerned. Nothing said so,
+    and a planner looking at 10,700 of 18,000 litres had no way to tell a binding
+    commitment from a broken filler.
+
+    Returned as facts rather than a sentence: the screen composes the wording, and
+    the arithmetic is the part that has to be right.
+    """
+    tol = float(CAP_TOLERANCE)
+    cap_u = float((commit or {}).get('units') or 0)
+    cap_c = float((commit or {}).get('cartons') or 0)
+    allowed_u = round(cap_u * tol) if cap_u > 0 else None
+    allowed_c = round(cap_c * tol) if cap_c > 0 else None
+
+    units = float(summary.get('planned_units') or 0)
+    cartons = float(summary.get('planned_cartons') or 0)
+    liters = float(summary.get('planned_liters') or 0)
+    cap_l = float(capacity or 0)
+
+    # Within a whole unit / carton / litre of the ceiling counts as reaching it:
+    # the packer works in whole units, so an exact equality would miss a load
+    # that stopped one unit short because the next line was larger than the gap.
+    def _at(x, lim, slack):
+        return lim is not None and lim > 0 and x >= lim - slack
+
+    bound = None
+    if _at(units, allowed_u, 1):
+        bound = 'units'
+    elif _at(cartons, allowed_c, 1):
+        bound = 'cartons'
+    elif cap_l > 0 and liters >= cap_l - 1:
+        bound = 'capacity'
+    elif liters > 0:
+        # Nothing external stopped it, so the pool did — there was simply nothing
+        # more that could legally go on.
+        bound = 'pool'
+
+    return {
+        'bound_by': bound,
+        'tolerance': tol,
+        'units': {'planned': int(round(units)),
+                  'committed': int(cap_u) if cap_u else None,
+                  'allowed': int(allowed_u) if allowed_u else None},
+        'cartons': {'planned': int(round(cartons)),
+                    'committed': int(cap_c) if cap_c else None,
+                    'allowed': int(allowed_c) if allowed_c else None},
+        'liters': {'planned': round(liters, 2), 'capacity': round(cap_l, 2)},
+    }
 
 
 def _book_stock_meta():
@@ -1914,6 +1969,18 @@ class V2FillView(_SafeAPIView):
                 }},
                 key_field='appointment_id',
                 fill_order=order_key,
+                # The SAME floor the packer was given. Without it the trim
+                # undoes the packer's work: a commitment with 17 units of
+                # headroom left produced a truck carrying 8 of one SKU and 9 of
+                # another, both far under this, because the trim cut lines down
+                # to the headroom and never re-checked how small that made them.
+                min_units=MIN_AUTO_LINE_UNITS,
+                # THE SPLIT HAS TO SURVIVE THE TRIM. Without this the trimmer
+                # spends the whole commitment in fill order, so one big Commodity
+                # line took 84 per cent of a 10,700-unit allowance and a 50/50
+                # request came back 9,000 / 1,700 — with Premium holding 20,385
+                # units of free stock it was never allowed to reach.
+                bucket_shares=priority if priority else None,
             )
             # Trimming frees litres, so the meter has to be recomputed or the bar
             # reports the pre-trim load against the post-trim truck.
@@ -1924,6 +1991,22 @@ class V2FillView(_SafeAPIView):
             ), 4)
             load_pct = round((planned_liters / capacity * 100) if capacity else 0, 2)
             loaded.sort(key=order_key)
+            # AND THE SPLIT REPORT, recomputed from what survived.
+            #
+            # `priority_actual` comes out of the packer, which runs BEFORE this
+            # trim — so it was reporting the slices as filled exactly while the
+            # load on the truck was nothing like them. That is why a 9,000 / 1,700
+            # truck came with no explanation: the one figure that could have shown
+            # the problem was measuring the wrong stage.
+            if priority_actual:
+                for _b in priority_actual.values():
+                    if isinstance(_b, dict):
+                        _b['used_liters'] = 0.0
+                for it in loaded:
+                    b = priority_actual.get(_item_head_bucket(it))
+                    if isinstance(b, dict):
+                        b['used_liters'] = round(
+                            b['used_liters'] + _num(it.get('planned_liters')), 4)
 
         _tag_expiry_warnings(loaded)
         _tag_expiry_warnings(not_loaded)
@@ -1932,11 +2015,16 @@ class V2FillView(_SafeAPIView):
             it['planned_liters'] = 0
             it['not_loaded'] = True
 
+        summary = self._summary(loaded, capacity, planned_liters, load_pct, unbacked_count)
         return Response({
             'loaded': [_serialize_row(it) for it in loaded],
             'not_loaded': [_serialize_row(it) for it in not_loaded],
             'by_po': self._by_po(loaded),
-            'summary': self._summary(loaded, capacity, planned_liters, load_pct, unbacked_count),
+            'summary': summary,
+            # WHY IT STOPPED WHERE IT DID. See _fill_limits: a load at 59 per cent
+            # of its litres because the unit commitment is full is a finished
+            # truck, not a failed fill, and the screen could not tell.
+            'limits': _fill_limits(summary, capacity, commit),
             'priority_actual': priority_actual,
             'product_split': product_split,
             'strategies': strategies,
