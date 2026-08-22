@@ -1568,7 +1568,8 @@ def _filler_pass(loaded, leftover_pool, capacity, primary_fc=None, mark_key='_fi
 
 
 def _enforce_commit_caps(loaded, not_loaded, commit_caps, key_field='appointment_id',
-                         family=None, fill_order=None, min_units=None):
+                         family=None, fill_order=None, min_units=None,
+                         bucket_shares=None):
     """Trim ``loaded`` so each capped group respects its Vendor Central commit,
     allowing up to CAP_TOLERANCE (7%) over:
     sum(planned_qty) ≤ units_cap×1.07 AND sum(planned_qty/case_pack) ≤ cartons_cap×1.07.
@@ -1600,6 +1601,23 @@ def _enforce_commit_caps(loaded, not_loaded, commit_caps, key_field='appointment
     exist to prevent.
 
     Left falsy by manual callers, where the floor does not apply at all.
+
+    ``bucket_shares`` is the priority split as ``{'PREMIUM': pct, ...}``, and it
+    is what stops this function DESTROYING that split.
+
+    The packer carves the truck into slices and fills each one, so a 50/50 request
+    on an 18,000 L truck arrives here as 9,000 L of Premium and 9,000 L of
+    Commodity. This function then spent the appointment's unit commitment in fill
+    order — biggest line first — so a single 9,000-unit Commodity line took 84 per
+    cent of a 10,700-unit allowance and Premium was left the remainder. The split
+    was honoured by the packer and then thrown away one stage later: 9,000 / 1,700
+    out of a 50/50 request, with Premium having 20,385 units of free stock it was
+    never allowed to use.
+
+    With shares given, the allowance is divided between the buckets in the
+    requested proportion FIRST, and only what a bucket cannot use is then offered
+    to the others (second pass, in fill order) so a truck is not left short
+    because one head ran dry. Absent, the old tail-first behaviour is unchanged.
     """
     if not commit_caps:
         return loaded, not_loaded
@@ -1641,12 +1659,32 @@ def _enforce_commit_caps(loaded, not_loaded, commit_caps, key_field='appointment
     totals = {k: {'u': 0.0, 'c': 0.0} for k in norm_caps}
     keep_flags = [True] * len(loaded)
     extras = []
+
+    # The priority split, normalised to fractions. A share of zero means the
+    # packer should not have loaded that bucket at all, so it gets no allowance
+    # and its items fall through to the second pass like anything else.
+    shares = None
+    if bucket_shares:
+        _tot = sum(max(0.0, float(v or 0)) for v in bucket_shares.values())
+        if _tot > 0:
+            shares = {k: max(0.0, float(v or 0)) / _tot for k, v in bucket_shares.items()}
+    # Per (group, bucket) running totals, used only while shares are in force.
+    btotals = {}
     # DOH fillers have no appointment of their own; with exactly one cap they're
     # attributed to it so the truck total (fillers included) respects the commit.
     # The sort above keeps appointment items first and drops fillers first when
     # the cap is reached. With multiple caps we can't attribute, so they pass.
     single_cap_key = next(iter(norm_caps)) if len(norm_caps) == 1 else None
 
+    # TWO PASSES when a split is being honoured, one when it is not.
+    #
+    # Pass 1 gives each bucket only its own share of the allowance, so the
+    # requested proportion survives. Pass 2 then offers whatever a bucket could
+    # not use to the lines that were cut, in fill order — otherwise honouring the
+    # ratio would leave a truck short whenever one head runs dry, which is the
+    # opposite complaint. With no shares there is a single pass and the behaviour
+    # is exactly what it was.
+    respect_shares = shares is not None
     for orig_idx, it in indexed:
         gk = _key(it)
         if gk not in norm_caps:
@@ -1658,6 +1696,17 @@ def _enforce_commit_caps(loaded, not_loaded, commit_caps, key_field='appointment
         # Allow up to 7% over the Vendor Central commit (units AND cartons).
         cap_u = (float(cap.get('units') or 0) * CAP_TOLERANCE) or float('inf')
         cap_c = (float(cap.get('cartons') or 0) * CAP_TOLERANCE) or float('inf')
+        # This item's own ceilings: the group's, narrowed to its bucket's share
+        # while pass 1 is running.
+        bkt = _item_head_bucket(it)
+        lim_u, lim_c = cap_u, cap_c
+        bt = None
+        if shares:
+            bt = btotals.setdefault((gk, bkt), {'u': 0.0, 'c': 0.0})
+            if respect_shares:
+                sh = shares.get(bkt, 0.0)
+                lim_u = cap_u * sh if cap_u != float('inf') else float('inf')
+                lim_c = cap_c * sh if cap_c != float('inf') else float('inf')
 
         # planned_qty / case_pack are DecimalFields — keep them as floats so the
         # running cap comparison stays accurate (int() truncation undercounts
@@ -1668,16 +1717,24 @@ def _enforce_commit_caps(loaded, not_loaded, commit_caps, key_field='appointment
 
         t = totals[gk]
         label = 'PO' if key_field == 'po_number' else 'appointment'
-        if t['u'] + pq <= cap_u and t['c'] + c_units <= cap_c:
+        # Room is the tighter of the group's remaining allowance and, in pass 1,
+        # this bucket's share of it.
+        room_u = min(cap_u - t['u'], (lim_u - bt['u']) if bt is not None else float('inf'))
+        room_c = min(cap_c - t['c'], (lim_c - bt['c']) if bt is not None else float('inf'))
+        if pq <= room_u and c_units <= room_c:
             t['u'] += pq
             t['c'] += c_units
+            if bt is not None:
+                bt['u'] += pq
+                bt['c'] += c_units
+            it.pop('_cap_trimmed', None)
         else:
             # Item would breach the cap. Rather than dropping it whole, fill it
             # PARTIALLY up to whatever headroom is left (units AND cartons) so
             # the commit is respected exactly, and short-supply the remainder.
             # (A partial of an item that already fit the truck can't overflow it.)
-            ru = max(0.0, cap_u - t['u'])                  # units headroom
-            rc_units = max(0.0, cap_c - t['c']) * cp        # carton headroom, in units
+            ru = max(0.0, room_u)                          # units headroom
+            rc_units = max(0.0, room_c) * cp                # carton headroom, in units
             allow = math.floor(min(pq, ru, rc_units))       # whole units only
             # THE FLOOR, ON WHAT THE TRIM ACTUALLY LEAVES. A line cut to 8 units
             # is not a smaller version of a good line, it is a dribble: it still
@@ -1703,7 +1760,27 @@ def _enforce_commit_caps(loaded, not_loaded, commit_caps, key_field='appointment
                 )
                 t['u'] += allow
                 t['c'] += allow / cp
+                if bt is not None:
+                    bt['u'] += allow
+                    bt['c'] += allow / cp
+                    # Still short of what it wanted, so the top-up should look at
+                    # it again in case another bucket left something on the table.
+                    it['_cap_trimmed'] = True
+                    it['_cap_want'] = pq
+                    it['_cap_placed'] = allow
+                    it['_cap_group'] = gk
                 # keep_flags[orig_idx] stays True — item remains loaded (partial)
+            elif shares and respect_shares:
+                # NOT a decision yet. This bucket has spent its share, but another
+                # may not have spent all of its own, and pass 2 hands what is left
+                # to whatever was cut. Dropping here would make honouring the
+                # ratio cost the truck lines it could still legally carry.
+                it['planned_qty'] = 0
+                it['planned_liters'] = 0
+                it['_cap_trimmed'] = True
+                it['_cap_want'] = pq
+                it['_cap_placed'] = 0.0
+                it['_cap_group'] = gk
             else:
                 keep_flags[orig_idx] = False
                 removed = dict(it)
@@ -1736,6 +1813,87 @@ def _enforce_commit_caps(loaded, not_loaded, commit_caps, key_field='appointment
                         f'{family_note}'
                     )
                 extras.append(removed)
+
+    # ── Leftovers ────────────────────────────────────────────────────────────
+    # A bucket that could not spend its share leaves allowance on the table.
+    # Honouring the ratio must not cost the truck lines it can legally carry, so
+    # what is unspent is offered to the lines that were cut, in the same fill
+    # order. Works from `_cap_placed` rather than `planned_qty`, which the main
+    # loop has already rewritten — reading that back would count a partial twice.
+    if respect_shares:
+        for orig_idx, it in indexed:
+            if not it.get('_cap_trimmed'):
+                continue
+            gk = it.get('_cap_group')
+            if gk not in norm_caps:
+                continue
+            cap = norm_caps[gk] or {}
+            cap_u = (float(cap.get('units') or 0) * CAP_TOLERANCE) or float('inf')
+            cap_c = (float(cap.get('cartons') or 0) * CAP_TOLERANCE) or float('inf')
+            t = totals[gk]
+            want = float(it.get('_cap_want') or 0)
+            placed = float(it.get('_cap_placed') or 0)
+            short = max(0.0, want - placed)
+            if short <= 0:
+                continue
+            cp = max(float(it.get('case_pack') or 1), 1.0)
+            extra = math.floor(min(
+                short,
+                max(0.0, cap_u - t['u']),
+                max(0.0, cap_c - t['c']) * cp,
+            ))
+            if extra <= 0:
+                continue
+            final = placed + extra
+            # The floor applies to the FINAL figure, not the top-up: a line ending
+            # at 12 units is a dribble however it got there.
+            _min_t = _effective_min_units(it, min_units)
+            if _min_t and 0 < final < float(_min_t):
+                continue
+            per_liter = float(it.get('per_liter') or 0)
+            it['planned_qty'] = final
+            it['planned_liters'] = round(final * per_liter, 4)
+            t['u'] += extra
+            t['c'] += extra / cp
+            it['_cap_placed'] = final
+            if final >= want:
+                it.pop('short_reason', None)
+            else:
+                it['short_reason'] = (
+                    f'Capped at Vendor Central commit for this '
+                    f'{"PO" if key_field == "po_number" else "appointment"} '
+                    f'(cap: {int(cap.get("units") or 0)} units / '
+                    f'{int(cap.get("cartons") or 0)} cartons, +7% allowed) — '
+                    f'{int(round(want - final))} units short-supplied.{family_note}'
+                )
+
+        # Anything the top-up could not place is only NOW a drop.
+        for orig_idx, it in indexed:
+            if not it.get('_cap_trimmed'):
+                continue
+            if float(it.get('planned_qty') or 0) > 0:
+                continue
+            keep_flags[orig_idx] = False
+            removed = dict(it)
+            removed['planned_qty'] = 0
+            removed['planned_liters'] = 0
+            removed['not_loaded'] = True
+            removed['unfit_reason'] = (
+                f'The priority split left no room for this line: its item head had '
+                f'spent its share of the commitment and the other heads used the '
+                f'rest. Change the split, or add it by hand.{family_note}'
+            )
+            removed['suggestion'] = True
+            removed['suggestion_kind'] = 'priority_share'
+            extras.append(removed)
+
+    # Scratch keys never reach the API payload or a saved row.
+    for it in loaded:
+        for k in ('_cap_trimmed', '_cap_want', '_cap_placed', '_cap_group'):
+            it.pop(k, None)
+    for it in extras:
+        for k in ('_cap_trimmed', '_cap_want', '_cap_placed', '_cap_group'):
+            it.pop(k, None)
 
     new_loaded = [it for i, it in enumerate(loaded) if keep_flags[i]]
     return new_loaded, list(not_loaded) + extras
